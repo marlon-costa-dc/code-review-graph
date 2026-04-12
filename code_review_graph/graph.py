@@ -456,6 +456,16 @@ class GraphStore:
             rows = self._conn.execute("SELECT * FROM nodes").fetchall()
         return [self._row_to_node(r) for r in rows]
 
+    def get_all_nodes(self, exclude_files: bool = True) -> list[GraphNode]:
+        """Return all nodes, optionally excluding File nodes."""
+        if exclude_files:
+            rows = self._conn.execute(
+                "SELECT * FROM nodes WHERE kind != 'File'"
+            ).fetchall()
+        else:
+            rows = self._conn.execute("SELECT * FROM nodes").fetchall()
+        return [self._row_to_node(r) for r in rows]
+
     def get_edges_by_source(self, qualified_name: str) -> list[GraphEdge]:
         return list(self.iter_edges_by_source(qualified_name))
 
@@ -1182,6 +1192,182 @@ class GraphStore:
                 kind,
                 endpoint_label,
             )
+        return resolved
+
+    def get_transitive_tests(
+        self, qualified_name: str, max_depth: int = 1,
+    ) -> list[dict]:
+        """Find tests covering a node, including indirect (transitive) coverage.
+
+        1. Direct: TESTED_BY edges targeting this node (+ bare-name fallback).
+        2. Indirect: follow outgoing CALLS edges up to *max_depth* hops,
+           then collect TESTED_BY edges on each callee.
+
+        Returns a list of dicts with node fields plus ``indirect: bool``.
+        """
+        conn = self._conn
+        seen: set[str] = set()
+        results: list[dict] = []
+
+        # If the input is a class, expand to its methods first.
+        input_qns = [qualified_name]
+        row = conn.execute(
+            "SELECT kind FROM nodes WHERE qualified_name = ?",
+            (qualified_name,),
+        ).fetchone()
+        if row and row["kind"] == "Class":
+            for mrow in conn.execute(
+                "SELECT target_qualified FROM edges "
+                "WHERE source_qualified = ? AND kind = 'CONTAINS'",
+                (qualified_name,),
+            ).fetchall():
+                input_qns.append(mrow["target_qualified"])
+
+        def _node_dict(qn: str, indirect: bool) -> dict | None:
+            row = conn.execute(
+                "SELECT * FROM nodes WHERE qualified_name = ?", (qn,)
+            ).fetchone()
+            if not row:
+                return None
+            return {
+                "name": row["name"],
+                "qualified_name": row["qualified_name"],
+                "file_path": row["file_path"],
+                "kind": row["kind"],
+                "indirect": indirect,
+            }
+
+        # Direct TESTED_BY
+        for qn in input_qns:
+            for row in conn.execute(
+                "SELECT source_qualified FROM edges "
+                "WHERE target_qualified = ? AND kind = 'TESTED_BY'",
+                (qn,),
+            ).fetchall():
+                src = row["source_qualified"]
+                if src not in seen:
+                    seen.add(src)
+                    d = _node_dict(src, indirect=False)
+                    if d:
+                        results.append(d)
+
+        # Bare-name fallback for direct
+        bare = qualified_name.rsplit("::", 1)[-1] if "::" in qualified_name else qualified_name
+        for row in conn.execute(
+            "SELECT source_qualified FROM edges "
+            "WHERE target_qualified = ? AND kind = 'TESTED_BY'",
+            (bare,),
+        ).fetchall():
+            src = row["source_qualified"]
+            if src not in seen:
+                seen.add(src)
+                d = _node_dict(src, indirect=False)
+                if d:
+                    results.append(d)
+
+        # Transitive: follow CALLS edges, then collect TESTED_BY on callees
+        frontier = set(input_qns)
+        for _ in range(max_depth):
+            next_frontier: set[str] = set()
+            for qn in frontier:
+                for row in conn.execute(
+                    "SELECT target_qualified FROM edges "
+                    "WHERE source_qualified = ? AND kind = 'CALLS'",
+                    (qn,),
+                ).fetchall():
+                    next_frontier.add(row["target_qualified"])
+            for callee in next_frontier:
+                for row in conn.execute(
+                    "SELECT source_qualified FROM edges "
+                    "WHERE target_qualified = ? AND kind = 'TESTED_BY'",
+                    (callee,),
+                ).fetchall():
+                    src = row["source_qualified"]
+                    if src not in seen:
+                        seen.add(src)
+                        d = _node_dict(src, indirect=True)
+                        if d:
+                            results.append(d)
+            frontier = next_frontier
+
+        return results
+
+    def resolve_bare_call_targets(self) -> int:
+        """Batch-resolve bare-name CALLS targets using the global node table.
+
+        After parsing, some CALLS edges have bare targets (no ``::`` separator)
+        because the parser couldn't resolve cross-file.  This method matches
+        them against nodes and updates unambiguous matches in-place.
+
+        Disambiguation strategy:
+          1. Single node with that name -> resolve directly
+          2. Multiple candidates -> prefer one whose file is imported by the
+             source file (via IMPORTS_FROM edges)
+
+        Returns the number of resolved edges.
+        """
+        conn = self._conn
+
+        bare_edges = conn.execute(
+            "SELECT id, source_qualified, target_qualified, file_path "
+            "FROM edges WHERE kind = 'CALLS' AND target_qualified NOT LIKE '%::%'"
+        ).fetchall()
+        if not bare_edges:
+            return 0
+
+        # bare_name -> list of qualified_names
+        node_lookup: dict[str, list[str]] = {}
+        for row in conn.execute(
+            "SELECT name, qualified_name FROM nodes "
+            "WHERE kind IN ('Function', 'Test', 'Class')"
+        ).fetchall():
+            node_lookup.setdefault(row["name"], []).append(row["qualified_name"])
+
+        # source_file -> set of imported files (for disambiguation)
+        import_targets: dict[str, set[str]] = {}
+        for row in conn.execute(
+            "SELECT DISTINCT file_path, target_qualified FROM edges "
+            "WHERE kind = 'IMPORTS_FROM'"
+        ).fetchall():
+            target = row["target_qualified"]
+            target_file = target.split("::", 1)[0] if "::" in target else target
+            import_targets.setdefault(row["file_path"], set()).add(target_file)
+
+        resolved = 0
+        for edge in bare_edges:
+            bare_name = edge["target_qualified"]
+            candidates = node_lookup.get(bare_name, [])
+            if not candidates:
+                continue
+
+            if len(candidates) == 1:
+                qualified = candidates[0]
+            else:
+                # Disambiguate via imports
+                src_qn = edge["source_qualified"]
+                src_file = (
+                    src_qn.split("::", 1)[0] if "::" in src_qn
+                    else edge["file_path"]
+                )
+                imported_files = import_targets.get(src_file, set())
+                imported = [
+                    c for c in candidates
+                    if c.split("::", 1)[0] in imported_files
+                ]
+                if len(imported) == 1:
+                    qualified = imported[0]
+                else:
+                    continue
+
+            conn.execute(
+                "UPDATE edges SET target_qualified = ? WHERE id = ?",
+                (qualified, edge["id"]),
+            )
+            resolved += 1
+
+        if resolved:
+            conn.commit()
+            logger.info("Resolved %d bare-name CALLS targets", resolved)
         return resolved
 
     def get_all_files(self) -> list[str]:

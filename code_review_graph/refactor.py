@@ -356,6 +356,8 @@ def find_dead_code(
         # Skip test nodes and anything defined in test files.
         if node.is_test or _is_test_file(node.file_path):
             continue
+        if node.extra.get("verilog_kind"):
+            continue
 
         # Skip ambient type declarations (.d.ts) — they describe external APIs.
         if node.file_path.endswith(".d.ts"):
@@ -375,9 +377,6 @@ def find_dead_code(
         if node.is_test or _is_test_file(node.file_path):
             if _MOCK_NAME_RE.search(node.name):
                 continue
-
-        if node.extra.get("verilog_kind"):
-            continue
 
         # Skip entry points (by name pattern or decorator, not just "uncalled").
         if _is_entry_point(node):
