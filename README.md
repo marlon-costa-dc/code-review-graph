@@ -28,6 +28,7 @@
   <a href="https://github.com/tirth8205/code-review-graph/stargazers"><img src="https://img.shields.io/github/stars/tirth8205/code-review-graph?style=flat-square" alt="Stars"></a>
   <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square" alt="MIT Licence"></a>
   <a href="https://github.com/tirth8205/code-review-graph/actions/workflows/ci.yml"><img src="https://github.com/tirth8205/code-review-graph/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/tirth8205/code-review-graph/actions/workflows/eval.yml"><img src="https://img.shields.io/badge/benchmarks-reproducible-success?style=flat-square" alt="Benchmarks: reproducible"></a>
   <a href="https://www.python.org/"><img src="https://img.shields.io/badge/python-3.10%2B-blue.svg?style=flat-square" alt="Python 3.10+"></a>
   <a href="https://modelcontextprotocol.io/"><img src="https://img.shields.io/badge/MCP-compatible-green.svg?style=flat-square" alt="MCP"></a>
   <a href="https://code-review-graph.com"><img src="https://img.shields.io/badge/website-code--review--graph.com-blue?style=flat-square" alt="Website"></a>
@@ -237,7 +238,7 @@ See [docs/GITHUB_ACTION.md](docs/GITHUB_ACTION.md) for inputs, risk levels, and 
 
 **Headline number: the median per-question token reduction across the 6 repos is ~65x** (whole-corpus baseline vs graph query). The **376x maximum** is a single best-case repo (fastapi, the largest corpus) — not the typical result.
 
-All numbers come from the automated evaluation runner against 6 real open-source repositories (13 commits total). Every config pins an upstream SHA, the Leiden community detector runs with a fixed seed, and embeddings are deterministic on CPU — so two runs on different machines produce identical numbers. The full reproduction recipe with expected outputs is in [`docs/REPRODUCING.md`](docs/REPRODUCING.md). A weekly report-only run on the two smallest configs lives in [`.github/workflows/eval.yml`](.github/workflows/eval.yml).
+All numbers come from the automated evaluation runner against 6 real open-source repositories (13 commits total). Every config pins an upstream SHA, the Leiden community detector runs with a fixed seed, and embeddings are deterministic on CPU — so two runs on different machines produce identical numbers. The full reproduction recipe with expected outputs is in [`docs/REPRODUCING.md`](docs/REPRODUCING.md). A weekly report-only run on the two smallest configs lives in [`.github/workflows/eval.yml`](.github/workflows/eval.yml); it publishes the **median per-question token reduction** for that run as a table in the job summary and uploads the raw CSVs as an artifact. The [`benchmarks: reproducible`](https://github.com/tirth8205/code-review-graph/actions/workflows/eval.yml) badge links to those runs — the badge asserts the pipeline is reproducible; the canonical numbers live here and in [`docs/REPRODUCING.md`](docs/REPRODUCING.md), never auto-committed from CI.
 
 <details>
 <summary><strong>Token efficiency: ~65x median per-question reduction (range 36x – 376x; whole-corpus vs graph query)</strong></summary>
