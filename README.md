@@ -58,8 +58,27 @@ Where retrieval tools focus on navigation, CRG is review-native — risk-scored 
 
 ## Quick Start
 
+### Quick install (no Python setup)
+
+macOS / Linux:
+
+```bash
+curl -LsSf https://raw.githubusercontent.com/tirth8205/code-review-graph/main/install.sh | sh
+```
+
+Windows (PowerShell):
+
+```powershell
+irm https://raw.githubusercontent.com/tirth8205/code-review-graph/main/install.ps1 | iex
+```
+
+This installs [uv](https://docs.astral.sh/uv/) (a single static binary that manages Python for you) if it is missing, then installs the `code-review-graph` CLI. It does **not** ship a bundled runtime — uv handles Python under the hood, so you don't have to. The script is idempotent; re-run it any time. Prefer to do it yourself? Use the alternatives below.
+
+### Alternatives (already have Python / uv)
+
 ```bash
 pip install code-review-graph                     # or: pipx install code-review-graph
+uvx code-review-graph install                     # or run without installing, via uv
 code-review-graph install          # auto-detects and configures all supported platforms
 code-review-graph build            # parse your codebase
 code-review-graph doctor           # verify the install is healthy
