@@ -15,7 +15,12 @@ from ..hints import generate_hints, get_session
 from ..incremental import get_changed_files, get_db_path, get_staged_and_unstaged
 from ..parser import normalize_file_path
 from ..search import hybrid_search
-from ._common import _BUILTIN_CALL_NAMES, _get_store, _resolve_graph_file_paths
+from ._common import (
+    _BUILTIN_CALL_NAMES,
+    _get_store_for_read,
+    _not_built_response,
+    _resolve_graph_file_paths,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -130,7 +135,9 @@ def get_impact_radius(
     if isinstance(max_results, bool) or max_results < 1:
         raise ValueError("max_results must be an integer greater than or equal to 1")
 
-    store, root = _get_store(repo_root)
+    store, root, not_built = _get_store_for_read(repo_root)
+    if store is None or root is None:
+        return not_built if not_built is not None else _not_built_response()
     try:
         if changed_files is None:
             changed_files = get_changed_files(root, base)
@@ -252,7 +259,9 @@ def query_graph(
     if isinstance(max_results, bool) or max_results < 1:
         raise ValueError("max_results must be an integer greater than or equal to 1")
 
-    store, root = _get_store(repo_root)
+    store, root, not_built = _get_store_for_read(repo_root)
+    if store is None or root is None:
+        return not_built if not_built is not None else _not_built_response()
     try:
         if pattern not in _QUERY_PATTERNS:
             return {
@@ -724,7 +733,9 @@ def semantic_search_nodes(
     Returns:
         Ranked list of matching nodes.
     """
-    store, root = _get_store(repo_root)
+    store, root, not_built = _get_store_for_read(repo_root)
+    if store is None or root is None:
+        return not_built if not_built is not None else _not_built_response()
     try:
         mode_out: list[str] = []
         results = hybrid_search(
@@ -786,7 +797,9 @@ def list_graph_stats(repo_root: str | None = None) -> dict[str, Any]:
     Returns:
         Total nodes, edges, breakdown by kind, languages, and last update time.
     """
-    store, root = _get_store(repo_root)
+    store, root, not_built = _get_store_for_read(repo_root)
+    if store is None or root is None:
+        return not_built if not_built is not None else _not_built_response()
     try:
         stats = store.get_stats()
 
@@ -863,7 +876,9 @@ def find_large_functions(
     Returns:
         Oversized nodes with line counts, ordered largest first.
     """
-    store, root = _get_store(repo_root)
+    store, root, not_built = _get_store_for_read(repo_root)
+    if store is None or root is None:
+        return not_built if not_built is not None else _not_built_response()
     try:
         nodes = store.get_nodes_by_size(
             min_lines=min_lines,
@@ -933,7 +948,9 @@ def traverse_graph_func(
         token_budget: Approximate token limit for results.
         repo_root: Repository root path.
     """
-    store, root = _get_store(repo_root)
+    store, root, not_built = _get_store_for_read(repo_root)
+    if store is None or root is None:
+        return not_built if not_built is not None else _not_built_response()
     try:
         results = hybrid_search(store, query, limit=1)
         if not results:

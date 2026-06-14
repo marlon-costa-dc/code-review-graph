@@ -131,6 +131,62 @@ def with_provenance(result: Any, repo_root: str | None = None) -> Any:
         result["_graph"] = provenance
     return result
 
+
+# Metadata keys written by a build/update run. Their presence proves the graph
+# was built at least once, even if the resulting graph legitimately has 0 nodes
+# (e.g. an empty repo). Used to distinguish "never built" from "built, empty".
+_BUILD_MARKER_KEYS: tuple[str, ...] = ("last_updated", "last_build_type")
+
+
+def _graph_is_built(store: GraphStore) -> bool:
+    """Return True if the graph has been built at least once.
+
+    A graph counts as built when it contains any node, or when a build marker
+    metadata row is present. The marker check ensures a legitimately empty repo
+    that was actually built is not mistaken for a never-built repo.
+    """
+    try:
+        if store.get_stats().total_nodes > 0:
+            return True
+        return any(store.get_metadata(key) for key in _BUILD_MARKER_KEYS)
+    except sqlite3.Error:
+        logger.warning("Failed to read graph build state", exc_info=True)
+        # Be conservative: if we cannot tell, do not block the read tool.
+        return True
+
+
+def _not_built_response() -> dict[str, Any]:
+    """Standard response returned by read tools when the graph is not built."""
+    return {
+        "status": "not_built",
+        "message": "Graph not built — run build_or_update_graph_tool first.",
+        "summary": "Graph not built — run build_or_update_graph_tool first.",
+        "next_tool_suggestions": ["build_or_update_graph_tool"],
+    }
+
+
+def _get_store_for_read(
+    repo_root: str | None = None,
+) -> tuple[GraphStore | None, Path | None, dict[str, Any] | None]:
+    """Open the store for a read tool, guarding against an unbuilt graph.
+
+    Returns ``(store, root, None)`` when the graph has been built; the caller
+    owns ``store`` and must close it. Returns ``(None, None, not_built)`` when
+    the graph is missing or never built, in which case the caller should return
+    the ``not_built`` dict immediately (no store to close).
+    """
+    root = _resolve_root(repo_root)
+    db_path = get_db_path(root, read_only=True)
+    # A missing db file means the graph was never built. Opening GraphStore
+    # would silently create an empty db, so short-circuit before that happens.
+    if not Path(db_path).exists():
+        return None, None, _not_built_response()
+    store = GraphStore(db_path)
+    if not _graph_is_built(store):
+        store.close()
+        return None, None, _not_built_response()
+    return store, root, None
+
 # Common JS/TS builtin method names filtered from callers_of results.
 # "Who calls .map()?" returns hundreds of hits and is never useful.
 # These are kept in the graph (callees_of still shows them) but excluded
