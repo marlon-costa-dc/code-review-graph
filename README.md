@@ -48,6 +48,8 @@
 
 AI coding tools can end up re-reading large parts of your codebase on review tasks. `code-review-graph` fixes that. It builds a structural map of your code with [Tree-sitter](https://tree-sitter.github.io/tree-sitter/), tracks changes incrementally, and gives your AI assistant precise context via [MCP](https://modelcontextprotocol.io/) so it reads only what matters.
 
+Where retrieval tools focus on navigation, CRG is review-native — risk-scored change analysis, impact radius, and a PR-review GitHub Action — token-efficient, local, and free, with no waitlist.
+
 <p align="center">
   <img src="diagrams/diagram1_before_vs_after.png" alt="The Token Problem: reading flask's whole corpus costs 143,594 tokens, a graph answer costs 2,196 — 71.0x fewer" width="85%" />
 </p>
