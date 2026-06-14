@@ -62,6 +62,7 @@ Where retrieval tools focus on navigation, CRG is review-native — risk-scored 
 pip install code-review-graph                     # or: pipx install code-review-graph
 code-review-graph install          # auto-detects and configures all supported platforms
 code-review-graph build            # parse your codebase
+code-review-graph doctor           # verify the install is healthy
 ```
 
 One command sets up everything. `install` detects which AI coding tools you have, writes the correct MCP configuration for each one, installs platform-native hooks/skills where supported, and injects graph-aware instructions into your platform rules. It auto-detects whether you installed via `uvx` or `pip`/`pipx` and generates the right config. Restart your editor/tool after installing.
