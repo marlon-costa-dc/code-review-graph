@@ -251,7 +251,8 @@ def query_graph(
         repo_root: Repository root path. Auto-detected if omitted.
         detail_level: "standard" (full output) or "minimal" (summary only).
         max_results: Maximum results to return. Minimal mode additionally caps
-            visible results at five and reports the exact omitted count.
+            visible results at five. Truncated responses report the exact total
+            and omitted counts.
 
     Returns:
         Matching nodes and their aligned edges, with total and omitted counts.
@@ -658,6 +659,7 @@ def query_graph(
                     add_result(node_to_dict(n))
 
         results_omitted = max(0, total_results - len(results))
+        truncated = results_omitted > 0
         summary = (
             f"Found {total_results} result(s) "
             f"for {pattern}('{target}')"
@@ -674,7 +676,7 @@ def query_graph(
                 }
                 for r in results
             ]
-            return {
+            response: dict[str, Any] = {
                 "status": "ok",
                 "pattern": pattern,
                 "target": target,
@@ -684,8 +686,12 @@ def query_graph(
                 "results_omitted": results_omitted,
                 "results": minimal_results,
             }
+            if truncated:
+                response["truncated"] = True
+                response["total_results"] = total_results
+            return response
 
-        return {
+        response = {
             "status": "ok",
             "pattern": pattern,
             "target": target,
@@ -696,6 +702,10 @@ def query_graph(
             "results": results,
             "edges": edges_out,
         }
+        if truncated:
+            response["truncated"] = True
+            response["total_results"] = total_results
+        return response
     finally:
         store.close()
 
