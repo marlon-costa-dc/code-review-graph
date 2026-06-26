@@ -4579,11 +4579,13 @@ class CodeParser:
         """Walk ancestors to detect statically-dead guards.
 
         Returns True when ``node`` sits inside an ``if_statement`` whose
-        condition is ``False`` (the literal) or ``TYPE_CHECKING`` (the
-        ``typing`` sentinel).  This covers the two most common Python
-        idioms for compile-time-only code:
+        condition is ``False`` (the literal), the integer ``0``, or
+        ``TYPE_CHECKING`` (the ``typing`` sentinel).  This covers the
+        most common Python idioms for compile-time-only code:
 
             if False:
+                ...
+            if 0:
                 ...
             if TYPE_CHECKING:
                 ...
@@ -4605,6 +4607,12 @@ class CodeParser:
                 if cond is not None:
                     # ``if False:``
                     if cond.type == "false":
+                        return True
+                    # ``if 0:``
+                    if (
+                        cond.type == "integer"
+                        and cond.text == b"0"
+                    ):
                         return True
                     # ``if TYPE_CHECKING:``
                     if (
