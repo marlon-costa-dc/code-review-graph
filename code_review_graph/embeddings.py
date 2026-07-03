@@ -28,6 +28,11 @@ from urllib.parse import urlparse
 from . import __version__ as _crg_version
 from .graph import GraphNode, GraphStore, node_to_dict
 
+try:  # Optional acceleration — ships with the [embeddings] extra.
+    import numpy as _np
+except ImportError:  # pragma: no cover
+    _np = None
+
 logger = logging.getLogger(__name__)
 
 # Sent on every cloud-provider HTTP request. Some providers (e.g. Fireworks)
@@ -1252,12 +1257,40 @@ class EmbeddingStore:
         provider_name = self.provider.name
         query_vec = self.provider.embed_query(query)
 
-        # Process in chunks, only matching current provider
-        scored: list[tuple[str, float]] = []
         cursor = self._conn.execute(
             "SELECT qualified_name, vector FROM embeddings WHERE provider = ?",
             (provider_name,),
         )
+
+        # Vectorized scan when numpy is available (one matmul instead of a
+        # per-row Python cosine — ~100x on large stores). Rows whose stored
+        # dimension differs from the query score 0.0, matching
+        # ``_cosine_similarity``'s length-mismatch behaviour.
+        if _np is not None:
+            rows = cursor.fetchall()
+            if not rows:
+                return []
+            expected = len(query_vec) * 4  # float32 bytes per stored vector
+            names = [row["qualified_name"] for row in rows]
+            zero = b"\x00" * expected
+            blobs = b"".join(
+                row["vector"] if len(row["vector"]) == expected else zero
+                for row in rows
+            )
+            mat = _np.frombuffer(blobs, dtype=_np.float32).reshape(len(rows), -1)
+            q = _np.asarray(query_vec, dtype=_np.float32)
+            denom = _np.linalg.norm(mat, axis=1) * float(_np.linalg.norm(q))
+            sims = _np.divide(
+                mat @ q, denom, out=_np.zeros(len(rows), dtype=_np.float32),
+                where=denom > 0,
+            )
+            k = min(limit, len(rows))
+            top = _np.argpartition(sims, -k)[-k:]
+            top = top[_np.argsort(sims[top])[::-1]]
+            return [(names[i], float(sims[i])) for i in top]
+
+        # Pure-Python fallback: process in chunks, only matching current provider
+        scored: list[tuple[str, float]] = []
         chunk_size = 500
         while True:
             rows = cursor.fetchmany(chunk_size)
