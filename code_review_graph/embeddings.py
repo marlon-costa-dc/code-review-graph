@@ -1207,9 +1207,18 @@ class EmbeddingStore:
         if not self.provider:
             return 0
 
-        # Filter to nodes that need embedding
+        # Filter to nodes that need embedding. Load existing hashes in one
+        # query instead of one SELECT per node (44k+ round-trips on large
+        # graphs made no-op re-embeds take seconds).
         to_embed: list[tuple[GraphNode, str, str]] = []
         provider_name = self.provider.name
+
+        existing_rows: dict[str, tuple[str, str]] = {
+            row["qualified_name"]: (row["text_hash"], row["provider"])
+            for row in self._conn.execute(
+                "SELECT qualified_name, text_hash, provider FROM embeddings"
+            )
+        }
 
         for node in nodes:
             if node.kind == "File":
@@ -1217,14 +1226,8 @@ class EmbeddingStore:
             text = _node_to_text(node)
             text_hash = hashlib.sha256(text.encode()).hexdigest()
 
-            existing = self._conn.execute(
-                "SELECT text_hash, provider FROM embeddings WHERE qualified_name = ?",
-                (node.qualified_name,),
-            ).fetchone()
-
             # Re-embed if text changed OR provider changed
-            if (existing and existing["text_hash"] == text_hash
-                    and existing["provider"] == provider_name):
+            if existing_rows.get(node.qualified_name) == (text_hash, provider_name):
                 continue
             to_embed.append((node, text, text_hash))
 
@@ -1237,17 +1240,17 @@ class EmbeddingStore:
             texts = [t for _, t, _ in batch]
             vectors = self.provider.embed(texts)
 
-            for (node, _text, text_hash), vec in zip(batch, vectors):
-                blob = _encode_vector(vec)
-                self._conn.execute(
-                    """
-                    INSERT OR REPLACE INTO embeddings
-                        (qualified_name, vector, text_hash, provider)
-                    VALUES (?, ?, ?, ?)
-                    """,
-                    (node.qualified_name, blob, text_hash, provider_name),
-                )
-                embedded += 1
+            rows = [
+                (node.qualified_name, _encode_vector(vec), text_hash, provider_name)
+                for (node, _text, text_hash), vec in zip(batch, vectors)
+            ]
+            self._conn.executemany(
+                """INSERT OR REPLACE INTO embeddings
+                   (qualified_name, vector, text_hash, provider)
+                   VALUES (?, ?, ?, ?)""",
+                rows,
+            )
+            embedded += len(rows)
 
             self._conn.commit()
 
