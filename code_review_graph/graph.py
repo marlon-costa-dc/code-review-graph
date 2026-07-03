@@ -1024,6 +1024,27 @@ class GraphStore:
             (signature, node_id),
         )
 
+    def update_node_signatures(
+        self, updates: list[tuple[str, int]],
+    ) -> None:
+        """Set the ``signature`` column for many nodes in one transaction.
+
+        With the connection in autocommit mode, per-row updates each pay a
+        full WAL commit; batching them keeps postprocess signature writes
+        to a single transaction.
+        """
+        if not updates:
+            return
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            self._conn.executemany(
+                "UPDATE nodes SET signature = ? WHERE id = ?", updates,
+            )
+            self._conn.commit()
+        except BaseException:
+            self._conn.rollback()
+            raise
+
     def get_all_community_ids(self) -> dict[str, int | None]:
         """Return a mapping of *all* qualified names to their community_id.
 
