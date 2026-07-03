@@ -195,6 +195,12 @@ class GraphStore:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA busy_timeout=5000")
+        # NORMAL is the documented safe pairing with WAL (a power loss can
+        # roll back the last transaction but cannot corrupt the DB) and
+        # avoids a full fsync on every commit.
+        self._conn.execute("PRAGMA synchronous=NORMAL")
+        self._conn.execute("PRAGMA cache_size=-64000")  # 64 MiB page cache
+        self._conn.execute("PRAGMA temp_store=MEMORY")
         self._init_schema()
         # Ensure schema_version is set, then run pending migrations
         if get_schema_version(self._conn) < 1:
