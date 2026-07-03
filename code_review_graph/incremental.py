@@ -24,6 +24,9 @@ from .parser import CodeParser
 
 _MAX_PARSE_WORKERS = int(os.environ.get("CRG_PARSE_WORKERS", str(min(os.cpu_count() or 4, 8))))
 
+# Files stored per write transaction during parallel builds/updates.
+_STORE_BATCH_SIZE = int(os.environ.get("CRG_STORE_BATCH_SIZE", "50"))
+
 
 def _select_executor_kind() -> str:
     """Return 'process' or 'thread' for parallel parsing.
@@ -875,6 +878,9 @@ def full_build(
         # thread on Windows-MCP-stdio to avoid pipe-handle inheritance
         # deadlock (issues #46, #136). Override via CRG_PARSE_EXECUTOR env.
         args_list = [(rel_path, str(repo_root)) for rel_path in files]
+        # Group stored files into batches: one transaction per ~50 files
+        # instead of one per file (each commit pays a WAL fsync).
+        batch: list[tuple[str, list, list, str]] = []
         with _make_executor(_MAX_PARSE_WORKERS) as executor:
             for i, (rel_path, nodes, edges, error, fhash) in enumerate(
                 executor.map(_parse_single_file, args_list, chunksize=20),
@@ -885,16 +891,16 @@ def full_build(
                     errors.append({"file": rel_path, "error": error})
                     continue
                 full_path = repo_root / rel_path
-                store.store_file_nodes_edges(
-                    str(full_path),
-                    nodes,
-                    edges,
-                    fhash,
-                )
+                batch.append((str(full_path), nodes, edges, fhash))
+                if len(batch) >= _STORE_BATCH_SIZE:
+                    store.store_file_batch(batch)
+                    batch.clear()
                 total_nodes += len(nodes)
                 total_edges += len(edges)
                 if i % 200 == 0 or i == file_count:
                     logger.info("Progress: %d/%d files parsed", i, file_count)
+            if batch:
+                store.store_file_batch(batch)
 
     store.set_metadata("last_updated", time.strftime("%Y-%m-%dT%H:%M:%S"))
     store.set_metadata("last_build_type", "full")
@@ -1007,6 +1013,7 @@ def incremental_update(
     else:
         # See full-build comment above for executor kind rationale.
         args_list = [(rel_path, str(repo_root)) for rel_path in to_parse]
+        batch: list[tuple[str, list, list, str]] = []
         with _make_executor(_MAX_PARSE_WORKERS) as executor:
             for rel_path, nodes, edges, error, fhash in executor.map(
                 _parse_single_file,
@@ -1017,14 +1024,14 @@ def incremental_update(
                     logger.warning("Error parsing %s: %s", rel_path, error)
                     errors.append({"file": rel_path, "error": error})
                     continue
-                store.store_file_nodes_edges(
-                    str(repo_root / rel_path),
-                    nodes,
-                    edges,
-                    fhash,
-                )
+                batch.append((str(repo_root / rel_path), nodes, edges, fhash))
+                if len(batch) >= _STORE_BATCH_SIZE:
+                    store.store_file_batch(batch)
+                    batch.clear()
                 total_nodes += len(nodes)
                 total_edges += len(edges)
+            if batch:
+                store.store_file_batch(batch)
 
     store.set_metadata("last_updated", time.strftime("%Y-%m-%dT%H:%M:%S"))
     store.set_metadata("last_build_type", "incremental")
