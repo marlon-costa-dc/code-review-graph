@@ -285,6 +285,50 @@ def find_dead_code(
         base = row[1].rsplit("::", 1)[-1] if "::" in row[1] else row[1]
         class_bases.setdefault(row[0], []).append(base)
 
+    # Build MRO connectivity among classes so a method reachable through the
+    # inheritance chain is not flagged dead. Bare base names are resolved to
+    # class nodes so cross-file inheritance links up. The graph is undirected
+    # (child <-> base) so dispatch works both ways: a call to a base method
+    # keeps every override alive, and a call to an override keeps the
+    # inherited base method reachable. See OO/MRO false positives.
+    class_name_to_qns: dict[str, set[str]] = {}
+    for row in conn.execute(
+        "SELECT name, qualified_name FROM nodes WHERE kind = 'Class'"
+    ).fetchall():
+        class_name_to_qns.setdefault(row[0], set()).add(row[1])
+
+    mro_adj: dict[str, set[str]] = {}
+
+    def _link_classes(a: str, b: str) -> None:
+        mro_adj.setdefault(a, set()).add(b)
+        mro_adj.setdefault(b, set()).add(a)
+
+    for child_qn, base_list in class_bases.items():
+        for base in base_list:
+            for base_qn in class_name_to_qns.get(base, ()):
+                if base_qn != child_qn:
+                    _link_classes(child_qn, base_qn)
+
+    _mro_component_cache: dict[str, frozenset[str]] = {}
+
+    def _mro_component(class_qn: str) -> frozenset[str]:
+        """Return every class qn reachable from *class_qn* via inheritance."""
+        cached = _mro_component_cache.get(class_qn)
+        if cached is not None:
+            return cached
+        seen: set[str] = set()
+        stack = [class_qn]
+        while stack:
+            cur = stack.pop()
+            if cur in seen:
+                continue
+            seen.add(cur)
+            stack.extend(mro_adj.get(cur, ()))
+        frozen = frozenset(seen)
+        for member in seen:
+            _mro_component_cache[member] = frozen
+        return frozen
+
     # Build import graph: file_path -> set of file_paths it imports from.
     # Used to filter bare-name caller matches to plausible callers.
     importer_files: dict[str, set[str]] = {}
@@ -556,23 +600,24 @@ def find_dead_code(
                 method_suffix = "." + node.name
                 if node.qualified_name.endswith(method_suffix):
                     class_qn = node.qualified_name[: -len(method_suffix)]
-                    for base_name in class_bases.get(class_qn, []):
-                        rows = conn.execute(
-                            "SELECT n.qualified_name FROM nodes n "
-                            "WHERE n.parent_name = ? AND n.name = ? "
-                            "AND n.kind IN ('Function', 'Test')",
-                            (base_name, node.name),
-                        ).fetchall()
-                        for (base_method_qn,) in rows:
-                            if conn.execute(
-                                "SELECT 1 FROM edges "
-                                "WHERE target_qualified = ? AND kind = 'CALLS' "
-                                "LIMIT 1",
-                                (base_method_qn,),
-                            ).fetchone():
-                                has_callers = True
-                                break
-                        if has_callers:
+                    # A method is alive if ANY class in the same MRO-connected
+                    # component defines a same-named method that has a caller.
+                    # A call to any relative dispatches to this method at
+                    # runtime, so overrides and inherited bases stay reachable.
+                    for rel_qn in _mro_component(class_qn):
+                        if rel_qn == class_qn:
+                            continue
+                        sibling_qn = rel_qn + method_suffix
+                        rel_name = (
+                            rel_qn.rsplit("::", 1)[-1]
+                            if "::" in rel_qn else rel_qn
+                        )
+                        if conn.execute(
+                            "SELECT 1 FROM edges WHERE kind = 'CALLS' "
+                            "AND target_qualified IN (?, ?) LIMIT 1",
+                            (sibling_qn, f"{rel_name}::{node.name}"),
+                        ).fetchone():
+                            has_callers = True
                             break
 
             if not has_callers:
