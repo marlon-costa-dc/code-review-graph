@@ -102,4 +102,4 @@ PRESENTATION_BRIEF.md
 
 # Beads / Dolt files (added by bd init)
 .beads/proxieddb/
-.omo/run-continuation/
+.omo/
