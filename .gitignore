@@ -92,3 +92,7 @@ SCALING_AND_TOKEN_EFFICIENCY_PLAN.md
 # Beads / Dolt files (added by bd init)
 .dolt/
 .beads-credential-key
+
+# Beads / Dolt files (added by bd init)
+.beads/proxieddb/
+.omo/run-continuation/
