@@ -96,6 +96,19 @@ def _run_temporal_resolver(store: GraphStore) -> Optional[dict]:
         logger.warning("Temporal resolver failed: %s", exc)
         return None
 
+
+def _run_jedi_resolver(store: GraphStore, repo_root: Path) -> Optional[dict]:
+    """Run the Jedi Python call resolver, swallowing any failure so build
+    never fails because of it. Recovers lowercase-receiver method calls
+    (obj.method()) that tree-sitter drops, removing OO dead-code false
+    positives. Returns stats or None on error.
+    """
+    try:
+        from .jedi_resolver import enrich_jedi_calls
+        return enrich_jedi_calls(store, repo_root)
+    except Exception as exc:  # noqa: BLE001 - best-effort post-pass
+        logger.warning("Jedi Python resolver failed: %s", exc)
+
 # Default ignore patterns (in addition to .gitignore).
 #
 # `<dir>/**` patterns are matched at any depth by _should_ignore, so
@@ -910,6 +923,7 @@ def full_build(
     rescript_stats = _run_rescript_resolver(store)
     spring_stats = _run_spring_resolver(store)
     temporal_stats = _run_temporal_resolver(store)
+    jedi_stats = _run_jedi_resolver(store, repo_root)
 
     return {
         "files_parsed": len(files),
@@ -919,6 +933,7 @@ def full_build(
         "rescript_resolution": rescript_stats,
         "spring_resolution": spring_stats,
         "temporal_resolution": temporal_stats,
+        "python_enrichment": jedi_stats,
     }
 
 
@@ -1049,6 +1064,8 @@ def incremental_update(
     spring_changed = any(rp.endswith(".java") for rp in all_files)
     spring_stats = _run_spring_resolver(store) if spring_changed else None
     temporal_stats = _run_temporal_resolver(store) if spring_changed else None
+    py_changed = any(rp.endswith(".py") for rp in all_files)
+    jedi_stats = _run_jedi_resolver(store, repo_root) if py_changed else None
 
     return {
         "files_updated": len(all_files),
@@ -1060,6 +1077,7 @@ def incremental_update(
         "rescript_resolution": rescript_stats,
         "spring_resolution": spring_stats,
         "temporal_resolution": temporal_stats,
+        "python_enrichment": jedi_stats,
     }
 
 
