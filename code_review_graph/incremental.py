@@ -155,6 +155,19 @@ def _run_scoped_resolver(store: GraphStore) -> Optional[dict]:
         return None
 
 
+def _run_jedi_resolver(store: GraphStore, repo_root: Path) -> Optional[dict]:
+    """Run the Jedi Python call resolver, swallowing any failure so build
+    never fails because of it. Recovers lowercase-receiver method calls
+    (obj.method()) that tree-sitter drops, removing OO dead-code false
+    positives. Returns stats or None on error.
+    """
+    try:
+        from .jedi_resolver import enrich_jedi_calls
+        return enrich_jedi_calls(store, repo_root)
+    except Exception as exc:  # noqa: BLE001 - best-effort post-pass
+        logger.warning("Jedi Python resolver failed: %s", exc)
+        return None
+
 # Default ignore patterns (in addition to .gitignore).
 #
 # ``**/<dir>/**`` patterns are safe-anywhere directory exclusions.  A leading
@@ -1147,6 +1160,7 @@ def full_build(
     temporal_stats = _run_temporal_resolver(store)
     hcl_stats = _run_hcl_resolver(store)
     scoped_stats = _run_scoped_resolver(store)
+    jedi_stats = _run_jedi_resolver(store, repo_root)
 
     return {
         "files_parsed": len(files),
@@ -1161,6 +1175,7 @@ def full_build(
         "temporal_resolution": temporal_stats,
         "hcl_resolution": hcl_stats,
         "scoped_resolution": scoped_stats,
+        "python_enrichment": jedi_stats,
     }
 
 
@@ -1342,6 +1357,8 @@ def incremental_update(
     hcl_stats = _run_hcl_resolver(store) if hcl_changed else None
     scoped_changed = any(rp.endswith((".php", ".rs", ".cs")) for rp in all_files)
     scoped_stats = _run_scoped_resolver(store) if scoped_changed else None
+    py_changed = any(rp.endswith(".py") for rp in all_files)
+    jedi_stats = _run_jedi_resolver(store, repo_root) if py_changed else None
 
     return {
         "files_updated": files_updated,
@@ -1358,6 +1375,7 @@ def incremental_update(
         "temporal_resolution": temporal_stats,
         "hcl_resolution": hcl_stats,
         "scoped_resolution": scoped_stats,
+        "python_enrichment": jedi_stats,
     }
 
 
