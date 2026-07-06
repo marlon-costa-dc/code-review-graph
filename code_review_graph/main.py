@@ -86,11 +86,12 @@ def _resolve_repo_root(repo_root: Optional[str]) -> Optional[str]:
     return repo_root if repo_root else _default_repo_root
 
 
-# The curated "lean" allow-list loaded by default.  CRG registers ~30 MCP
-# tools; shipping every description costs ~8k tokens per LLM turn before any
-# work happens.  This set is the smallest one that still covers every
-# documented workflow (see CLAUDE.md "When to use graph tools FIRST" and the
-# prompt templates in prompts.py):
+# The curated "lean" allow-list, available on demand via ``--tools lean`` /
+# ``CRG_TOOLS=lean``.  CRG registers ~30 MCP tools and exposes them all by
+# default (upstream behavior); shipping every description costs ~8k tokens per
+# LLM turn, so token-constrained clients can opt into this smaller set that
+# still covers every documented workflow (see CLAUDE.md "When to use graph
+# tools FIRST" and the prompt templates in prompts.py):
 #
 #   - get_minimal_context_tool   : the mandated entry point (~100 tokens).
 #   - query_graph_tool           : callers/callees/imports/tests tracing.
@@ -100,9 +101,9 @@ def _resolve_repo_root(repo_root: Optional[str]) -> Optional[str]:
 #   - get_impact_radius_tool     : blast-radius analysis.
 #   - get_affected_flows_tool    : which execution paths a change touches.
 #
-# The remaining ~23 tools (wiki, communities, refactor, viz, embeddings,
-# build/postprocess, cross-repo, analysis explorers, docs) stay one
-# ``--tools all`` / ``CRG_TOOLS=all`` away.
+# The full set (wiki, communities, refactor, viz, embeddings,
+# build/postprocess, cross-repo, analysis explorers, docs) is the default;
+# ``--tools lean`` / ``CRG_TOOLS=lean`` narrows to the 7 above.
 LEAN_TOOLS: tuple[str, ...] = (
     "get_minimal_context_tool",
     "query_graph_tool",
@@ -1110,8 +1111,9 @@ def _resolve_tool_allowlist(tools: str | None) -> set[str] | None:
     """
     raw = tools if tools is not None else os.environ.get("CRG_TOOLS")
     if raw is None:
-        # Nothing specified anywhere -> lean is the default.
-        return set(LEAN_TOOLS)
+        # Nothing specified anywhere -> expose ALL tools (upstream default).
+        # Token-lean mode is opt-in via ``--tools lean`` / ``CRG_TOOLS=lean``.
+        return None
     raw = raw.strip()
     if not raw:
         return None
@@ -1128,14 +1130,14 @@ def _resolve_tool_allowlist(tools: str | None) -> set[str] | None:
 def _apply_tool_filter(tools: str | None = None) -> None:
     """Trim registered MCP tools down to an allow-list.
 
-    CRG registers ~30 MCP tools; shipping every description costs ~8k tokens
-    per LLM turn before any work happens.  To keep the token moat intact the
-    server loads only the curated :data:`LEAN_TOOLS` set **by default**.
+    CRG registers ~30 MCP tools.  By default **every** tool is exposed
+    (matching upstream).  For token-constrained clients, opt into the curated
+    :data:`LEAN_TOOLS` set with ``--tools lean`` / ``CRG_TOOLS=lean``.
 
     The allow-list is resolved by :func:`_resolve_tool_allowlist` from, in
     order: the ``tools`` argument (``serve --tools ...``), the ``CRG_TOOLS``
-    env var, then the lean default.  Pass ``"all"`` (CLI or env) to restore
-    every tool, ``"lean"`` for the explicit curated set, or a comma-separated
+    env var, then the all-tools default.  Pass ``"all"`` (CLI or env) to keep
+    every tool explicitly, ``"lean"`` for the curated 7-tool set, or a
     list for a custom set.  Unknown names are ignored gracefully.
 
     A one-line notice is written to **stderr** whenever tools are trimmed, so
@@ -1144,8 +1146,11 @@ def _apply_tool_filter(tools: str | None = None) -> None:
 
     Examples::
 
-        # default — lean set (7 tools)
+        # default — all 30 tools
         code-review-graph serve
+
+        # token-lean set (7 tools)
+        code-review-graph serve --tools lean
 
         # restore everything
         code-review-graph serve --tools all

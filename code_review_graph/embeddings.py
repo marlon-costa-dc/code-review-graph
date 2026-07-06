@@ -25,10 +25,10 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+import numpy as _np
+
 from . import __version__ as _crg_version
 from .graph import GraphNode, GraphStore, node_to_dict
-
-import numpy as _np
 
 logger = logging.getLogger(__name__)
 

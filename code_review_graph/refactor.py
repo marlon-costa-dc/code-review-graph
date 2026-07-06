@@ -205,7 +205,8 @@ def _is_entry_point(node: Any) -> bool:
 # "body: GoalCreate", "Optional[UserResponse]", "list[Item]").
 _TEST_FILE_RE = re.compile(
     r"([\\/]__tests__[\\/]|\.spec\.[jt]sx?$|\.test\.[jt]sx?$|[\\/]test_[^/\\]*\.py$"
-    r"|[\\/]e2e[_-]?tests?[\\/]|[\\/]test[_-]utils?[\\/])",
+    r"|[\\/][^/\\]*_tests?\.py$|[\\/]conftest\.py$"
+    r"|[\\/]e2e[_-]?tests?[\\/]|[\\/]test[_-]utils?[\\/])"
 )
 
 
@@ -580,7 +581,13 @@ def find_dead_code(
                 language=node.language or None,
             )
             incoming = incoming + bare_inh
-        has_callers = any(e.kind == "CALLS" for e in incoming)
+        # Count only reachable CALLS: edges tagged reachable=False sit inside
+        # statically-dead guards (if False: / if 0: / if TYPE_CHECKING:) and
+        # must not keep their target alive. Absent key = live (see PR #580).
+        has_callers = any(
+            e.kind == "CALLS" and e.extra.get("reachable", True)
+            for e in incoming
+        )
         has_test_refs = bool(outgoing_tb)
         has_importers = any(e.kind == "IMPORTS_FROM" for e in incoming)
         has_references = any(e.kind == "REFERENCES" for e in incoming)
