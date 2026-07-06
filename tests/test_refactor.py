@@ -1099,3 +1099,139 @@ class TestFindDeadCodeModuleScope:
         dead = find_dead_code(self.store)
         dead_names = {d["name"] for d in dead}
         assert "launch" not in dead_names
+
+
+class TestFindDeadCodeMRO:
+    """MRO / polymorphic-dispatch false positives (OO reachability)."""
+
+    def setup_method(self):
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.store = GraphStore(self.tmp.name)
+
+    def teardown_method(self):
+        self.store.close()
+        Path(self.tmp.name).unlink(missing_ok=True)
+
+    def _cls(self, name, file_path, line=5):
+        self.store.upsert_node(NodeInfo(
+            kind="Class", name=name, file_path=file_path,
+            line_start=line, line_end=line + 40, language="python",
+        ))
+
+    def _meth(self, cls, name, file_path, line):
+        self.store.upsert_node(NodeInfo(
+            kind="Function", name=name, file_path=file_path,
+            line_start=line, line_end=line + 5, language="python",
+            parent_name=cls,
+        ))
+
+    def _inherits(self, child_qn, base_name, file_path, line):
+        self.store.upsert_edge(EdgeInfo(
+            kind="INHERITS", source=child_qn, target=base_name,
+            file_path=file_path, line=line,
+        ))
+
+    def _caller(self, name, file_path, line):
+        self.store.upsert_node(NodeInfo(
+            kind="Function", name=name, file_path=file_path,
+            line_start=line, line_end=line + 3, language="python",
+        ))
+
+    def _calls(self, src, tgt, file_path, line):
+        self.store.upsert_edge(EdgeInfo(
+            kind="CALLS", source=src, target=tgt,
+            file_path=file_path, line=line,
+        ))
+
+    def test_base_method_alive_when_only_override_called(self):
+        f = "/repo/handlers.py"
+        self._cls("Base", f, 5)
+        self._cls("Sub", f, 50)
+        self._meth("Base", "process", f, 10)
+        self._meth("Sub", "process", f, 55)
+        self._inherits(f + "::Sub", "Base", f, 50)
+        self._caller("run", f, 90)
+        self._calls(f + "::run", f + "::Sub.process", f, 92)
+        self.store.commit()
+        dead_q = {d["qualified_name"] for d in find_dead_code(self.store)}
+        assert f + "::Base.process" not in dead_q
+
+    def test_override_alive_when_base_called(self):
+        f = "/repo/handlers.py"
+        self._cls("Base", f, 5)
+        self._cls("Sub", f, 50)
+        self._meth("Base", "process", f, 10)
+        self._meth("Sub", "process", f, 55)
+        self._inherits(f + "::Sub", "Base", f, 50)
+        self._caller("run", f, 90)
+        self._calls(f + "::run", f + "::Base.process", f, 92)
+        self.store.commit()
+        dead_q = {d["qualified_name"] for d in find_dead_code(self.store)}
+        assert f + "::Sub.process" not in dead_q
+
+    def test_transitive_mro_three_levels(self):
+        f = "/repo/chain.py"
+        self._cls("A", f, 5)
+        self._cls("B", f, 50)
+        self._cls("C", f, 95)
+        self._meth("A", "run", f, 10)
+        self._meth("C", "run", f, 100)
+        self._inherits(f + "::B", "A", f, 50)
+        self._inherits(f + "::C", "B", f, 95)
+        self._caller("main", f, 140)
+        self._calls(f + "::main", f + "::A.run", f, 142)
+        self.store.commit()
+        dead_q = {d["qualified_name"] for d in find_dead_code(self.store)}
+        assert f + "::C.run" not in dead_q
+
+    def test_cross_file_inheritance_override_alive(self):
+        base_f = "/repo/pkg/base.py"
+        sub_f = "/repo/pkg/impl.py"
+        self._cls("BaseHandler", base_f, 5)
+        self._cls("JsonHandler", sub_f, 5)
+        self._meth("BaseHandler", "handle", base_f, 10)
+        self._meth("JsonHandler", "handle", sub_f, 10)
+        self._inherits(sub_f + "::JsonHandler", "BaseHandler", sub_f, 5)
+        self._caller("dispatch", base_f, 40)
+        self._calls(base_f + "::dispatch", base_f + "::BaseHandler.handle", base_f, 42)
+        self.store.commit()
+        dead_q = {d["qualified_name"] for d in find_dead_code(self.store)}
+        assert sub_f + "::JsonHandler.handle" not in dead_q
+
+    def test_unrelated_class_same_method_name_still_dead(self):
+        f = "/repo/two.py"
+        self._cls("Alpha", f, 5)
+        self._cls("Beta", f, 50)
+        self._meth("Alpha", "save", f, 10)
+        self._meth("Beta", "save", f, 55)
+        self._caller("go", f, 90)
+        self._calls(f + "::go", f + "::Alpha.save", f, 92)
+        self.store.commit()
+        dead_q = {d["qualified_name"] for d in find_dead_code(self.store)}
+        assert f + "::Beta.save" in dead_q
+        assert f + "::Alpha.save" not in dead_q
+
+
+class TestPythonEnrichmentWiring:
+    """Jedi Python call-resolution pass must be wired into the build."""
+
+    def test_full_build_reports_python_enrichment(self, tmp_path):
+        from code_review_graph.incremental import full_build
+        (tmp_path / "a.py").write_text("def foo():\n    return 1\n", encoding="utf-8")
+        store = GraphStore(str(tmp_path / "graph.db"))
+        try:
+            result = full_build(tmp_path, store)
+        finally:
+            store.close()
+        assert "python_enrichment" in result
+
+    def test_incremental_reports_python_enrichment_when_py_changed(self, tmp_path):
+        from code_review_graph.incremental import full_build, incremental_update
+        (tmp_path / "a.py").write_text("def foo():\n    return 1\n", encoding="utf-8")
+        store = GraphStore(str(tmp_path / "graph.db"))
+        try:
+            full_build(tmp_path, store)
+            result = incremental_update(tmp_path, store, changed_files=["a.py"])
+        finally:
+            store.close()
+        assert "python_enrichment" in result

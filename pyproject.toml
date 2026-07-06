@@ -35,6 +35,16 @@ dependencies = [
     "pyyaml>=6.0,<7",
     "networkx>=3.2,<4",
     "watchdog>=4.0.0,<7",
+    # Core analysis stack — mandatory (previously optional extras).
+    # numpy: vectorised embedding search hot path (embeddings.py).
+    # jedi: Python call resolution that removes OO/MRO dead-code false
+    #   positives (jedi_resolver.py, wired into the build).
+    # igraph: Leiden community detection run by the default postprocess.
+    # sentence-transformers: local semantic-search embedding backend.
+    "numpy>=1.26,<3",
+    "jedi>=0.19.2",
+    "igraph>=0.11.0",
+    "sentence-transformers>=3.0.0,<6",
     "tomli>=2.0.0,<3; python_version < '3.11'",
 ]
 
@@ -50,15 +60,15 @@ code-review-graph = "code_review_graph.cli:main"
 crg-daemon = "code_review_graph.daemon_cli:main"
 
 [project.optional-dependencies]
-embeddings = [
-    "sentence-transformers>=3.0.0,<6",
-    "numpy>=1.26,<3",
-]
+# numpy, sentence-transformers, jedi, and igraph are now MANDATORY core
+# dependencies (see [project.dependencies]). These extras remain as
+# no-op back-compat aliases so existing `pip install code-review-graph[...]`
+# invocations keep working.
+embeddings = []
+communities = []
+enrichment = []
 google-embeddings = [
     "google-generativeai>=0.8.0,<1",
-]
-communities = [
-    "igraph>=0.11.0",
 ]
 eval = [
     "matplotlib>=3.7.0",
@@ -68,14 +78,9 @@ wiki = [
     "ollama>=0.1.0",
 ]
 all = [
-    "code-review-graph[embeddings]",
-    "code-review-graph[communities]",
-    "code-review-graph[enrichment]",
+    "code-review-graph[google-embeddings]",
     "code-review-graph[eval]",
     "code-review-graph[wiki]",
-]
-enrichment = [
-    "jedi>=0.19.2",
 ]
 dev = [
     "mypy>=1.10,<3",
