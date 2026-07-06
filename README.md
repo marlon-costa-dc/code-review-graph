@@ -18,6 +18,7 @@
   <a href="https://github.com/tirth8205/code-review-graph/stargazers"><img src="https://img.shields.io/github/stars/tirth8205/code-review-graph?style=flat-square" alt="Stars"></a>
   <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square" alt="MIT Licence"></a>
   <a href="https://github.com/tirth8205/code-review-graph/actions/workflows/ci.yml"><img src="https://github.com/tirth8205/code-review-graph/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/tirth8205/code-review-graph/actions/workflows/eval.yml"><img src="https://img.shields.io/badge/benchmarks-reproducible-success?style=flat-square" alt="Benchmarks: reproducible"></a>
   <a href="https://www.python.org/"><img src="https://img.shields.io/badge/python-3.10%2B-blue.svg?style=flat-square" alt="Python 3.10+"></a>
   <a href="https://modelcontextprotocol.io/"><img src="https://img.shields.io/badge/MCP-compatible-green.svg?style=flat-square" alt="MCP"></a>
   <a href="https://code-review-graph.com"><img src="https://img.shields.io/badge/website-code--review--graph.com-blue?style=flat-square" alt="Website"></a>
@@ -38,6 +39,8 @@
 
 AI coding tools can end up re-reading large parts of your codebase on review tasks. `code-review-graph` fixes that. It builds a structural map of your code with [Tree-sitter](https://tree-sitter.github.io/tree-sitter/), tracks changes incrementally, and gives your AI assistant precise context via [MCP](https://modelcontextprotocol.io/) so it reads only what matters.
 
+Where retrieval tools focus on navigation, CRG is review-native — risk-scored change analysis, impact radius, and a PR-review GitHub Action — token-efficient, local, and free, with no waitlist.
+
 <p align="center">
   <img src="diagrams/diagram1_before_vs_after.png" alt="The Token Problem: 38x to 528x token reduction across 6 real repositories" width="85%" />
 </p>
@@ -46,10 +49,30 @@ AI coding tools can end up re-reading large parts of your codebase on review tas
 
 ## Quick Start
 
+### Quick install (no Python setup)
+
+macOS / Linux:
+
+```bash
+curl -LsSf https://raw.githubusercontent.com/tirth8205/code-review-graph/main/install.sh | sh
+```
+
+Windows (PowerShell):
+
+```powershell
+irm https://raw.githubusercontent.com/tirth8205/code-review-graph/main/install.ps1 | iex
+```
+
+This installs [uv](https://docs.astral.sh/uv/) (a single static binary that manages Python for you) if it is missing, then installs the `code-review-graph` CLI. It does **not** ship a bundled runtime — uv handles Python under the hood, so you don't have to. The script is idempotent; re-run it any time. Prefer to do it yourself? Use the alternatives below.
+
+### Alternatives (already have Python / uv)
+
 ```bash
 pip install code-review-graph                     # or: pipx install code-review-graph
+uvx code-review-graph install                     # or run without installing, via uv
 code-review-graph install          # auto-detects and configures all supported platforms
 code-review-graph build            # parse your codebase
+code-review-graph doctor           # verify the install is healthy
 ```
 
 One command sets up everything. `install` detects which AI coding tools you have, writes the correct MCP configuration for each one, installs platform-native hooks/skills where supported, and injects graph-aware instructions into your platform rules. It auto-detects whether you installed via `uvx` or `pip`/`pipx` and generates the right config. Restart your editor/tool after installing.
@@ -176,7 +199,7 @@ See [docs/GITHUB_ACTION.md](docs/GITHUB_ACTION.md) for inputs, risk levels, and 
 
 **Headline number: the median per-question token reduction across the 6 repos is ~82x** (whole-corpus baseline vs graph query). The frequently quoted **528x is the maximum** — a single best-case repo (fastapi) — not the typical result.
 
-All numbers come from the automated evaluation runner against 6 real open-source repositories (13 commits total). Every config pins an upstream SHA, the Leiden community detector runs with a fixed seed, and embeddings are deterministic on CPU — so two runs on different machines produce identical numbers. The full reproduction recipe with expected outputs is in [`docs/REPRODUCING.md`](docs/REPRODUCING.md). A weekly report-only run on the two smallest configs lives in [`.github/workflows/eval.yml`](.github/workflows/eval.yml).
+All numbers come from the automated evaluation runner against 6 real open-source repositories (13 commits total). Every config pins an upstream SHA, the Leiden community detector runs with a fixed seed, and embeddings are deterministic on CPU — so two runs on different machines produce identical numbers. The full reproduction recipe with expected outputs is in [`docs/REPRODUCING.md`](docs/REPRODUCING.md). A weekly report-only run on the two smallest configs lives in [`.github/workflows/eval.yml`](.github/workflows/eval.yml); it publishes the **median per-question token reduction** for that run as a table in the job summary and uploads the raw CSVs as an artifact. The [`benchmarks: reproducible`](https://github.com/tirth8205/code-review-graph/actions/workflows/eval.yml) badge links to those runs — the badge asserts the pipeline is reproducible; the canonical numbers live here and in [`docs/REPRODUCING.md`](docs/REPRODUCING.md), never auto-committed from CI.
 
 <details>
 <summary><strong>Token efficiency: ~82x median per-question reduction (range 38x – 528x; whole-corpus vs graph query)</strong></summary>
@@ -543,22 +566,39 @@ The cloud-egress warning is auto-skipped when the base URL points to localhost
 > much narrower quality gap against smaller models at this input length.
 > Body/docstring embedding is tracked as a follow-up enhancement.
 
-#### Tool Filtering
+#### Tool Filtering (lean by default)
 
-CRG exposes 30 MCP tools by default. In token-constrained environments, you can
-limit the server to a subset of tools using `--tools` or the `CRG_TOOLS`
-environment variable:
+CRG registers 30 MCP tools, but loading every description costs ~8k tokens
+per LLM turn before any work happens. To protect that budget the server ships
+a **curated lean set of 7 tools by default**:
+
+`get_minimal_context_tool`, `query_graph_tool`, `semantic_search_nodes_tool`,
+`detect_changes_tool`, `get_review_context_tool`, `get_impact_radius_tool`,
+`get_affected_flows_tool`.
+
+These cover every documented workflow (explore, review, impact, flows). When
+the server trims tools it prints a one-line notice to **stderr** so a reduced
+list is never silent.
+
+Restore the full set, pick the curated set explicitly, or pass a custom list
+via `--tools` or the `CRG_TOOLS` environment variable:
 
 ```bash
-# Via CLI flag
-code-review-graph serve --tools query_graph_tool,semantic_search_nodes_tool,detect_changes_tool
+# All 30 tools
+code-review-graph serve --tools all
+CRG_TOOLS=all code-review-graph serve
 
-# Via environment variable
+# The curated lean set (the default), spelled out
+code-review-graph serve --tools lean
+
+# A custom subset
+code-review-graph serve --tools query_graph_tool,semantic_search_nodes_tool,detect_changes_tool
 CRG_TOOLS=query_graph_tool,semantic_search_nodes_tool code-review-graph serve
 ```
 
-The CLI flag takes precedence over the environment variable. When neither is set,
-all tools are available. This is especially useful for MCP client configurations:
+The CLI flag takes precedence over the environment variable, which takes
+precedence over the lean default. Unknown tool names are ignored gracefully.
+This is especially useful for MCP client configurations:
 
 ```json
 {
@@ -570,6 +610,10 @@ all tools are available. This is especially useful for MCP client configurations
   }
 }
 ```
+
+You can also force a server-wide response verbosity with `--detail`
+(`minimal`/`standard`/`verbose`) or the `CRG_DETAIL_LEVEL` env var; it
+overrides each tool's per-call `detail_level`.
 
 </details>
 

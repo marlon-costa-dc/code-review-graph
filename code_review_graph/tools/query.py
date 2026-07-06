@@ -12,7 +12,12 @@ from ..graph import _sanitize_name, edge_to_dict, node_to_dict
 from ..hints import generate_hints, get_session
 from ..incremental import get_changed_files, get_db_path, get_staged_and_unstaged
 from ..search import hybrid_search
-from ._common import _BUILTIN_CALL_NAMES, _get_store, _resolve_graph_file_paths
+from ._common import (
+    _BUILTIN_CALL_NAMES,
+    _get_store_for_read,
+    _not_built_response,
+    _resolve_graph_file_paths,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +60,9 @@ def get_impact_radius(
         Changed nodes, impacted nodes, impacted files, connecting edges,
         plus ``truncated`` flag and ``total_impacted`` count.
     """
-    store, root = _get_store(repo_root)
+    store, root, not_built = _get_store_for_read(repo_root)
+    if store is None or root is None:
+        return not_built if not_built is not None else _not_built_response()
     try:
         if changed_files is None:
             changed_files = get_changed_files(root, base)
@@ -147,6 +154,7 @@ def query_graph(
     target: str,
     repo_root: str | None = None,
     detail_level: str = "standard",
+    max_results: int = 0,
 ) -> dict[str, Any]:
     """Run a predefined graph query.
 
@@ -156,11 +164,17 @@ def query_graph(
         target: The node name, qualified name, or file path to query about.
         repo_root: Repository root path. Auto-detected if omitted.
         detail_level: "standard" (full output) or "minimal" (summary only).
+        max_results: Cap on returned ``results`` (and matching ``edges``) so a
+            hot symbol cannot return an unbounded payload.  ``0`` (default)
+            means no cap.  When the cap trims results the response carries
+            ``truncated=True`` and ``total_results`` with the full count.
 
     Returns:
         Matching nodes and edges for the query.
     """
-    store, root = _get_store(repo_root)
+    store, root, not_built = _get_store_for_read(repo_root)
+    if store is None or root is None:
+        return not_built if not_built is not None else _not_built_response()
     try:
         if pattern not in _QUERY_PATTERNS:
             return {
@@ -293,9 +307,11 @@ def query_graph(
                         results.append(node_to_dict(child))
 
         elif pattern == "tests_for":
-            for e in store.get_edges_by_target(qn):
+            # TESTED_BY edges are stored as source=production, target=test
+            # by the parser, so look them up by source. See: #515
+            for e in store.get_edges_by_source(qn):
                 if e.kind == "TESTED_BY":
-                    test = store.get_node(e.source_qualified)
+                    test = store.get_node(e.target_qualified)
                     if test:
                         results.append(node_to_dict(test))
             # Also search by naming convention
@@ -331,10 +347,32 @@ def query_graph(
                 for n in store.get_nodes_by_file(graph_path):
                     results.append(node_to_dict(n))
 
+        total_results = len(results)
+
+        # Cap the payload so callers_of/callees_of on a hot symbol cannot
+        # return unbounded results.  Keep the head (queries append in a stable
+        # graph order) and trim edges to the surviving result set when we can.
+        truncated = False
+        if max_results and total_results > max_results:
+            truncated = True
+            results = results[:max_results]
+            kept_qns = {
+                r.get("qualified_name") for r in results if "qualified_name" in r
+            }
+            if kept_qns:
+                edges_out = [
+                    e for e in edges_out
+                    if e.get("source") in kept_qns or e.get("target") in kept_qns
+                ][:max_results]
+            else:
+                edges_out = edges_out[:max_results]
+
         summary = (
-            f"Found {len(results)} result(s) "
+            f"Found {total_results} result(s) "
             f"for {pattern}('{target}')"
         )
+        if truncated:
+            summary += f" (showing first {len(results)})"
 
         if detail_level == "minimal":
             minimal_results = [
@@ -345,17 +383,21 @@ def query_graph(
                 }
                 for r in results[:5]
             ]
-            return {
+            response: dict[str, Any] = {
                 "status": "ok",
                 "pattern": pattern,
                 "target": target,
                 "description": _QUERY_PATTERNS[pattern],
                 "summary": summary,
-                "result_count": len(results),
+                "result_count": total_results,
                 "results": minimal_results,
             }
+            if truncated:
+                response["truncated"] = True
+                response["total_results"] = total_results
+            return response
 
-        return {
+        response = {
             "status": "ok",
             "pattern": pattern,
             "target": target,
@@ -364,6 +406,10 @@ def query_graph(
             "results": results,
             "edges": edges_out,
         }
+        if truncated:
+            response["truncated"] = True
+            response["total_results"] = total_results
+        return response
     finally:
         store.close()
 
@@ -401,7 +447,9 @@ def semantic_search_nodes(
     Returns:
         Ranked list of matching nodes.
     """
-    store, root = _get_store(repo_root)
+    store, root, not_built = _get_store_for_read(repo_root)
+    if store is None or root is None:
+        return not_built if not_built is not None else _not_built_response()
     try:
         results = hybrid_search(
             store, query, kind=kind, limit=limit, context_files=context_files,
@@ -462,7 +510,9 @@ def list_graph_stats(repo_root: str | None = None) -> dict[str, Any]:
     Returns:
         Total nodes, edges, breakdown by kind, languages, and last update time.
     """
-    store, root = _get_store(repo_root)
+    store, root, not_built = _get_store_for_read(repo_root)
+    if store is None or root is None:
+        return not_built if not_built is not None else _not_built_response()
     try:
         stats = store.get_stats()
 
@@ -539,7 +589,9 @@ def find_large_functions(
     Returns:
         Oversized nodes with line counts, ordered largest first.
     """
-    store, root = _get_store(repo_root)
+    store, root, not_built = _get_store_for_read(repo_root)
+    if store is None or root is None:
+        return not_built if not_built is not None else _not_built_response()
     try:
         nodes = store.get_nodes_by_size(
             min_lines=min_lines,
@@ -609,7 +661,9 @@ def traverse_graph_func(
         token_budget: Approximate token limit for results.
         repo_root: Repository root path.
     """
-    store, root = _get_store(repo_root)
+    store, root, not_built = _get_store_for_read(repo_root)
+    if store is None or root is None:
+        return not_built if not_built is not None else _not_built_response()
     try:
         results = hybrid_search(store, query, limit=1)
         if not results:

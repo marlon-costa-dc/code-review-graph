@@ -2,6 +2,71 @@
 
 ## [Unreleased]
 
+## [2.4.0] - 2026-06-14
+
+**The token moat, sharpened.** This release makes the graph spend fewer of your
+tokens by default, lets you *prove* the savings, and removes the Python-install
+friction — without changing how anything works (still a local SQLite graph,
+Tree-sitter parsed, served over MCP). Several defaults changed in your favor;
+see "Behavior changes" below.
+
+### Added
+
+- **`code-review-graph doctor`** — a read-only health checklist (✓/✗) that
+  verifies the graph exists and is fresh, MCP config is present, the server
+  boots, hooks are installed, and embeddings status — then prints your latest
+  **Token Savings** number as proof it's working. Answers the most common
+  question ("is this actually running?") in one command.
+- **One-line install that hides Python**: `install.sh` (macOS/Linux) and
+  `install.ps1` (Windows) bootstrap `uv` if missing, then install the CLI.
+  `curl -fsSL .../install.sh | sh`. `pip`/`pipx`/`uvx` remain alternatives.
+- **`serve --tools all|lean|<csv>`** and **`serve --detail minimal|standard|verbose`**
+  (plus `CRG_TOOLS` / `CRG_DETAIL_LEVEL` env vars) to control the exposed tool
+  set and default verbosity per server.
+- **Token budget for review output**: `get_review_context` and `detect_changes`
+  take a `max_tokens` (default 6000), keeping the highest-risk findings and
+  honestly reporting what was omitted — so a review can never blow the context
+  window.
+- Weekly eval CI now surfaces the **median per-question token reduction** in its
+  job summary; README gains a "benchmarks: reproducible" badge.
+
+### Changed (defaults that now save more tokens)
+
+- **Lean tool set by default**: `serve` exposes 7 curated tools
+  (`get_minimal_context`, `query_graph`, `semantic_search_nodes`,
+  `detect_changes`, `get_review_context`, `get_impact_radius`,
+  `get_affected_flows`) instead of all 30 — cutting ~8k tokens of tool
+  descriptions per session and reducing agent mis-picks. Restore everything with
+  `serve --tools all` or `CRG_TOOLS=all`.
+- **Minimal detail by default** for `query_graph`, `semantic_search_nodes`,
+  `get_impact_radius`, and `detect_changes`. Pass `detail_level="standard"` (or
+  `CRG_DETAIL_LEVEL=standard`) for full payloads.
+- `query_graph` gains a `max_results` cap (default 100) so `callers_of` on a hot
+  symbol can't return an unbounded payload.
+
+### Fixed
+
+- **TESTED_BY edge direction** (#515, integrates community PR #527 by
+  @Devilthelegend with an added producer-side regression test): `tests_for`,
+  `get_transitive_tests`, test-gap detection, flow criticality, symbol
+  enrichment, and dead-code detection now read test-coverage edges in the
+  canonical direction. Changed functions with tests are no longer reported as
+  untested, and the GitHub Action's "Tested" column is now correct. No DB
+  migration needed (read-side fix; stored edges were always canonical).
+- **First-run guard**: read MCP tools on a never-built repo now return a clear
+  `not_built` status pointing at `build_or_update_graph_tool`, instead of
+  silently creating an empty `graph.db` and returning "0 results".
+- GitHub Action PR comments now show **repo-relative paths** instead of absolute
+  CI-runner paths.
+
+### Behavior changes (read before upgrading)
+
+- `serve` exposes 7 tools by default; opt back into all 30 with `--tools all` /
+  `CRG_TOOLS=all`.
+- Four tools default to `minimal` detail; pass `detail_level="standard"` or set
+  `CRG_DETAIL_LEVEL=standard` for the old output.
+- Read tools return `not_built` on a fresh repo instead of an empty result.
+
 ## [2.3.6] - 2026-06-10
 
 **Community-response release.** Built from a full audit of every open PR,
