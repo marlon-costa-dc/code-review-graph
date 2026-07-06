@@ -488,35 +488,49 @@ class GraphStore:
         return results
 
     def resolve_bare_call_targets(self) -> int:
-        """Batch-resolve bare-name CALLS targets using the global node table.
+        """Batch-resolve bare-name CALLS and INHERITS targets against nodes.
 
-        After parsing, some CALLS edges have bare targets (no ``::`` separator)
-        because the parser couldn't resolve cross-file.  This method matches
-        them against nodes and updates unambiguous matches in-place.
+        After parsing, some CALLS and INHERITS edges have bare targets (no
+        ``::`` separator) because the parser could not resolve them
+        cross-file.  This method matches them against the global node table
+        and rewrites unambiguous matches in place, so every downstream
+        command (impact radius, query_graph, detect_changes, flows) can
+        traverse calls and inheritance across files.
 
         Disambiguation strategy:
           1. Single node with that name -> resolve directly
           2. Multiple candidates -> prefer one whose file is imported by the
              source file (via IMPORTS_FROM edges)
+        INHERITS targets resolve against Class nodes only; CALLS targets
+        resolve against Function/Test/Class nodes.
 
-        Returns the number of resolved edges.
+        Returns the number of resolved edges (CALLS + INHERITS).
         """
         conn = self._conn
 
         bare_edges = conn.execute(
-            "SELECT id, source_qualified, target_qualified, file_path "
-            "FROM edges WHERE kind = 'CALLS' AND target_qualified NOT LIKE '%::%'"
+            "SELECT id, kind, source_qualified, target_qualified, file_path "
+            "FROM edges WHERE kind IN ('CALLS', 'INHERITS') "
+            "AND target_qualified NOT LIKE '%::%'"
         ).fetchall()
         if not bare_edges:
             return 0
 
         # bare_name -> list of qualified_names
-        node_lookup: dict[str, list[str]] = {}
+        # bare_name -> list of qualified_names, split by the kinds each edge
+        # type may target. CALLS may hit any callable/class; INHERITS only
+        # a class.
+        call_lookup: dict[str, list[str]] = {}
+        class_lookup: dict[str, list[str]] = {}
         for row in conn.execute(
-            "SELECT name, qualified_name FROM nodes "
+            "SELECT name, qualified_name, kind FROM nodes "
             "WHERE kind IN ('Function', 'Test', 'Class')"
         ).fetchall():
-            node_lookup.setdefault(row["name"], []).append(row["qualified_name"])
+            call_lookup.setdefault(row["name"], []).append(row["qualified_name"])
+            if row["kind"] == "Class":
+                class_lookup.setdefault(row["name"], []).append(
+                    row["qualified_name"]
+                )
 
         # source_file -> set of imported files (for disambiguation)
         import_targets: dict[str, set[str]] = {}
@@ -531,7 +545,8 @@ class GraphStore:
         resolved = 0
         for edge in bare_edges:
             bare_name = edge["target_qualified"]
-            candidates = node_lookup.get(bare_name, [])
+            lookup = class_lookup if edge["kind"] == "INHERITS" else call_lookup
+            candidates = lookup.get(bare_name, [])
             if not candidates:
                 continue
 
@@ -562,7 +577,7 @@ class GraphStore:
 
         if resolved:
             conn.commit()
-            logger.info("Resolved %d bare-name CALLS targets", resolved)
+            logger.info("Resolved %d bare-name CALLS/INHERITS targets", resolved)
         return resolved
 
     def get_all_files(self) -> list[str]:

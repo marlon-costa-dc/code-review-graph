@@ -9,6 +9,7 @@ from code_review_graph.graph import GraphStore
 from code_review_graph.parser import CodeParser, EdgeInfo, NodeInfo
 from code_review_graph.refactor import (
     REFACTOR_EXPIRY_SECONDS,
+    _is_test_file,
     _pending_refactors,
     _refactor_lock,
     apply_refactor,
@@ -195,6 +196,19 @@ class TestFindDeadCode:
         dead = find_dead_code(self.store)
         dead_names = {d["name"] for d in dead}
         assert "test_something" not in dead_names
+
+
+    def test_is_test_file_recognizes_suffix_variants(self):
+        """_is_test_file recognizes pytest suffix/prefix variants without over-matching."""
+        assert _is_test_file("a/values_check_tests.py")
+        assert _is_test_file("a/foo_tests.py")
+        assert _is_test_file("a/foo_test.py")
+        assert _is_test_file("a/conftest.py")
+        assert _is_test_file("b/sub/bar_tests.py")
+        assert not _is_test_file("src/real_module.py")
+        assert not _is_test_file("a/contest.py")
+        assert not _is_test_file("a/latest.py")
+        assert not _is_test_file("a/attest.py")
 
     def test_find_dead_code_kind_filter(self):
         """kind filter restricts results."""
@@ -1079,6 +1093,47 @@ class TestFindDeadCodeMRO:
         dead_q = {d["qualified_name"] for d in find_dead_code(self.store)}
         assert f + "::Beta.save" in dead_q
         assert f + "::Alpha.save" not in dead_q
+
+    def test_call_only_from_dead_guard_still_dead(self):
+        """A function whose ONLY caller edge is tagged reachable=False
+        (call sits inside `if False:` / `if TYPE_CHECKING:`) is still dead.
+        Completes PR #580: parser tags the flag, find_dead_code consumes it."""
+        f = "/repo/guard.py"
+        self._caller("caller", f, 5)
+        self.store.upsert_node(NodeInfo(
+            kind="Function", name="only_in_guard", file_path=f,
+            line_start=20, line_end=25, language="python",
+        ))
+        self.store.upsert_edge(EdgeInfo(
+            kind="CALLS", source=f + "::caller",
+            target=f + "::only_in_guard", file_path=f, line=8,
+            extra={"reachable": False},
+        ))
+        self.store.commit()
+        dead_q = {d["qualified_name"] for d in find_dead_code(self.store)}
+        assert f + "::only_in_guard" in dead_q
+
+    def test_live_and_dead_guard_call_keeps_alive(self):
+        """If a function has a live call AND a dead-guard call, it stays alive."""
+        f = "/repo/guard2.py"
+        self._caller("live_caller", f, 5)
+        self._caller("guard_caller", f, 30)
+        self.store.upsert_node(NodeInfo(
+            kind="Function", name="target", file_path=f,
+            line_start=50, line_end=55, language="python",
+        ))
+        self.store.upsert_edge(EdgeInfo(
+            kind="CALLS", source=f + "::live_caller",
+            target=f + "::target", file_path=f, line=8,
+        ))
+        self.store.upsert_edge(EdgeInfo(
+            kind="CALLS", source=f + "::guard_caller",
+            target=f + "::target", file_path=f, line=33,
+            extra={"reachable": False},
+        ))
+        self.store.commit()
+        dead_q = {d["qualified_name"] for d in find_dead_code(self.store)}
+        assert f + "::target" not in dead_q
 
 
 class TestPythonEnrichmentWiring:

@@ -680,10 +680,10 @@ def main() -> None:
         "--tools", default=None,
         metavar="all|lean|<csv>",
         help=(
-            "Which MCP tools to expose. 'all' = every tool (~30), 'lean' = the "
-            "curated low-token set (default), or a comma-separated list "
+            "Which MCP tools to expose. 'all' = every tool (~30, default), "
+            "'lean' = the curated low-token set (7), or a comma-separated list "
             "(e.g. query_graph_tool,semantic_search_nodes_tool). Unlisted tools "
-            "are removed. Falls back to CRG_TOOLS env var, then 'lean'."
+            "are removed. Falls back to CRG_TOOLS env var, then 'all'."
         ),
     )
     serve_cmd.add_argument(

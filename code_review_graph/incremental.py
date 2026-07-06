@@ -108,6 +108,20 @@ def _run_jedi_resolver(store: GraphStore, repo_root: Path) -> Optional[dict]:
         return enrich_jedi_calls(store, repo_root)
     except Exception as exc:  # noqa: BLE001 - best-effort post-pass
         logger.warning("Jedi Python resolver failed: %s", exc)
+        return None
+
+
+def _run_bare_target_resolver(store: GraphStore) -> Optional[int]:
+    """Resolve bare cross-file CALLS/INHERITS targets to qualified nodes so
+    every command (impact radius, query_graph, detect_changes, flows)
+    traverses calls and inheritance correctly. Best-effort: never fails the
+    build. Returns the resolved-edge count or None on error.
+    """
+    try:
+        return store.resolve_bare_call_targets()
+    except Exception as exc:  # noqa: BLE001 - best-effort post-pass
+        logger.warning("Bare-target resolver failed: %s", exc)
+        return None
 
 # Default ignore patterns (in addition to .gitignore).
 #
@@ -924,6 +938,9 @@ def full_build(
     spring_stats = _run_spring_resolver(store)
     temporal_stats = _run_temporal_resolver(store)
     jedi_stats = _run_jedi_resolver(store, repo_root)
+    # Generic name-based bare-target resolution runs LAST so it only mops up
+    # edges the language-aware resolvers above left unresolved.
+    _run_bare_target_resolver(store)
 
     return {
         "files_parsed": len(files),
@@ -1066,6 +1083,9 @@ def incremental_update(
     temporal_stats = _run_temporal_resolver(store) if spring_changed else None
     py_changed = any(rp.endswith(".py") for rp in all_files)
     jedi_stats = _run_jedi_resolver(store, repo_root) if py_changed else None
+    # Generic name-based bare-target resolution runs LAST so it only mops up
+    # edges the language-aware resolvers above left unresolved.
+    _run_bare_target_resolver(store)
 
     return {
         "files_updated": len(all_files),

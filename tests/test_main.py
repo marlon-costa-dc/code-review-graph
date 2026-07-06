@@ -304,15 +304,15 @@ class TestApplyToolFilter:
         return {t.name for t in await crg_main.mcp.list_tools()}
 
     @pytest.mark.asyncio
-    async def test_default_is_lean_set(self):
-        """With nothing specified, the server trims to the curated lean set."""
+    async def test_default_exposes_all_tools(self):
+        """With nothing specified, the server exposes EVERY tool (upstream
+        behavior). Token-lean mode is opt-in via --tools lean / CRG_TOOLS=lean."""
         before = await self._tool_names()
-        assert before == set(await self._tool_names())  # sanity
         crg_main._apply_tool_filter(None)
         after = await self._tool_names()
-        assert after == set(crg_main.LEAN_TOOLS)
-        # Lean is strictly a subset and never larger than the full registry.
-        assert after < before
+        assert after == before
+        assert len(after) == 30
+        # The curated lean set stays available as an explicit opt-in.
         assert len(crg_main.LEAN_TOOLS) == 7
 
     @pytest.mark.asyncio
