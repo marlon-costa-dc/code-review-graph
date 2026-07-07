@@ -41,7 +41,6 @@ import argparse
 import json
 import logging
 import os
-from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as pkg_version
 from pathlib import Path
 
@@ -56,28 +55,13 @@ _PLATFORM_CHOICES = [
 
 
 def _get_version() -> str:
-    """Get the installed package version.
+    """Get the installed package version from distribution metadata.
 
-    Tries ``importlib.metadata`` first (canonical source from the installed
-    dist-info), falling back to the package's ``__version__`` attribute if
-    metadata is unavailable or corrupt. This matters for editable installs
-    on filesystems where iCloud / OneDrive can leave orphan dist-info dirs
-    behind that confuse importlib.metadata's lookup.
+    The canonical version is read from the installed ``dist-info`` via
+    ``importlib.metadata``. This always reflects the version defined in
+    ``pyproject.toml``, regardless of how the package was installed.
     """
-    try:
-        v = pkg_version("code-review-graph")
-        if v:
-            return v
-    except PackageNotFoundError as exc:
-        logger.debug("Package metadata unavailable: %s", exc)
-    # Fallback: read __version__ directly from the package.
-    try:
-        from . import __version__ as fallback_version
-        if fallback_version:
-            return fallback_version
-    except ImportError:
-        pass
-    return "dev"
+    return pkg_version("code-review-graph")
 
 
 def _supports_color() -> bool:
