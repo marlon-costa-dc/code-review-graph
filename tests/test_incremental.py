@@ -1,13 +1,20 @@
 """Tests for the incremental graph update module."""
-
+import sqlite3
 import subprocess
 from unittest.mock import MagicMock, patch  # noqa: F401 – patch used in tests
+
+import pytest
 
 from code_review_graph.graph import GraphStore
 from code_review_graph.incremental import (
     _is_binary,
     _load_ignore_patterns,
     _parse_single_file,
+    _run_bare_target_resolver,
+    _run_jedi_resolver,
+    _run_rescript_resolver,
+    _run_spring_resolver,
+    _run_temporal_resolver,
     _should_ignore,
     _single_hop_dependents,
     ensure_repo_gitignore_excludes_crg,
@@ -868,3 +875,76 @@ class TestStartWatchThread:
             assert thread is None
         finally:
             store.close()
+
+
+
+class TestResolverWrappers:
+    """Tests for the best-effort resolver wrappers in incremental.py."""
+
+    def test_bare_target_resolver_swallows_sqlite_error(self):
+        store = MagicMock()
+        store.resolve_bare_call_targets.side_effect = sqlite3.Error("database is locked")
+        result = _run_bare_target_resolver(store)
+        assert result is None
+
+    def test_bare_target_resolver_propagates_value_error(self):
+        store = MagicMock()
+        store.resolve_bare_call_targets.side_effect = ValueError("programming error")
+        with pytest.raises(ValueError, match="programming error"):
+            _run_bare_target_resolver(store)
+
+    def test_jedi_resolver_swallows_sqlite_error(self, tmp_path):
+        store = MagicMock()
+        with patch("code_review_graph.jedi_resolver.enrich_jedi_calls") as mock:
+            mock.side_effect = sqlite3.Error("database is locked")
+            result = _run_jedi_resolver(store, tmp_path)
+        assert result is None
+
+    def test_jedi_resolver_propagates_value_error(self, tmp_path):
+        store = MagicMock()
+        with patch("code_review_graph.jedi_resolver.enrich_jedi_calls") as mock:
+            mock.side_effect = ValueError("programming error")
+            with pytest.raises(ValueError, match="programming error"):
+                _run_jedi_resolver(store, tmp_path)
+
+    def test_spring_resolver_swallows_sqlite_error(self):
+        store = MagicMock()
+        with patch("code_review_graph.spring_resolver.resolve_spring_di_calls") as mock:
+            mock.side_effect = sqlite3.Error("database is locked")
+            result = _run_spring_resolver(store)
+        assert result is None
+
+    def test_spring_resolver_propagates_value_error(self):
+        store = MagicMock()
+        with patch("code_review_graph.spring_resolver.resolve_spring_di_calls") as mock:
+            mock.side_effect = ValueError("programming error")
+            with pytest.raises(ValueError, match="programming error"):
+                _run_spring_resolver(store)
+
+    def test_temporal_resolver_swallows_sqlite_error(self):
+        store = MagicMock()
+        with patch("code_review_graph.temporal_resolver.resolve_temporal_calls") as mock:
+            mock.side_effect = sqlite3.Error("database is locked")
+            result = _run_temporal_resolver(store)
+        assert result is None
+
+    def test_temporal_resolver_propagates_value_error(self):
+        store = MagicMock()
+        with patch("code_review_graph.temporal_resolver.resolve_temporal_calls") as mock:
+            mock.side_effect = ValueError("programming error")
+            with pytest.raises(ValueError, match="programming error"):
+                _run_temporal_resolver(store)
+
+    def test_rescript_resolver_swallows_sqlite_error(self):
+        store = MagicMock()
+        with patch("code_review_graph.rescript_resolver.resolve_rescript_cross_module") as mock:
+            mock.side_effect = sqlite3.Error("database is locked")
+            result = _run_rescript_resolver(store)
+        assert result is None
+
+    def test_rescript_resolver_propagates_value_error(self):
+        store = MagicMock()
+        with patch("code_review_graph.rescript_resolver.resolve_rescript_cross_module") as mock:
+            mock.side_effect = ValueError("programming error")
+            with pytest.raises(ValueError, match="programming error"):
+                _run_rescript_resolver(store)

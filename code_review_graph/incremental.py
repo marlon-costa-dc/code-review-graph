@@ -12,6 +12,7 @@ import hashlib
 import logging
 import os
 import re
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -62,64 +63,87 @@ logger = logging.getLogger(__name__)
 
 
 def _run_rescript_resolver(store: GraphStore) -> Optional[dict]:
-    """Run the ReScript cross-module resolver, swallowing any failure so
-    build never fails because of it. Returns stats or None on error.
+    """Run the ReScript cross-module resolver.
+
+    Best-effort post-pass: only ``sqlite3.Error`` is caught so the build
+    continues when the database is transiently unavailable. Programming
+    errors propagate and fail the build, which is the intended behaviour.
+    Returns stats or None on database error.
     """
     try:
         from .rescript_resolver import resolve_rescript_cross_module
         return resolve_rescript_cross_module(store)
-    except Exception as exc:  # noqa: BLE001 - best-effort post-pass
+    except sqlite3.Error as exc:
         logger.warning("ReScript cross-module resolver failed: %s", exc)
         return None
 
 
 def _run_spring_resolver(store: GraphStore) -> Optional[dict]:
-    """Run the Spring DI call resolver, swallowing any failure so
-    build never fails because of it. Returns stats or None on error.
+    """Run the Spring DI call resolver.
+
+    Best-effort post-pass: only ``sqlite3.Error`` is caught so the build
+    continues when the database is transiently unavailable. Programming
+    errors propagate and fail the build, which is the intended behaviour.
+    Returns stats or None on database error.
     """
     try:
         from .spring_resolver import resolve_spring_di_calls
         return resolve_spring_di_calls(store)
-    except Exception as exc:  # noqa: BLE001 - best-effort post-pass
+    except sqlite3.Error as exc:
         logger.warning("Spring DI resolver failed: %s", exc)
         return None
 
 
 def _run_temporal_resolver(store: GraphStore) -> Optional[dict]:
-    """Run the Temporal workflow/activity call resolver, swallowing any failure so
-    build never fails because of it. Returns stats or None on error.
+    """Run the Temporal workflow/activity call resolver.
+
+    Best-effort post-pass: only ``sqlite3.Error`` is caught so the build
+    continues when the database is transiently unavailable. Programming
+    errors propagate and fail the build, which is the intended behaviour.
+    Returns stats or None on database error.
     """
     try:
         from .temporal_resolver import resolve_temporal_calls
         return resolve_temporal_calls(store)
-    except Exception as exc:  # noqa: BLE001 - best-effort post-pass
+    except sqlite3.Error as exc:
         logger.warning("Temporal resolver failed: %s", exc)
         return None
 
 
 def _run_jedi_resolver(store: GraphStore, repo_root: Path) -> Optional[dict]:
-    """Run the Jedi Python call resolver, swallowing any failure so build
-    never fails because of it. Recovers lowercase-receiver method calls
-    (obj.method()) that tree-sitter drops, removing OO dead-code false
-    positives. Returns stats or None on error.
+    """Run the Jedi Python call resolver.
+
+    Recovers lowercase-receiver method calls (obj.method()) that tree-sitter
+    drops, removing OO dead-code false positives.
+
+    Best-effort post-pass: only ``sqlite3.Error`` is caught so the build
+    continues when the database is transiently unavailable. Programming
+    errors propagate and fail the build, which is the intended behaviour.
+    Returns stats or None on database error.
     """
     try:
         from .jedi_resolver import enrich_jedi_calls
         return enrich_jedi_calls(store, repo_root)
-    except Exception as exc:  # noqa: BLE001 - best-effort post-pass
+    except sqlite3.Error as exc:
         logger.warning("Jedi Python resolver failed: %s", exc)
         return None
 
 
 def _run_bare_target_resolver(store: GraphStore) -> Optional[int]:
-    """Resolve bare cross-file CALLS/INHERITS targets to qualified nodes so
-    every command (impact radius, query_graph, detect_changes, flows)
-    traverses calls and inheritance correctly. Best-effort: never fails the
-    build. Returns the resolved-edge count or None on error.
+    """Resolve bare cross-file CALLS/INHERITS targets to qualified nodes.
+
+    Ensures every command (impact radius, query_graph, detect_changes, flows)
+    traverses calls and inheritance correctly. Runs last so it only mops up
+    edges the language-aware resolvers left unresolved.
+
+    Best-effort post-pass: only ``sqlite3.Error`` is caught so the build
+    continues when the database is transiently unavailable. Programming
+    errors propagate and fail the build, which is the intended behaviour.
+    Returns the resolved-edge count or None on database error.
     """
     try:
         return store.resolve_bare_call_targets()
-    except Exception as exc:  # noqa: BLE001 - best-effort post-pass
+    except sqlite3.Error as exc:
         logger.warning("Bare-target resolver failed: %s", exc)
         return None
 
