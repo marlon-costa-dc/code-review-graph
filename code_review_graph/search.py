@@ -57,7 +57,6 @@ def rebuild_fts_index(store: GraphStore) -> int:
         # Rebuild from the content table (nodes) using the FTS5 rebuild command
         conn.execute("INSERT INTO nodes_fts(nodes_fts) VALUES('rebuild')")
 
-
         conn.commit()
     except BaseException:
         conn.rollback()
@@ -73,9 +72,9 @@ def rebuild_fts_index(store: GraphStore) -> int:
 # ---------------------------------------------------------------------------
 
 
-_DOTTED_IDENT_RE = re.compile(r'\b[A-Za-z_][\w]*(?:\.[A-Za-z_][\w]*)+\b')
-_SNAKE_IDENT_RE = re.compile(r'\b[a-z][a-z0-9]*(?:_[a-z0-9]+)+\b')
-_PASCAL_IDENT_RE = re.compile(r'\b[A-Z][a-z0-9]+(?:[A-Z][a-z0-9]+)+\b')
+_DOTTED_IDENT_RE = re.compile(r"\b[A-Za-z_][\w]*(?:\.[A-Za-z_][\w]*)+\b")
+_SNAKE_IDENT_RE = re.compile(r"\b[a-z][a-z0-9]*(?:_[a-z0-9]+)+\b")
+_PASCAL_IDENT_RE = re.compile(r"\b[A-Z][a-z0-9]+(?:[A-Z][a-z0-9]+)+\b")
 
 
 def extract_query_identifiers(query: str) -> list[str]:
@@ -123,16 +122,16 @@ def detect_query_kind_boost(query: str) -> dict[str, Any]:
     q = query.strip()
 
     # PascalCase: starts with uppercase, has at least one lowercase after
-    if re.match(r'^[A-Z][a-z]', q) and not q.isupper():
+    if re.match(r"^[A-Z][a-z]", q) and not q.isupper():
         boosts["Class"] = 1.5
         boosts["Type"] = 1.5
 
     # snake_case or SCREAMING_SNAKE_CASE: contains underscore with letters
-    if '_' in q and re.search(r'[a-zA-Z]', q):
+    if "_" in q and re.search(r"[a-zA-Z]", q):
         boosts["Function"] = 1.5
 
     # Dotted path: boost qualified name matches
-    if '.' in q:
+    if "." in q:
         boosts["_qualified"] = 2.0
 
     # Identifiers extracted from anywhere in the query
@@ -148,7 +147,9 @@ def detect_query_kind_boost(query: str) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def rrf_merge(*result_lists: list[tuple[int, float]], k: int = 60) -> list[tuple[int, float]]:
+def rrf_merge(
+    *result_lists: list[tuple[int, float]], k: int = 60
+) -> list[tuple[int, float]]:
     """Merge multiple ranked result lists using Reciprocal Rank Fusion.
 
     Each input list contains ``(id, score)`` tuples, ordered by score
@@ -234,6 +235,7 @@ def _embedding_search(
     limit: int = 50,
     model: str | None = None,
     provider: str | None = None,
+    diagnostics: dict[str, Any] | None = None,
 ) -> list[tuple[int, float]]:
     """Run a vector similarity search using the embedding store.
 
@@ -241,20 +243,29 @@ def _embedding_search(
     Gracefully returns an empty list if embeddings are not available.
     """
     if not _has_embedding_rows(store._conn):
+        if diagnostics is not None:
+            diagnostics["embedding_status"] = "absent"
         return []
     try:
         from .embeddings import EmbeddingStore
     except ImportError as exc:
         logger.warning("Embedding search unavailable: %s", exc)
+        if diagnostics is not None:
+            diagnostics["embedding_status"] = "unavailable"
+            diagnostics["embedding_warning"] = str(exc)
         return []
 
     try:
         emb_store = EmbeddingStore(store.db_path, provider=provider, model=model)
         try:
             if not emb_store.available or emb_store.count() == 0:
+                if diagnostics is not None:
+                    diagnostics["embedding_status"] = "unavailable"
                 return []
 
             results = emb_store.search(query, limit=limit)
+            if diagnostics is not None:
+                diagnostics["embedding_status"] = "used"
             # Map qualified names back to node IDs
             id_scores: list[tuple[int, float]] = []
             for qn, score in results:
@@ -268,6 +279,9 @@ def _embedding_search(
         raise
     except Exception as e:
         logger.warning("Embedding search failed: %s", e)
+        if diagnostics is not None:
+            diagnostics["embedding_status"] = "failed"
+            diagnostics["embedding_warning"] = str(e)
         return []
 
 
@@ -293,9 +307,7 @@ def _keyword_search(
     conditions: list[str] = []
     params: list[str | int] = []
     for word in words:
-        conditions.append(
-            "(LOWER(name) LIKE ? OR LOWER(qualified_name) LIKE ?)"
-        )
+        conditions.append("(LOWER(name) LIKE ? OR LOWER(qualified_name) LIKE ?)")
         params.extend([f"%{word}%", f"%{word}%"])
 
     where = " AND ".join(conditions)
@@ -383,7 +395,12 @@ def hybrid_search(
 
     # Try embedding search
     emb_results = _embedding_search(
-        store, query, limit=fetch_limit, model=model, provider=provider,
+        store,
+        query,
+        limit=fetch_limit,
+        model=model,
+        provider=provider,
+        diagnostics=diagnostics,
     )
 
     # ------ Phase 2: Merge via RRF or fallback ------
@@ -424,7 +441,7 @@ def hybrid_search(
     node_rows: dict[int, Any] = {}
     batch_size = 450
     for i in range(0, len(candidate_ids), batch_size):
-        batch = candidate_ids[i:i + batch_size]
+        batch = candidate_ids[i : i + batch_size]
         placeholders = ",".join("?" for _ in batch)
         rows = conn.execute(
             f"SELECT * FROM nodes WHERE id IN ({placeholders})",  # nosec B608
@@ -447,7 +464,7 @@ def hybrid_search(
         boost = 1.0
         if node_kind in kind_boosts:
             boost *= kind_boosts[node_kind]
-        if "_qualified" in kind_boosts and '.' in query:
+        if "_qualified" in kind_boosts and "." in query:
             if query.lower() in qualified_name.lower():
                 boost *= kind_boosts["_qualified"]
         idents = kind_boosts.get("_qualified_identifiers")
@@ -476,18 +493,20 @@ def hybrid_search(
         if kind and node_kind != kind:
             continue
 
-        results.append({
-            "name": _sanitize_name(row["name"]),
-            "qualified_name": _sanitize_name(row["qualified_name"]),
-            "kind": node_kind,
-            "file_path": row["file_path"],
-            "line_start": row["line_start"],
-            "line_end": row["line_end"],
-            "language": row["language"] or "",
-            "params": row["params"],
-            "return_type": row["return_type"],
-            "signature": row["signature"] if "signature" in row.keys() else None,
-            "score": round(final_score, 6),
-        })
+        results.append(
+            {
+                "name": _sanitize_name(row["name"]),
+                "qualified_name": _sanitize_name(row["qualified_name"]),
+                "kind": node_kind,
+                "file_path": row["file_path"],
+                "line_start": row["line_start"],
+                "line_end": row["line_end"],
+                "language": row["language"] or "",
+                "params": row["params"],
+                "return_type": row["return_type"],
+                "signature": row["signature"] if "signature" in row.keys() else None,
+                "score": round(final_score, 6),
+            }
+        )
 
     return results

@@ -370,40 +370,58 @@ def test_cpp_include_resolution(tmp_path):
 
     def _file(name, path, lang="cpp"):
         return NodeInfo(
-            kind="File", name=name, file_path=path,
-            line_start=1, line_end=10, language=lang,
-            parent_name=None, params=None, return_type=None,
-            modifiers=None, is_test=False, extra={},
+            kind="File",
+            name=name,
+            file_path=path,
+            line_start=1,
+            line_end=10,
+            language=lang,
+            parent_name=None,
+            params=None,
+            return_type=None,
+            modifiers=None,
+            is_test=False,
+            extra={},
         )
 
-    store.upsert_node(_file("main.cpp",  "/abs/src/main.cpp"))
+    store.upsert_node(_file("main.cpp", "/abs/src/main.cpp"))
     store.upsert_node(_file("Renderer.hpp", "/abs/libs/rendering/Renderer.hpp"))
-    store.upsert_node(_file("Utils.hpp",    "/abs/libs/utils/Utils.hpp"))
+    store.upsert_node(_file("Utils.hpp", "/abs/libs/utils/Utils.hpp"))
 
     # Parser emits bare include paths as targets — exactly what Tree-sitter sees
-    store.upsert_edge(EdgeInfo(
-        kind="IMPORTS_FROM",
-        source="/abs/src/main.cpp",
-        target="rendering/Renderer.hpp",   # relative, one directory level
-        file_path="/abs/src/main.cpp", line=1, extra={},
-    ))
-    store.upsert_edge(EdgeInfo(
-        kind="IMPORTS_FROM",
-        source="/abs/src/main.cpp",
-        target="Utils.hpp",                # bare filename only
-        file_path="/abs/src/main.cpp", line=2, extra={},
-    ))
+    store.upsert_edge(
+        EdgeInfo(
+            kind="IMPORTS_FROM",
+            source="/abs/src/main.cpp",
+            target="rendering/Renderer.hpp",  # relative, one directory level
+            file_path="/abs/src/main.cpp",
+            line=1,
+            extra={},
+        )
+    )
+    store.upsert_edge(
+        EdgeInfo(
+            kind="IMPORTS_FROM",
+            source="/abs/src/main.cpp",
+            target="Utils.hpp",  # bare filename only
+            file_path="/abs/src/main.cpp",
+            line=2,
+            extra={},
+        )
+    )
     store.commit()
 
     data = export_graph_data(store)
-    resolved_targets = {e["target"] for e in data["edges"] if e["kind"] == "IMPORTS_FROM"}
+    resolved_targets = {
+        e["target"] for e in data["edges"] if e["kind"] == "IMPORTS_FROM"
+    }
 
-    assert "/abs/libs/rendering/Renderer.hpp" in resolved_targets, (
-        "bare relative include 'rendering/Renderer.hpp' was not resolved to its absolute path"
-    )
-    assert "/abs/libs/utils/Utils.hpp" in resolved_targets, (
-        "bare filename include 'Utils.hpp' was not resolved to its absolute path"
-    )
+    assert (
+        "/abs/libs/rendering/Renderer.hpp" in resolved_targets
+    ), "bare relative include 'rendering/Renderer.hpp' was not resolved to its absolute path"
+    assert (
+        "/abs/libs/utils/Utils.hpp" in resolved_targets
+    ), "bare filename include 'Utils.hpp' was not resolved to its absolute path"
 
 
 def test_generate_html_overwrites(store_with_data, tmp_path):
@@ -445,13 +463,28 @@ def test_export_reads_stored_communities_without_detector_import(
 
     def fail_communities_import(name, globals=None, locals=None, fromlist=(), level=0):
         if name == "code_review_graph.communities":
-            raise AssertionError("visualization export must not import community detector")
+            raise AssertionError(
+                "visualization export must not import community detector"
+            )
         return real_import(name, globals, locals, fromlist, level)
 
     monkeypatch.setattr(builtins, "__import__", fail_communities_import)
 
     data = export_graph_data(large_store)
     assert len(data["communities"]) == 3
+
+
+def test_export_does_not_hide_broken_communities_schema(large_store):
+    from code_review_graph.visualization import export_graph_data
+
+    large_store._conn.execute("DROP TABLE communities")
+    large_store._conn.execute(
+        "CREATE VIEW communities AS SELECT * FROM missing_communities_table"
+    )
+    large_store.commit()
+
+    with pytest.raises(sqlite3.OperationalError, match="missing_communities_table"):
+        export_graph_data(large_store)
 
 
 def test_generate_html_includes_all_edge_types(store_with_data, tmp_path):
@@ -461,8 +494,15 @@ def test_generate_html_includes_all_edge_types(store_with_data, tmp_path):
     output_path = tmp_path / "graph.html"
     generate_html(store_with_data, output_path)
     content = output_path.read_text()
-    for edge_kind in ["CALLS", "IMPORTS_FROM", "INHERITS", "CONTAINS",
-                       "IMPLEMENTS", "TESTED_BY", "DEPENDS_ON"]:
+    for edge_kind in [
+        "CALLS",
+        "IMPORTS_FROM",
+        "INHERITS",
+        "CONTAINS",
+        "IMPLEMENTS",
+        "TESTED_BY",
+        "DEPENDS_ON",
+    ]:
         assert edge_kind in content, f"Edge type {edge_kind} missing from HTML"
 
 
@@ -651,48 +691,80 @@ def large_store(tmp_path):
     files = [f"src/mod{i}.py" for i in range(5)]
     for fp in files:
         file_node = NodeInfo(
-            kind="File", name=fp.split("/")[-1], file_path=fp,
-            line_start=1, line_end=100, language="python",
-            parent_name=None, params=None, return_type=None,
-            modifiers=None, is_test=False, extra={},
+            kind="File",
+            name=fp.split("/")[-1],
+            file_path=fp,
+            line_start=1,
+            line_end=100,
+            language="python",
+            parent_name=None,
+            params=None,
+            return_type=None,
+            modifiers=None,
+            is_test=False,
+            extra={},
         )
         store.upsert_node(file_node)
         # Add some functions per file
         for j in range(3):
             func_node = NodeInfo(
-                kind="Function", name=f"func_{j}",
-                file_path=fp, line_start=10 + j * 10, line_end=20 + j * 10,
-                language="python", parent_name=None,
-                params="x", return_type="int",
-                modifiers=None, is_test=False, extra={},
+                kind="Function",
+                name=f"func_{j}",
+                file_path=fp,
+                line_start=10 + j * 10,
+                line_end=20 + j * 10,
+                language="python",
+                parent_name=None,
+                params="x",
+                return_type="int",
+                modifiers=None,
+                is_test=False,
+                extra={},
             )
             store.upsert_node(func_node)
             # CONTAINS edge from file to function
-            store.upsert_edge(EdgeInfo(
-                kind="CONTAINS", source=fp,
-                target=f"{fp}::func_{j}",
-                file_path=fp, line=10 + j * 10, extra={},
-            ))
+            store.upsert_edge(
+                EdgeInfo(
+                    kind="CONTAINS",
+                    source=fp,
+                    target=f"{fp}::func_{j}",
+                    file_path=fp,
+                    line=10 + j * 10,
+                    extra={},
+                )
+            )
 
     # Add some cross-file CALLS edges
-    store.upsert_edge(EdgeInfo(
-        kind="CALLS",
-        source="src/mod0.py::func_0",
-        target="src/mod1.py::func_1",
-        file_path="src/mod0.py", line=15, extra={},
-    ))
-    store.upsert_edge(EdgeInfo(
-        kind="CALLS",
-        source="src/mod2.py::func_0",
-        target="src/mod3.py::func_2",
-        file_path="src/mod2.py", line=12, extra={},
-    ))
-    store.upsert_edge(EdgeInfo(
-        kind="CALLS",
-        source="src/mod1.py::func_2",
-        target="src/mod4.py::func_0",
-        file_path="src/mod1.py", line=35, extra={},
-    ))
+    store.upsert_edge(
+        EdgeInfo(
+            kind="CALLS",
+            source="src/mod0.py::func_0",
+            target="src/mod1.py::func_1",
+            file_path="src/mod0.py",
+            line=15,
+            extra={},
+        )
+    )
+    store.upsert_edge(
+        EdgeInfo(
+            kind="CALLS",
+            source="src/mod2.py::func_0",
+            target="src/mod3.py::func_2",
+            file_path="src/mod2.py",
+            line=12,
+            extra={},
+        )
+    )
+    store.upsert_edge(
+        EdgeInfo(
+            kind="CALLS",
+            source="src/mod1.py::func_2",
+            target="src/mod4.py::func_0",
+            file_path="src/mod1.py",
+            line=35,
+            extra={},
+        )
+    )
 
     # Set community_id on nodes (simulate community detection)
     store._conn.execute(
@@ -1004,6 +1076,6 @@ def test_community_detail_data_complete(large_store):
         for n in detail["nodes"]:
             all_detail_qns.add(n["qualified_name"])
     original_qns = {n["qualified_name"] for n in data["nodes"]}
-    assert original_qns == all_detail_qns, (
-        "All original nodes should be accounted for in community details"
-    )
+    assert (
+        original_qns == all_detail_qns
+    ), "All original nodes should be accounted for in community details"

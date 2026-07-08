@@ -67,23 +67,41 @@ from .tools import (
 logger = logging.getLogger(__name__)
 
 _TOOL_IMPLS: dict[str, tuple[str, str]] = {
-    "apply_refactor_func": ("code_review_graph.tools.refactor_tools", "apply_refactor_func"),
+    "apply_refactor_func": (
+        "code_review_graph.tools.refactor_tools",
+        "apply_refactor_func",
+    ),
     "build_or_update_graph": ("code_review_graph.tools.build", "build_or_update_graph"),
-    "cross_repo_search_func": ("code_review_graph.tools.registry_tools", "cross_repo_search_func"),
+    "cross_repo_search_func": (
+        "code_review_graph.tools.registry_tools",
+        "cross_repo_search_func",
+    ),
     "detect_changes_func": ("code_review_graph.tools.review", "detect_changes_func"),
     "embed_graph": ("code_review_graph.tools.docs", "embed_graph"),
     "find_large_functions": ("code_review_graph.tools.query", "find_large_functions"),
     "generate_wiki_func": ("code_review_graph.tools.docs", "generate_wiki_func"),
-    "get_affected_flows_func": ("code_review_graph.tools.review", "get_affected_flows_func"),
+    "get_affected_flows_func": (
+        "code_review_graph.tools.review",
+        "get_affected_flows_func",
+    ),
     "get_architecture_overview_func": (
         "code_review_graph.tools.community_tools",
         "get_architecture_overview_func",
     ),
-    "get_bridge_nodes_func": ("code_review_graph.tools.analysis_tools", "get_bridge_nodes_func"),
-    "get_community_func": ("code_review_graph.tools.community_tools", "get_community_func"),
+    "get_bridge_nodes_func": (
+        "code_review_graph.tools.analysis_tools",
+        "get_bridge_nodes_func",
+    ),
+    "get_community_func": (
+        "code_review_graph.tools.community_tools",
+        "get_community_func",
+    ),
     "get_docs_section": ("code_review_graph.tools.docs", "get_docs_section"),
     "get_flow": ("code_review_graph.tools.flows_tools", "get_flow"),
-    "get_hub_nodes_func": ("code_review_graph.tools.analysis_tools", "get_hub_nodes_func"),
+    "get_hub_nodes_func": (
+        "code_review_graph.tools.analysis_tools",
+        "get_hub_nodes_func",
+    ),
     "get_impact_radius": ("code_review_graph.tools.query", "get_impact_radius"),
     "get_knowledge_gaps_func": (
         "code_review_graph.tools.analysis_tools",
@@ -100,7 +118,10 @@ _TOOL_IMPLS: dict[str, tuple[str, str]] = {
         "get_surprising_connections_func",
     ),
     "get_wiki_page_func": ("code_review_graph.tools.docs", "get_wiki_page_func"),
-    "list_communities_func": ("code_review_graph.tools.community_tools", "list_communities_func"),
+    "list_communities_func": (
+        "code_review_graph.tools.community_tools",
+        "list_communities_func",
+    ),
     "list_flows": ("code_review_graph.tools.flows_tools", "list_flows"),
     "list_graph_stats": ("code_review_graph.tools.query", "list_graph_stats"),
     "list_repos_func": ("code_review_graph.tools.registry_tools", "list_repos_func"),
@@ -127,10 +148,19 @@ def _find_project_root(start: Path | None = None) -> Path:
     root = (start or Path.cwd()).resolve()
     if root.is_file():
         root = root.parent
-    for candidate in (root, *root.parents):
-        if (candidate / ".git").exists() or (candidate / ".svn").exists():
+    candidates = (root, *root.parents)
+    for candidate in candidates:
+        if (candidate / ".git").exists():
             return candidate
+
+    svn_candidate: Path | None = None
+    for candidate in candidates:
+        if (candidate / ".svn").exists():
+            svn_candidate = candidate
+    if svn_candidate is not None:
+        return svn_candidate
     return start or Path.cwd()
+
 
 # NOTE: Thread-safe for stdio MCP (single-threaded). If adding HTTP/SSE
 # transport with concurrent requests, replace with contextvars.ContextVar.
@@ -1272,7 +1302,6 @@ def _apply_tool_filter(tools: str | None = None) -> None:
         )
 
 
-
 def main(
     repo_root: str | None = None,
     tools: str | None = None,
@@ -1318,7 +1347,8 @@ def main(
         else:
             logger.warning(
                 "Ignoring unknown --detail %r (expected one of %s)",
-                detail_level, ", ".join(_VALID_DETAIL_LEVELS),
+                detail_level,
+                ", ".join(_VALID_DETAIL_LEVELS),
             )
     _apply_tool_filter(tools)
 

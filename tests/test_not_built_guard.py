@@ -8,6 +8,7 @@ A read tool run against a repo whose graph was never built must return a
 from __future__ import annotations
 
 import builtins
+import sqlite3
 from pathlib import Path
 
 from code_review_graph.graph import GraphStore
@@ -43,14 +44,26 @@ def _make_built_repo(tmp_path: Path, *, with_nodes: bool = True) -> Path:
     db_path = db_dir / "graph.db"
     with GraphStore(db_path) as store:
         if with_nodes:
-            store.upsert_node(NodeInfo(
-                kind="File", name="a.py", file_path=str(tmp_path / "a.py"),
-                line_start=1, line_end=10, language="python",
-            ))
-            store.upsert_node(NodeInfo(
-                kind="Function", name="hello", file_path=str(tmp_path / "a.py"),
-                line_start=2, line_end=4, language="python",
-            ))
+            store.upsert_node(
+                NodeInfo(
+                    kind="File",
+                    name="a.py",
+                    file_path=str(tmp_path / "a.py"),
+                    line_start=1,
+                    line_end=10,
+                    language="python",
+                )
+            )
+            store.upsert_node(
+                NodeInfo(
+                    kind="Function",
+                    name="hello",
+                    file_path=str(tmp_path / "a.py"),
+                    line_start=2,
+                    line_end=4,
+                    language="python",
+                )
+            )
         else:
             # Simulate a build over an empty repo: a build marker is written
             # even though no nodes were produced.
@@ -81,10 +94,16 @@ def test_graph_is_built_false_when_empty(tmp_path):
 def test_graph_is_built_true_with_nodes(tmp_path):
     db_path = tmp_path / "graph.db"
     with GraphStore(db_path) as store:
-        store.upsert_node(NodeInfo(
-            kind="File", name="a.py", file_path="a.py",
-            line_start=1, line_end=1, language="python",
-        ))
+        store.upsert_node(
+            NodeInfo(
+                kind="File",
+                name="a.py",
+                file_path="a.py",
+                line_start=1,
+                line_end=1,
+                language="python",
+            )
+        )
         store.commit()
         assert _graph_is_built(store) is True
 
@@ -127,7 +146,9 @@ def test_get_store_for_read_built(tmp_path):
 
 def test_query_graph_unbuilt_returns_not_built(tmp_path):
     _make_unbuilt_repo(tmp_path)
-    result = query_graph(pattern="callers_of", target="anything", repo_root=str(tmp_path))
+    result = query_graph(
+        pattern="callers_of", target="anything", repo_root=str(tmp_path)
+    )
     assert result["status"] == "not_built"
     assert "build_or_update_graph_tool" in result["next_tool_suggestions"]
 
@@ -176,7 +197,9 @@ def test_architecture_overview_unbuilt_returns_not_built(tmp_path):
 def test_query_graph_built_no_match_is_not_guarded(tmp_path):
     _make_built_repo(tmp_path)
     result = query_graph(
-        pattern="callers_of", target="does_not_exist", repo_root=str(tmp_path),
+        pattern="callers_of",
+        target="does_not_exist",
+        repo_root=str(tmp_path),
     )
     assert result["status"] != "not_built"
     # Real "no node" path, not the build guard.
@@ -188,6 +211,13 @@ def test_semantic_search_built_no_match_is_not_guarded(tmp_path):
     result = semantic_search_nodes("zzz_nonexistent_zzz", repo_root=str(tmp_path))
     assert result["status"] == "ok"
     assert result["results"] == []
+
+
+def test_semantic_search_without_embeddings_reports_lexical_mode(tmp_path):
+    _make_built_repo(tmp_path)
+    result = semantic_search_nodes("hello", repo_root=str(tmp_path))
+    assert result["status"] == "ok"
+    assert result["search_mode"] == "lexical"
 
 
 def test_semantic_search_without_embeddings_does_not_import_provider(
@@ -231,6 +261,24 @@ def test_list_graph_stats_does_not_initialize_embedding_provider(tmp_path, monke
     result = list_graph_stats(repo_root=str(tmp_path))
     assert result["status"] == "ok"
     assert result["embeddings_count"] == 0
+
+
+def test_list_graph_stats_does_not_hide_broken_embeddings_schema(tmp_path):
+    _make_built_repo(tmp_path)
+    db_path = tmp_path / ".code-review-graph" / "graph.db"
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("CREATE VIEW embeddings AS SELECT * FROM missing_embedding_table")
+        conn.commit()
+    finally:
+        conn.close()
+
+    try:
+        list_graph_stats(repo_root=str(tmp_path))
+    except sqlite3.OperationalError as exc:
+        assert "missing_embedding_table" in str(exc)
+    else:
+        raise AssertionError("broken embeddings schema must fail loud")
 
 
 def test_built_but_empty_graph_is_not_guarded(tmp_path):

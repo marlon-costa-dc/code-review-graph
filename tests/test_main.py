@@ -169,6 +169,28 @@ class TestServeMainTransport:
             crg_main.main(transport="streamable-http", host="127.0.0.1", port=None)
 
 
+class TestFindProjectRoot:
+    """Lightweight server root detection mirrors the canonical helper."""
+
+    def test_old_style_svn_uses_topmost_working_copy_root(self, tmp_path):
+        root = tmp_path / "repo"
+        child = root / "subdir" / "nested"
+        child.mkdir(parents=True)
+        for path in (root, root / "subdir", child):
+            (path / ".svn").mkdir()
+
+        assert crg_main._find_project_root(child) == root
+
+    def test_git_takes_precedence_over_nested_svn(self, tmp_path):
+        root = tmp_path / "repo"
+        child = root / "subdir"
+        child.mkdir(parents=True)
+        (root / ".git").mkdir()
+        (child / ".svn").mkdir()
+
+        assert crg_main._find_project_root(child) == root
+
+
 class TestLongRunningToolsAreAsync:
     """Long-running MCP tools must be registered as coroutines so the
     asyncio event loop stays responsive while the work runs in a
@@ -275,9 +297,7 @@ class TestLongRunningToolsAreAsync:
         assert all(tid != event_loop_thread for tid in provenance_threads)
 
     @pytest.mark.asyncio
-    async def test_detect_changes_timeout_uses_error_response_shape(
-        self, monkeypatch
-    ):
+    async def test_detect_changes_timeout_uses_error_response_shape(self, monkeypatch):
         async def fake_wait_for(coro, timeout):
             coro.close()
             raise asyncio.TimeoutError
@@ -325,7 +345,10 @@ class TestLongRunningToolsAreAsync:
         # function bodies (not the docstrings) so an explanatory comment
         # mentioning an old API name doesn't trip this guard.
         forbidden_mcp_attrs = {
-            "get_tools", "_tools", "tool_manager", "_tool_manager",
+            "get_tools",
+            "_tools",
+            "tool_manager",
+            "_tool_manager",
         }
         for guard_fn in (
             self.test_heavy_tools_are_coroutines,
@@ -420,9 +443,7 @@ class TestApplyToolFilter:
 
         original = asyncio.run(crg_main.mcp.list_tools())
         yield
-        current_names = {
-            t.name for t in asyncio.run(crg_main.mcp.list_tools())
-        }
+        current_names = {t.name for t in asyncio.run(crg_main.mcp.list_tools())}
         for tool in original:
             if tool.name not in current_names:
                 crg_main.mcp.add_tool(tool)

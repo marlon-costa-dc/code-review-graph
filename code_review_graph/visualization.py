@@ -96,9 +96,7 @@ DEFAULT_MAX_FULL_NODES = 3000
 DEFAULT_MAX_FULL_EDGES = 3 * DEFAULT_MAX_FULL_NODES
 
 
-def _build_name_index(
-    nodes: list[dict], seen_qn: set[str]
-) -> dict[str, list[str]]:
+def _build_name_index(nodes: list[dict], seen_qn: set[str]) -> dict[str, list[str]]:
     """Build a mapping from short/module-style names to qualified names.
 
     Returns ``{short_name: [qualified_name, ...]}``.
@@ -187,7 +185,9 @@ def _get_stored_communities(store: GraphStore) -> list[dict[str, Any]]:
     ).fetchall()
     members_by_cid: dict[int, list[str]] = defaultdict(list)
     for row in member_rows:
-        members_by_cid[row["community_id"]].append(_sanitize_name(row["qualified_name"]))
+        members_by_cid[row["community_id"]].append(
+            _sanitize_name(row["qualified_name"])
+        )
 
     return [
         {
@@ -246,6 +246,7 @@ def export_graph_data(store: GraphStore) -> dict:
     # Include flows (graceful fallback if table doesn't exist)
     try:
         from code_review_graph.flows import get_flows
+
         flows = get_flows(store, limit=100)
     except (ImportError, sqlite3.OperationalError) as exc:
         logger.debug("flows unavailable for export: %s", exc)
@@ -312,19 +313,21 @@ def _aggregate_community(data: dict) -> dict:
         size = info.get("size", len(info.get("members", [])))
         if size == 0:
             continue
-        super_nodes.append({
-            "qualified_name": f"__community__{cid}",
-            "name": info.get("name", f"Community {cid}"),
-            "kind": "Community",
-            "file_path": "",
-            "line_start": None,
-            "line_end": None,
-            "language": info.get("dominant_language", ""),
-            "community_id": cid,
-            "member_count": size,
-            "description": info.get("description", ""),
-            "id": cid,
-        })
+        super_nodes.append(
+            {
+                "qualified_name": f"__community__{cid}",
+                "name": info.get("name", f"Community {cid}"),
+                "kind": "Community",
+                "file_path": "",
+                "line_start": None,
+                "line_end": None,
+                "language": info.get("dominant_language", ""),
+                "community_id": cid,
+                "member_count": size,
+                "description": info.get("description", ""),
+                "id": cid,
+            }
+        )
 
     # Build super-edges: aggregate cross-community edges
     cross_edge_counts: Counter[tuple[int, int]] = Counter()
@@ -337,18 +340,18 @@ def _aggregate_community(data: dict) -> dict:
 
     super_edges = []
     for (c1, c2), count in cross_edge_counts.items():
-        super_edges.append({
-            "source": f"__community__{c1}",
-            "target": f"__community__{c2}",
-            "kind": "CROSS_COMMUNITY",
-            "weight": count,
-        })
+        super_edges.append(
+            {
+                "source": f"__community__{c1}",
+                "target": f"__community__{c2}",
+                "kind": "CROSS_COMMUNITY",
+                "weight": count,
+            }
+        )
 
     # Build per-community detail data for drill-down in one pass. The previous
     # implementation scanned every node and edge once per community.
-    community_details: dict[int, dict] = defaultdict(
-        lambda: {"nodes": [], "edges": []}
-    )
+    community_details: dict[int, dict] = defaultdict(lambda: {"nodes": [], "edges": []})
     for n in nodes:
         community_details[qn_to_cid[n["qualified_name"]]]["nodes"].append(n)
 
@@ -365,9 +368,7 @@ def _aggregate_community(data: dict) -> dict:
         "flows": data.get("flows", []),
         "communities": communities,
         "mode": "community",
-        "community_details": {
-            str(k): v for k, v in community_details.items()
-        },
+        "community_details": {str(k): v for k, v in community_details.items()},
     }
 
 
@@ -410,17 +411,19 @@ def _aggregate_file(data: dict) -> dict:
             if n.get("file_path") == fp and n.get("community_id") is not None:
                 cid = n["community_id"]
                 break
-        file_nodes.append({
-            "qualified_name": fp,
-            "name": label,
-            "kind": "File",
-            "file_path": fp,
-            "line_start": None,
-            "line_end": None,
-            "language": file_languages.get(fp, ""),
-            "community_id": cid,
-            "symbol_count": count,
-        })
+        file_nodes.append(
+            {
+                "qualified_name": fp,
+                "name": label,
+                "kind": "File",
+                "file_path": fp,
+                "line_start": None,
+                "line_end": None,
+                "language": file_languages.get(fp, ""),
+                "community_id": cid,
+                "symbol_count": count,
+            }
+        )
 
     # Aggregate cross-file edges
     cross_file_counts: Counter[tuple[str, str]] = Counter()
@@ -433,12 +436,14 @@ def _aggregate_file(data: dict) -> dict:
 
     file_edges = []
     for (f1, f2), count in cross_file_counts.items():
-        file_edges.append({
-            "source": f1,
-            "target": f2,
-            "kind": "DEPENDS_ON",
-            "weight": count,
-        })
+        file_edges.append(
+            {
+                "source": f1,
+                "target": f2,
+                "kind": "DEPENDS_ON",
+                "weight": count,
+            }
+        )
 
     return {
         "nodes": file_nodes,
@@ -505,7 +510,8 @@ def generate_html(
     if stats.total_nodes > 50000:
         logger.warning(
             "Graph has %d nodes — visualization may be slow. "
-            "Consider filtering by file pattern.", stats.total_nodes,
+            "Consider filtering by file pattern.",
+            stats.total_nodes,
         )
     data = export_graph_data(store)
 
