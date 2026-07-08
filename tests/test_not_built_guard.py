@@ -7,6 +7,7 @@ A read tool run against a repo whose graph was never built must return a
 
 from __future__ import annotations
 
+import builtins
 from pathlib import Path
 
 from code_review_graph.graph import GraphStore
@@ -189,11 +190,47 @@ def test_semantic_search_built_no_match_is_not_guarded(tmp_path):
     assert result["results"] == []
 
 
+def test_semantic_search_without_embeddings_does_not_import_provider(
+    tmp_path, monkeypatch
+):
+    _make_built_repo(tmp_path)
+    real_import = builtins.__import__
+
+    def fail_embeddings_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "code_review_graph.embeddings" or (
+            level and fromlist and "EmbeddingStore" in fromlist
+        ):
+            raise AssertionError(
+                "semantic_search_nodes must not import embedding providers "
+                "when no vectors exist"
+            )
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", fail_embeddings_import)
+
+    result = semantic_search_nodes("zzz_nonexistent_zzz", repo_root=str(tmp_path))
+    assert result["status"] == "ok"
+    assert result["results"] == []
+
+
 def test_list_graph_stats_built_returns_ok(tmp_path):
     _make_built_repo(tmp_path)
     result = list_graph_stats(repo_root=str(tmp_path))
     assert result["status"] == "ok"
     assert result["total_nodes"] >= 1
+
+
+def test_list_graph_stats_does_not_initialize_embedding_provider(tmp_path, monkeypatch):
+    _make_built_repo(tmp_path)
+
+    def fail_provider(*_args, **_kwargs):
+        raise AssertionError("list_graph_stats must not initialize embedding providers")
+
+    monkeypatch.setattr("code_review_graph.embeddings.get_provider", fail_provider)
+
+    result = list_graph_stats(repo_root=str(tmp_path))
+    assert result["status"] == "ok"
+    assert result["embeddings_count"] == 0
 
 
 def test_built_but_empty_graph_is_not_guarded(tmp_path):

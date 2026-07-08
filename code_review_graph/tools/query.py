@@ -24,6 +24,17 @@ from ._common import (
 
 logger = logging.getLogger(__name__)
 
+
+def _count_embeddings(conn) -> int:
+    """Return stored embedding count without loading embedding providers."""
+    try:
+        return int(conn.execute("SELECT COUNT(*) FROM embeddings").fetchone()[0])
+    except sqlite3.OperationalError as exc:
+        if "no such table: embeddings" in str(exc).lower():
+            return 0
+        raise
+        return 0
+
 # ---------------------------------------------------------------------------
 # Tool 2: get_impact_radius
 # ---------------------------------------------------------------------------
@@ -830,18 +841,11 @@ def list_graph_stats(repo_root: str | None = None) -> dict[str, Any]:
         for kind, count in sorted(stats.edges_by_kind.items()):
             summary_parts.append(f"  {kind}: {count}")
 
-        # Add embedding info if available
-        emb_store = EmbeddingStore(get_db_path(root))
-        try:
-            emb_count = emb_store.count()
-            summary_parts.append("")
-            summary_parts.append(f"Embeddings: {emb_count} nodes embedded")
-            if not emb_store.available:
-                summary_parts.append(
-                    "  (install sentence-transformers for semantic search)"
-                )
-        finally:
-            emb_store.close()
+        # Count existing vectors directly. Stats is a read-only path and must
+        # not instantiate embedding providers, which can import torch.
+        emb_count = _count_embeddings(store._conn)
+        summary_parts.append("")
+        summary_parts.append(f"Embeddings: {emb_count} nodes embedded")
 
         return {
             "status": "ok",

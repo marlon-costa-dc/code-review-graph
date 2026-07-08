@@ -14,8 +14,9 @@ import asyncio
 import logging
 import os
 import sys
+from importlib import import_module
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from fastmcp import FastMCP
 
@@ -64,6 +65,72 @@ from .tools import (
 )
 
 logger = logging.getLogger(__name__)
+
+_TOOL_IMPLS: dict[str, tuple[str, str]] = {
+    "apply_refactor_func": ("code_review_graph.tools.refactor_tools", "apply_refactor_func"),
+    "build_or_update_graph": ("code_review_graph.tools.build", "build_or_update_graph"),
+    "cross_repo_search_func": ("code_review_graph.tools.registry_tools", "cross_repo_search_func"),
+    "detect_changes_func": ("code_review_graph.tools.review", "detect_changes_func"),
+    "embed_graph": ("code_review_graph.tools.docs", "embed_graph"),
+    "find_large_functions": ("code_review_graph.tools.query", "find_large_functions"),
+    "generate_wiki_func": ("code_review_graph.tools.docs", "generate_wiki_func"),
+    "get_affected_flows_func": ("code_review_graph.tools.review", "get_affected_flows_func"),
+    "get_architecture_overview_func": (
+        "code_review_graph.tools.community_tools",
+        "get_architecture_overview_func",
+    ),
+    "get_bridge_nodes_func": ("code_review_graph.tools.analysis_tools", "get_bridge_nodes_func"),
+    "get_community_func": ("code_review_graph.tools.community_tools", "get_community_func"),
+    "get_docs_section": ("code_review_graph.tools.docs", "get_docs_section"),
+    "get_flow": ("code_review_graph.tools.flows_tools", "get_flow"),
+    "get_hub_nodes_func": ("code_review_graph.tools.analysis_tools", "get_hub_nodes_func"),
+    "get_impact_radius": ("code_review_graph.tools.query", "get_impact_radius"),
+    "get_knowledge_gaps_func": (
+        "code_review_graph.tools.analysis_tools",
+        "get_knowledge_gaps_func",
+    ),
+    "get_minimal_context": ("code_review_graph.tools.context", "get_minimal_context"),
+    "get_review_context": ("code_review_graph.tools.review", "get_review_context"),
+    "get_suggested_questions_func": (
+        "code_review_graph.tools.analysis_tools",
+        "get_suggested_questions_func",
+    ),
+    "get_surprising_connections_func": (
+        "code_review_graph.tools.analysis_tools",
+        "get_surprising_connections_func",
+    ),
+    "get_wiki_page_func": ("code_review_graph.tools.docs", "get_wiki_page_func"),
+    "list_communities_func": ("code_review_graph.tools.community_tools", "list_communities_func"),
+    "list_flows": ("code_review_graph.tools.flows_tools", "list_flows"),
+    "list_graph_stats": ("code_review_graph.tools.query", "list_graph_stats"),
+    "list_repos_func": ("code_review_graph.tools.registry_tools", "list_repos_func"),
+    "query_graph": ("code_review_graph.tools.query", "query_graph"),
+    "refactor_func": ("code_review_graph.tools.refactor_tools", "refactor_func"),
+    "run_postprocess": ("code_review_graph.tools.build", "run_postprocess"),
+    "semantic_search_nodes": ("code_review_graph.tools.query", "semantic_search_nodes"),
+    "traverse_graph_func": ("code_review_graph.tools.query", "traverse_graph_func"),
+}
+
+
+def _tool_impl(name: str) -> Any:
+    module_name, attr_name = _TOOL_IMPLS[name]
+    return getattr(import_module(module_name), attr_name)
+
+
+def _find_project_root(start: Path | None = None) -> Path:
+    env_override = os.environ.get("CRG_REPO_ROOT", "").strip()
+    if env_override:
+        root = Path(env_override).expanduser().resolve()
+        if root.exists():
+            return root
+
+    root = (start or Path.cwd()).resolve()
+    if root.is_file():
+        root = root.parent
+    for candidate in (root, *root.parents):
+        if (candidate / ".git").exists() or (candidate / ".svn").exists():
+            return candidate
+    return start or Path.cwd()
 
 # NOTE: Thread-safe for stdio MCP (single-threaded). If adding HTTP/SSE
 # transport with concurrent requests, replace with contextvars.ContextVar.
@@ -503,7 +570,7 @@ def get_docs_section_tool(
         section_name: The section to retrieve (e.g. "review-delta", "usage").
         repo_root: Repository root path. Auto-detected if omitted.
     """
-    return get_docs_section(
+    return _tool_impl("get_docs_section")(
         section_name=section_name,
         repo_root=_resolve_repo_root(repo_root),
     )
@@ -1014,7 +1081,7 @@ def list_repos_tool() -> dict:
     Returns the list of repos registered at ~/.code-review-graph/registry.json.
     Use the CLI 'register' command to add repos.
     """
-    return list_repos_func()
+    return _tool_impl("list_repos_func")()
 
 
 @mcp.tool()
@@ -1035,7 +1102,7 @@ def cross_repo_search_tool(
         kind: Optional filter: File, Class, Function, Type, or Test.
         limit: Maximum results per repo. Default: 20.
     """
-    return cross_repo_search_func(query=query, kind=kind, limit=limit)
+    return _tool_impl("cross_repo_search_func")(query=query, kind=kind, limit=limit)
 
 
 @mcp.prompt()
@@ -1242,7 +1309,7 @@ def main(
             per-call ``detail_level`` argument.
     """
     global _default_repo_root, _detail_level_override
-    root = Path(repo_root) if repo_root else find_project_root()
+    root = Path(repo_root) if repo_root else _find_project_root()
     _default_repo_root = str(root)
     if detail_level:
         normalized = detail_level.strip().lower()

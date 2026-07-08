@@ -67,6 +67,10 @@ def _bridge_qualified_name(qualified_name: str) -> str:
     return normalize_file_path(path_part) + sep + symbol_part
 
 
+_CONTROL_CHAR_DELETE_TABLE = dict.fromkeys(
+    codepoint for codepoint in range(0x20) if codepoint not in (0x09, 0x0A)
+)
+
 # ---------------------------------------------------------------------------
 # Schema
 # ---------------------------------------------------------------------------
@@ -2436,12 +2440,7 @@ def _sanitize_name(s: str, max_len: int = 256) -> str:
     that names flowing through MCP tool responses cannot easily influence AI
     agent behaviour.
     """
-    # Strip control chars 0x00-0x1F except \t (0x09) and \n (0x0A)
-    cleaned = "".join(
-        ch for ch in s
-        if ch in ("\t", "\n") or ord(ch) >= 0x20
-    )
-    return cleaned[:max_len]
+    return s.translate(_CONTROL_CHAR_DELETE_TABLE)[:max_len]
 
 
 def node_to_dict(n: GraphNode) -> dict:
