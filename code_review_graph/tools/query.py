@@ -32,6 +32,7 @@ def _count_embeddings(conn) -> int:
         raise
         return 0
 
+
 # ---------------------------------------------------------------------------
 # Tool 2: get_impact_radius
 # ---------------------------------------------------------------------------
@@ -124,9 +125,7 @@ def get_impact_radius(
                 risk = "medium"
             else:
                 risk = "low"
-            key_entities = [
-                n["name"] for n in impacted_dicts[:5]
-            ]
+            key_entities = [n["name"] for n in impacted_dicts[:5]]
             minimal_response = {
                 "status": "ok",
                 "summary": "\n".join(summary_parts),
@@ -208,13 +207,16 @@ def query_graph(
             and "::" not in target
         ):
             return {
-                "status": "ok", "pattern": pattern, "target": target,
+                "status": "ok",
+                "pattern": pattern,
+                "target": target,
                 "description": _QUERY_PATTERNS[pattern],
                 "summary": (
                     f"'{target}' is a common builtin "
                     "— callers_of skipped to avoid noise."
                 ),
-                "results": [], "edges": [],
+                "results": [],
+                "edges": [],
             }
 
         # Resolve target - try as-is, then as absolute path, then search.
@@ -281,11 +283,13 @@ def query_graph(
                         if callee:
                             results.append(node_to_dict(callee))
                         elif "::" not in e.target_qualified:
-                            results.append({
-                                "kind": "Function",
-                                "name": e.target_qualified,
-                                "qualified_name": e.target_qualified,
-                            })
+                            results.append(
+                                {
+                                    "kind": "Function",
+                                    "name": e.target_qualified,
+                                    "qualified_name": e.target_qualified,
+                                }
+                            )
                         edges_out.append(edge_to_dict(e))
 
         elif pattern == "imports_of":
@@ -299,15 +303,16 @@ def query_graph(
             # Use resolve() to canonicalize the path, matching how
             # _resolve_module_to_file stores edge targets.
             abs_target = (
-                str((root / target).resolve()) if node is None
-                else node.file_path
+                str((root / target).resolve()) if node is None else node.file_path
             )
             for e in store.get_edges_by_target(abs_target):
                 if e.kind == "IMPORTS_FROM":
-                    results.append({
-                        "importer": e.source_qualified,
-                        "file": e.file_path,
-                    })
+                    results.append(
+                        {
+                            "importer": e.source_qualified,
+                            "file": e.file_path,
+                        }
+                    )
                     edges_out.append(edge_to_dict(e))
 
         elif pattern == "children_of":
@@ -372,26 +377,20 @@ def query_graph(
             }
             if kept_qns:
                 edges_out = [
-                    e for e in edges_out
+                    e
+                    for e in edges_out
                     if e.get("source") in kept_qns or e.get("target") in kept_qns
                 ][:max_results]
             else:
                 edges_out = edges_out[:max_results]
 
-        summary = (
-            f"Found {total_results} result(s) "
-            f"for {pattern}('{target}')"
-        )
+        summary = f"Found {total_results} result(s) " f"for {pattern}('{target}')"
         if truncated:
             summary += f" (showing first {len(results)})"
 
         if detail_level == "minimal":
             minimal_results = [
-                {
-                    k: r[k]
-                    for k in ("name", "kind", "file_path")
-                    if k in r
-                }
+                {k: r[k] for k in ("name", "kind", "file_path") if k in r}
                 for r in results[:5]
             ]
             response: dict[str, Any] = {
@@ -463,12 +462,22 @@ def semantic_search_nodes(
         return not_built if not_built is not None else _not_built_response()
     try:
         embeddings_present = has_embedding_rows(store._conn)
+        diagnostics: dict[str, Any] = {}
         results = hybrid_search(
-            store, query, kind=kind, limit=limit, context_files=context_files,
-            model=model, provider=provider,
+            store,
+            query,
+            kind=kind,
+            limit=limit,
+            context_files=context_files,
+            model=model,
+            provider=provider,
+            diagnostics=diagnostics,
         )
 
-        search_mode = "hybrid" if embeddings_present else "lexical"
+        embedding_status = diagnostics.get("embedding_status")
+        search_mode = (
+            "hybrid" if embeddings_present and embedding_status == "used" else "lexical"
+        )
         if not results:
             search_mode = "keyword"
 
@@ -478,20 +487,21 @@ def semantic_search_nodes(
 
         if detail_level == "minimal":
             minimal_results = [
-                {
-                    k: r[k]
-                    for k in ("name", "kind", "file_path", "score")
-                    if k in r
-                }
+                {k: r[k] for k in ("name", "kind", "file_path", "score") if k in r}
                 for r in results[:5]
             ]
-            return {
+            response = {
                 "status": "ok",
                 "query": query,
                 "search_mode": search_mode,
                 "summary": summary,
                 "results": minimal_results,
             }
+            if embedding_status in {"failed", "unavailable"}:
+                response["embedding_warning"] = diagnostics.get(
+                    "embedding_warning", "embedding search unavailable"
+                )
+            return response
 
         result: dict[str, object] = {
             "status": "ok",
@@ -500,6 +510,10 @@ def semantic_search_nodes(
             "summary": summary,
             "results": results,
         }
+        if embedding_status in {"failed", "unavailable"}:
+            result["embedding_warning"] = diagnostics.get(
+                "embedding_warning", "embedding search unavailable"
+            )
         result["_hints"] = generate_hints(
             "semantic_search_nodes", result, get_session()
         )
@@ -609,9 +623,7 @@ def find_large_functions(
         for n in nodes:
             d = node_to_dict(n)
             d["line_count"] = (
-                (n.line_end - n.line_start + 1)
-                if n.line_start and n.line_end
-                else 0
+                (n.line_end - n.line_start + 1) if n.line_start and n.line_end else 0
             )
             # Make file_path relative for readability
             try:
@@ -718,12 +730,8 @@ def traverse_graph_func(
             traversal.append(entry)
 
             # Get neighbours
-            out_edges = store.get_edges_by_source(
-                current_qn
-            )
-            in_edges = store.get_edges_by_target(
-                current_qn
-            )
+            out_edges = store.get_edges_by_source(current_qn)
+            in_edges = store.get_edges_by_target(current_qn)
             for e in out_edges:
                 tgt = e.target_qualified
                 if tgt not in visited:
@@ -741,10 +749,8 @@ def traverse_graph_func(
             "traversal": traversal,
             "truncated": approx_tokens > token_budget,
             "next_tool_suggestions": [
-                "query_graph callers_of"
-                " -- focused relationship query",
-                "get_impact_radius"
-                " -- blast radius analysis",
+                "query_graph callers_of" " -- focused relationship query",
+                "get_impact_radius" " -- blast radius analysis",
             ],
         }
     finally:
