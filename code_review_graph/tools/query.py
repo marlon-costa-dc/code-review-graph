@@ -3,15 +3,15 @@
 from __future__ import annotations
 
 import logging
+import sqlite3
 from pathlib import Path
 from typing import Any
 
 from ..context_savings import attach_context_savings, estimate_file_tokens
-from ..embeddings import EmbeddingStore
 from ..graph import _sanitize_name, edge_to_dict, node_to_dict
 from ..hints import generate_hints, get_session
-from ..incremental import get_changed_files, get_db_path, get_staged_and_unstaged
-from ..search import hybrid_search
+from ..incremental import get_changed_files, get_staged_and_unstaged
+from ..search import has_embedding_rows, hybrid_search
 from ._common import (
     _BUILTIN_CALL_NAMES,
     _get_store_for_read,
@@ -20,6 +20,17 @@ from ._common import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _count_embeddings(conn) -> int:
+    """Return stored embedding count without loading embedding providers."""
+    try:
+        return int(conn.execute("SELECT COUNT(*) FROM embeddings").fetchone()[0])
+    except sqlite3.OperationalError as exc:
+        if "no such table: embeddings" in str(exc).lower():
+            return 0
+        raise
+        return 0
 
 # ---------------------------------------------------------------------------
 # Tool 2: get_impact_radius
@@ -451,12 +462,13 @@ def semantic_search_nodes(
     if store is None or root is None:
         return not_built if not_built is not None else _not_built_response()
     try:
+        embeddings_present = has_embedding_rows(store._conn)
         results = hybrid_search(
             store, query, kind=kind, limit=limit, context_files=context_files,
             model=model, provider=provider,
         )
 
-        search_mode = "hybrid"
+        search_mode = "hybrid" if embeddings_present else "lexical"
         if not results:
             search_mode = "keyword"
 
@@ -533,18 +545,11 @@ def list_graph_stats(repo_root: str | None = None) -> dict[str, Any]:
         for kind, count in sorted(stats.edges_by_kind.items()):
             summary_parts.append(f"  {kind}: {count}")
 
-        # Add embedding info if available
-        emb_store = EmbeddingStore(get_db_path(root))
-        try:
-            emb_count = emb_store.count()
-            summary_parts.append("")
-            summary_parts.append(f"Embeddings: {emb_count} nodes embedded")
-            if not emb_store.available:
-                summary_parts.append(
-                    "  (install sentence-transformers for semantic search)"
-                )
-        finally:
-            emb_store.close()
+        # Count existing vectors directly. Stats is a read-only path and must
+        # not instantiate embedding providers, which can import torch.
+        emb_count = _count_embeddings(store._conn)
+        summary_parts.append("")
+        summary_parts.append(f"Embeddings: {emb_count} nodes embedded")
 
         return {
             "status": "ok",

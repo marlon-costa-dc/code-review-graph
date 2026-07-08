@@ -12,13 +12,12 @@ import asyncio
 import logging
 import os
 import sys
+from importlib import import_module
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from fastmcp import FastMCP
 
-from .graph import GraphStore
-from .incremental import find_project_root, get_db_path, start_watch_thread
 from .prompts import (
     architecture_map_prompt,
     debug_issue_prompt,
@@ -26,40 +25,74 @@ from .prompts import (
     pre_merge_check_prompt,
     review_changes_prompt,
 )
-from .tools import (
-    apply_refactor_func,
-    build_or_update_graph,
-    cross_repo_search_func,
-    detect_changes_func,
-    embed_graph,
-    find_large_functions,
-    generate_wiki_func,
-    get_affected_flows_func,
-    get_architecture_overview_func,
-    get_bridge_nodes_func,
-    get_community_func,
-    get_docs_section,
-    get_flow,
-    get_hub_nodes_func,
-    get_impact_radius,
-    get_knowledge_gaps_func,
-    get_minimal_context,
-    get_review_context,
-    get_suggested_questions_func,
-    get_surprising_connections_func,
-    get_wiki_page_func,
-    list_communities_func,
-    list_flows,
-    list_graph_stats,
-    list_repos_func,
-    query_graph,
-    refactor_func,
-    run_postprocess,
-    semantic_search_nodes,
-    traverse_graph_func,
-)
 
 logger = logging.getLogger(__name__)
+
+_TOOL_IMPLS: dict[str, tuple[str, str]] = {
+    "apply_refactor_func": ("code_review_graph.tools.refactor_tools", "apply_refactor_func"),
+    "build_or_update_graph": ("code_review_graph.tools.build", "build_or_update_graph"),
+    "cross_repo_search_func": ("code_review_graph.tools.registry_tools", "cross_repo_search_func"),
+    "detect_changes_func": ("code_review_graph.tools.review", "detect_changes_func"),
+    "embed_graph": ("code_review_graph.tools.docs", "embed_graph"),
+    "find_large_functions": ("code_review_graph.tools.query", "find_large_functions"),
+    "generate_wiki_func": ("code_review_graph.tools.docs", "generate_wiki_func"),
+    "get_affected_flows_func": ("code_review_graph.tools.review", "get_affected_flows_func"),
+    "get_architecture_overview_func": (
+        "code_review_graph.tools.community_tools",
+        "get_architecture_overview_func",
+    ),
+    "get_bridge_nodes_func": ("code_review_graph.tools.analysis_tools", "get_bridge_nodes_func"),
+    "get_community_func": ("code_review_graph.tools.community_tools", "get_community_func"),
+    "get_docs_section": ("code_review_graph.tools.docs", "get_docs_section"),
+    "get_flow": ("code_review_graph.tools.flows_tools", "get_flow"),
+    "get_hub_nodes_func": ("code_review_graph.tools.analysis_tools", "get_hub_nodes_func"),
+    "get_impact_radius": ("code_review_graph.tools.query", "get_impact_radius"),
+    "get_knowledge_gaps_func": (
+        "code_review_graph.tools.analysis_tools",
+        "get_knowledge_gaps_func",
+    ),
+    "get_minimal_context": ("code_review_graph.tools.context", "get_minimal_context"),
+    "get_review_context": ("code_review_graph.tools.review", "get_review_context"),
+    "get_suggested_questions_func": (
+        "code_review_graph.tools.analysis_tools",
+        "get_suggested_questions_func",
+    ),
+    "get_surprising_connections_func": (
+        "code_review_graph.tools.analysis_tools",
+        "get_surprising_connections_func",
+    ),
+    "get_wiki_page_func": ("code_review_graph.tools.docs", "get_wiki_page_func"),
+    "list_communities_func": ("code_review_graph.tools.community_tools", "list_communities_func"),
+    "list_flows": ("code_review_graph.tools.flows_tools", "list_flows"),
+    "list_graph_stats": ("code_review_graph.tools.query", "list_graph_stats"),
+    "list_repos_func": ("code_review_graph.tools.registry_tools", "list_repos_func"),
+    "query_graph": ("code_review_graph.tools.query", "query_graph"),
+    "refactor_func": ("code_review_graph.tools.refactor_tools", "refactor_func"),
+    "run_postprocess": ("code_review_graph.tools.build", "run_postprocess"),
+    "semantic_search_nodes": ("code_review_graph.tools.query", "semantic_search_nodes"),
+    "traverse_graph_func": ("code_review_graph.tools.query", "traverse_graph_func"),
+}
+
+
+def _tool_impl(name: str) -> Any:
+    module_name, attr_name = _TOOL_IMPLS[name]
+    return getattr(import_module(module_name), attr_name)
+
+
+def _find_project_root(start: Path | None = None) -> Path:
+    env_override = os.environ.get("CRG_REPO_ROOT", "").strip()
+    if env_override:
+        root = Path(env_override).expanduser().resolve()
+        if root.exists():
+            return root
+
+    root = (start or Path.cwd()).resolve()
+    if root.is_file():
+        root = root.parent
+    for candidate in (root, *root.parents):
+        if (candidate / ".git").exists() or (candidate / ".svn").exists():
+            return candidate
+    return start or Path.cwd()
 
 # NOTE: Thread-safe for stdio MCP (single-threaded). If adding HTTP/SSE
 # transport with concurrent requests, replace with contextvars.ContextVar.
@@ -183,7 +216,7 @@ async def build_or_update_graph_tool(
             When None (default), falls back to CRG_RECURSE_SUBMODULES env var.
     """
     return await asyncio.to_thread(
-        build_or_update_graph,
+        _tool_impl("build_or_update_graph"),
         full_rebuild=full_rebuild,
         repo_root=_resolve_repo_root(repo_root),
         base=base,
@@ -215,7 +248,7 @@ async def run_postprocess_tool(
         repo_root: Repository root path. Auto-detected if omitted.
     """
     return await asyncio.to_thread(
-        run_postprocess,
+        _tool_impl("run_postprocess"),
         flows=flows, communities=communities, fts=fts,
         repo_root=_resolve_repo_root(repo_root),
     )
@@ -240,7 +273,7 @@ def get_minimal_context_tool(
         repo_root: Repository root path. Auto-detected if omitted.
         base: Git ref for diff comparison. Default: HEAD~1.
     """
-    return get_minimal_context(
+    return _tool_impl("get_minimal_context")(
         task=task, changed_files=changed_files,
         repo_root=_resolve_repo_root(repo_root), base=base,
     )
@@ -266,7 +299,7 @@ def get_impact_radius_tool(
         base: Git ref for auto-detecting changes. Default: HEAD~1.
         detail_level: "minimal" (default) for a compact summary; "standard" for full output.
     """
-    return get_impact_radius(
+    return _tool_impl("get_impact_radius")(
         changed_files=changed_files, max_depth=max_depth,
         repo_root=_resolve_repo_root(repo_root), base=base,
         detail_level=_resolve_detail_level(detail_level),
@@ -301,7 +334,7 @@ def query_graph_tool(
         max_results: Cap on results returned so callers_of/callees_of on a hot
             symbol cannot return an unbounded payload. Default: 100.
     """
-    return query_graph(
+    return _tool_impl("query_graph")(
         pattern=pattern, target=target, repo_root=_resolve_repo_root(repo_root),
         detail_level=_resolve_detail_level(detail_level), max_results=max_results,
     )
@@ -336,7 +369,7 @@ def get_review_context_tool(
             exceed this, the lowest-risk source snippets are dropped first and
             an honest ``omitted`` note is added. Default: 6000. Set 0 to disable.
     """
-    return get_review_context(
+    return _tool_impl("get_review_context")(
         changed_files=changed_files, max_depth=max_depth,
         include_source=include_source, max_lines_per_file=max_lines_per_file,
         repo_root=_resolve_repo_root(repo_root), base=base,
@@ -374,7 +407,7 @@ def semantic_search_nodes_tool(
                   or "minimax". Must match the provider used during embed_graph.
         detail_level: "minimal" (default) for a compact summary; "standard" for full output.
     """
-    return semantic_search_nodes(
+    return _tool_impl("semantic_search_nodes")(
         query=query, kind=kind, limit=limit, repo_root=_resolve_repo_root(repo_root),
         model=model, provider=provider, detail_level=_resolve_detail_level(detail_level),
     )
@@ -415,7 +448,7 @@ async def embed_graph_tool(
                   endpoint (real OpenAI, Azure, new-api, LiteLLM, vLLM, etc.).
     """
     return await asyncio.to_thread(
-        embed_graph,
+        _tool_impl("embed_graph"),
         repo_root=_resolve_repo_root(repo_root),
         model=model,
         provider=provider,
@@ -434,7 +467,7 @@ def list_graph_stats_tool(
     Args:
         repo_root: Repository root path. Auto-detected if omitted.
     """
-    return list_graph_stats(repo_root=_resolve_repo_root(repo_root))
+    return _tool_impl("list_graph_stats")(repo_root=_resolve_repo_root(repo_root))
 
 
 @mcp.tool()
@@ -454,7 +487,7 @@ def get_docs_section_tool(
         section_name: The section to retrieve (e.g. "review-delta", "usage").
         repo_root: Repository root path. Auto-detected if omitted.
     """
-    return get_docs_section(
+    return _tool_impl("get_docs_section")(
         section_name=section_name,
         repo_root=_resolve_repo_root(repo_root),
     )
@@ -480,7 +513,7 @@ def find_large_functions_tool(
         limit: Maximum results. Default: 50.
         repo_root: Repository root path. Auto-detected if omitted.
     """
-    return find_large_functions(
+    return _tool_impl("find_large_functions")(
         min_lines=min_lines, kind=kind, file_path_pattern=file_path_pattern,
         limit=limit, repo_root=_resolve_repo_root(repo_root),
     )
@@ -508,7 +541,7 @@ def list_flows_tool(
                       returns only name, criticality, and node_count per flow.
         repo_root: Repository root path. Auto-detected if omitted.
     """
-    return list_flows(
+    return _tool_impl("list_flows")(
         repo_root=_resolve_repo_root(repo_root), sort_by=sort_by, limit=limit, kind=kind,
         detail_level=detail_level,
     )
@@ -534,7 +567,7 @@ def get_flow_tool(
         include_source: Include source code snippets for each step. Default: False.
         repo_root: Repository root path. Auto-detected if omitted.
     """
-    return get_flow(
+    return _tool_impl("get_flow")(
         flow_id=flow_id, flow_name=flow_name,
         include_source=include_source, repo_root=_resolve_repo_root(repo_root),
     )
@@ -557,7 +590,7 @@ def get_affected_flows_tool(
         base: Git ref for auto-detecting changes. Default: HEAD~1.
         repo_root: Repository root path. Auto-detected if omitted.
     """
-    return get_affected_flows_func(
+    return _tool_impl("get_affected_flows_func")(
         changed_files=changed_files, base=base, repo_root=_resolve_repo_root(repo_root),
     )
 
@@ -583,7 +616,7 @@ def list_communities_tool(
                       per community.
         repo_root: Repository root path. Auto-detected if omitted.
     """
-    return list_communities_func(
+    return _tool_impl("list_communities_func")(
         repo_root=_resolve_repo_root(repo_root), sort_by=sort_by, min_size=min_size,
         detail_level=detail_level,
     )
@@ -610,7 +643,7 @@ def get_community_tool(
         include_members: Include full member node details. Default: False.
         repo_root: Repository root path. Auto-detected if omitted.
     """
-    return get_community_func(
+    return _tool_impl("get_community_func")(
         community_name=community_name, community_id=community_id,
         include_members=include_members, repo_root=_resolve_repo_root(repo_root),
     )
@@ -634,7 +667,7 @@ def get_architecture_overview_tool(
                       community pair (typical reduction: 600KB -> <5KB);
                       "standard" returns full per-edge detail.
     """
-    return get_architecture_overview_func(
+    return _tool_impl("get_architecture_overview_func")(
         repo_root=_resolve_repo_root(repo_root),
         detail_level=detail_level,
     )
@@ -674,7 +707,7 @@ async def detect_changes_tool(
             Default: 6000. Set 0 to disable.
     """
     coro = asyncio.to_thread(
-        detect_changes_func,
+        _tool_impl("detect_changes_func"),
         base=base, changed_files=changed_files,
         include_source=include_source, max_depth=max_depth,
         repo_root=_resolve_repo_root(repo_root),
@@ -728,7 +761,7 @@ def refactor_tool(
         file_pattern: (dead_code) Filter by file path substring.
         repo_root: Repository root path. Auto-detected if omitted.
     """
-    return refactor_func(
+    return _tool_impl("refactor_func")(
         mode=mode, old_name=old_name, new_name=new_name,
         kind=kind, file_pattern=file_pattern, repo_root=_resolve_repo_root(repo_root),
     )
@@ -758,7 +791,7 @@ def apply_refactor_tool(
             dry_run. Use this for a human-in-the-loop review before
             committing changes to disk. See: #176
     """
-    return apply_refactor_func(
+    return _tool_impl("apply_refactor_func")(
         refactor_id=refactor_id, repo_root=_resolve_repo_root(repo_root),
         dry_run=dry_run,
     )
@@ -784,7 +817,7 @@ async def generate_wiki_tool(
         force: If True, regenerate all pages even if content unchanged. Default: False.
     """
     return await asyncio.to_thread(
-        generate_wiki_func,
+        _tool_impl("generate_wiki_func"),
         repo_root=_resolve_repo_root(repo_root),
         force=force,
     )
@@ -804,7 +837,7 @@ def get_wiki_page_tool(
         community_name: Community name to look up.
         repo_root: Repository root path. Auto-detected if omitted.
     """
-    return get_wiki_page_func(
+    return _tool_impl("get_wiki_page_func")(
         community_name=community_name, repo_root=_resolve_repo_root(repo_root),
     )
 
@@ -823,7 +856,7 @@ def get_hub_nodes_tool(
         top_n: Number of top hubs to return. Default: 10.
         repo_root: Repository root path. Auto-detected if omitted.
     """
-    return get_hub_nodes_func(
+    return _tool_impl("get_hub_nodes_func")(
         repo_root=_resolve_repo_root(repo_root), top_n=top_n,
     )
 
@@ -843,7 +876,7 @@ def get_bridge_nodes_tool(
         top_n: Number of top bridges to return. Default: 10.
         repo_root: Repository root path. Auto-detected if omitted.
     """
-    return get_bridge_nodes_func(
+    return _tool_impl("get_bridge_nodes_func")(
         repo_root=_resolve_repo_root(repo_root), top_n=top_n,
     )
 
@@ -861,7 +894,7 @@ def get_knowledge_gaps_tool(
     Args:
         repo_root: Repository root path. Auto-detected if omitted.
     """
-    return get_knowledge_gaps_func(
+    return _tool_impl("get_knowledge_gaps_func")(
         repo_root=_resolve_repo_root(repo_root),
     )
 
@@ -881,7 +914,7 @@ def get_surprising_connections_tool(
         top_n: Number of top surprises to return. Default: 15.
         repo_root: Repository root path. Auto-detected if omitted.
     """
-    return get_surprising_connections_func(
+    return _tool_impl("get_surprising_connections_func")(
         repo_root=_resolve_repo_root(repo_root), top_n=top_n,
     )
 
@@ -899,7 +932,7 @@ def get_suggested_questions_tool(
     Args:
         repo_root: Repository root path. Auto-detected if omitted.
     """
-    return get_suggested_questions_func(
+    return _tool_impl("get_suggested_questions_func")(
         repo_root=_resolve_repo_root(repo_root),
     )
 
@@ -927,7 +960,7 @@ def traverse_graph_tool(
             Default: 2000.
         repo_root: Repository root path. Auto-detected if omitted.
     """
-    return traverse_graph_func(
+    return _tool_impl("traverse_graph_func")(
         query=query, mode=mode, depth=depth,
         token_budget=token_budget,
         repo_root=_resolve_repo_root(repo_root) or "",
@@ -941,7 +974,7 @@ def list_repos_tool() -> dict:
     Returns the list of repos registered at ~/.code-review-graph/registry.json.
     Use the CLI 'register' command to add repos.
     """
-    return list_repos_func()
+    return _tool_impl("list_repos_func")()
 
 
 @mcp.tool()
@@ -960,7 +993,7 @@ def cross_repo_search_tool(
         kind: Optional filter: File, Class, Function, Type, or Test.
         limit: Maximum results per repo. Default: 20.
     """
-    return cross_repo_search_func(query=query, kind=kind, limit=limit)
+    return _tool_impl("cross_repo_search_func")(query=query, kind=kind, limit=limit)
 
 
 @mcp.prompt()
@@ -1167,7 +1200,7 @@ def main(
             per-call ``detail_level`` argument.
     """
     global _default_repo_root, _detail_level_override
-    root = Path(repo_root) if repo_root else find_project_root()
+    root = Path(repo_root) if repo_root else _find_project_root()
     _default_repo_root = str(root)
     if detail_level:
         normalized = detail_level.strip().lower()
@@ -1180,8 +1213,11 @@ def main(
             )
     _apply_tool_filter(tools)
 
-    watch_store: GraphStore | None = None
+    watch_store: Any | None = None
     if auto_watch:
+        from .graph import GraphStore
+        from .incremental import get_db_path, start_watch_thread
+
         watch_store = GraphStore(get_db_path(root))
         thread = start_watch_thread(root, watch_store, daemon=True)
         if thread is None:

@@ -10,12 +10,9 @@ Run: python3 scripts/diagnose_pypi_connectivity.py
 """
 from __future__ import annotations
 
-import json
-import os
 import socket
 import ssl
 import sys
-import time
 import urllib.error
 import urllib.request
 
@@ -29,7 +26,10 @@ def main() -> int:
     print("PyPI check: FAILED (pip/pipx may be unable to download build deps like hatchling).")
     print("Workaround: from the repo root, with https://github.com/astral-sh/uv installed:")
     print('  uv tool install . --force')
-    print("Or run pipx from macOS Terminal.app (outside the IDE) if the failure is terminal-specific.")
+    print(
+        "Or run pipx from macOS Terminal.app (outside the IDE) if the failure "
+        "is terminal-specific."
+    )
     return 1
 
 

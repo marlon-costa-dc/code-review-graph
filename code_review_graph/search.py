@@ -209,6 +209,24 @@ def _fts_search(
 # ---------------------------------------------------------------------------
 
 
+def _is_missing_table_error(exc: sqlite3.OperationalError, table: str) -> bool:
+    return f"no such table: {table}" in str(exc).lower()
+
+
+def _has_embedding_rows(conn: sqlite3.Connection) -> bool:
+    try:
+        return conn.execute("SELECT 1 FROM embeddings LIMIT 1").fetchone() is not None
+    except sqlite3.OperationalError as exc:
+        if _is_missing_table_error(exc, "embeddings"):
+            return False
+        raise
+
+
+def has_embedding_rows(conn: sqlite3.Connection) -> bool:
+    """Return whether vectors exist, treating only a missing table as absent."""
+    return _has_embedding_rows(conn)
+
+
 def _embedding_search(
     store: GraphStore,
     query: str,
@@ -221,9 +239,12 @@ def _embedding_search(
     Returns list of ``(node_id, similarity_score)`` tuples.
     Gracefully returns an empty list if embeddings are not available.
     """
+    if not _has_embedding_rows(store._conn):
+        return []
     try:
         from .embeddings import EmbeddingStore
-    except ImportError:
+    except ImportError as exc:
+        logger.warning("Embedding search unavailable: %s", exc)
         return []
 
     try:
@@ -242,6 +263,8 @@ def _embedding_search(
             return id_scores
         finally:
             emb_store.close()
+    except sqlite3.OperationalError:
+        raise
     except Exception as e:
         logger.warning("Embedding search failed: %s", e)
         return []

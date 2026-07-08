@@ -1,5 +1,6 @@
 """Tests for graph visualization export."""
 
+import builtins
 import json
 
 import pytest
@@ -216,6 +217,25 @@ def test_export_includes_communities(store_with_data):
     data = export_graph_data(store_with_data)
     assert "communities" in data
     assert isinstance(data["communities"], list)
+
+
+def test_export_reads_stored_communities_without_detector_import(
+    large_store, monkeypatch
+):
+    """Rendering stored communities must not import igraph-backed detection."""
+    from code_review_graph.visualization import export_graph_data
+
+    real_import = builtins.__import__
+
+    def fail_communities_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "code_review_graph.communities":
+            raise AssertionError("visualization export must not import community detector")
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", fail_communities_import)
+
+    data = export_graph_data(large_store)
+    assert len(data["communities"]) == 3
 
 
 def test_generate_html_includes_all_edge_types(store_with_data, tmp_path):
