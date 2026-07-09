@@ -570,6 +570,169 @@ class TestFindDeadCode:
         assert "db" not in dead_names
 
 
+class TestFindDeadCodeNewHeuristics:
+    """Regression tests for recently added false-positive filters."""
+
+    def setup_method(self):
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.store = GraphStore(self.tmp.name)
+
+    def teardown_method(self):
+        self.store.close()
+        Path(self.tmp.name).unlink(missing_ok=True)
+
+    def test_protocol_class_methods_not_dead(self):
+        """Methods of typing.Protocol classes are interface contract, not dead."""
+        self.store.upsert_node(NodeInfo(
+            kind="Class", name="Greeter", file_path="/repo/protocols.py",
+            line_start=1, line_end=10, language="python",
+        ))
+        self.store.upsert_edge(EdgeInfo(
+            kind="INHERITS", source="/repo/protocols.py::Greeter",
+            target="typing.Protocol", file_path="/repo/protocols.py", line=1,
+        ))
+        self.store.upsert_node(NodeInfo(
+            kind="Function", name="greet", file_path="/repo/protocols.py",
+            line_start=2, line_end=5, language="python", parent_name="Greeter",
+        ))
+        self.store.commit()
+        dead = find_dead_code(self.store)
+        dead_names = {d["name"] for d in dead}
+        assert "greet" not in dead_names
+
+    def test_testcase_methods_not_dead(self):
+        """Methods of unittest.TestCase subclasses are wired by the runner."""
+        self.store.upsert_node(NodeInfo(
+            kind="Class", name="MyTests", file_path="/repo/test_helpers.py",
+            line_start=1, line_end=20, language="python",
+        ))
+        self.store.upsert_edge(EdgeInfo(
+            kind="INHERITS", source="/repo/test_helpers.py::MyTests",
+            target="unittest.TestCase", file_path="/repo/test_helpers.py", line=1,
+        ))
+        for name in ("setUp", "tearDown", "test_something"):
+            self.store.upsert_node(NodeInfo(
+                kind="Function", name=name, file_path="/repo/test_helpers.py",
+                line_start=3, line_end=5, language="python", parent_name="MyTests",
+            ))
+        self.store.commit()
+        dead = find_dead_code(self.store)
+        dead_names = {d["name"] for d in dead}
+        for name in ("setUp", "tearDown", "test_something"):
+            assert name not in dead_names, f"{name} should not be flagged dead"
+
+    def test_pydantic_computed_field_not_dead(self):
+        """Methods decorated with @computed_field are framework-managed."""
+        self.store.upsert_node(NodeInfo(
+            kind="Function", name="display_name", file_path="/repo/schemas.py",
+            line_start=10, line_end=15, language="python",
+            extra={"decorators": ["computed_field"]},
+        ))
+        self.store.commit()
+        dead = find_dead_code(self.store)
+        dead_names = {d["name"] for d in dead}
+        assert "display_name" not in dead_names
+
+    def test_orm_validates_not_dead(self):
+        """Methods decorated with @orm.validates are SQLAlchemy event hooks."""
+        self.store.upsert_node(NodeInfo(
+            kind="Function", name="validate_email", file_path="/repo/models.py",
+            line_start=20, line_end=25, language="python",
+            extra={"decorators": ["orm.validates('email')"]},
+        ))
+        self.store.commit()
+        dead = find_dead_code(self.store)
+        dead_names = {d["name"] for d in dead}
+        assert "validate_email" not in dead_names
+
+    def test_django_permission_classes_not_dead(self):
+        """Functions with DRF permission_classes decorator are API entry points."""
+        self.store.upsert_node(NodeInfo(
+            kind="Function", name="list_users", file_path="/repo/views.py",
+            line_start=5, line_end=10, language="python",
+            extra={"decorators": ["permission_classes([IsAuthenticated])"]},
+        ))
+        self.store.commit()
+        dead = find_dead_code(self.store)
+        dead_names = {d["name"] for d in dead}
+        assert "list_users" not in dead_names
+
+    def test_click_option_command_not_dead(self):
+        """Functions decorated with click.option are CLI command definitions."""
+        self.store.upsert_node(NodeInfo(
+            kind="Function", name="hello", file_path="/repo/cli.py",
+            line_start=10, line_end=15, language="python",
+            extra={"decorators": ["click.option('--count')"]},
+        ))
+        self.store.commit()
+        dead = find_dead_code(self.store)
+        dead_names = {d["name"] for d in dead}
+        assert "hello" not in dead_names
+
+    def test_argparse_subcommand_not_dead(self, tmp_path):
+        """Functions registered via ``set_defaults(func=...)`` are CLI entry points."""
+        cli_file = tmp_path / "cli.py"
+        cli_file.write_text(
+            "import argparse\n"
+            "def command_standard(args):\n"
+            "    pass\n"
+            "subparsers = argparse.ArgumentParser().add_subparsers()\n"
+            "subparsers.add_parser('standard').set_defaults(func=command_standard)\n",
+            encoding="utf-8",
+        )
+        self.store.upsert_node(NodeInfo(
+            kind="Function", name="command_standard", file_path=str(cli_file),
+            line_start=2, line_end=3, language="python",
+        ))
+        self.store.commit()
+        dead = find_dead_code(self.store)
+        dead_names = {d["name"] for d in dead}
+        assert "command_standard" not in dead_names
+
+    def test_method_call_in_fstring_not_dead(self, tmp_path):
+        """Methods invoked inside f-string interpolations are not dead code."""
+        src_file = tmp_path / "app.py"
+        src_file.write_text(
+            "class PublishResult:\n"
+            "    def to_tsv(self) -> str:\n"
+            "        return ''\n"
+            "def write(results):\n"
+            "    f'{results[0].to_tsv()}\\n'\n",
+            encoding="utf-8",
+        )
+        self.store.upsert_node(NodeInfo(
+            kind="Class", name="PublishResult", file_path=str(src_file),
+            line_start=1, line_end=3, language="python",
+        ))
+        self.store.upsert_node(NodeInfo(
+            kind="Function", name="to_tsv", file_path=str(src_file),
+            line_start=2, line_end=3, language="python", parent_name="PublishResult",
+        ))
+        self.store.commit()
+        dead = find_dead_code(self.store)
+        dead_names = {d["name"] for d in dead}
+        assert "to_tsv" not in dead_names
+
+    def test_tornado_request_handler_methods_not_dead(self):
+        """Methods of tornado RequestHandler subclasses are framework hooks."""
+        self.store.upsert_node(NodeInfo(
+            kind="Class", name="HelloHandler", file_path="/repo/handlers.py",
+            line_start=1, line_end=20, language="python",
+        ))
+        self.store.upsert_edge(EdgeInfo(
+            kind="INHERITS", source="/repo/handlers.py::HelloHandler",
+            target="tornado.web.RequestHandler", file_path="/repo/handlers.py", line=1,
+        ))
+        self.store.upsert_node(NodeInfo(
+            kind="Function", name="get", file_path="/repo/handlers.py",
+            line_start=3, line_end=5, language="python", parent_name="HelloHandler",
+        ))
+        self.store.commit()
+        dead = find_dead_code(self.store)
+        dead_names = {d["name"] for d in dead}
+        assert "get" not in dead_names
+
+
 class TestSuggestRefactorings:
     """Tests for suggest_refactorings."""
 
@@ -1290,3 +1453,44 @@ class TestPythonEnrichmentWiring:
         finally:
             store.close()
         assert "python_enrichment" in result
+
+
+class TestFindDeadCodePerformance:
+    """Performance benchmark for dead-code detection on synthetic graphs."""
+
+    def _build_synthetic_store(self, n_functions: int = 500) -> tuple[GraphStore, str]:
+        """Create a store with *n_functions* functions and a sparse call graph."""
+        tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        store = GraphStore(tmp.name)
+        # Seed file node
+        store.upsert_node(NodeInfo(
+            kind="File", name="/repo/app.py", file_path="/repo/app.py",
+            line_start=1, line_end=n_functions * 10, language="python",
+        ))
+        # Create functions
+        for i in range(n_functions):
+            store.upsert_node(NodeInfo(
+                kind="Function", name=f"func_{i}", file_path="/repo/app.py",
+                line_start=i * 10 + 1, line_end=i * 10 + 5, language="python",
+            ))
+        # Wire a sparse call graph: each function calls the next one.
+        for i in range(0, n_functions - 1, 2):
+            store.upsert_edge(EdgeInfo(
+                kind="CALLS",
+                source=f"/repo/app.py::func_{i}",
+                target=f"/repo/app.py::func_{i + 1}",
+                file_path="/repo/app.py", line=i * 10 + 2,
+            ))
+        store.commit()
+        return store, tmp.name
+
+    def test_find_dead_code_performance(self, benchmark):
+        """Benchmark find_dead_code on a moderately large synthetic graph."""
+        store, db_path = self._build_synthetic_store(n_functions=500)
+        try:
+            result = benchmark(find_dead_code, store)
+            # Sanity: about half the functions have no incoming calls.
+            assert len(result) > 100
+        finally:
+            store.close()
+            Path(db_path).unlink(missing_ok=True)

@@ -1,8 +1,11 @@
 {
   "mcpServers": {
     "code-review-graph": {
-      "command": "uvx",
-      "args": ["code-review-graph", "serve"]
+      "command": "bash",
+      "args": [
+        "-lc",
+        "exec \"$HOME/.ai-hub/.venv/bin/code-review-graph\" serve --repo \"$PWD\""
+      ]
     }
   }
 }
