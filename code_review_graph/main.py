@@ -153,10 +153,15 @@ def _find_project_root(start: Path | None = None) -> Path:
         if (candidate / ".git").exists():
             return candidate
 
+    # SVN working copy: return the topmost continuous .svn directory.
+    # Stop as soon as the chain is broken so unrelated .svn directories
+    # further up the filesystem do not steal the result.
     svn_candidate: Path | None = None
     for candidate in candidates:
         if (candidate / ".svn").exists():
             svn_candidate = candidate
+        else:
+            break
     if svn_candidate is not None:
         return svn_candidate
     return start or Path.cwd()
