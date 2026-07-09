@@ -329,6 +329,19 @@ class _DeadCodeContext:
         # Parent-child index for namespace/dataclass detection.
         self.class_children = self._build_class_children(all_nodes)
         self.class_method_names = self._build_class_method_names(all_nodes)
+        self.class_qn_to_node = self._build_class_qn_to_node(all_nodes)
+
+    def _build_class_qn_to_node(self, nodes: list[Any]) -> dict[str, Any]:
+        """Map class qualified_name -> class node for O(1) class lookups."""
+        mapping: dict[str, Any] = {}
+        for n in nodes:
+            if n.kind == "Class":
+                if n.parent_name:
+                    qn = f"{n.file_path}::{n.parent_name}.{n.name}"
+                else:
+                    qn = f"{n.file_path}::{n.name}"
+                mapping[qn] = n
+        return mapping
 
     def _collect_type_referenced_names(self, nodes: list[Any]) -> set[str]:
         """Collect class names that appear in function params or return types."""
@@ -688,7 +701,7 @@ class _NodeFilter:
 
         # Skip enum classes and their members -- values are referenced by name
         # and static analysis rarely captures every enum access.
-        if node.kind == "Class" and self._is_enum_class(node):
+        if self._is_enum_class(node):
             return True
 
         # Skip namespace classes that only contain nested types/constants.
@@ -733,6 +746,107 @@ class _NodeFilter:
             return True
 
         return False
+
+    def _is_enum_class(self, node: Any) -> bool:
+        """Return True if the node is an enum class (or member of one).
+
+        Detects Python Enum/StrEnum/IntEnum/Flag via inheritance edges and
+        Swift enums via extra["swift_kind"].
+        """
+        class_qn = self._class_qn_for(node)
+        if not class_qn:
+            return False
+        class_node = self.context.class_qn_to_node.get(class_qn)
+        if class_node is None:
+            return False
+        # Swift / language-specific enum keyword.
+        if class_node.extra.get("swift_kind") == "enum":
+            return True
+        # Python enum via inheritance chain.
+        seen: set[str] = set()
+        stack = [class_qn]
+        while stack:
+            cur = stack.pop()
+            if cur in seen:
+                continue
+            seen.add(cur)
+            for base in self.context.class_bases.get(cur, ()):
+                if base in _ENUM_BASE_CLASSES:
+                    return True
+                # Resolve bare base name to qualified class names.
+                for base_qn in self.context.class_name_to_qns.get(base, ()):
+                    stack.append(base_qn)
+        return False
+
+    def _is_namespace_class(self, node: Any) -> bool:
+        """Return True if the class is a pure namespace (nested types/constants only).
+
+        Namespace classes contain nested classes or type aliases but no
+        callable methods.  They are referenced as containers, not instantiated.
+        """
+        if node.kind != "Class":
+            return False
+        class_qn = self._class_qn_for(node)
+        children = self.context.class_children.get(class_qn, [])
+        if not children:
+            return False
+        # Allow nested classes/types; reject callable members.
+        for child in children:
+            if child.kind in ("Class", "Type"):
+                continue
+            if child.kind == "Function" and child.name == "__init__":
+                # dataclass-like generated init still means data, not namespace
+                continue
+            return False
+        return True
+
+    def _is_dispatch_handler(self, node: Any) -> bool:
+        """Return True if the function name follows reflection/dispatch conventions.
+
+        Names like ``_handle_*``, ``_format_*``, ``_process_*`` are frequently
+        wired by dispatch tables, registries, or reflection and lack explicit
+        CALLS edges.  This is intentionally conservative: only well-known
+        prefixes are matched.
+        """
+        if node.kind != "Function":
+            return False
+        name = node.name
+        # Require a leading underscore so we only flag conventionally-private
+        # helper methods that are wired by reflection/dispatch tables.  Public
+        # names like ``format_date`` are regular utilities and must remain
+        # eligible for dead-code detection.
+        prefixes = (
+            "_handle_", "_format_", "_process_", "_parse_", "_serialize_",
+            "_validate_", "_dispatch_", "_route_", "_emit_", "_on_",
+        )
+        if any(name.startswith(p) for p in prefixes):
+            return True
+        # Common bare handler names used by plugin/dispatch systems.
+        bare = {"_handle", "_format", "_process", "_dispatch", "_route", "_emit"}
+        return name in bare
+
+    def _is_dataclass_method(self, node: Any) -> bool:
+        """Return True if the method belongs to a @dataclass-decorated class."""
+        if node.kind != "Function" or not node.parent_name:
+            return False
+        class_qn = node.qualified_name.rsplit(".", 1)[0]
+        class_node = self.context.class_qn_to_node.get(class_qn)
+        if class_node is None:
+            return False
+        decorators = class_node.extra.get("decorators", ())
+        if not isinstance(decorators, (list, tuple)):
+            return False
+        return any("dataclass" in d for d in decorators)
+
+    def _class_qn_for(self, node: Any) -> Optional[str]:
+        """Return the qualified name of the class a node belongs to."""
+        if node.kind == "Class":
+            if node.parent_name:
+                return f"{node.file_path}::{node.parent_name}.{node.name}"
+            return f"{node.file_path}::{node.name}"
+        if node.kind == "Function" and node.parent_name:
+            return node.qualified_name.rsplit(".", 1)[0]
+        return None
 
     def _is_framework_class(self, node: Any) -> bool:
         """Return True if the node (or its parent class) inherits a known framework base."""

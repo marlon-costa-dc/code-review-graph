@@ -610,6 +610,88 @@ class TestFindDeadCodeNewHeuristics:
         dead_names = {d["name"] for d in dead}
         assert "get" not in dead_names
 
+    def test_enum_class_members_not_dead(self):
+        """Enum classes and their members are not flagged as dead code."""
+        self.store.upsert_node(NodeInfo(
+            kind="Class", name="Color", file_path="/repo/enums.py",
+            line_start=1, line_end=10, language="python",
+        ))
+        self.store.upsert_edge(EdgeInfo(
+            kind="INHERITS", source="/repo/enums.py::Color",
+            target="enum.Enum", file_path="/repo/enums.py", line=1,
+        ))
+        self.store.upsert_node(NodeInfo(
+            kind="Function", name="value", file_path="/repo/enums.py",
+            line_start=2, line_end=3, language="python", parent_name="Color",
+        ))
+        self.store.commit()
+        dead = find_dead_code(self.store)
+        dead_names = {d["name"] for d in dead}
+        assert "Color" not in dead_names
+        assert "value" not in dead_names
+
+    def test_namespace_class_not_dead(self):
+        """Pure namespace classes (only nested types) are not dead code."""
+        self.store.upsert_node(NodeInfo(
+            kind="Class", name="Outer", file_path="/repo/ns.py",
+            line_start=1, line_end=20, language="python",
+        ))
+        self.store.upsert_node(NodeInfo(
+            kind="Class", name="Inner", file_path="/repo/ns.py",
+            line_start=2, line_end=5, language="python", parent_name="Outer",
+        ))
+        self.store.upsert_node(NodeInfo(
+            kind="Type", name="Alias", file_path="/repo/ns.py",
+            line_start=7, line_end=7, language="python", parent_name="Outer",
+        ))
+        self.store.commit()
+        dead = find_dead_code(self.store)
+        dead_names = {d["name"] for d in dead}
+        assert "Outer" not in dead_names
+
+    def test_dispatch_handler_not_dead(self):
+        """Convention-private dispatch/handler helpers are not dead code."""
+        for name in ("_handle_event", "_format_message", "_process_item",
+                     "_parse_payload", "_dispatch_request"):
+            self.store.upsert_node(NodeInfo(
+                kind="Function", name=name, file_path="/repo/handlers.py",
+                line_start=1, line_end=2, language="python",
+            ))
+        self.store.commit()
+        dead = find_dead_code(self.store)
+        dead_names = {d["name"] for d in dead}
+        for name in ("_handle_event", "_format_message", "_process_item",
+                     "_parse_payload", "_dispatch_request"):
+            assert name not in dead_names, f"{name} should not be flagged dead"
+
+    def test_public_format_function_can_be_dead(self):
+        """Public ``format_*`` names remain eligible for dead-code detection."""
+        self.store.upsert_node(NodeInfo(
+            kind="Function", name="format_date", file_path="/repo/utils.py",
+            line_start=1, line_end=2, language="python",
+        ))
+        self.store.commit()
+        dead = find_dead_code(self.store)
+        dead_names = {d["name"] for d in dead}
+        assert "format_date" in dead_names
+
+    def test_dataclass_method_not_dead(self):
+        """Methods of @dataclass-decorated classes are not dead code."""
+        self.store.upsert_node(NodeInfo(
+            kind="Class", name="User", file_path="/repo/models.py",
+            line_start=1, line_end=20, language="python",
+            extra={"decorators": ["dataclass"]},
+        ))
+        self.store.upsert_node(NodeInfo(
+            kind="Function", name="full_name", file_path="/repo/models.py",
+            line_start=3, line_end=5, language="python", parent_name="User",
+        ))
+        self.store.commit()
+        dead = find_dead_code(self.store)
+        dead_names = {d["name"] for d in dead}
+        assert "User" not in dead_names
+        assert "full_name" not in dead_names
+
 
 class TestSuggestRefactorings:
     """Tests for suggest_refactorings."""
