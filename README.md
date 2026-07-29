@@ -513,6 +513,7 @@ pip install code-review-graph[all]                 # All optional dependencies
 |----------|-------------|---------|
 | `CRG_GIT_TIMEOUT` | Timeout in seconds for Git operations | `30` |
 | `CRG_DATA_DIR` | Override directory for graph databases and generated graph artefacts | - |
+| `CRG_REGISTRY_PATH` | Override the multi-repository registry file for an isolated runtime or test process | `~/.code-review-graph/registry.json` |
 | `CRG_EMBEDDING_MODEL` | Default model for vector embeddings | `all-MiniLM-L6-v2` |
 | `CRG_ACCEPT_CLOUD_EMBEDDINGS` | Suppress the cloud embedding egress warning after explicit acknowledgement | - |
 | `CRG_ALLOW_REMOTE_CODE` | Allow HuggingFace models that require `trust_remote_code=True` | `0` |
