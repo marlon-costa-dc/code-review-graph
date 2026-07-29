@@ -936,9 +936,14 @@ class EmbeddingStore:
         if not to_embed:
             return 0
 
-        # Encode in batches
+        # Encode in batches. The local provider imports its runtime lazily, so
+        # a discoverable but broken installation can fail here.
         texts = [t for _, t, _ in to_embed]
-        vectors = self.provider.embed(texts)
+        try:
+            vectors = self.provider.embed(texts)
+        except ImportError:
+            self.available = False
+            return 0
 
         self._conn.executemany(
             """INSERT OR REPLACE INTO embeddings (qualified_name, vector, text_hash, provider)
@@ -958,7 +963,11 @@ class EmbeddingStore:
             return []
 
         provider_name = self.provider.name
-        query_vec = self.provider.embed_query(query)
+        try:
+            query_vec = self.provider.embed_query(query)
+        except ImportError:
+            self.available = False
+            return []
 
         cursor = self._conn.execute(
             "SELECT qualified_name, vector FROM embeddings WHERE provider = ?",

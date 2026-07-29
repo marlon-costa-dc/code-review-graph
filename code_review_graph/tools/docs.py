@@ -80,7 +80,17 @@ def embed_graph(
                     )
                 return {"status": "error", "error": err}
 
-            newly_embedded = embed_all_nodes(store, emb_store)
+            try:
+                newly_embedded = embed_all_nodes(store, emb_store)
+            except ImportError:
+                logger.error("embed_graph: embedding runtime is unavailable")
+                return {
+                    "status": "error",
+                    "error": (
+                        "The embedding runtime could not be imported. Install or "
+                        "repair sentence-transformers, then try again."
+                    ),
+                }
             total = emb_store.count()
 
             return {
