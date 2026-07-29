@@ -103,3 +103,6 @@ jobs:
         run: pip install -e ".[dev]" pytest-cov
       - name: Run tests with coverage
         run: pytest --tb=short -q --cov=code_review_graph --cov-report=term-missing --cov-fail-under=65
+
+      - name: Run performance benchmark serially
+        run: pytest -n 0 --benchmark-enable --benchmark-only tests/test_refactor.py::TestFindDeadCodePerformance::test_find_dead_code_performance

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sqlite3
 import threading
 from collections import OrderedDict
@@ -18,6 +19,7 @@ logger = logging.getLogger(__name__)
 # Default registry path
 _REGISTRY_DIR = Path.home() / ".code-review-graph"
 _REGISTRY_PATH = _REGISTRY_DIR / "registry.json"
+_REGISTRY_PATH_ENV = "CRG_REGISTRY_PATH"
 
 
 class Registry:
@@ -25,10 +27,19 @@ class Registry:
 
     Each entry stores the repo path and an optional alias.
     The registry lives at ``~/.code-review-graph/registry.json``.
+    Set ``CRG_REGISTRY_PATH`` to isolate the registry for a distinct runtime,
+    such as a test process.
     """
 
     def __init__(self, path: Path | None = None) -> None:
-        self._path = path or _REGISTRY_PATH
+        configured_path = os.environ.get(_REGISTRY_PATH_ENV, "").strip()
+        self._path = (
+            path
+            if path is not None
+            else (
+                Path(configured_path).expanduser().resolve() if configured_path else _REGISTRY_PATH
+            )
+        )
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
         self._repos: list[dict[str, str]] = []
@@ -50,12 +61,13 @@ class Registry:
         """Write registry to disk."""
         self._path.parent.mkdir(parents=True, exist_ok=True)
         data = {"repos": self._repos}
-        self._path.write_text(
-            json.dumps(data, indent=2) + "\n", encoding="utf-8"
-        )
+        self._path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
 
     def register(
-        self, path: str, alias: str | None = None, data_dir: str | None = None,
+        self,
+        path: str,
+        alias: str | None = None,
+        data_dir: str | None = None,
     ) -> dict[str, str]:
         """Register a repository path.
 
@@ -122,9 +134,9 @@ class Registry:
             resolved = str(Path(path_or_alias).resolve())
             original_len = len(self._repos)
             self._repos = [
-                entry for entry in self._repos
-                if entry["path"] != resolved
-                and entry.get("alias") != path_or_alias
+                entry
+                for entry in self._repos
+                if entry["path"] != resolved and entry.get("alias") != path_or_alias
             ]
             if len(self._repos) < original_len:
                 self._save()
@@ -193,10 +205,7 @@ class Registry:
                     return dict(entry)
 
             # Create new entry if not found
-            new_entry = {
-                "path": resolved,
-                "data_dir": data_resolved
-            }
+            new_entry = {"path": resolved, "data_dir": data_resolved}
             self._repos.append(new_entry)
             self._save()
             return new_entry
@@ -255,7 +264,9 @@ class ConnectionPool:
                 logger.debug("Evicted connection: %s", evict_key)
 
             conn = sqlite3.connect(
-                key, timeout=30, check_same_thread=False,
+                key,
+                timeout=30,
+                check_same_thread=False,
                 isolation_level=None,
             )
             conn.row_factory = sqlite3.Row

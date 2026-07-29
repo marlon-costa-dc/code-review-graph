@@ -11,6 +11,7 @@ Supports multiple providers:
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import logging
 import os
 import re
@@ -34,10 +35,7 @@ logger = logging.getLogger(__name__)
 # sit behind Cloudflare and reject the urllib default ``Python-urllib/X.Y``
 # UA with HTTP 403 / error 1010 ("browser signature banned"). A real UA gets
 # us through and gives upstream a way to identify CRG-driven traffic.
-_USER_AGENT = (
-    f"code-review-graph/{_crg_version} "
-    "(+https://github.com/tirth8205/code-review-graph)"
-)
+_USER_AGENT = f"code-review-graph/{_crg_version} (+https://github.com/tirth8205/code-review-graph)"
 
 # ---------------------------------------------------------------------------
 # Provider Interface and Implementations
@@ -100,9 +98,7 @@ def prewarm_local_embeddings(model_name: str | None = None) -> None:
     except ImportError:
         return  # cloud-only setup: nothing to pre-warm
 
-    resolved = model_name or os.environ.get(
-        "CRG_EMBEDDING_MODEL", LOCAL_DEFAULT_MODEL
-    )
+    resolved = model_name or os.environ.get("CRG_EMBEDDING_MODEL", LOCAL_DEFAULT_MODEL)
     if resolved in _MODEL_CACHE:
         return
 
@@ -114,9 +110,7 @@ def prewarm_local_embeddings(model_name: str | None = None) -> None:
 
 class LocalEmbeddingProvider(EmbeddingProvider):
     def __init__(self, model_name: str | None = None) -> None:
-        self._model_name = model_name or os.environ.get(
-            "CRG_EMBEDDING_MODEL", LOCAL_DEFAULT_MODEL
-        )
+        self._model_name = model_name or os.environ.get("CRG_EMBEDDING_MODEL", LOCAL_DEFAULT_MODEL)
         self._model = None  # Lazy-loaded
 
     def _get_model(self):
@@ -129,6 +123,7 @@ class LocalEmbeddingProvider(EmbeddingProvider):
                 return self._model
             try:
                 from sentence_transformers import SentenceTransformer
+
                 # Check environment variable, default to False to prevent RCE
                 _rce_val = os.environ.get("CRG_ALLOW_REMOTE_CODE", "0")
                 allow_remote_code = _rce_val.lower() in ("1", "true", "yes")
@@ -167,6 +162,7 @@ class GoogleEmbeddingProvider(EmbeddingProvider):
     def __init__(self, api_key: str, model: str = "gemini-embedding-001") -> None:
         try:
             from google import genai
+
             self._client = genai.Client(api_key=api_key)
             self.model = model
             self._dimension: int | None = None
@@ -180,7 +176,7 @@ class GoogleEmbeddingProvider(EmbeddingProvider):
         batch_size = 100
         results = []
         for i in range(0, len(texts), batch_size):
-            batch = texts[i:i + batch_size]
+            batch = texts[i : i + batch_size]
             response = self._call_with_retry(
                 lambda b=batch: self._client.models.embed_content(
                     model=self.model,
@@ -205,9 +201,14 @@ class GoogleEmbeddingProvider(EmbeddingProvider):
                 is_retryable = "429" in err_str or "500" in err_str or "503" in err_str
                 if not is_retryable or attempt == max_retries - 1:
                     raise
-                wait = 2 ** attempt
-                logger.warning("Gemini API error (attempt %d/%d), retrying in %ds: %s",
-                               attempt + 1, max_retries, wait, e)
+                wait = 2**attempt
+                logger.warning(
+                    "Gemini API error (attempt %d/%d), retrying in %ds: %s",
+                    attempt + 1,
+                    max_retries,
+                    wait,
+                    e,
+                )
                 time.sleep(wait)
 
     def embed_query(self, text: str) -> list[float]:
@@ -253,11 +254,13 @@ class MiniMaxEmbeddingProvider(EmbeddingProvider):
         import json as _json
         import urllib.request
 
-        payload = _json.dumps({
-            "model": self._MODEL,
-            "texts": texts,
-            "type": task_type,
-        }).encode("utf-8")
+        payload = _json.dumps(
+            {
+                "model": self._MODEL,
+                "texts": texts,
+                "type": task_type,
+            }
+        ).encode("utf-8")
 
         req = urllib.request.Request(
             self._ENDPOINT,
@@ -274,6 +277,7 @@ class MiniMaxEmbeddingProvider(EmbeddingProvider):
         for attempt in range(max_retries):
             try:
                 import ssl
+
                 _ssl_ctx = ssl.create_default_context()
                 with urllib.request.urlopen(req, timeout=60, context=_ssl_ctx) as resp:  # nosec B310
                     body = _json.loads(resp.read().decode("utf-8"))
@@ -290,10 +294,13 @@ class MiniMaxEmbeddingProvider(EmbeddingProvider):
                 is_retryable = "429" in err_str or "500" in err_str or "503" in err_str
                 if not is_retryable or attempt == max_retries - 1:
                     raise
-                wait = 2 ** attempt
+                wait = 2**attempt
                 logger.warning(
                     "MiniMax API error (attempt %d/%d), retrying in %ds: %s",
-                    attempt + 1, max_retries, wait, e,
+                    attempt + 1,
+                    max_retries,
+                    wait,
+                    e,
                 )
                 time.sleep(wait)
 
@@ -303,7 +310,7 @@ class MiniMaxEmbeddingProvider(EmbeddingProvider):
         batch_size = 100
         results: list[list[float]] = []
         for i in range(0, len(texts), batch_size):
-            batch = texts[i:i + batch_size]
+            batch = texts[i : i + batch_size]
             results.extend(self._call_api(batch, "db"))
         return results
 
@@ -433,7 +440,9 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
                 _ssl_ctx = ssl.create_default_context()
                 try:
                     with urllib.request.urlopen(  # nosec B310
-                        req, timeout=self._timeout, context=_ssl_ctx,
+                        req,
+                        timeout=self._timeout,
+                        context=_ssl_ctx,
                     ) as resp:
                         raw = resp.read().decode("utf-8")
                 except urllib.error.HTTPError as http_err:
@@ -457,15 +466,14 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
                             err_obj = parsed["error"]
                             err_msg = (
                                 err_obj.get("message", err_msg)
-                                if isinstance(err_obj, dict) else str(err_obj)
+                                if isinstance(err_obj, dict)
+                                else str(err_obj)
                             )
                     except Exception:  # nosec B110
                         # Non-JSON error body is fine: we already seeded
                         # err_msg with the raw body above, so fall through.
                         pass
-                    raise RuntimeError(
-                        f"OpenAI API HTTP {http_err.code}: {err_msg}"
-                    ) from http_err
+                    raise RuntimeError(f"OpenAI API HTTP {http_err.code}: {err_msg}") from http_err
 
                 response = _json.loads(raw)
 
@@ -489,9 +497,7 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
                 #      missing on some): refuse. Zipping server order in
                 #      that case would happily misalign the indexed items.
                 any_has_index = any("index" in item for item in data)
-                all_int_index = all(
-                    isinstance(item.get("index"), int) for item in data
-                )
+                all_int_index = all(isinstance(item.get("index"), int) for item in data)
                 if all_int_index:
                     expected = set(range(len(texts)))
                     indices = [int(item["index"]) for item in data]
@@ -531,27 +537,33 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
                 is_retryable = False
                 if isinstance(e, urllib.error.HTTPError):
                     is_retryable = e.code == 429 or 500 <= e.code < 600
-                elif isinstance(e, (
-                    urllib.error.URLError,
-                    socket.timeout,
-                    TimeoutError,
-                    ConnectionError,
-                    ssl.SSLError,
-                    # Reverse proxies and edge gateways surface transient
-                    # disconnects as these stdlib classes. Real incidents
-                    # have been observed on Cloudflare-fronted endpoints
-                    # and on LiteLLM when upstream providers hiccup.
-                    http.client.IncompleteRead,
-                    http.client.BadStatusLine,
-                    http.client.RemoteDisconnected,
-                )):
+                elif isinstance(
+                    e,
+                    (
+                        urllib.error.URLError,
+                        socket.timeout,
+                        TimeoutError,
+                        ConnectionError,
+                        ssl.SSLError,
+                        # Reverse proxies and edge gateways surface transient
+                        # disconnects as these stdlib classes. Real incidents
+                        # have been observed on Cloudflare-fronted endpoints
+                        # and on LiteLLM when upstream providers hiccup.
+                        http.client.IncompleteRead,
+                        http.client.BadStatusLine,
+                        http.client.RemoteDisconnected,
+                    ),
+                ):
                     is_retryable = True
                 if not is_retryable or attempt == max_retries - 1:
                     raise
-                wait = 2 ** attempt
+                wait = 2**attempt
                 logger.warning(
                     "OpenAI embeddings API error (attempt %d/%d), retrying in %ds: %s",
-                    attempt + 1, max_retries, wait, e,
+                    attempt + 1,
+                    max_retries,
+                    wait,
+                    e,
                 )
                 time.sleep(wait)
 
@@ -562,7 +574,7 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
             return []
         results: list[list[float]] = []
         for i in range(0, len(texts), self._batch_size):
-            results.extend(self._call_api(texts[i:i + self._batch_size]))
+            results.extend(self._call_api(texts[i : i + self._batch_size]))
         return results
 
     def embed_query(self, text: str) -> list[float]:
@@ -662,8 +674,7 @@ def get_provider(
     name = provider.strip().lower() if provider else ""
     if name and name not in _VALID_PROVIDERS:
         raise ValueError(
-            f"Unknown embedding provider '{name}'. "
-            "Valid: local, openai, google, minimax"
+            f"Unknown embedding provider '{name}'. Valid: local, openai, google, minimax"
         )
 
     if name == "openai":
@@ -672,11 +683,13 @@ def get_provider(
         resolved_model = model or os.environ.get("CRG_OPENAI_MODEL")
         if not api_key or not base_url or not resolved_model:
             missing = [
-                name for name, val in [
+                name
+                for name, val in [
                     ("CRG_OPENAI_API_KEY", api_key),
                     ("CRG_OPENAI_BASE_URL", base_url),
                     ("CRG_OPENAI_MODEL", resolved_model),
-                ] if not val
+                ]
+                if not val
             ]
             raise ValueError(
                 "Missing required environment variable(s) for the OpenAI "
@@ -710,8 +723,7 @@ def get_provider(
         api_key = os.environ.get("GOOGLE_API_KEY")
         if not api_key:
             raise ValueError(
-                "GOOGLE_API_KEY environment variable is required for "
-                "the Google embedding provider."
+                "GOOGLE_API_KEY environment variable is required for the Google embedding provider."
             )
         _warn_cloud_egress("google")
         try:
@@ -733,11 +745,7 @@ def get_provider(
 
 def _check_available() -> bool:
     """Check whether local embedding support is available."""
-    try:
-        import sentence_transformers  # noqa: F401
-        return True
-    except ImportError:
-        return False
+    return importlib.util.find_spec("sentence_transformers") is not None
 
 
 # ---------------------------------------------------------------------------
@@ -865,7 +873,9 @@ class EmbeddingStore:
         self.available = self.provider is not None
         self.db_path = Path(db_path)
         self._conn = sqlite3.connect(
-            str(self.db_path), timeout=30, check_same_thread=False,
+            str(self.db_path),
+            timeout=30,
+            check_same_thread=False,
             isolation_level=None,
         )
         self._conn.row_factory = sqlite3.Row
@@ -880,8 +890,7 @@ class EmbeddingStore:
             self._conn.execute("SELECT provider FROM embeddings LIMIT 1")
         except sqlite3.OperationalError:
             self._conn.execute(
-                "ALTER TABLE embeddings ADD COLUMN provider "
-                "TEXT NOT NULL DEFAULT 'unknown'"
+                "ALTER TABLE embeddings ADD COLUMN provider TEXT NOT NULL DEFAULT 'unknown'"
             )
 
         self._conn.commit()
@@ -966,15 +975,14 @@ class EmbeddingStore:
         expected = len(query_vec) * 4  # float32 bytes per stored vector
         names = [row["qualified_name"] for row in rows]
         zero = b"\x00" * expected
-        blobs = b"".join(
-            row["vector"] if len(row["vector"]) == expected else zero
-            for row in rows
-        )
+        blobs = b"".join(row["vector"] if len(row["vector"]) == expected else zero for row in rows)
         mat = _np.frombuffer(blobs, dtype=_np.float32).reshape(len(rows), -1)
         q = _np.asarray(query_vec, dtype=_np.float32)
         denom = _np.linalg.norm(mat, axis=1) * float(_np.linalg.norm(q))
         sims = _np.divide(
-            mat @ q, denom, out=_np.zeros(len(rows), dtype=_np.float32),
+            mat @ q,
+            denom,
+            out=_np.zeros(len(rows), dtype=_np.float32),
             where=denom > 0,
         )
         k = min(limit, len(rows))
@@ -983,9 +991,7 @@ class EmbeddingStore:
         return [(names[i], float(sims[i])) for i in top]
 
     def remove_node(self, qualified_name: str) -> None:
-        self._conn.execute(
-            "DELETE FROM embeddings WHERE qualified_name = ?", (qualified_name,)
-        )
+        self._conn.execute("DELETE FROM embeddings WHERE qualified_name = ?", (qualified_name,))
         self._conn.commit()
 
     def count(self) -> int:
