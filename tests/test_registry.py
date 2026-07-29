@@ -25,6 +25,7 @@ class TestRegistry:
 
     def teardown_method(self):
         import shutil
+
         shutil.rmtree(self.tmp_dir, ignore_errors=True)
 
     def test_register_and_list(self):
@@ -38,6 +39,17 @@ class TestRegistry:
         assert str(self.repo1.resolve()) in paths
         assert str(self.repo2.resolve()) in paths
 
+    def test_default_registry_uses_environment_path(self, tmp_path, monkeypatch):
+        """The default registry honors the process isolation boundary."""
+        registry_path = tmp_path / "isolated" / "registry.json"
+        monkeypatch.setenv("CRG_REGISTRY_PATH", str(registry_path))
+
+        registry = Registry()
+        registry.register(str(self.repo1), alias="isolated")
+
+        assert registry_path.is_file()
+        assert registry.list_repos() == [{"path": str(self.repo1.resolve()), "alias": "isolated"}]
+
     def test_register_duplicate_path(self):
         """Registering the same path twice updates alias."""
         self.registry.register(str(self.repo1), alias="first")
@@ -50,12 +62,14 @@ class TestRegistry:
     def test_register_invalid_path(self):
         """Registering a non-existent path raises ValueError."""
         import pytest
+
         with pytest.raises(ValueError, match="not a directory"):
             self.registry.register("/nonexistent/path/repo")
 
     def test_register_not_a_repo(self):
         """Registering a dir without .git or .code-review-graph raises ValueError."""
         import pytest
+
         bare_dir = Path(self.tmp_dir) / "bare"
         bare_dir.mkdir()
         with pytest.raises(ValueError, match="does not look like a repository"):
@@ -144,6 +158,7 @@ class TestConnectionPool:
     def teardown_method(self):
         self.pool.close_all()
         import shutil
+
         shutil.rmtree(self.tmp_dir, ignore_errors=True)
 
     def _make_db(self, name: str) -> str:
@@ -237,6 +252,7 @@ class TestCrossRepoSearch:
             assert result["results"] == []
 
         import shutil
+
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
     def test_cross_repo_search_merges_by_local_rank(self, tmp_path):
@@ -311,6 +327,7 @@ class TestSetDataDir:
     def teardown_method(self):
         """Clean up temporary directory."""
         import shutil
+
         shutil.rmtree(self.tmp_dir, ignore_errors=True)
 
     def test_set_data_dir_new_repo(self):
@@ -379,10 +396,7 @@ class TestSetDataDir:
         repo.mkdir()
 
         # Create entry without data_dir (old format)
-        self.registry._repos.append({
-            "path": str(repo.resolve()),
-            "alias": "old-project"
-        })
+        self.registry._repos.append({"path": str(repo.resolve()), "alias": "old-project"})
         self.registry._save()
 
         # Should not crash
