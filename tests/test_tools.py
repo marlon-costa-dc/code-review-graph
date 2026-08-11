@@ -17,11 +17,8 @@ from code_review_graph.incremental import full_build
 from code_review_graph.parser import EdgeInfo, NodeInfo
 from code_review_graph.context_savings import estimate_tokens
 from code_review_graph.tools import (
-<<<<<<< HEAD
     detect_changes_func,
-=======
     _validate_repo_root,
->>>>>>> upstream/main
     get_affected_flows_func,
     get_architecture_overview_func,
     get_community_func,
@@ -664,23 +661,14 @@ class TestQueryGraphTestsFor:
             line_start=1, line_end=5, language="python",
         ))
         self.store.upsert_node(NodeInfo(
-<<<<<<< HEAD
-=======
             kind="Function", name="orchestrate", file_path="/src/calc.py",
             line_start=7, line_end=12, language="python",
         ))
         self.store.upsert_node(NodeInfo(
->>>>>>> upstream/main
             kind="File", name="/tests/spec.py", file_path="/tests/spec.py",
             line_start=1, line_end=20, language="python",
         ))
         self.store.upsert_node(NodeInfo(
-<<<<<<< HEAD
-            kind="Test", name="verify_combine_behaviour",
-            file_path="/tests/spec.py",
-            line_start=1, line_end=5, language="python", is_test=True,
-        ))
-=======
             kind="Test", name="verify_\x01combine_behaviour",
             file_path="/tests/spec.py",
             line_start=1, line_end=5, language="python", is_test=True,
@@ -698,16 +686,10 @@ class TestQueryGraphTestsFor:
             kind="Function", name="shared_name", file_path="/src/second.py",
             line_start=1, line_end=5, language="python",
         ))
->>>>>>> upstream/main
         # Parser-canonical direction: source=production, target=test.
         self.store.upsert_edge(EdgeInfo(
             kind="TESTED_BY",
             source="/src/calc.py::combine",
-<<<<<<< HEAD
-            target="/tests/spec.py::verify_combine_behaviour",
-            file_path="/tests/spec.py", line=1,
-        ))
-=======
             target="/tests/spec.py::verify_\x01combine_behaviour",
             file_path="/tests/spec.py", line=1,
         ))
@@ -717,7 +699,6 @@ class TestQueryGraphTestsFor:
             target="/src/calc.py::combine",
             file_path="/src/calc.py", line=9,
         ))
->>>>>>> upstream/main
         self.store.commit()
         # Release the writer connection so query_graph can open its own.
         self.store.close()
@@ -730,10 +711,8 @@ class TestQueryGraphTestsFor:
             repo_root=str(self.repo_root),
         )
         assert result["status"] == "ok"
-<<<<<<< HEAD
         qns = {r["qualified_name"] for r in result["results"]}
         assert "/tests/spec.py::verify_combine_behaviour" in qns
-=======
         match = next(
             r for r in result["results"]
             if r["qualified_name"] == "/tests/spec.py::verify_combine_behaviour"
@@ -794,7 +773,6 @@ class TestQueryGraphTestsFor:
 
         assert result["status"] == "ambiguous"
         assert len(result["candidates"]) == 2
->>>>>>> upstream/main
 
 
 class TestGetDocsSection:
@@ -2216,7 +2194,6 @@ class TestGetMinimalContext:
         assert "refactor" in result["next_tool_suggestions"]
 
 
-<<<<<<< HEAD
 def _seed_large_review_repo(repo: Path, n_files: int = 12, lines: int = 400) -> list[str]:
     """Build a repo + graph with many large changed files, returning rel paths."""
     (repo / ".git").mkdir(parents=True, exist_ok=True)
@@ -2468,7 +2445,7 @@ class TestQueryGraphMaxResults:
         assert result["truncated"] is True
         assert result["total_results"] == 50
         assert len(result["results"]) <= 5  # minimal caps display at 5
-=======
+
 class TestGraphProvenance:
     """Freshness metadata attached to single-repository graph responses."""
 
@@ -2720,4 +2697,3 @@ def test_impact_radius_tool_exposes_best_first_scores(monkeypatch, tmp_path):
     ]
     scores = [node["impact_score"] for node in result["impacted_nodes"]]
     assert scores == sorted(scores, reverse=True)
->>>>>>> upstream/main

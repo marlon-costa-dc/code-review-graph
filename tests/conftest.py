@@ -1,11 +1,3 @@
-<<<<<<< HEAD
-"""Hermetic process-wide test configuration."""
-
-from __future__ import annotations
-
-from pathlib import Path
-
-=======
 """Shared test fixtures.
 
 Keeps code-review-graph's own per-user state out of the developer's real
@@ -17,19 +9,18 @@ not covered here — those tests patch ``Path.home()`` themselves.
 
 from __future__ import annotations
 
->>>>>>> upstream/main
+from pathlib import Path
 import pytest
 
 
 @pytest.fixture(autouse=True)
-<<<<<<< HEAD
 def isolate_crg_registry(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Keep every default registry access inside the current test sandbox."""
     monkeypatch.setenv("CRG_REGISTRY_PATH", str(tmp_path / "registry.json"))
-=======
+
 def isolated_crg_home(tmp_path_factory, monkeypatch):
     """Redirect the per-user state directory into a temporary directory.
 
@@ -51,4 +42,3 @@ def isolated_crg_home(tmp_path_factory, monkeypatch):
     home = tmp_path_factory.mktemp("crg-home")
     monkeypatch.setenv("CRG_HOME", str(home))
     return home
->>>>>>> upstream/main

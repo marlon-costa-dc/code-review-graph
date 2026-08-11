@@ -450,14 +450,11 @@ class TestChanges:
             # real method so teardown releases the database handle on Windows.
             patch.object(self.store, "close"),
         ):
-<<<<<<< HEAD
             mock_get_store.return_value = (self.store, Path("/fake/repo"), None)
             # Prevent the store from being closed by the tool
             # (our teardown handles it).
             self.store.close = lambda: None
-=======
             mock_get_store.return_value = (self.store, Path("/fake/repo"))
->>>>>>> upstream/main
 
             result = detect_changes_func(base="HEAD~1", repo_root="/fake/repo")
             assert result["status"] == "ok"

@@ -1193,10 +1193,7 @@ class TestFindDeadCodeWithTestedBy:
 
     def setup_method(self):
         self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
-<<<<<<< HEAD
-=======
         self.tmp.close()  # release the handle before GraphStore reopens it on Windows
->>>>>>> upstream/main
         self.store = GraphStore(self.tmp.name)
         self._seed()
 
