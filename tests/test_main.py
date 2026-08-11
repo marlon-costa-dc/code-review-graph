@@ -374,8 +374,6 @@ class TestLongRunningToolsAreAsync:
                     )
 
 
-<<<<<<< HEAD
-=======
 class TestGraphBackedToolProvenanceCoverage:
     """Every single-repository graph tool must expose freshness metadata."""
 
@@ -424,7 +422,6 @@ class TestGraphBackedToolProvenanceCoverage:
         underlying = getattr(tool, "fn", None) or tool
         assert "with_provenance" not in inspect.getsource(underlying)
 
->>>>>>> upstream/main
 class TestApplyToolFilter:
     """Tests for _apply_tool_filter (``serve --tools`` / ``CRG_TOOLS``).
 

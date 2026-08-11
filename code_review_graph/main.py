@@ -20,12 +20,9 @@ from typing import Any, Optional
 
 from fastmcp import FastMCP
 
-<<<<<<< HEAD
-=======
 from . import incremental as _incremental
 from .graph import GraphStore
 from .incremental import find_project_root, get_db_path, start_watch_thread
->>>>>>> upstream/main
 from .prompts import (
     architecture_map_prompt,
     debug_issue_prompt,
@@ -33,8 +30,6 @@ from .prompts import (
     pre_merge_check_prompt,
     review_changes_prompt,
 )
-<<<<<<< HEAD
-=======
 from .tools import (
     apply_refactor_func,
     build_or_update_graph,
@@ -68,7 +63,6 @@ from .tools import (
     traverse_graph_func,
     with_provenance,
 )
->>>>>>> upstream/main
 
 logger = logging.getLogger(__name__)
 
@@ -303,16 +297,6 @@ async def build_or_update_graph_tool(
         embedding_model: Exact model for an explicit post-build embedding
             refresh. Must be supplied with embedding_provider. Default: disabled.
     """
-<<<<<<< HEAD
-    return await asyncio.to_thread(
-        _tool_impl("build_or_update_graph"),
-        full_rebuild=full_rebuild,
-        repo_root=_resolve_repo_root(repo_root),
-        base=base,
-        postprocess=postprocess,
-        recurse_submodules=recurse_submodules,
-    )
-=======
     root = _resolve_repo_root(repo_root)
 
     def _run() -> dict:
@@ -324,7 +308,6 @@ async def build_or_update_graph_tool(
         ), root)
 
     return await asyncio.to_thread(_run)
->>>>>>> upstream/main
 
 
 @mcp.tool()
@@ -355,15 +338,6 @@ async def run_postprocess_tool(
         embedding_model: Exact model for an explicit embedding refresh.
             Must be supplied with embedding_provider. Default: disabled.
     """
-<<<<<<< HEAD
-    return await asyncio.to_thread(
-        _tool_impl("run_postprocess"),
-        flows=flows,
-        communities=communities,
-        fts=fts,
-        repo_root=_resolve_repo_root(repo_root),
-    )
-=======
     root = _resolve_repo_root(repo_root)
 
     def _run() -> dict:
@@ -374,7 +348,6 @@ async def run_postprocess_tool(
         ), root)
 
     return await asyncio.to_thread(_run)
->>>>>>> upstream/main
 
 
 @mcp.tool()
@@ -398,20 +371,11 @@ def get_minimal_context_tool(
         repo_root: Repository root path. Auto-detected if omitted.
         base: Git ref for diff comparison. Default: HEAD~1.
     """
-<<<<<<< HEAD
-    return _tool_impl("get_minimal_context")(
-        task=task,
-        changed_files=changed_files,
-        repo_root=_resolve_repo_root(repo_root),
-        base=base,
-    )
-=======
     root = _resolve_repo_root(repo_root)
     return with_provenance(get_minimal_context(
         task=task, changed_files=changed_files,
         repo_root=root, base=base,
     ), root)
->>>>>>> upstream/main
 
 
 @mcp.tool()
@@ -434,21 +398,11 @@ def get_impact_radius_tool(
         base: Git ref for auto-detecting changes. Default: HEAD~1.
         detail_level: "minimal" (default) for a compact summary; "standard" for full output.
     """
-<<<<<<< HEAD
-    return _tool_impl("get_impact_radius")(
-        changed_files=changed_files,
-        max_depth=max_depth,
-        repo_root=_resolve_repo_root(repo_root),
-        base=base,
-        detail_level=_resolve_detail_level(detail_level),
-    )
-=======
     root = _resolve_repo_root(repo_root)
     return with_provenance(get_impact_radius(
         changed_files=changed_files, max_depth=max_depth,
         repo_root=root, base=base, detail_level=detail_level,
     ), root)
->>>>>>> upstream/main
 
 
 @mcp.tool()
@@ -456,11 +410,7 @@ def query_graph_tool(
     pattern: str,
     target: str,
     repo_root: Optional[str] = None,
-<<<<<<< HEAD
-    detail_level: str = "minimal",
-=======
     detail_level: str = "standard",
->>>>>>> upstream/main
     max_results: int = 100,
 ) -> dict:
     """Run a predefined graph query to explore code relationships.
