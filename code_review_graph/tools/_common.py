@@ -4,11 +4,22 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+<<<<<<< HEAD
+=======
+import subprocess
+from datetime import datetime
+>>>>>>> upstream/main
 from pathlib import Path
 from typing import Any
 
 from ..graph import GraphStore
 from ..incremental import find_project_root, get_db_path
+from ..parser import normalize_file_path
+
+_PROVENANCE_READ_TIMEOUT_SECONDS = 0.05
+_PROVENANCE_GIT_TIMEOUT_SECONDS = 1.0
+
+logger = logging.getLogger(__name__)
 
 logger = logging.getLogger(__name__)
 
@@ -20,6 +31,7 @@ def _error_response(
     return {"status": status, "error": message, "summary": message, **extra}
 
 
+<<<<<<< HEAD
 # Metadata keys written by a build/update run. Their presence proves the graph
 # was built at least once, even if the resulting graph legitimately has 0 nodes
 # (e.g. an empty repo). Used to distinguish "never built" from "built, empty".
@@ -74,6 +86,112 @@ def _get_store_for_read(
         store.close()
         return None, None, _not_built_response()
     return store, root, None
+=======
+def _read_live_git_head(root: Path) -> str | None:
+    """Return the checked-out commit without making provenance mandatory.
+
+    ``head_matches_build`` deliberately compares commits only. It does not
+    claim that staged, unstaged, or untracked files are represented by the
+    graph, avoiding the misleading ``is_stale=False`` contract from #458.
+    """
+    if not (root / ".git").exists():
+        return None
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--verify", "HEAD"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            cwd=str(root),
+            timeout=_PROVENANCE_GIT_TIMEOUT_SECONDS,
+            stdin=subprocess.DEVNULL,
+            check=False,
+        )
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+        logger.debug("Could not read live Git HEAD for graph provenance", exc_info=True)
+        return None
+    if result.returncode != 0:
+        logger.debug("git rev-parse failed while reading graph provenance")
+        return None
+    head_sha = result.stdout.strip()
+    return head_sha or None
+
+
+def graph_provenance(repo_root: str | None = None) -> dict[str, Any] | None:
+    """Return best-effort build metadata for one repository's graph.
+
+    The metadata read is deliberately read-only. Missing, incomplete, or
+    unreadable graph databases must never make the enclosing tool call fail.
+    """
+    try:
+        root = _resolve_root(repo_root)
+        db_path = get_db_path(root, read_only=True)
+        if not db_path.exists():
+            return None
+
+        # ``as_uri`` escapes URI-significant path characters before the
+        # read-only mode query is appended. It also handles Windows drives.
+        database_uri = f"{db_path.resolve().as_uri()}?mode=ro"
+        # Provenance is optional and reads only three local metadata rows.
+        # Allow a brief commit boundary, but never inherit sqlite3's 5-second
+        # default wait when a build or migration holds an exclusive lock.
+        connection = sqlite3.connect(
+            database_uri,
+            uri=True,
+            timeout=_PROVENANCE_READ_TIMEOUT_SECONDS,
+        )
+        try:
+            rows = dict(connection.execute(
+                "SELECT key, value FROM metadata WHERE key IN "
+                "('last_updated', 'git_branch', 'git_head_sha')"
+            ).fetchall())
+        finally:
+            connection.close()
+
+        provenance: dict[str, Any] = {}
+        updated_at = rows.get("last_updated")
+        if isinstance(updated_at, str) and updated_at:
+            provenance["updated_at"] = updated_at
+            try:
+                built_at = datetime.fromisoformat(updated_at)
+                # Match aware timestamps with an aware ``now`` in the same
+                # timezone; None preserves the stored naive/local format.
+                now = datetime.now(tz=built_at.tzinfo)
+                provenance["age_seconds"] = max(
+                    0, int((now - built_at).total_seconds()),
+                )
+            except (OverflowError, TypeError, ValueError):
+                # A malformed timestamp only removes the derived age. The raw
+                # timestamp and independently valid branch/SHA remain useful.
+                pass
+
+        head_sha = rows.get("git_head_sha")
+        if isinstance(head_sha, str) and head_sha:
+            provenance["built_at_sha"] = head_sha
+        if provenance:
+            branch = rows.get("git_branch")
+            if isinstance(branch, str) and branch:
+                provenance["built_on_branch"] = branch
+            live_head_sha = _read_live_git_head(root)
+            if live_head_sha:
+                provenance["head_sha"] = live_head_sha
+                if isinstance(head_sha, str) and head_sha:
+                    provenance["head_matches_build"] = live_head_sha == head_sha
+        return provenance or None
+    except Exception:
+        return None
+
+
+def with_provenance(result: Any, repo_root: str | None = None) -> Any:
+    """Attach a ``_graph`` envelope without changing existing fields."""
+    if not isinstance(result, dict) or "_graph" in result:
+        return result
+    provenance = graph_provenance(repo_root)
+    if provenance:
+        result["_graph"] = provenance
+    return result
+>>>>>>> upstream/main
 
 # Common JS/TS builtin method names filtered from callers_of results.
 # "Who calls .map()?" returns hundreds of hits and is never useful.
@@ -187,7 +305,7 @@ def _resolve_graph_file_paths(
             except ValueError:
                 pass
         else:
-            candidates.append(str(root / path))
+            candidates.append(normalize_file_path(root / path))
 
         for candidate in candidates:
             if store.get_nodes_by_file(candidate):

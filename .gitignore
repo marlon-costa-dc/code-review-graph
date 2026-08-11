@@ -93,6 +93,15 @@ SCALING_AND_TOKEN_EFFICIENCY_PLAN.md
 .dolt/
 .beads-credential-key
 
+<<<<<<< HEAD
 # Beads / Dolt files (added by bd init)
 .beads/proxieddb/
 .omo/
+=======
+# Local-only pending files (temporary — revisit before tracking)
+.codex/
+2026-06-10-194632-local-command-caveatcaveat-the-messages-below.txt
+OC3_TECHNICAL_CONTRIBUTION.md
+OC3_TECHNICAL_CONTRIBUTION.pdf
+PRESENTATION_BRIEF.md
+>>>>>>> upstream/main

@@ -21,22 +21,37 @@ from pathlib import Path, PurePosixPath
 from typing import Callable, Optional
 
 from .graph import GraphStore
-from .parser import CodeParser
+from .parser import CodeParser, normalize_file_path
 
 _MAX_PARSE_WORKERS = int(os.environ.get("CRG_PARSE_WORKERS", str(min(os.cpu_count() or 4, 8))))
 
+<<<<<<< HEAD
 # Files stored per write transaction during parallel builds/updates.
 _STORE_BATCH_SIZE = int(os.environ.get("CRG_STORE_BATCH_SIZE", "50"))
+=======
+# Set only while the in-process FastMCP server is using stdio transport.
+# This is deliberately separate from ``sys.stdin.isatty()``: CI, cron, and
+# redirected CLI builds also have non-TTY stdin, but do not share the MCP
+# transport's file-descriptor lifetime problem.
+_MCP_STDIO_ACTIVE = False
+
+# Each process-pool worker runs this module in its own process, while each
+# thread-pool worker needs isolated parser state.  A thread-local cache covers
+# both cases and avoids rebuilding CodeParser (including its grammar probes and
+# parser caches) for every file in a parallel build.
+_PARSE_WORKER_STATE = threading.local()
+>>>>>>> upstream/main
 
 
 def _select_executor_kind() -> str:
     """Return 'process' or 'thread' for parallel parsing.
 
     Defaults to ``process`` (the original behavior, fastest on Linux/macOS).
-    Auto-switches to ``thread`` when running on Windows with stdin not
-    attached to a TTY — that combination indicates an MCP/stdio host, where
-    ``ProcessPoolExecutor`` workers inherit the parent's pipe handles and
-    leak as zombies after the pool closes (issues #46, #136).
+    Auto-switches to ``thread`` for an active MCP stdio server on every
+    platform, where ``ProcessPoolExecutor`` workers can inherit the transport
+    pipe/socket and prevent EOF shutdown. The older Windows non-TTY fallback
+    remains for direct integrations that predate the explicit transport flag
+    (issues #46, #136, PR #615).
 
     Override explicitly with ``CRG_PARSE_EXECUTOR={process,thread}``.
 
@@ -48,6 +63,8 @@ def _select_executor_kind() -> str:
     explicit = os.environ.get("CRG_PARSE_EXECUTOR", "").strip().lower()
     if explicit in ("process", "thread"):
         return explicit
+    if _MCP_STDIO_ACTIVE:
+        return "thread"
     if sys.platform == "win32" and not sys.stdin.isatty():
         return "thread"
     return "process"
@@ -60,6 +77,19 @@ def _make_executor(max_workers: int):
     return concurrent.futures.ProcessPoolExecutor(max_workers=max_workers)
 
 logger = logging.getLogger(__name__)
+
+CPP_IDENTITY_VERSION = "1"
+_CPP_IDENTITY_METADATA_KEY = "cpp_identity_version"
+
+
+def _run_python_resolver(store: GraphStore) -> Optional[dict]:
+    """Run repository-wide Python import resolution without failing a build."""
+    try:
+        from .python_resolver import resolve_python_imports
+        return resolve_python_imports(store)
+    except Exception as exc:  # noqa: BLE001 - best-effort post-pass
+        logger.warning("Python import resolver failed: %s", exc)
+        return None
 
 
 def _run_rescript_resolver(store: GraphStore) -> Optional[dict]:
@@ -94,6 +124,16 @@ def _run_spring_resolver(store: GraphStore) -> Optional[dict]:
         return None
 
 
+def _run_spring_event_resolver(store: GraphStore) -> Optional[dict]:
+    """Run the Spring application-event resolver without failing a build."""
+    try:
+        from .event_resolver import resolve_spring_events
+        return resolve_spring_events(store)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Spring event resolver failed: %s", exc)
+        return None
+
+
 def _run_temporal_resolver(store: GraphStore) -> Optional[dict]:
     """Run the Temporal workflow/activity call resolver.
 
@@ -110,6 +150,7 @@ def _run_temporal_resolver(store: GraphStore) -> Optional[dict]:
         return None
 
 
+<<<<<<< HEAD
 def _run_jedi_resolver(store: GraphStore, repo_root: Path) -> Optional[dict]:
     """Run the Jedi Python call resolver.
 
@@ -147,39 +188,70 @@ def _run_bare_target_resolver(store: GraphStore) -> Optional[int]:
         logger.warning("Bare-target resolver failed: %s", exc)
         return None
 
+=======
+def _run_hcl_resolver(store: GraphStore) -> Optional[dict]:
+    """Run Terraform module-scope resolution without failing a build."""
+    try:
+        from .hcl_resolver import resolve_hcl_module_references
+        return resolve_hcl_module_references(store)
+    except Exception as exc:  # noqa: BLE001 - best-effort post-pass
+        logger.warning("Terraform/HCL resolver failed: %s", exc)
+        return None
+
+
+def _run_scoped_resolver(store: GraphStore) -> Optional[dict]:
+    """Resolve static/scoped ``Class::method`` calls without failing a build."""
+    try:
+        from .scoped_resolver import resolve_scoped_calls
+        return resolve_scoped_calls(store)
+    except Exception as exc:  # noqa: BLE001 - best-effort post-pass
+        logger.warning("Scoped call resolver failed: %s", exc)
+        return None
+
+
+>>>>>>> upstream/main
 # Default ignore patterns (in addition to .gitignore).
 #
-# `<dir>/**` patterns are matched at any depth by _should_ignore, so
-# `node_modules/**` also excludes `packages/app/node_modules/react/index.js`
-# inside monorepos. See: #91
+# ``**/<dir>/**`` patterns are safe-anywhere directory exclusions.  A leading
+# slash anchors a pattern to the repository root, which prevents ambiguous
+# output names such as ``build`` and ``dist`` from hiding nested source
+# directories.  See: #91 and PR #92.
 DEFAULT_IGNORE_PATTERNS = [
-    ".code-review-graph/**",
-    "node_modules/**",
-    ".git/**",
-    ".svn/**",
-    "__pycache__/**",
+    "**/.code-review-graph/**",
+    "**/node_modules/**",
+    "**/.git/**",
+    "**/.svn/**",
+    "**/__pycache__/**",
     "*.pyc",
-    ".venv/**",
-    "venv/**",
-    "dist/**",
-    "build/**",
-    ".next/**",
-    "target/**",
+    "**/.venv/**",
+    "**/venv/**",
+    "/dist/**",
+    "/build/**",
+    "/.next/**",
+    "/.nuxt/**",
+    "/target/**",
+    "/bin/**",
+    "/obj/**",
     # PHP / Laravel / Composer
-    "vendor/**",
-    "bootstrap/cache/**",
-    "public/build/**",
+    "**/vendor/**",
+    "/storage/**",
+    "/bootstrap/cache/**",
+    "/public/build/**",
     # Ruby / Bundler
-    ".bundle/**",
+    "**/.bundle/**",
     # Java / Kotlin / Gradle
-    ".gradle/**",
+    "**/.gradle/**",
     "*.jar",
     # Dart / Flutter
-    ".dart_tool/**",
-    ".pub-cache/**",
+    "**/.dart_tool/**",
+    "**/.pub-cache/**",
+    # AWS CDK
+    "**/cdk.out/**",
     # General
-    "coverage/**",
-    ".cache/**",
+    "/coverage/**",
+    "**/.cache/**",
+    "/.tmp/**",
+    "/tmp/**",  # nosec B108 -- repo-relative ignore glob, not a temp-file path
     "*.min.js",
     "*.min.css",
     "*.map",
@@ -309,7 +381,7 @@ def _write_data_dir_gitignore(data_dir: Path) -> None:
             pass
 
 
-def get_data_dir(repo_root: Path) -> Path:
+def get_data_dir(repo_root: Path, *, create: bool = True) -> Path:
     """Return the directory where this project's graph data lives.
 
     Resolution priority:
@@ -322,19 +394,25 @@ def get_data_dir(repo_root: Path) -> Path:
     instead — letting you keep graphs outside the working tree (useful
     for ephemeral workspaces, Docker volumes, or shared caches). See: #155
 
-    The directory is created if it does not already exist; an inner
-    ``.gitignore`` (with ``*``) is written so any accidentally-nested
-    files never get committed. Both are idempotent.
+    By default the directory is created if it does not already exist; an
+    inner ``.gitignore`` (with ``*``) is written so any accidentally-nested
+    files never get committed. Both are idempotent. Pass ``create=False``
+    when resolving the path for a read-only existence check.
     """
     # Check registry first
     try:
-        from .registry import Registry
-        registry_data_dir = Registry().get_data_dir_for_repo(str(repo_root))
-        if registry_data_dir:
-            data_dir = Path(registry_data_dir).resolve()
-            data_dir.mkdir(parents=True, exist_ok=True)
-            _write_data_dir_gitignore(data_dir)
-            return data_dir
+        from .registry import Registry, default_registry_path
+
+        # Registry construction creates its parent directory. A read-only
+        # lookup must skip it entirely when no registry file exists.
+        if create or default_registry_path().is_file():
+            registry_data_dir = Registry().get_data_dir_for_repo(str(repo_root))
+            if registry_data_dir:
+                data_dir = Path(registry_data_dir).resolve()
+                if create:
+                    data_dir.mkdir(parents=True, exist_ok=True)
+                    _write_data_dir_gitignore(data_dir)
+                return data_dir
     except Exception as exc:
         # If registry lookup fails, log and fall through to other methods
         logger.debug("Registry lookup failed for %s: %s", repo_root, exc)
@@ -346,21 +424,27 @@ def get_data_dir(repo_root: Path) -> Path:
     else:
         data_dir = repo_root / ".code-review-graph"
 
-    data_dir.mkdir(parents=True, exist_ok=True)
-    _write_data_dir_gitignore(data_dir)
+    if create:
+        data_dir.mkdir(parents=True, exist_ok=True)
+        _write_data_dir_gitignore(data_dir)
 
     return data_dir
 
 
-def get_db_path(repo_root: Path) -> Path:
+def get_db_path(repo_root: Path, *, read_only: bool = False) -> Path:
     """Determine the database path for a repository.
 
     Respects ``CRG_DATA_DIR`` (see :func:`get_data_dir`). Migrates a
     legacy top-level ``.code-review-graph.db`` file into the new
-    directory when it exists (WAL/SHM side-files are discarded).
+    directory when it exists (WAL/SHM side-files are discarded). Pass
+    ``read_only=True`` to resolve the current path without creating a data
+    directory, migrating a legacy database, or deleting side-files.
     """
-    crg_dir = get_data_dir(repo_root)
+    crg_dir = get_data_dir(repo_root, create=not read_only)
     new_db = crg_dir / "graph.db"
+
+    if read_only:
+        return new_db
 
     # Migrate legacy database if present (only meaningful when the
     # legacy file sits at the repo root — if CRG_DATA_DIR is set we
@@ -413,34 +497,55 @@ def _load_ignore_patterns(repo_root: Path) -> list[str]:
         for line in ignore_file.read_text(encoding="utf-8", errors="replace").splitlines():
             line = line.strip()
             if line and not line.startswith("#"):
-                patterns.append(line)
+                # Directory names without a slash match at any depth, as in
+                # .gitignore. A leading slash remains an explicit root anchor.
+                if line.endswith("/"):
+                    prefix = line[:-1]
+                    if prefix.startswith("/") or "/" in prefix:
+                        line = f"{prefix}/**"
+                    else:
+                        line = f"**/{prefix}/**"
+                elif line.endswith("/**") and not line.startswith(("/", "**/")):
+                    prefix = line[:-3]
+                    if "/" in prefix:
+                        line = f"/{line}"
+                    else:
+                        line = f"**/{line}"
+                if line:
+                    patterns.append(line)
     return patterns
 
 
 def _should_ignore(path: str, patterns: list[str]) -> bool:
     """Check if a path matches any ignore pattern.
 
-    Handles nested occurrences of ``<dir>/**`` patterns: for example,
-    ``node_modules/**`` also matches ``packages/app/node_modules/foo.js``
-    inside monorepos. ``fnmatch`` alone treats ``*`` as not crossing ``/``
-    and only matches the prefix, so we additionally test each path segment
-    against the bare prefix of ``<dir>/**`` patterns. See: #91
+    ``**/<dir>/**`` and unanchored single-directory patterns match at any
+    depth. A leading slash anchors a pattern to the repository root.
     """
-    # Direct fnmatch first (cheap)
-    if any(fnmatch.fnmatch(path, p) for p in patterns):
-        return True
-    # Then: treat simple single-segment "dir/**" patterns as
-    # "this directory at any depth".
-    parts = PurePosixPath(path).parts
-    for p in patterns:
-        if not p.endswith("/**"):
+    normalized = path.replace("\\", "/").lstrip("/")
+    parts = PurePosixPath(normalized).parts
+    for pattern in patterns:
+        anchored = pattern.startswith("/")
+        candidate = pattern[1:] if anchored else pattern
+
+        if candidate.startswith("**/") and candidate.endswith("/**"):
+            segment = candidate[3:-3]
+            if segment and segment in parts:
+                return True
             continue
-        prefix = p[:-3]
-        # Only single-segment dir patterns (no "/" inside the prefix)
-        # qualify for nested matching.
-        if "/" in prefix or not prefix:
+
+        if candidate.endswith("/**"):
+            prefix = tuple(part for part in candidate[:-3].split("/") if part)
+            if not prefix:
+                continue
+            if anchored or len(prefix) > 1:
+                if parts[: len(prefix)] == prefix:
+                    return True
+            elif prefix[0] in parts:
+                return True
             continue
-        if prefix in parts:
+
+        if fnmatch.fnmatch(normalized, candidate):
             return True
     return False
 
@@ -470,25 +575,27 @@ def _git_branch_info(repo_root: Path) -> tuple[str, str]:
         result = subprocess.run(
             ["git", "rev-parse", "--abbrev-ref", "HEAD"],
             capture_output=True,
-            text=True, encoding='utf-8',            cwd=str(repo_root),
+            text=True, encoding='utf-8', errors='replace',
+            cwd=str(repo_root),
             timeout=_GIT_TIMEOUT,
             stdin=subprocess.DEVNULL,
         )
         if result.returncode == 0:
             branch = result.stdout.strip()
-    except (subprocess.TimeoutExpired, FileNotFoundError):
+    except (subprocess.TimeoutExpired, FileNotFoundError, UnicodeDecodeError):
         pass
     try:
         result = subprocess.run(
             ["git", "rev-parse", "HEAD"],
             capture_output=True,
-            text=True, encoding='utf-8',            cwd=str(repo_root),
+            text=True, encoding='utf-8', errors='replace',
+            cwd=str(repo_root),
             timeout=_GIT_TIMEOUT,
             stdin=subprocess.DEVNULL,
         )
         if result.returncode == 0:
             sha = result.stdout.strip()
-    except (subprocess.TimeoutExpired, FileNotFoundError):
+    except (subprocess.TimeoutExpired, FileNotFoundError, UnicodeDecodeError):
         pass
     return branch, sha
 
@@ -527,6 +634,31 @@ _SAFE_GIT_REF = re.compile(r"^[A-Za-z0-9_.~^/@{}\-]+$")
 _SAFE_SVN_REV = re.compile(r"^r?\d+(:r?\d+|:HEAD|:BASE|:COMMITTED)?$", re.IGNORECASE)
 
 
+def _decode_name_status_paths(output: bytes) -> list[str]:
+    """Decode ``git diff --name-status -z`` output into a list of paths.
+
+    Renames and copies (``R<score>``/``C<score>`` records) carry two paths —
+    the old and the new one.  Both are emitted so the old path flows through
+    the purge loop in :func:`incremental_update`; otherwise a rename leaves
+    the old path's nodes and edges in the graph and the incremental result
+    diverges from a full rebuild.
+    """
+    fields = [os.fsdecode(f) for f in output.split(b"\0") if f]
+    paths: list[str] = []
+    seen: set[str] = set()
+    i = 0
+    while i < len(fields):
+        status = fields[i]
+        takes_two = status[:1] in ("R", "C")
+        entry = fields[i + 1 : i + (3 if takes_two else 2)]
+        i += 3 if takes_two else 2
+        for path in entry:
+            if path not in seen:
+                seen.add(path)
+                paths.append(path)
+    return paths
+
+
 def _store_vcs_metadata(repo_root: Path, store: "GraphStore") -> None:
     """Persist VCS branch/revision info into the graph metadata table."""
     vcs = detect_vcs(repo_root)
@@ -544,6 +676,55 @@ def _store_vcs_metadata(repo_root: Path, store: "GraphStore") -> None:
             store.set_metadata("svn_revision", rev)
 
 
+def _commit_object_exists(repo_root: Path, ref: str) -> bool:
+    """Return True if *ref* resolves to a commit object present in the repo.
+
+    This is an object-existence check, not an ancestry check: a commit that is
+    only reachable from a branch we have since switched away from is still a
+    valid ``git diff`` base, so we must accept it. Any git failure (missing
+    binary, timeout, unknown ref) is treated as "not usable".
+    """
+    if not ref or ref.startswith("-") or not _SAFE_GIT_REF.fullmatch(ref):
+        return False
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"],
+            capture_output=True,
+            cwd=str(repo_root),
+            timeout=_GIT_TIMEOUT,
+            stdin=subprocess.DEVNULL,
+        )
+        return result.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def resolve_incremental_base(repo_root: Path, store: "GraphStore") -> str | None:
+    """Resolve the automatic diff base for a default incremental update.
+
+    The graph records the commit it was last built at (``git_head_sha``). Using
+    that as the diff base lets a single ``update`` reconcile every change since
+    the graph was last in sync, instead of only the most recent commit, which
+    is what a fixed ``HEAD~1`` base does. That fixed base silently misses work
+    that arrived through a multi-commit pull, rebase, or branch switch.
+
+    Returns:
+        - the stored commit SHA when it is still a usable diff base;
+        - ``"HEAD~1"`` for SVN or non-git working copies, whose change
+          discovery ignores or reinterprets the base anyway;
+        - ``None`` for a git repo with no usable anchor (a fresh or legacy
+          database, or a stored commit lost to a history rewrite or shallow
+          clone), signalling the caller to do a full rebuild rather than
+          diff against a wrong base.
+    """
+    if detect_vcs(repo_root) != "git":
+        return "HEAD~1"
+    stored = store.get_metadata("git_head_sha")
+    if stored and _commit_object_exists(repo_root, stored):
+        return stored
+    return None
+
+
 def get_changed_files(repo_root: Path, base: str = "HEAD~1") -> list[str]:
     """Get list of changed files via git diff or svn status.
 
@@ -555,31 +736,34 @@ def get_changed_files(repo_root: Path, base: str = "HEAD~1") -> list[str]:
     if detect_vcs(repo_root) == "svn":
         return _get_svn_changed_files(repo_root, base if _SAFE_SVN_REV.match(base) else None)
     # Git path
-    if not _SAFE_GIT_REF.match(base):
+    if base.startswith("-") or not _SAFE_GIT_REF.fullmatch(base):
         logger.warning("Invalid git ref rejected: %s", base)
         return []
     try:
+        # --name-status (not --name-only): renames/copies must report BOTH
+        # paths, or the old path never reaches the purge loop (issue #684).
         result = subprocess.run(
-            ["git", "diff", "--name-only", base, "--"],
+            ["git", "diff", "--name-status", "-z", base, "--"],
             capture_output=True,
-            text=True, encoding='utf-8',            cwd=str(repo_root),
+            cwd=str(repo_root),
             timeout=_GIT_TIMEOUT,
             stdin=subprocess.DEVNULL,
         )
         if result.returncode != 0:
             # Fallback: try diff against empty tree (initial commit)
             result = subprocess.run(
-                ["git", "diff", "--name-only", "--cached"],
+                ["git", "diff", "--name-status", "-z", "--cached"],
                 capture_output=True,
-                text=True, encoding='utf-8',                cwd=str(repo_root),
+                cwd=str(repo_root),
                 timeout=_GIT_TIMEOUT,
                 stdin=subprocess.DEVNULL,
             )
-        files = [f.strip() for f in result.stdout.splitlines() if f.strip()]
-        return files
+        if result.returncode != 0:
+            logger.warning("git diff failed while discovering changed files")
+            return []
+        return _decode_name_status_paths(result.stdout)
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return []
-
 
 def _get_svn_changed_files(repo_root: Path, rev_range: str | None = None) -> list[str]:
     """Return changed files in an SVN working copy.
@@ -624,9 +808,8 @@ def _get_svn_changed_files(repo_root: Path, rev_range: str | None = None) -> lis
                     path = line[8:].strip() if len(line) > 8 else line[1:].strip()
                     files.append(path)
             return files
-    except (FileNotFoundError, subprocess.TimeoutExpired):
+    except (FileNotFoundError, subprocess.TimeoutExpired, UnicodeDecodeError):
         return []
-
 
 def get_staged_and_unstaged(repo_root: Path) -> list[str]:
     """Get all modified files (staged + unstaged + untracked)."""
@@ -634,24 +817,37 @@ def get_staged_and_unstaged(repo_root: Path) -> list[str]:
         return _get_svn_changed_files(repo_root)
     try:
         result = subprocess.run(
-            ["git", "status", "--porcelain"],
+            [
+                "git",
+                "status",
+                "--porcelain=v1",
+                "-z",
+                "--untracked-files=all",
+            ],
             capture_output=True,
-            text=True, encoding='utf-8',            cwd=str(repo_root),
+            cwd=str(repo_root),
             timeout=_GIT_TIMEOUT,
             stdin=subprocess.DEVNULL,
         )
-        files = []
-        for line in result.stdout.splitlines():
-            if len(line) > 3:
-                entry = line[3:].strip()
-                # Handle renamed files: "R  old -> new"
-                if " -> " in entry:
-                    entry = entry.split(" -> ", 1)[1]
-                files.append(entry)
+        if result.returncode != 0:
+            logger.warning("git status failed while discovering working-tree files")
+            return []
+        files: list[str] = []
+        records = result.stdout.split(b"\0")
+        index = 0
+        while index < len(records):
+            record = records[index]
+            if len(record) > 3:
+                status = record[:2]
+                files.append(os.fsdecode(record[3:]))
+                # With porcelain -z, a rename/copy record stores the
+                # destination first and its source in the following record.
+                if b"R" in status or b"C" in status:
+                    index += 1
+            index += 1
         return files
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return []
-
 
 def get_all_tracked_files(
     repo_root: Path,
@@ -681,14 +877,14 @@ def get_all_tracked_files(
         result = subprocess.run(
             cmd,
             capture_output=True,
-            text=True, encoding='utf-8',            cwd=str(repo_root),
+            text=True, encoding='utf-8', errors='replace',
+            cwd=str(repo_root),
             timeout=_GIT_TIMEOUT,
             stdin=subprocess.DEVNULL,
         )
         return [f.strip() for f in result.stdout.splitlines() if f.strip()]
-    except (FileNotFoundError, subprocess.TimeoutExpired):
+    except (FileNotFoundError, subprocess.TimeoutExpired, UnicodeDecodeError):
         return []
-
 
 def _get_svn_all_tracked_files(repo_root: Path) -> list[str]:
     """Return SVN-versioned files by walking the working copy.
@@ -765,6 +961,42 @@ def collect_all_files(
         files.append(rel_path)
 
     return files
+
+
+def _reconcile_stale_files(
+    repo_root: Path,
+    store: GraphStore,
+    current_files: list[str] | None = None,
+) -> list[str]:
+    """Remove graph files absent from the current parseable repository inventory."""
+    stored_files = set(store.get_all_files())
+    current_paths: set[str]
+    if current_files is not None:
+        current_paths = {
+            normalize_file_path(repo_root / file_path) for file_path in current_files
+        }
+    else:
+        ignore_patterns = _load_ignore_patterns(repo_root)
+        parser = CodeParser(repo_root)
+        current_paths = set()
+        for stored_file in stored_files:
+            path = Path(stored_file)
+            try:
+                relative = str(path.relative_to(repo_root))
+            except ValueError:
+                continue
+            if (
+                path.is_file()
+                and not path.is_symlink()
+                and not _should_ignore(relative, ignore_patterns)
+                and parser.detect_language(path) is not None
+                and not _is_binary(path)
+            ):
+                current_paths.add(stored_file)
+    stale_files = sorted(stored_files - current_paths)
+    if stale_files:
+        store.remove_files_permanently(stale_files)
+    return stale_files
 
 
 _MAX_DEPENDENT_HOPS = int(os.environ.get("CRG_DEPENDENT_HOPS", "2"))
@@ -853,7 +1085,7 @@ def find_dependents(
 def _parse_single_file(
     args: tuple[str, str],
 ) -> tuple[str, list, list, str | None, str]:
-    """Parse one file in a worker process.
+    """Parse one file in a process- or thread-pool worker.
 
     Returns ``(rel_path, nodes, edges, error_or_none, file_hash)``.
     Must be a module-level function so ``ProcessPoolExecutor`` can
@@ -864,7 +1096,12 @@ def _parse_single_file(
     try:
         raw = abs_path.read_bytes()
         fhash = hashlib.sha256(raw).hexdigest()
-        parser = CodeParser(Path(repo_root_str))
+        parser = getattr(_PARSE_WORKER_STATE, "parser", None)
+        parser_repo_root = getattr(_PARSE_WORKER_STATE, "repo_root", None)
+        if parser is None or parser_repo_root != repo_root_str:
+            parser = CodeParser(Path(repo_root_str))
+            _PARSE_WORKER_STATE.parser = parser
+            _PARSE_WORKER_STATE.repo_root = repo_root_str
         nodes, edges = parser.parse_bytes(abs_path, raw)
         return (rel_path, nodes, edges, None, fhash)
     except Exception as e:
@@ -886,21 +1123,12 @@ def full_build(
     """
     parser = CodeParser(repo_root)
     files = collect_all_files(repo_root, recurse_submodules)
-
-    # Purge stale data from files no longer on disk
-    existing_files = set(store.get_all_files())
-    current_abs = {str(repo_root / f) for f in files}
-    stale_files = existing_files - current_abs
-    for stale in stale_files:
-        store.remove_file_data(stale)
-    # Ensure deletions are persisted before store_file_nodes_edges()
-    # starts its own explicit transaction via BEGIN IMMEDIATE.
-    if stale_files:
-        store.commit()
+    stale_files = _reconcile_stale_files(repo_root, store, files)
 
     total_nodes = 0
     total_edges = 0
     errors = []
+    cpp_errors: set[str] = set()
     file_count = len(files)
 
     use_serial = os.environ.get("CRG_SERIAL_PARSE", "") == "1"
@@ -918,16 +1146,21 @@ def full_build(
                 total_edges += len(edges)
             except (OSError, PermissionError) as e:
                 errors.append({"file": rel_path, "error": str(e)})
+                if parser.detect_language(full_path) == "cpp":
+                    cpp_errors.add(str(rel_path))
             except Exception as e:
                 logger.warning("Error parsing %s: %s", rel_path, e)
                 errors.append({"file": rel_path, "error": str(e)})
+                if parser.detect_language(full_path) == "cpp":
+                    cpp_errors.add(str(rel_path))
             if i % 50 == 0 or i == file_count:
                 logger.info("Progress: %d/%d files parsed", i, file_count)
     else:
         # Parallel parsing — store calls remain serial (SQLite single-writer).
-        # Executor kind auto-selected: process on Linux/macOS/Windows-TTY,
-        # thread on Windows-MCP-stdio to avoid pipe-handle inheritance
-        # deadlock (issues #46, #136). Override via CRG_PARSE_EXECUTOR env.
+        # Executor kind auto-selected: process for normal CLI/automation;
+        # thread for MCP stdio to avoid pipe-handle inheritance deadlocks and
+        # orphan workers (issues #46, #136, PR #615). Override via
+        # CRG_PARSE_EXECUTOR env.
         args_list = [(rel_path, str(repo_root)) for rel_path in files]
         # Group stored files into batches: one transaction per ~50 files
         # instead of one per file (each commit pays a WAL fsync).
@@ -940,6 +1173,8 @@ def full_build(
                 if error:
                     logger.warning("Error parsing %s: %s", rel_path, error)
                     errors.append({"file": rel_path, "error": error})
+                    if parser.detect_language(repo_root / rel_path) == "cpp":
+                        cpp_errors.add(str(rel_path))
                     continue
                 full_path = repo_root / rel_path
                 batch.append((str(full_path), nodes, edges, fhash))
@@ -955,26 +1190,43 @@ def full_build(
 
     store.set_metadata("last_updated", time.strftime("%Y-%m-%dT%H:%M:%S"))
     store.set_metadata("last_build_type", "full")
+    if not cpp_errors:
+        store.set_metadata(_CPP_IDENTITY_METADATA_KEY, CPP_IDENTITY_VERSION)
     _store_vcs_metadata(repo_root, store)
     store.commit()
 
+    python_stats = _run_python_resolver(store)
     rescript_stats = _run_rescript_resolver(store)
     spring_stats = _run_spring_resolver(store)
+    spring_event_stats = _run_spring_event_resolver(store)
     temporal_stats = _run_temporal_resolver(store)
+<<<<<<< HEAD
     jedi_stats = _run_jedi_resolver(store, repo_root)
     # Generic name-based bare-target resolution runs LAST so it only mops up
     # edges the language-aware resolvers above left unresolved.
     _run_bare_target_resolver(store)
+=======
+    hcl_stats = _run_hcl_resolver(store)
+    scoped_stats = _run_scoped_resolver(store)
+>>>>>>> upstream/main
 
     return {
         "files_parsed": len(files),
+        "stale_files_removed": len(stale_files),
         "total_nodes": total_nodes,
         "total_edges": total_edges,
         "errors": errors,
+        "python_resolution": python_stats,
         "rescript_resolution": rescript_stats,
         "spring_resolution": spring_stats,
+        "event_resolution": spring_event_stats,
         "temporal_resolution": temporal_stats,
+<<<<<<< HEAD
         "python_enrichment": jedi_stats,
+=======
+        "hcl_resolution": hcl_stats,
+        "scoped_resolution": scoped_stats,
+>>>>>>> upstream/main
     }
 
 
@@ -983,28 +1235,56 @@ def incremental_update(
     store: GraphStore,
     base: str = "HEAD~1",
     changed_files: list[str] | None = None,
+    reconcile_stale: bool = True,
 ) -> dict:
     """Incremental update: re-parse changed + dependent files only."""
     parser = CodeParser(repo_root)
     ignore_patterns = _load_ignore_patterns(repo_root)
 
+    if (
+        store.get_metadata(_CPP_IDENTITY_METADATA_KEY) != CPP_IDENTITY_VERSION
+        and store.has_nodes_for_language("cpp")
+    ):
+        logger.info(
+            "C++ identity format changed; rebuilding the graph before incremental update",
+        )
+        rebuilt = full_build(repo_root, store)
+        return {
+            "files_updated": rebuilt["files_parsed"],
+            "total_nodes": rebuilt["total_nodes"],
+            "total_edges": rebuilt["total_edges"],
+            "changed_files": list(changed_files or []),
+            "dependent_files": [],
+            "errors": rebuilt["errors"],
+            "identity_rebuild": True,
+            "python_resolution": rebuilt["python_resolution"],
+            "rescript_resolution": rebuilt["rescript_resolution"],
+            "spring_resolution": rebuilt["spring_resolution"],
+            "event_resolution": rebuilt["event_resolution"],
+            "temporal_resolution": rebuilt["temporal_resolution"],
+            "hcl_resolution": rebuilt["hcl_resolution"],
+        }
+
     # Determine changed files
     if changed_files is None:
         changed_files = get_changed_files(repo_root, base)
+    stale_files = _reconcile_stale_files(repo_root, store) if reconcile_stale else []
 
-    if not changed_files:
+    if not changed_files and not stale_files:
         return {
             "files_updated": 0,
             "total_nodes": 0,
             "total_edges": 0,
             "changed_files": [],
             "dependent_files": [],
+            "stale_files_removed": 0,
+            "errors": [],
         }
 
     # Find dependent files (files that import from changed files)
     dependent_files: set[str] = set()
     for rel_path in changed_files:
-        full_path = str(repo_root / rel_path)
+        full_path = normalize_file_path(repo_root / rel_path)
         deps = find_dependents(store, full_path)
         for d in deps:
             # Convert back to relative path if needed
@@ -1019,17 +1299,17 @@ def incremental_update(
     total_nodes = 0
     total_edges = 0
     errors = []
+    missing_paths: set[str] = set()
 
     # Separate deleted/unparseable files from files that need re-parsing
     to_parse: list[str] = []
-    removed_any = False
     for rel_path in all_files:
         if _should_ignore(rel_path, ignore_patterns):
             continue
         abs_path = repo_root / rel_path
         if not abs_path.is_file():
-            store.remove_file_data(str(abs_path))
-            removed_any = True
+            if normalize_file_path(abs_path) not in stale_files:
+                missing_paths.add(normalize_file_path(abs_path))
             continue
         if parser.detect_language(abs_path) is None:
             continue
@@ -1046,10 +1326,8 @@ def incremental_update(
 
     # Persist deletions before store_file_nodes_edges() opens its own
     # explicit transaction — avoids nested transaction errors.
-    if removed_any:
-        store.commit()
-
     use_serial = os.environ.get("CRG_SERIAL_PARSE", "") == "1"
+    parsed_files = 0
 
     if use_serial or len(to_parse) < 8:
         for rel_path in to_parse:
@@ -1059,6 +1337,7 @@ def incremental_update(
                 fhash = hashlib.sha256(source).hexdigest()
                 nodes, edges = parser.parse_bytes(abs_path, source)
                 store.store_file_nodes_edges(str(abs_path), nodes, edges, fhash)
+                parsed_files += 1
                 total_nodes += len(nodes)
                 total_edges += len(edges)
             except (OSError, PermissionError) as e:
@@ -1080,21 +1359,41 @@ def incremental_update(
                     logger.warning("Error parsing %s: %s", rel_path, error)
                     errors.append({"file": rel_path, "error": error})
                     continue
+<<<<<<< HEAD
                 batch.append((str(repo_root / rel_path), nodes, edges, fhash))
                 if len(batch) >= _STORE_BATCH_SIZE:
                     store.store_file_batch(batch)
                     batch.clear()
+=======
+                store.store_file_nodes_edges(
+                    str(repo_root / rel_path),
+                    nodes,
+                    edges,
+                    fhash,
+                )
+                parsed_files += 1
+>>>>>>> upstream/main
                 total_nodes += len(nodes)
                 total_edges += len(edges)
             if batch:
                 store.store_file_batch(batch)
 
-    store.set_metadata("last_updated", time.strftime("%Y-%m-%dT%H:%M:%S"))
-    store.set_metadata("last_build_type", "incremental")
-    _store_vcs_metadata(repo_root, store)
-    store.commit()
+    removed_files = store.remove_files_permanently(sorted(missing_paths)) if missing_paths else 0
+    files_updated = parsed_files + len(stale_files) + removed_files
+    if files_updated:
+        store.set_metadata("last_updated", time.strftime("%Y-%m-%dT%H:%M:%S"))
+        store.set_metadata("last_build_type", "incremental")
+        store.set_metadata(_CPP_IDENTITY_METADATA_KEY, CPP_IDENTITY_VERSION)
+        _store_vcs_metadata(repo_root, store)
+        store.commit()
 
     # Only re-run language-specific resolvers when the relevant files changed.
+    python_changed = any(
+        path.endswith(".py")
+        for path in set(all_files) | set(stale_files) | missing_paths
+    )
+    python_stats = _run_python_resolver(store) if python_changed else None
+
     rescript_changed = any(
         rp.endswith((".res", ".resi")) for rp in all_files
     )
@@ -1102,26 +1401,50 @@ def incremental_update(
         _run_rescript_resolver(store) if rescript_changed else None
     )
 
-    spring_changed = any(rp.endswith(".java") for rp in all_files)
+    # Like python_changed above, include stale/missing paths so a deletion
+    # that only surfaces through reconciliation still clears derived state
+    # (e.g. virtual Spring Event nodes — issue #474).
+    spring_changed = any(
+        path.endswith(".java")
+        for path in set(all_files) | set(stale_files) | missing_paths
+    )
     spring_stats = _run_spring_resolver(store) if spring_changed else None
+    spring_event_stats = (
+        _run_spring_event_resolver(store) if spring_changed else None
+    )
     temporal_stats = _run_temporal_resolver(store) if spring_changed else None
+<<<<<<< HEAD
     py_changed = any(rp.endswith(".py") for rp in all_files)
     jedi_stats = _run_jedi_resolver(store, repo_root) if py_changed else None
     # Generic name-based bare-target resolution runs LAST so it only mops up
     # edges the language-aware resolvers above left unresolved.
     _run_bare_target_resolver(store)
+=======
+    hcl_changed = any(rp.endswith((".tf", ".hcl")) for rp in all_files)
+    hcl_stats = _run_hcl_resolver(store) if hcl_changed else None
+    scoped_changed = any(rp.endswith((".php", ".rs", ".cs")) for rp in all_files)
+    scoped_stats = _run_scoped_resolver(store) if scoped_changed else None
+>>>>>>> upstream/main
 
     return {
-        "files_updated": len(all_files),
+        "files_updated": files_updated,
         "total_nodes": total_nodes,
         "total_edges": total_edges,
         "changed_files": list(changed_files),
         "dependent_files": list(dependent_files),
+        "stale_files_removed": len(stale_files),
         "errors": errors,
+        "python_resolution": python_stats,
         "rescript_resolution": rescript_stats,
         "spring_resolution": spring_stats,
+        "event_resolution": spring_event_stats,
         "temporal_resolution": temporal_stats,
+<<<<<<< HEAD
         "python_enrichment": jedi_stats,
+=======
+        "hcl_resolution": hcl_stats,
+        "scoped_resolution": scoped_stats,
+>>>>>>> upstream/main
     }
 
 
@@ -1130,7 +1453,182 @@ def incremental_update(
 # ---------------------------------------------------------------------------
 
 
-_DEBOUNCE_SECONDS = 0.3
+_DEBOUNCE_SECONDS = 1
+
+
+def _raise_watch_update_errors(result: dict, context: str) -> None:
+    """Fail the watch boundary when an incremental update reports errors."""
+    errors = result.get("errors") or []
+    if not errors:
+        return
+    details = "; ".join(
+        f"{error.get('file', 'unknown')}: {error.get('error', 'unknown error')}"
+        for error in errors
+    )
+    raise RuntimeError(f"{context} reported errors: {details}")
+
+
+def _raise_watch_postprocess_warnings(result: object) -> None:
+    """Treat structured post-processing warnings as a failed watch update."""
+    if not isinstance(result, dict):
+        return
+    warnings = result.get("warnings") or []
+    if warnings:
+        details = "; ".join(str(warning) for warning in warnings)
+        raise RuntimeError(f"post-processing reported warnings: {details}")
+
+
+def _create_watch_handler(
+    repo_root: Path,
+    store: GraphStore,
+    on_files_updated: Optional[Callable],
+):
+    """Create the debounced watchdog handler for one repository."""
+    from watchdog.events import FileSystemEvent, FileSystemEventHandler
+    from watchdog.utils.event_debouncer import EventDebouncer
+
+    ignore_patterns = _load_ignore_patterns(repo_root)
+    parser = CodeParser(repo_root)
+    lexical_root = Path(os.path.abspath(repo_root))
+    resolved_root = lexical_root.resolve()
+
+    class WatchBatchProcessor:
+        def __init__(self) -> None:
+            self.failure: BaseException | None = None
+
+        def _relative_path(self, path: str) -> str | None:
+            candidate = Path(os.path.abspath(path))
+            try:
+                relative = candidate.relative_to(lexical_root)
+            except ValueError:
+                return None
+            existing = candidate
+            while not existing.exists() and existing != lexical_root:
+                existing = existing.parent
+            try:
+                existing.resolve().relative_to(resolved_root)
+            except ValueError:
+                return None
+            if any(
+                component.is_symlink()
+                for component in [
+                    lexical_root / Path(*relative.parts[:index])
+                    for index in range(1, len(relative.parts) + 1)
+                ]
+            ):
+                return None
+            if _should_ignore(str(relative), ignore_patterns):
+                return None
+            return str(relative)
+
+        def _stored_descendants(self, relative_directory: str) -> set[str]:
+            # Stored file paths use POSIX separators (#774).
+            directory = normalize_file_path(repo_root / relative_directory) + "/"
+            return {
+                str(Path(file_path).relative_to(repo_root))
+                for file_path in store.get_all_files()
+                if file_path.startswith(directory)
+            }
+
+        def _parseable_file(self, relative_path: str) -> bool:
+            absolute_path = repo_root / relative_path
+            resolved_path = absolute_path.resolve()
+            try:
+                resolved_path.relative_to(resolved_root)
+            except ValueError:
+                return False
+            return (
+                absolute_path.is_file()
+                and not absolute_path.is_symlink()
+                and parser.detect_language(absolute_path) is not None
+                and not _is_binary(absolute_path)
+            )
+
+        def _parseable_descendants(self, relative_directory: str) -> set[str]:
+            directory = repo_root / relative_directory
+            if not directory.is_dir() or directory.is_symlink():
+                return set()
+            return {
+                str(path.relative_to(repo_root))
+                for path in directory.rglob("*")
+                if self._parseable_file(str(path.relative_to(repo_root)))
+                and not _should_ignore(str(path.relative_to(repo_root)), ignore_patterns)
+            }
+
+        def _event_paths(self, event: FileSystemEvent) -> set[str]:
+            paths: set[str] = set()
+            source = self._relative_path(os.fsdecode(event.src_path))
+            destination_path = getattr(event, "dest_path", "")
+            destination = (
+                self._relative_path(os.fsdecode(destination_path))
+                if destination_path
+                else None
+            )
+            if event.is_directory:
+                if source is not None and event.event_type in {"deleted", "moved"}:
+                    paths.update(self._stored_descendants(source))
+                if destination is not None:
+                    paths.update(self._parseable_descendants(destination))
+                elif source is not None and event.event_type == "created":
+                    paths.update(self._parseable_descendants(source))
+            else:
+                if source is not None and event.event_type in {"deleted", "moved"}:
+                    paths.add(source)
+                elif source is not None and self._parseable_file(source):
+                    paths.add(source)
+                if destination is not None and self._parseable_file(destination):
+                    paths.add(destination)
+            return paths
+
+        def process(self, events: list[FileSystemEvent]) -> None:
+            try:
+                changed_files = sorted(
+                    {path for event in events for path in self._event_paths(event)}
+                )
+                if not changed_files:
+                    return
+                result = incremental_update(
+                    repo_root,
+                    store,
+                    changed_files=changed_files,
+                    reconcile_stale=False,
+                )
+                _raise_watch_update_errors(result, "incremental update")
+                if result["files_updated"] > 0 and on_files_updated is not None:
+                    postprocess_result = on_files_updated(store)
+                    _raise_watch_postprocess_warnings(postprocess_result)
+            except BaseException as exc:
+                self.failure = exc
+
+        def raise_if_failed(self) -> None:
+            if self.failure is not None:
+                raise RuntimeError("watch update failed") from self.failure
+
+    processor = WatchBatchProcessor()
+    debouncer = EventDebouncer(_DEBOUNCE_SECONDS, processor.process)
+
+    class GraphUpdateHandler(FileSystemEventHandler):
+        def dispatch(self, event: FileSystemEvent) -> None:
+            if event.event_type not in {"created", "modified", "deleted", "moved"}:
+                return
+            if event.is_directory and event.event_type == "modified":
+                return
+            debouncer.handle_event(event)
+
+        def start(self) -> None:
+            debouncer.start()
+
+        def stop(self) -> None:
+            debouncer.stop()
+            debouncer.join()
+
+        def process(self, events: list[FileSystemEvent]) -> None:
+            processor.process(events)
+
+        def raise_if_failed(self) -> None:
+            processor.raise_if_failed()
+
+    return GraphUpdateHandler()
 
 
 def watch(
@@ -1140,7 +1638,7 @@ def watch(
 ) -> None:
     """Watch for file changes and auto-update the graph.
 
-    Uses a 300ms debounce to batch rapid-fire saves into a single update.
+    Uses a one-second debounce to batch rapid-fire saves into a single update.
 
     Args:
         repo_root: Repository root to watch.
@@ -1150,119 +1648,17 @@ def watch(
             only argument.  Used by the CLI to run post-processing
             (FTS, flows, communities) after watch updates.
     """
-    import threading
-
-    from watchdog.events import FileSystemEventHandler
     from watchdog.observers import Observer
 
-    parser = CodeParser(repo_root)
-    ignore_patterns = _load_ignore_patterns(repo_root)
-
-    class GraphUpdateHandler(FileSystemEventHandler):
-        def __init__(self):
-            self._pending: set[str] = set()
-            self._lock = threading.Lock()
-            self._timer: threading.Timer | None = None
-
-        def _should_handle(self, path: str) -> bool:
-            if Path(path).is_symlink():
-                return False
-            try:
-                rel = str(Path(path).relative_to(repo_root))
-            except ValueError:
-                return False
-            if _should_ignore(rel, ignore_patterns):
-                return False
-            if parser.detect_language(Path(path)) is None:
-                return False
-            return True
-
-        def on_modified(self, event):
-            if event.is_directory:
-                return
-            if self._should_handle(event.src_path):
-                self._schedule(event.src_path)
-
-        def on_created(self, event):
-            if event.is_directory:
-                return
-            if self._should_handle(event.src_path):
-                self._schedule(event.src_path)
-
-        def on_deleted(self, event):
-            if event.is_directory:
-                return
-            # Only handle files we would normally track
-            try:
-                rel = str(Path(event.src_path).relative_to(repo_root))
-            except ValueError:
-                return
-            if _should_ignore(rel, ignore_patterns):
-                return
-            try:
-                store.remove_file_data(event.src_path)
-                store.commit()
-                logger.info("Removed: %s", rel)
-            except Exception as e:
-                logger.error("Error removing %s: %s", rel, e)
-
-        def _schedule(self, abs_path: str):
-            """Add file to pending set and reset the debounce timer."""
-            with self._lock:
-                self._pending.add(abs_path)
-                if self._timer is not None:
-                    self._timer.cancel()
-                self._timer = threading.Timer(_DEBOUNCE_SECONDS, self._flush)
-                self._timer.start()
-
-        def _flush(self):
-            """Process all pending files after the debounce window."""
-            with self._lock:
-                paths = list(self._pending)
-                self._pending.clear()
-                self._timer = None
-
-            updated = 0
-            for abs_path in paths:
-                if self._update_file(abs_path):
-                    updated += 1
-
-            if updated > 0 and on_files_updated is not None:
-                try:
-                    on_files_updated(store)
-                except Exception as e:
-                    logger.error("Post-update callback failed: %s", e)
-
-        def _update_file(self, abs_path: str) -> bool:
-            path = Path(abs_path)
-            if not path.is_file():
-                return False
-            if path.is_symlink():
-                return False
-            if _is_binary(path):
-                return False
-            try:
-                source = path.read_bytes()
-                fhash = hashlib.sha256(source).hexdigest()
-                nodes, edges = parser.parse_bytes(path, source)
-                store.store_file_nodes_edges(abs_path, nodes, edges, fhash)
-                store.set_metadata("last_updated", time.strftime("%Y-%m-%dT%H:%M:%S"))
-                store.commit()
-                rel = str(path.relative_to(repo_root))
-                logger.info(
-                    "Updated: %s (%d nodes, %d edges)",
-                    rel,
-                    len(nodes),
-                    len(edges),
-                )
-                return True
-            except Exception as e:
-                logger.error("Error updating %s: %s", abs_path, e)
-                return False
-
-    handler = GraphUpdateHandler()
+    initial = incremental_update(repo_root, store, changed_files=[])
+    _raise_watch_update_errors(initial, "initial watch reconciliation")
+    if initial["files_updated"] > 0 and on_files_updated is not None:
+        postprocess_result = on_files_updated(store)
+        _raise_watch_postprocess_warnings(postprocess_result)
+    handler = _create_watch_handler(repo_root, store, on_files_updated)
     observer = Observer()
     observer.schedule(handler, str(repo_root), recursive=True)
+    handler.start()
     observer.start()
 
     logger.info("Watching %s for changes... (Ctrl+C to stop)", repo_root)
@@ -1271,9 +1667,13 @@ def watch(
 
         while True:
             _time.sleep(1)
+            handler.raise_if_failed()
     except KeyboardInterrupt:
         observer.stop()
-    observer.join()
+    finally:
+        observer.stop()
+        observer.join()
+        handler.stop()
     logger.info("Watch stopped.")
 
 

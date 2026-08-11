@@ -3,15 +3,21 @@
 import logging
 import sqlite3
 import tempfile
-from pathlib import Path
+import time
+from pathlib import Path, PureWindowsPath
 
+import pytest
+
+import code_review_graph.constants as constants_module
 from code_review_graph.graph import GraphStore
+from code_review_graph.incremental import full_build
 from code_review_graph.parser import EdgeInfo, NodeInfo
 
 
 class TestGraphStore:
     def setup_method(self):
         self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.tmp.close()  # release the handle before GraphStore reopens it on Windows
         self.store = GraphStore(self.tmp.name)
 
     def teardown_method(self):
@@ -67,6 +73,42 @@ class TestGraphStore:
         assert result is not None
         assert result.parent_name == "MyClass"
 
+    def test_get_node_bridges_windows_native_qualified_names(self):
+        """A Windows-native path prefix still finds the POSIX-keyed node (#774)."""
+        path = "repo/pkg/mod.py"
+        self.store.upsert_node(self._make_file_node(path))
+        self.store.upsert_node(self._make_func_node("my_func", path))
+        self.store.commit()
+
+        native_prefix = str(PureWindowsPath(path))
+        assert native_prefix == "repo\\pkg\\mod.py"
+        native_qn = f"{native_prefix}::my_func"
+        result = self.store.get_node(native_qn)
+        assert result is not None
+        assert result.qualified_name == "repo/pkg/mod.py::my_func"
+
+        file_node = self.store.get_node(native_prefix)
+        assert file_node is not None
+        assert file_node.qualified_name == "repo/pkg/mod.py"
+
+        assert self.store.get_node(f"{native_prefix}::missing") is None
+
+    def test_get_node_bridge_keeps_php_backslashes_in_symbol_part(self):
+        """Only the path component is normalized; PHP FQN symbols keep ``\\``."""
+        node = NodeInfo(
+            kind="Class", name="App\\Domain\\Job", file_path="src/App.php",
+            line_start=1, line_end=10, language="php",
+        )
+        self.store.upsert_node(node)
+        self.store.commit()
+
+        posix_qn = "src/App.php::App\\Domain\\Job"
+        assert self.store.get_node(posix_qn) is not None
+        native_qn = "src\\App.php::App\\Domain\\Job"
+        bridged = self.store.get_node(native_qn)
+        assert bridged is not None
+        assert bridged.qualified_name == posix_qn
+
     def test_upsert_edge(self):
         edge = EdgeInfo(
             kind="CALLS",
@@ -95,6 +137,216 @@ class TestGraphStore:
 
         assert self.store.get_node("/test/file.py") is None
         assert self.store.get_node("/test/file.py::my_func") is None
+
+    def test_remove_file_permanently_removes_references_and_same_db_embeddings(self):
+        deleted_path = "/test/deleted.py"
+        survivor_path = "/test/survivor.py"
+        deleted_qn = f"{deleted_path}::removed"
+        survivor_qn = f"{survivor_path}::caller"
+        self.store.store_file_nodes_edges(
+            deleted_path,
+            [
+                self._make_file_node(deleted_path),
+                self._make_func_node("removed", deleted_path),
+            ],
+            [],
+        )
+        self.store.store_file_nodes_edges(
+            survivor_path,
+            [
+                self._make_file_node(survivor_path),
+                self._make_func_node("caller", survivor_path),
+            ],
+            [
+                EdgeInfo(
+                    kind="CALLS",
+                    source=survivor_qn,
+                    target=deleted_qn,
+                    file_path=survivor_path,
+                ),
+            ],
+        )
+        self.store._conn.execute(
+            "CREATE TABLE embeddings ("
+            "qualified_name TEXT PRIMARY KEY, vector BLOB NOT NULL, "
+            "text_hash TEXT NOT NULL, provider TEXT NOT NULL)"
+        )
+        self.store._conn.executemany(
+            "INSERT INTO embeddings VALUES (?, ?, ?, ?)",
+            [
+                (deleted_qn, b"deleted", "deleted", "test"),
+                (survivor_qn, b"survivor", "survivor", "test"),
+                ("unrelated::orphan", b"orphan", "orphan", "test"),
+            ],
+        )
+        self.store.commit()
+
+        self.store.remove_file_permanently(deleted_path)
+        self.store.commit()
+
+        assert self.store.get_nodes_by_file(deleted_path) == []
+        assert self.store.get_node(survivor_qn) is not None
+        assert self.store.get_edges_by_source(survivor_qn) == []
+        embeddings = self.store._conn.execute(
+            "SELECT qualified_name FROM embeddings ORDER BY qualified_name"
+        ).fetchall()
+        assert [row["qualified_name"] for row in embeddings] == [
+            survivor_qn,
+            "unrelated::orphan",
+        ]
+
+    def test_remove_file_permanently_handles_more_than_sqlite_variable_limit(self):
+        deleted_path = "/test/large.py"
+        rows = [
+            (
+                "Function",
+                f"node_{index}",
+                f"{deleted_path}::node_{index}",
+                deleted_path,
+                index + 1,
+                index + 1,
+                "python",
+                0,
+                0.0,
+            )
+            for index in range(16_384)
+        ]
+        self.store._conn.executemany(
+            "INSERT INTO nodes "
+            "(kind, name, qualified_name, file_path, line_start, line_end, language, "
+            "is_test, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            rows,
+        )
+        self.store.commit()
+
+        changed = self.store.remove_file_permanently(deleted_path)
+
+        assert changed == 1
+        assert self.store.get_nodes_by_file(deleted_path) == []
+
+    def test_remove_files_permanently_rolls_back_every_table_on_failure(self):
+        deleted_path = "/test/deleted.py"
+        survivor_path = "/test/survivor.py"
+        deleted_qn = f"{deleted_path}::removed"
+        survivor_qn = f"{survivor_path}::caller"
+        self.store.store_file_nodes_edges(
+            deleted_path,
+            [self._make_file_node(deleted_path), self._make_func_node("removed", deleted_path)],
+            [
+                EdgeInfo(
+                    kind="CONTAINS",
+                    source=deleted_path,
+                    target=deleted_qn,
+                    file_path=deleted_path,
+                )
+            ],
+        )
+        self.store.store_file_nodes_edges(
+            survivor_path,
+            [self._make_file_node(survivor_path), self._make_func_node("caller", survivor_path)],
+            [
+                EdgeInfo(
+                    kind="CALLS",
+                    source=survivor_qn,
+                    target=deleted_qn,
+                    file_path=survivor_path,
+                )
+            ],
+        )
+        self.store._conn.execute(
+            "CREATE TABLE embeddings (qualified_name TEXT PRIMARY KEY, vector BLOB NOT NULL, "
+            "text_hash TEXT NOT NULL, provider TEXT NOT NULL)"
+        )
+        self.store._conn.execute(
+            "INSERT INTO embeddings VALUES (?, ?, ?, ?)",
+            (deleted_qn, b"deleted", "deleted", "test"),
+        )
+        self.store.commit()
+        before = {
+            "nodes": self.store._conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0],
+            "edges": self.store._conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0],
+            "embeddings": self.store._conn.execute("SELECT COUNT(*) FROM embeddings").fetchone()[0],
+        }
+
+        self.store._conn.execute(
+            "CREATE TRIGGER fail_deleted_node BEFORE DELETE ON nodes "
+            f"WHEN OLD.file_path = '{deleted_path}' "
+            "BEGIN SELECT RAISE(ABORT, 'injected deletion failure'); END"
+        )
+        self.store.commit()
+
+        with pytest.raises(sqlite3.IntegrityError, match="injected deletion failure"):
+            self.store.remove_files_permanently([deleted_path])
+
+        after = {
+            "nodes": self.store._conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0],
+            "edges": self.store._conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0],
+            "embeddings": self.store._conn.execute("SELECT COUNT(*) FROM embeddings").fetchone()[0],
+        }
+        assert after == before
+
+    def test_remove_files_permanently_counts_changed_paths_and_commits_once(self):
+        paths = ["/test/first.py", "/test/second.py", "/test/missing.py"]
+        for path in paths[:2]:
+            self.store.store_file_nodes_edges(path, [self._make_file_node(path)], [])
+
+        commits = 0
+
+        def count_commits() -> int:
+            nonlocal commits
+            commits += 1
+            return 0
+
+        self.store._conn.set_trace_callback(
+            lambda statement: count_commits() if statement == "COMMIT" else None
+        )
+        changed = self.store.remove_files_permanently(paths)
+
+        assert changed == 2
+        assert commits == 1
+
+    def test_replacement_preserves_incoming_edges_from_other_files(self):
+        target_path = "/test/target.py"
+        caller_path = "/test/caller.py"
+        target_qn = f"{target_path}::target"
+        caller_qn = f"{caller_path}::caller"
+        self.store.store_file_nodes_edges(
+            target_path,
+            [
+                self._make_file_node(target_path),
+                self._make_func_node("target", target_path),
+            ],
+            [],
+        )
+        self.store.store_file_nodes_edges(
+            caller_path,
+            [
+                self._make_file_node(caller_path),
+                self._make_func_node("caller", caller_path),
+            ],
+            [
+                EdgeInfo(
+                    kind="CALLS",
+                    source=caller_qn,
+                    target=target_qn,
+                    file_path=caller_path,
+                ),
+            ],
+        )
+
+        self.store.store_file_nodes_edges(
+            target_path,
+            [
+                self._make_file_node(target_path),
+                self._make_func_node("target", target_path),
+            ],
+            [],
+        )
+
+        incoming = self.store.get_edges_by_target(target_qn)
+        assert [(edge.source_qualified, edge.file_path) for edge in incoming] == [
+            (caller_qn, caller_path),
+        ]
 
     def test_store_file_nodes_edges(self):
         nodes = [self._make_file_node(), self._make_func_node()]
@@ -206,15 +458,22 @@ class TestGraphStore:
         assert stats.nodes_by_kind["Class"] == 1
         assert "python" in stats.languages
 
+    def test_has_nodes(self):
+        assert self.store.has_nodes() is False
+
+        self.store.upsert_node(self._make_file_node())
+
+        assert self.store.has_nodes() is True
+
     def test_impact_radius(self):
-        # Create a chain: file_a -> func_a -> (calls) -> func_b in file_b
+        # func_b depends on the changed func_a, so func_b is impacted.
         self.store.upsert_node(self._make_file_node("/a.py"))
         self.store.upsert_node(self._make_func_node("func_a", "/a.py"))
         self.store.upsert_node(self._make_file_node("/b.py"))
         self.store.upsert_node(self._make_func_node("func_b", "/b.py"))
         self.store.upsert_edge(EdgeInfo(
-            kind="CALLS", source="/a.py::func_a",
-            target="/b.py::func_b", file_path="/a.py", line=10,
+            kind="CALLS", source="/b.py::func_b",
+            target="/a.py::func_a", file_path="/b.py", line=10,
         ))
         self.store.commit()
 
@@ -396,6 +655,7 @@ class TestImpactRadiusSql:
 
     def setup_method(self):
         self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.tmp.close()  # release the handle before GraphStore reopens it on Windows
         self.store = GraphStore(self.tmp.name)
         self._build_chain()
 
@@ -404,7 +664,7 @@ class TestImpactRadiusSql:
         Path(self.tmp.name).unlink(missing_ok=True)
 
     def _build_chain(self):
-        """Build A -> B -> C -> D chain for testing."""
+        """Build D -> C -> B -> A dependency chain for testing."""
         for name, path in [
             ("func_a", "/a.py"), ("func_b", "/b.py"),
             ("func_c", "/c.py"), ("func_d", "/d.py"),
@@ -418,16 +678,16 @@ class TestImpactRadiusSql:
                 line_start=5, line_end=20, language="python",
             ))
         self.store.upsert_edge(EdgeInfo(
-            kind="CALLS", source="/a.py::func_a",
-            target="/b.py::func_b", file_path="/a.py", line=10,
-        ))
-        self.store.upsert_edge(EdgeInfo(
             kind="CALLS", source="/b.py::func_b",
-            target="/c.py::func_c", file_path="/b.py", line=10,
+            target="/a.py::func_a", file_path="/b.py", line=10,
         ))
         self.store.upsert_edge(EdgeInfo(
             kind="CALLS", source="/c.py::func_c",
-            target="/d.py::func_d", file_path="/c.py", line=10,
+            target="/b.py::func_b", file_path="/c.py", line=10,
+        ))
+        self.store.upsert_edge(EdgeInfo(
+            kind="CALLS", source="/d.py::func_d",
+            target="/c.py::func_c", file_path="/d.py", line=10,
         ))
         self.store.commit()
 
@@ -438,6 +698,7 @@ class TestImpactRadiusSql:
 
         sql_qns = {n.qualified_name for n in sql_result["impacted_nodes"]}
         nx_qns = {n.qualified_name for n in nx_result["impacted_nodes"]}
+        assert sql_qns == {"/b.py::func_b", "/c.py::func_c"}
         assert sql_qns == nx_qns
 
     def test_max_nodes_truncation(self):
@@ -445,8 +706,9 @@ class TestImpactRadiusSql:
         result = self.store.get_impact_radius_sql(
             ["/a.py"], max_depth=3, max_nodes=2,
         )
-        # With 4 files in chain + file nodes, max_nodes=2 should limit
-        assert result["total_impacted"] <= 2 or result["truncated"]
+        assert result["truncated"] is True
+        assert result["total_impacted"] == 3
+        assert len(result["impacted_nodes"]) == 2
 
     def test_empty_changed_files(self):
         result = self.store.get_impact_radius_sql([], max_depth=2)
@@ -455,11 +717,364 @@ class TestImpactRadiusSql:
         assert result["total_impacted"] == 0
 
 
+def test_impact_radius_real_build_includes_importer_not_imported_dependency(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A real parsed import graph follows impact toward dependents only."""
+    monkeypatch.setenv("CRG_SERIAL_PARSE", "1")
+    dependency = tmp_path / "dependency.py"
+    changed = tmp_path / "changed.py"
+    importer = tmp_path / "importer.py"
+    dependency.write_text("VALUE = 1\n", encoding="utf-8")
+    changed.write_text(
+        "from dependency import VALUE\n\n"
+        "def changed_value():\n"
+        "    return VALUE\n",
+        encoding="utf-8",
+    )
+    importer.write_text(
+        "from changed import changed_value\n\n"
+        "def consume():\n"
+        "    return changed_value()\n",
+        encoding="utf-8",
+    )
+
+    with GraphStore(tmp_path / "graph.db") as store:
+        built = full_build(tmp_path, store)
+        assert built["errors"] == []
+
+        sql = store.get_impact_radius_sql([str(changed)], max_depth=1)
+        networkx = store._get_impact_radius_networkx(
+            [str(changed)],
+            max_depth=1,
+        )
+
+    expected = {importer.as_posix()}
+    assert set(sql["impacted_files"]) == expected
+    assert set(networkx["impacted_files"]) == expected
+    assert dependency.as_posix() not in sql["impacted_files"]
+    assert sql["impact_scores"] == networkx["impact_scores"]
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("0.75", 0.75),
+        ("", 0.6),
+        ("not-a-number", 0.6),
+        ("nan", 0.6),
+        ("inf", 0.6),
+        ("-0.1", 0.6),
+        ("0", 0.6),
+        ("1", 0.6),
+        ("1.2", 0.6),
+    ],
+)
+def test_impact_float_configuration_is_finite_and_bounded(
+    monkeypatch, raw, expected,
+):
+    monkeypatch.setenv("CRG_TEST_IMPACT_FLOAT", raw)
+    assert constants_module._bounded_float_env(
+        "CRG_TEST_IMPACT_FLOAT", 0.6, lower=0.0, upper=1.0,
+    ) == pytest.approx(expected)
+
+
+class TestWeightedImpactScoring:
+    """Best-path scoring stays ranked, bounded, and engine-independent."""
+
+    def setup_method(self):
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.tmp.close()
+        self.store = GraphStore(self.tmp.name)
+
+    def teardown_method(self):
+        self.store.close()
+        Path(self.tmp.name).unlink(missing_ok=True)
+
+    def _add_func(self, name: str, path: str) -> str:
+        self.store.upsert_node(NodeInfo(
+            kind="Function", name=name, file_path=path,
+            line_start=1, line_end=10, language="python",
+        ))
+        return f"{path}::{name}"
+
+    def _add_edge(
+        self, kind: str, source: str, target: str, line: int = 1,
+    ) -> None:
+        self.store.upsert_edge(EdgeInfo(
+            kind=kind, source=source, target=target,
+            file_path="/seed.py", line=line,
+        ))
+
+    @staticmethod
+    def _ordered_qns(result) -> list[str]:
+        return [node.qualified_name for node in result["impacted_nodes"]]
+
+    @pytest.mark.parametrize(
+        "kind",
+        [
+            "CALLS",
+            "IMPORTS_FROM",
+            "DEPENDS_ON",
+            "REFERENCES",
+            "INHERITS",
+            "OVERRIDES",
+            "IMPLEMENTS",
+        ],
+    )
+    def test_dependency_edges_include_dependents_not_dependencies(self, kind):
+        seed = self._add_func("seed", "/seed.py")
+        dependent = self._add_func("dependent", "/dependent.py")
+        dependency = self._add_func("dependency", "/dependency.py")
+        self._add_edge(kind, dependent, seed)
+        self._add_edge(kind, seed, dependency, line=2)
+        self.store.commit()
+
+        sql = self.store.get_impact_radius_sql(["/seed.py"], max_depth=1)
+        nx_result = self.store._get_impact_radius_networkx(
+            ["/seed.py"], max_depth=1,
+        )
+
+        assert self._ordered_qns(sql) == [dependent]
+        assert self._ordered_qns(nx_result) == [dependent]
+        assert sql["impact_scores"] == nx_result["impact_scores"]
+
+    def test_tested_by_traverses_from_production_to_test_only(self):
+        seed = self._add_func("seed", "/seed.py")
+        test = self._add_func("test_seed", "/test_seed.py")
+        unrelated_production = self._add_func(
+            "unrelated_production", "/unrelated.py",
+        )
+        self._add_edge("TESTED_BY", seed, test)
+        self._add_edge("TESTED_BY", unrelated_production, seed, line=2)
+        self.store.commit()
+
+        sql = self.store.get_impact_radius_sql(["/seed.py"], max_depth=1)
+        nx_result = self.store._get_impact_radius_networkx(
+            ["/seed.py"], max_depth=1,
+        )
+
+        assert self._ordered_qns(sql) == [test]
+        assert self._ordered_qns(nx_result) == [test]
+        assert sql["impact_scores"] == nx_result["impact_scores"]
+
+    def test_contains_edge_cannot_bridge_impact(self):
+        seed = self._add_func("seed", "/seed.py")
+        stale_container = "stale.py::Container"
+        dependent = self._add_func("dependent", "/dependent.py")
+        self._add_edge("CONTAINS", stale_container, seed)
+        self._add_edge("CALLS", dependent, stale_container, line=2)
+        self.store.commit()
+
+        sql = self.store.get_impact_radius_sql(["/seed.py"], max_depth=2)
+        nx_result = self.store._get_impact_radius_networkx(
+            ["/seed.py"], max_depth=2,
+        )
+
+        assert self._ordered_qns(sql) == []
+        assert self._ordered_qns(nx_result) == []
+        assert sql["impact_scores"] == nx_result["impact_scores"]
+
+    def test_unknown_edge_kind_defaults_to_incoming_dependency_direction(self):
+        seed = self._add_func("seed", "/seed.py")
+        dependent = self._add_func("dependent", "/dependent.py")
+        dependency = self._add_func("dependency", "/dependency.py")
+        self._add_edge("UNKNOWN_KIND", dependent, seed)
+        self._add_edge("UNKNOWN_KIND", seed, dependency, line=2)
+        self.store.commit()
+
+        sql = self.store.get_impact_radius_sql(["/seed.py"], max_depth=1)
+        nx_result = self.store._get_impact_radius_networkx(
+            ["/seed.py"], max_depth=1,
+        )
+
+        assert self._ordered_qns(sql) == [dependent]
+        assert sql["impact_scores"][dependent] == pytest.approx(0.3)
+        assert self._ordered_qns(nx_result) == [dependent]
+        assert sql["impact_scores"] == nx_result["impact_scores"]
+
+    def test_edge_weights_rank_best_path_and_engines_match(self):
+        seed = self._add_func("seed", "/seed.py")
+        caller = self._add_func("caller", "/caller.py")
+        importer = self._add_func("importer", "/importer.py")
+        indirect_caller = self._add_func(
+            "indirect_caller", "/indirect_caller.py",
+        )
+        self._add_edge("CALLS", caller, seed)
+        self._add_edge("IMPORTS_FROM", importer, seed)
+        self._add_edge("CALLS", indirect_caller, caller)
+        self.store.commit()
+
+        sql = self.store.get_impact_radius_sql(["/seed.py"], max_depth=2)
+        nx_result = self.store._get_impact_radius_networkx(
+            ["/seed.py"], max_depth=2,
+        )
+
+        assert sql["impact_scores"][caller] == pytest.approx(0.6)
+        assert sql["impact_scores"][indirect_caller] == pytest.approx(0.36)
+        assert sql["impact_scores"][importer] == pytest.approx(0.3)
+        assert self._ordered_qns(sql) == [
+            caller, indirect_caller, importer,
+        ]
+        assert sql["impact_scores"] == nx_result["impact_scores"]
+        assert self._ordered_qns(sql) == self._ordered_qns(nx_result)
+
+    def test_deeper_strong_path_beats_shallow_weak_path(self):
+        seed = self._add_func("seed", "/seed.py")
+        middle = self._add_func("middle", "/middle.py")
+        target = self._add_func("target", "/target.py")
+        self._add_edge("IMPORTS_FROM", target, seed)
+        self._add_edge("CALLS", middle, seed, line=2)
+        self._add_edge("CALLS", target, middle, line=3)
+        self.store.commit()
+
+        sql = self.store.get_impact_radius_sql(["/seed.py"], max_depth=2)
+        nx_result = self.store._get_impact_radius_networkx(
+            ["/seed.py"], max_depth=2,
+        )
+
+        assert sql["impact_scores"][target] == pytest.approx(0.36)
+        assert sql["impact_scores"] == nx_result["impact_scores"]
+
+    def test_score_floor_stops_expansion_in_both_engines(self):
+        qns = [
+            self._add_func(f"node_{index}", f"/node_{index}.py")
+            for index in range(8)
+        ]
+        for index, (source, target) in enumerate(zip(qns[1:], qns)):
+            self._add_edge("CALLS", source, target, line=index + 1)
+        self.store.commit()
+
+        sql = self.store.get_impact_radius_sql(
+            ["/node_0.py"], max_depth=8,
+        )
+        nx_result = self.store._get_impact_radius_networkx(
+            ["/node_0.py"], max_depth=8,
+        )
+
+        assert qns[5] in sql["impact_scores"]
+        assert qns[6] not in sql["impact_scores"]
+        assert sql["impact_scores"] == nx_result["impact_scores"]
+
+    def test_unknown_edge_kind_uses_default_weight(self):
+        seed = self._add_func("seed", "/seed.py")
+        target = self._add_func("target", "/target.py")
+        self._add_edge("UNKNOWN_KIND", target, seed)
+        self.store.commit()
+
+        sql = self.store.get_impact_radius_sql(["/seed.py"], max_depth=1)
+        nx_result = self.store._get_impact_radius_networkx(
+            ["/seed.py"], max_depth=1,
+        )
+
+        assert sql["impact_scores"][target] == pytest.approx(0.3)
+        assert sql["impact_scores"] == nx_result["impact_scores"]
+
+    def test_truncation_is_exact_at_boundary_and_uses_sentinel(self):
+        seed = self._add_func("seed", "/seed.py")
+        targets = [
+            self._add_func(f"target_{index}", f"/target_{index}.py")
+            for index in range(3)
+        ]
+        for index, target in enumerate(targets):
+            self._add_edge("CALLS", target, seed, line=index + 1)
+        self.store.commit()
+
+        exact = self.store.get_impact_radius_sql(
+            ["/seed.py"], max_depth=1, max_nodes=3,
+        )
+        capped = self.store.get_impact_radius_sql(
+            ["/seed.py"], max_depth=1, max_nodes=2,
+        )
+
+        assert exact["truncated"] is False
+        assert exact["total_impacted"] == 3
+        assert capped["truncated"] is True
+        assert capped["total_impacted"] == 3
+        assert len(capped["impacted_nodes"]) == 2
+
+    def test_ghost_endpoint_bridges_without_consuming_limit(self):
+        seed = self._add_func("seed", "/seed.py")
+        target = self._add_func("target", "/target.py")
+        ghost = "external.package::ghost"
+        self._add_edge("CALLS", ghost, seed)
+        self._add_edge("CALLS", target, ghost, line=2)
+        self.store.commit()
+
+        result = self.store.get_impact_radius_sql(
+            ["/seed.py"], max_depth=2, max_nodes=1,
+        )
+
+        assert self._ordered_qns(result) == [target]
+        assert ghost not in result["impact_scores"]
+        assert result["truncated"] is False
+
+    def test_parallel_edges_use_strongest_weight_in_both_engines(self):
+        seed = self._add_func("seed", "/seed.py")
+        target = self._add_func("target", "/target.py")
+        self._add_edge("CALLS", target, seed, line=1)
+        self._add_edge("IMPORTS_FROM", target, seed, line=2)
+        self.store.commit()
+
+        sql = self.store.get_impact_radius_sql(["/seed.py"], max_depth=1)
+        nx_result = self.store._get_impact_radius_networkx(
+            ["/seed.py"], max_depth=1,
+        )
+        assert sql["impact_scores"][target] == pytest.approx(0.6)
+        assert sql["impact_scores"] == nx_result["impact_scores"]
+
+    def test_parallel_edges_preserve_each_direction_in_both_engines(self):
+        source = self._add_func("source", "/source.py")
+        target = self._add_func("target", "/target.py")
+        self._add_edge("CALLS", source, target, line=1)
+        self._add_edge("TESTED_BY", source, target, line=2)
+        self.store.commit()
+
+        for path, expected_qn, expected_score in (
+            ("/source.py", target, 0.42),
+            ("/target.py", source, 0.6),
+        ):
+            sql = self.store.get_impact_radius_sql([path], max_depth=1)
+            nx_result = self.store._get_impact_radius_networkx(
+                [path], max_depth=1,
+            )
+
+            assert self._ordered_qns(sql) == [expected_qn]
+            assert sql["impact_scores"][expected_qn] == pytest.approx(
+                expected_score,
+            )
+            assert sql["impact_scores"] == nx_result["impact_scores"]
+
+    def test_dense_mixed_cycle_is_bounded(self):
+        qns = [self._add_func(f"node_{i}", f"/node_{i}.py") for i in range(12)]
+        line = 1
+        for source_index, source in enumerate(qns):
+            for target_index, target in enumerate(qns):
+                if source_index == target_index:
+                    continue
+                kind = "CALLS" if (source_index + target_index) % 2 else "IMPORTS_FROM"
+                self._add_edge(kind, source, target, line=line)
+                line += 1
+        self.store.commit()
+
+        started = time.monotonic()
+        result = self.store.get_impact_radius_sql(
+            ["/node_0.py"], max_depth=25, max_nodes=20,
+        )
+        elapsed = time.monotonic() - started
+
+        assert len(result["impacted_nodes"]) == 11
+        assert result["truncated"] is False
+        assert elapsed < 5.0
+
+
 class TestGetTransitiveTestsFrontierCap:
     """Regression tests for O(N*M) query explosion in get_transitive_tests."""
 
     def setup_method(self):
         self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.tmp.close()  # release the handle before GraphStore reopens it on Windows
         self.store = GraphStore(self.tmp.name)
 
     def teardown_method(self):
@@ -529,6 +1144,7 @@ class TestGetTransitiveTestsFrontierCap:
         assert indirect_default[0]["name"] == indirect_capped[0]["name"]
 
 
+<<<<<<< HEAD
 class TestResolveBareTargets:
     """Bare cross-file CALLS and INHERITS targets must be resolved to node
     qualified_names so every graph command (impact radius, query_graph,
@@ -607,3 +1223,149 @@ class TestResolveBareTargets:
         ]
         # Ambiguous -> stays bare, never guesses.
         assert targets == ["Base"]
+=======
+class TestResolveBareEndpoints:
+    """Only graph evidence may turn a bare call/test endpoint into a node."""
+
+    def setup_method(self):
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.tmp.close()
+        self.store = GraphStore(self.tmp.name)
+
+    def teardown_method(self):
+        self.store.close()
+        Path(self.tmp.name).unlink(missing_ok=True)
+
+    def _func(self, name: str, path: str, *, is_test: bool = False) -> str:
+        self.store.upsert_node(NodeInfo(
+            kind="Test" if is_test else "Function",
+            name=name,
+            file_path=path,
+            line_start=1,
+            line_end=5,
+            language="python",
+            is_test=is_test,
+        ))
+        return f"{path}::{name}"
+
+    def _edge(
+        self, kind: str, source: str, target: str, file_path: str,
+    ) -> None:
+        self.store.upsert_edge(EdgeInfo(
+            kind=kind,
+            source=source,
+            target=target,
+            file_path=file_path,
+            line=1,
+        ))
+
+    def _endpoints(self, kind: str) -> list[tuple[str, str]]:
+        rows = self.store._conn.execute(
+            "SELECT source_qualified, target_qualified FROM edges "
+            "WHERE kind = ? ORDER BY id",
+            (kind,),
+        ).fetchall()
+        return [
+            (row["source_qualified"], row["target_qualified"])
+            for row in rows
+        ]
+
+    def test_unique_tested_by_source_without_evidence_stays_bare(self):
+        """A globally unique name in an unrelated file is still not evidence."""
+        self._func("parse", "/repo/src/app.py")
+        test_qn = self._func(
+            "test_parse", "/repo/tests/test_other.py", is_test=True,
+        )
+        self._edge("TESTED_BY", "parse", test_qn, "/repo/tests/test_other.py")
+        self.store.commit()
+
+        assert self.store.resolve_bare_tested_by_sources() == 0
+        assert self._endpoints("TESTED_BY") == [("parse", test_qn)]
+
+    def test_unique_tested_by_source_resolves_with_import_evidence(self):
+        source_qn = self._func("parse", "/repo/src/app.py")
+        test_file = "/repo/tests/test_app.py"
+        test_qn = self._func("test_parse", test_file, is_test=True)
+        self._edge("IMPORTS_FROM", test_file, "/repo/src/app.py", test_file)
+        self._edge("TESTED_BY", "parse", test_qn, test_file)
+        self.store.commit()
+
+        assert self.store.resolve_bare_tested_by_sources() == 1
+        assert self._endpoints("TESTED_BY") == [(source_qn, test_qn)]
+
+    def test_ambiguous_tested_by_source_uses_one_imported_candidate(self):
+        source_qn = self._func("parse", "/repo/src/app.py")
+        self._func("parse", "/repo/vendor/app.py")
+        test_file = "/repo/tests/test_app.py"
+        test_qn = self._func("test_parse", test_file, is_test=True)
+        self._edge("IMPORTS_FROM", test_file, "/repo/src/app.py", test_file)
+        self._edge("TESTED_BY", "parse", test_qn, test_file)
+        self.store.commit()
+
+        assert self.store.resolve_bare_tested_by_sources() == 1
+        assert self._endpoints("TESTED_BY") == [(source_qn, test_qn)]
+
+    def test_same_file_call_target_is_strong_evidence(self):
+        file_path = "/repo/src/app.py"
+        caller_qn = self._func("caller", file_path)
+        helper_qn = self._func("helper", file_path)
+        self._edge("CALLS", caller_qn, "helper", file_path)
+        self.store.commit()
+
+        assert self.store.resolve_bare_call_targets() == 1
+        assert self._endpoints("CALLS") == [(caller_qn, helper_qn)]
+
+    def test_unique_unrelated_call_target_stays_bare(self):
+        caller_file = "/repo/src/app.py"
+        caller_qn = self._func("caller", caller_file)
+        self._func("helper", "/repo/unrelated/util.py")
+        self._edge("CALLS", caller_qn, "helper", caller_file)
+        self.store.commit()
+
+        assert self.store.resolve_bare_call_targets() == 0
+        assert self._endpoints("CALLS") == [(caller_qn, "helper")]
+
+    def test_tests_for_does_not_guess_unrelated_bare_source(self):
+        source_qn = self._func("parse", "/repo/src/app.py")
+        test_file = "/repo/tests/test_other.py"
+        test_qn = self._func("test_parse", test_file, is_test=True)
+        self._edge("TESTED_BY", "parse", test_qn, test_file)
+        self.store.commit()
+
+        assert self.store.get_transitive_tests(source_qn, max_depth=0) == []
+
+    def test_tests_for_accepts_unique_import_backed_bare_source(self):
+        source_qn = self._func("parse", "/repo/src/app.py")
+        test_file = "/repo/tests/test_app.py"
+        test_qn = self._func("test_parse", test_file, is_test=True)
+        self._edge("IMPORTS_FROM", test_file, "/repo/src/app.py", test_file)
+        self._edge("TESTED_BY", "parse", test_qn, test_file)
+        self.store.commit()
+
+        results = self.store.get_transitive_tests(source_qn, max_depth=0)
+        assert [result["qualified_name"] for result in results] == [test_qn]
+
+    def test_tests_for_rejects_bare_source_with_two_imported_candidates(self):
+        first_qn = self._func("parse", "/repo/src/app.py")
+        second_qn = self._func("parse", "/repo/vendor/app.py")
+        test_file = "/repo/tests/test_app.py"
+        test_qn = self._func("test_parse", test_file, is_test=True)
+        self._edge("IMPORTS_FROM", test_file, "/repo/src/app.py", test_file)
+        self._edge("IMPORTS_FROM", test_file, "/repo/vendor/app.py", test_file)
+        self._edge("TESTED_BY", "parse", test_qn, test_file)
+        self.store.commit()
+
+        assert self.store.get_transitive_tests(first_qn, max_depth=0) == []
+        assert self.store.get_transitive_tests(second_qn, max_depth=0) == []
+
+    def test_transitive_tests_do_not_follow_unresolved_bare_callee(self):
+        hub_qn = self._func("hub", "/repo/src/hub.py")
+        self._func("parse", "/repo/unrelated/app.py")
+        test_file = "/repo/tests/test_app.py"
+        test_qn = self._func("test_parse", test_file, is_test=True)
+        self._edge("CALLS", hub_qn, "parse", "/repo/src/hub.py")
+        self._edge("TESTED_BY", "parse", test_qn, test_file)
+        self.store.commit()
+
+        assert self.store.get_transitive_tests(hub_qn, max_depth=1) == []
+>>>>>>> upstream/main

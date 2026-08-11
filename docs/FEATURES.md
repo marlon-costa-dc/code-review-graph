@@ -1,6 +1,7 @@
 # Features
 
 ## v2.3.6 (Current)
+- **Framework-aware PHP parsing**: traits, enums, object creation, and base clauses are indexed; Composer PSR-4 resolution is longest-prefix, multi-directory, cached, and repository-bounded; Blade references ignore comments/escaped directives; Laravel Route and Eloquent edges require explicit framework/import/receiver evidence.
 - **Custom languages without forking**: drop a `.code-review-graph/languages.toml` into your repo to index any grammar shipped by tree-sitter-language-pack — extension map plus node-type lists, validated and capped, with built-in languages always winning. See [CUSTOM_LANGUAGES.md](CUSTOM_LANGUAGES.md).
 - **GitHub Action for risk-scored PR reviews**: composite `action.yml` builds/restores the graph from CI cache, runs `detect-changes` against the PR base, and upserts a sticky comment with risk table, affected flows, test gaps, and the Token Savings line. Optional `fail-on-risk` merge gate. Dogfooded on this repo via `.github/workflows/pr-review.yml`. See [GITHUB_ACTION.md](GITHUB_ACTION.md).
 - **`agent_baseline` eval benchmark**: compares graph queries against a realistic grep-and-read-top-k agent baseline instead of the whole-corpus strawman; wired into all six pinned eval configs.
@@ -36,7 +37,7 @@
 - **Graph lookup correctness**: Review, impact, and file-summary tools resolve user-facing paths to stored graph paths; `callers_of` includes cross-file callers even when same-file callers exist.
 - **Install/runtime reliability**: Generated Codex/Claude hooks drain stdin, bundled docs are available from wheels, missing local embeddings report unavailable status, and `.svn` roots pass validation.
 - **CLI reliability**: `build --skip-postprocess` and `update --skip-flows` honor the requested post-processing level.
-- **Broad parser surface**: Python, JavaScript/TypeScript/TSX, Go, Rust, Java, C/C++, C#, Ruby, Kotlin, Swift, PHP, Scala, Solidity, Dart, R, Perl, Lua/Luau, Objective-C, shell scripts, Elixir, Zig, PowerShell, Julia, ReScript, GDScript, Nix, Verilog/SystemVerilog, SQL, Vue/Svelte SFCs, Astro files parsed through the TypeScript parser, Jupyter/Databricks notebooks, and Perl XS files.
+- **Broad parser surface**: Python, JavaScript/TypeScript/TSX, Go, Rust, Java, C/C++, C#, VB.NET, Ruby, Kotlin, Swift, PHP, Scala, Solidity, Dart, R, Perl, Lua/Luau, Objective-C, shell scripts, Elixir, Zig, PowerShell, Julia, ReScript, GDScript, Nix, Verilog/SystemVerilog, SQL, Terraform/OpenTofu structure (`.tf`; generic `.hcl` files are recognized as file nodes), Ansible playbooks/roles/tasks, Vue/Svelte SFCs, Astro files parsed through the TypeScript parser, Jupyter/Databricks notebooks, and Perl XS files. Generic YAML is not treated as source code.
 - **Local-first by design**: SQLite graph storage remains local, with no telemetry and no cloud-default behavior.
 
 ## v2.0.0

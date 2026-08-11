@@ -4,7 +4,11 @@ build-backend = "hatchling.build"
 
 [project]
 name = "code-review-graph"
+<<<<<<< HEAD
 version = "2.4.0+dc1"
+=======
+version = "2.3.7"
+>>>>>>> upstream/main
 description = "Local-first knowledge graph for token-efficient code review through MCP and CLI"
 readme = {file = "README.md", content-type = "text/markdown"}
 license = "MIT"
@@ -25,14 +29,16 @@ classifiers = [
     "Topic :: Software Development :: Quality Assurance",
 ]
 dependencies = [
-    "mcp>=1.0.0,<2",
+    "mcp>=1.0.0,<3",
     # fastmcp >=3.2.4 is required for Message-based prompts and includes the
     # CVE-2025-62800/62801/66416 fixes; <4 prevents the next major release
     # from breaking the server the way fastmcp 3.0 did. See: #488
     "fastmcp>=3.2.4,<4",
     "tree-sitter>=0.23.0,<1",
     "tree-sitter-language-pack>=0.3.0,<1",
+    "pyyaml>=6.0,<7",
     "networkx>=3.2,<4",
+<<<<<<< HEAD
     "watchdog>=4.0.0,<6",
     # Core analysis stack — mandatory (previously optional extras).
     # numpy: vectorised embedding search hot path (embeddings.py).
@@ -44,6 +50,9 @@ dependencies = [
     "jedi>=0.19.2",
     "igraph>=0.11.0",
     "sentence-transformers>=5.6.0,<6",
+=======
+    "watchdog>=4.0.0,<7",
+>>>>>>> upstream/main
     "tomli>=2.0.0,<3; python_version < '3.11'",
 ]
 
@@ -59,6 +68,7 @@ code-review-graph = "code_review_graph.cli:main"
 crg-daemon = "code_review_graph.daemon_cli:main"
 
 [project.optional-dependencies]
+<<<<<<< HEAD
 # numpy, sentence-transformers, jedi, and igraph are now MANDATORY core
 # dependencies (see [project.dependencies]). These extras remain as
 # no-op back-compat aliases so existing `pip install code-review-graph[...]`
@@ -66,6 +76,12 @@ crg-daemon = "code_review_graph.daemon_cli:main"
 embeddings = []
 communities = []
 enrichment = []
+=======
+embeddings = [
+    "sentence-transformers>=3.0.0,<6",
+    "numpy>=1.26,<3",
+]
+>>>>>>> upstream/main
 google-embeddings = [
     "google-generativeai>=0.8.0,<1",
 ]
@@ -82,9 +98,14 @@ all = [
     "code-review-graph[wiki]",
 ]
 dev = [
+    "mypy>=1.10,<3",
     "pytest>=8.0,<9",
+<<<<<<< HEAD
     "pytest-asyncio>=0.23,<1",
     "pytest-benchmark>=5.2,<6",
+=======
+    "pytest-asyncio>=0.23,<2",
+>>>>>>> upstream/main
     "pytest-cov>=4.0,<8",
     "pytest-xdist>=3.8,<4",
     "ruff>=0.3.0,<1",
@@ -93,9 +114,6 @@ dev = [
 
 [tool.hatch.build.targets.wheel]
 packages = ["code_review_graph"]
-
-[tool.hatch.build.targets.wheel.force-include]
-"docs/LLM-OPTIMIZED-REFERENCE.md" = "code_review_graph/docs/LLM-OPTIMIZED-REFERENCE.md"
 
 [tool.hatch.build.targets.sdist]
 include = [
@@ -168,7 +186,11 @@ norecursedirs = ["tests/fixtures"]
 [dependency-groups]
 dev = [
     "pytest>=8.4.2",
+<<<<<<< HEAD
     "pytest-asyncio>=0.23,<1",
     "pytest-benchmark>=5.2,<6",
     "pytest-xdist>=3.8,<4",
+=======
+    "pytest-asyncio>=0.23,<2",
+>>>>>>> upstream/main
 ]

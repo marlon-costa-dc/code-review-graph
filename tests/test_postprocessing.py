@@ -1,11 +1,12 @@
 """Tests for the shared post-processing pipeline."""
 
+import sqlite3
 import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from code_review_graph.graph import GraphStore
-from code_review_graph.incremental import full_build
+from code_review_graph.incremental import full_build, incremental_update
 from code_review_graph.parser import EdgeInfo, NodeInfo
 from code_review_graph.postprocessing import run_post_processing
 
@@ -21,6 +22,7 @@ def _get_signature(store, qualified_name):
 class TestRunPostProcessing:
     def setup_method(self):
         self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.tmp.close()  # release the handle before GraphStore reopens it on Windows
         self.store = GraphStore(self.tmp.name)
         self._seed_data()
 
@@ -174,6 +176,7 @@ class TestRunPostProcessing:
 
     def test_empty_store_no_crash(self):
         empty_tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        empty_tmp.close()  # release the handle before GraphStore reopens it on Windows
         empty_store = GraphStore(empty_tmp.name)
         try:
             result = run_post_processing(empty_store)
@@ -213,6 +216,7 @@ class TestRunPostProcessing:
 class TestPostProcessingStepIsolation:
     def setup_method(self):
         self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.tmp.close()  # release the handle before GraphStore reopens it on Windows
         self.store = GraphStore(self.tmp.name)
         self.store.upsert_node(
             NodeInfo(
@@ -288,6 +292,178 @@ class TestToolBuildUsesSharedPipeline:
         finally:
             store.close()
 
+    def test_src_layout_imports_resolve_before_test_coverage(self, tmp_path):
+        runner = tmp_path / "src" / "mypkg" / "runner.py"
+        test_file = tmp_path / "tests" / "test_runner.py"
+        runner.parent.mkdir(parents=True)
+        test_file.parent.mkdir()
+        (runner.parent / "__init__.py").write_text("")
+        runner.write_text(
+            "def render_thing(code: str) -> str:\n"
+            "    return code.upper()\n"
+        )
+        test_file.write_text(
+            "from mypkg.runner import render_thing\n\n"
+            "def test_render_thing_basic():\n"
+            "    assert render_thing('a') == 'A'\n\n"
+            "def test_pipeline_uses_uppercase():\n"
+            "    assert render_thing('bc') == 'BC'\n"
+        )
+        (tmp_path / ".git").mkdir()
+        graph_dir = tmp_path / ".code-review-graph"
+        graph_dir.mkdir()
+
+        store = GraphStore(graph_dir / "graph.db")
+        try:
+            tracked = [
+                "src/mypkg/__init__.py",
+                "src/mypkg/runner.py",
+                "tests/test_runner.py",
+            ]
+            with patch(
+                "code_review_graph.incremental.get_all_tracked_files",
+                return_value=tracked,
+            ):
+                result = full_build(tmp_path, store)
+            assert result["python_resolution"]["imports_resolved"] == 1
+            assert {
+                row["target_qualified"]
+                for row in store._conn.execute(
+                    "SELECT target_qualified FROM edges "
+                    "WHERE kind = 'IMPORTS_FROM' AND file_path = ?",
+                    (test_file.as_posix(),),
+                ).fetchall()
+            } == {runner.as_posix()}
+
+            run_post_processing(store)
+            production = f"{runner.as_posix()}::render_thing"
+            tests = store.get_transitive_tests(production, max_depth=0)
+            assert {test["name"] for test in tests} == {
+                "test_render_thing_basic",
+                "test_pipeline_uses_uppercase",
+            }
+
+            duplicate = tmp_path / "packages" / "other" / "src" / "mypkg" / "runner.py"
+            duplicate.parent.mkdir(parents=True)
+            duplicate.write_text(runner.read_text())
+            update = incremental_update(
+                tmp_path,
+                store,
+                changed_files=["packages/other/src/mypkg/runner.py"],
+            )
+            assert update["python_resolution"]["imports_ambiguous"] == 1
+            imported = store._conn.execute(
+                "SELECT target_qualified, extra FROM edges "
+                "WHERE kind = 'IMPORTS_FROM' AND file_path = ?",
+                (test_file.as_posix(),),
+            ).fetchone()
+            assert imported["target_qualified"] == "mypkg.runner"
+            assert '"import_resolution": "ambiguous"' in imported["extra"]
+
+            run_post_processing(store)
+            assert store.get_transitive_tests(production, max_depth=0) == []
+
+            duplicate.unlink()
+            update = incremental_update(
+                tmp_path,
+                store,
+                changed_files=["packages/other/src/mypkg/runner.py"],
+            )
+            assert update["python_resolution"]["imports_resolved"] == 1
+            imported = store._conn.execute(
+                "SELECT target_qualified FROM edges "
+                "WHERE kind = 'IMPORTS_FROM' AND file_path = ?",
+                (test_file.as_posix(),),
+            ).fetchone()
+            assert imported["target_qualified"] == runner.as_posix()
+
+            run_post_processing(store)
+            tests = store.get_transitive_tests(production, max_depth=0)
+            assert {test["name"] for test in tests} == {
+                "test_render_thing_basic",
+                "test_pipeline_uses_uppercase",
+            }
+        finally:
+            store.close()
+
+    def test_initial_ambiguous_python_import_has_no_claimed_caller(self, tmp_path):
+        """A graph first built with duplicate module suffixes must stay ambiguous."""
+        from code_review_graph.tools.query import query_graph
+
+        production_files = []
+        for package in ("a", "b"):
+            runner = (
+                tmp_path
+                / "packages"
+                / package
+                / "src"
+                / "mypkg"
+                / "runner.py"
+            )
+            runner.parent.mkdir(parents=True)
+            runner.write_text(
+                "def render_thing(code: str) -> str:\n"
+                "    return code.upper()\n"
+            )
+            production_files.append(runner)
+
+        test_file = tmp_path / "tests" / "test_runner.py"
+        test_file.parent.mkdir()
+        test_file.write_text(
+            "from mypkg.runner import render_thing\n\n"
+            "def test_pipeline():\n"
+            "    assert render_thing('bc') == 'BC'\n"
+        )
+        (tmp_path / ".git").mkdir()
+        graph_dir = tmp_path / ".code-review-graph"
+        graph_dir.mkdir()
+        tracked = [
+            *(path.relative_to(tmp_path).as_posix() for path in production_files),
+            "tests/test_runner.py",
+        ]
+
+        store = GraphStore(graph_dir / "graph.db")
+        try:
+            with patch(
+                "code_review_graph.incremental.get_all_tracked_files",
+                return_value=tracked,
+            ):
+                result = full_build(tmp_path, store)
+            assert result["python_resolution"]["imports_ambiguous"] == 1
+            run_post_processing(store)
+
+            import_edge = store._conn.execute(
+                "SELECT target_qualified, extra FROM edges "
+                "WHERE kind = 'IMPORTS_FROM' AND file_path = ?",
+                (test_file.as_posix(),),
+            ).fetchone()
+            assert import_edge["target_qualified"] == "mypkg.runner"
+            assert '"import_resolution": "ambiguous"' in import_edge["extra"]
+
+            endpoint_edges = store._conn.execute(
+                "SELECT kind, extra FROM edges "
+                "WHERE kind IN ('CALLS', 'TESTED_BY') AND file_path = ?",
+                (test_file.as_posix(),),
+            ).fetchall()
+            assert {row["kind"] for row in endpoint_edges} == {
+                "CALLS",
+                "TESTED_BY",
+            }
+            assert all(
+                '"ambiguous_target_count": 2' in row["extra"]
+                for row in endpoint_edges
+            )
+
+            for runner in production_files:
+                callers = query_graph(
+                    pattern="callers_of",
+                    target=f"{runner.as_posix()}::render_thing",
+                    repo_root=str(tmp_path),
+                )
+                assert callers["results"] == []
+        finally:
+            store.close()
+
 
 class TestWatchCallbackIntegration:
     def test_watch_accepts_callback_parameter(self):
@@ -299,8 +475,6 @@ class TestWatchCallbackIntegration:
         assert "on_files_updated" in sig.parameters
 
     def test_watch_callback_not_called_without_updates(self, tmp_path):
-        import threading
-
         from code_review_graph.incremental import watch
 
         (tmp_path / ".git").mkdir()
@@ -309,19 +483,162 @@ class TestWatchCallbackIntegration:
         callback = MagicMock()
 
         try:
+            with (
+                patch("watchdog.observers.Observer") as observer,
+                patch("time.sleep", side_effect=KeyboardInterrupt),
+            ):
+                watch(tmp_path, store, on_files_updated=callback)
 
-            def run_watch():
-                try:
-                    watch(tmp_path, store, on_files_updated=callback)
-                except KeyboardInterrupt:
-                    pass
-
-            t = threading.Thread(target=run_watch, daemon=True)
-            t.start()
-
-            import time
-
-            time.sleep(0.5)
             callback.assert_not_called()
+            observer.return_value.start.assert_called_once()
+            observer.return_value.stop.assert_called()
+            observer.return_value.join.assert_called_once()
         finally:
             store.close()
+
+    def test_watch_deletion_reresolves_python_imports(self, tmp_path):
+        from code_review_graph.incremental import full_build, watch
+
+        runner = tmp_path / "src" / "mypkg" / "runner.py"
+        duplicate = tmp_path / "packages" / "other" / "src" / "mypkg" / "runner.py"
+        test_file = tmp_path / "tests" / "test_runner.py"
+        runner.parent.mkdir(parents=True)
+        duplicate.parent.mkdir(parents=True)
+        test_file.parent.mkdir()
+        (runner.parent / "__init__.py").write_text("")
+        runner.write_text("def render_thing(code: str) -> str:\n    return code.upper()\n")
+        duplicate.write_text(runner.read_text())
+        test_file.write_text(
+            "from mypkg.runner import render_thing\n\n"
+            "def test_render_thing():\n"
+            "    assert render_thing('a') == 'A'\n"
+        )
+        (tmp_path / ".git").mkdir()
+        store = GraphStore(tmp_path / "graph.db")
+        observer = MagicMock()
+
+        try:
+            tracked = [
+                "src/mypkg/__init__.py",
+                "src/mypkg/runner.py",
+                "packages/other/src/mypkg/runner.py",
+                "tests/test_runner.py",
+            ]
+            with patch(
+                "code_review_graph.incremental.get_all_tracked_files",
+                return_value=tracked,
+            ):
+                full_build(tmp_path, store)
+            run_post_processing(store)
+            duplicate.unlink()
+
+            with (
+                patch("watchdog.observers.Observer", return_value=observer),
+                patch("time.sleep", side_effect=KeyboardInterrupt),
+            ):
+                watch(tmp_path, store, on_files_updated=run_post_processing)
+
+            imported = store._conn.execute(
+                "SELECT target_qualified FROM edges "
+                "WHERE kind = 'IMPORTS_FROM' AND file_path = ?",
+                (test_file.as_posix(),),
+            ).fetchone()
+            assert imported["target_qualified"] == runner.as_posix()
+            tests = store.get_transitive_tests(
+                f"{runner.as_posix()}::render_thing",
+                max_depth=0,
+            )
+            assert {test["name"] for test in tests} == {"test_render_thing"}
+        finally:
+            store.close()
+
+
+class TestResolveBareEndpointsStep:
+    """The shared/watch pipeline resolves evidence-backed bare endpoints."""
+
+    def setup_method(self):
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.tmp.close()
+        self.store = GraphStore(self.tmp.name)
+        self._seed_bare_edges()
+
+    def teardown_method(self):
+        self.store.close()
+        Path(self.tmp.name).unlink(missing_ok=True)
+
+    def _seed_bare_edges(self):
+        app_file = "/repo/src/app.py"
+        util_file = "/repo/src/util.py"
+        test_file = "/repo/tests/test_app.py"
+        for name, path, is_test in [
+            ("parse", app_file, False),
+            ("helper", util_file, False),
+            ("test_parse", test_file, True),
+        ]:
+            self.store.upsert_node(NodeInfo(
+                kind="Test" if is_test else "Function",
+                name=name,
+                file_path=path,
+                line_start=1,
+                line_end=5,
+                language="python",
+                is_test=is_test,
+            ))
+        for imported in (app_file, util_file):
+            self.store.upsert_edge(EdgeInfo(
+                kind="IMPORTS_FROM",
+                source=test_file,
+                target=imported,
+                file_path=test_file,
+                line=1,
+            ))
+        self.store.upsert_edge(EdgeInfo(
+            kind="CALLS",
+            source=f"{test_file}::test_parse",
+            target="helper",
+            file_path=test_file,
+            line=2,
+        ))
+        self.store.upsert_edge(EdgeInfo(
+            kind="TESTED_BY",
+            source="parse",
+            target=f"{test_file}::test_parse",
+            file_path=test_file,
+            line=3,
+        ))
+        self.store.commit()
+
+    def test_resolves_before_derived_steps_and_reports_count(self):
+        result = run_post_processing(self.store)
+
+        assert result["bare_edges_resolved"] == 2
+        rows = self.store._conn.execute(
+            "SELECT kind, source_qualified, target_qualified FROM edges "
+            "WHERE kind IN ('CALLS', 'TESTED_BY') ORDER BY kind"
+        ).fetchall()
+        by_kind = {
+            row["kind"]: (
+                row["source_qualified"], row["target_qualified"],
+            )
+            for row in rows
+        }
+        assert by_kind["CALLS"] == (
+            "/repo/tests/test_app.py::test_parse",
+            "/repo/src/util.py::helper",
+        )
+        assert by_kind["TESTED_BY"] == (
+            "/repo/src/app.py::parse",
+            "/repo/tests/test_app.py::test_parse",
+        )
+
+    def test_resolution_failure_is_a_warning_not_a_pipeline_failure(self):
+        with patch.object(
+            GraphStore,
+            "resolve_bare_call_targets",
+            side_effect=sqlite3.OperationalError("boom"),
+        ):
+            result = run_post_processing(self.store)
+
+        assert "bare_edges_resolved" not in result
+        assert any("Call-target resolution" in w for w in result["warnings"])
+        assert "communities_detected" in result

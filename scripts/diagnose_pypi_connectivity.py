@@ -24,6 +24,7 @@ def main() -> int:
     if ok_tls and ok_url:
         print("PyPI check: OK (this Python can use HTTPS to pypi.org).")
         return 0
+<<<<<<< HEAD
     print(
         "PyPI check: FAILED (pip/pipx may be unable to download build deps like hatchling)."
     )
@@ -34,6 +35,14 @@ def main() -> int:
     print(
         "Or run pipx from macOS Terminal.app (outside the IDE) if the failure "
         "is terminal-specific."
+=======
+    print("PyPI check: FAILED (pip/pipx may be unable to download build deps like hatchling).")
+    print("Workaround: from the repo root, with https://github.com/astral-sh/uv installed:")
+    print('  uv tool install . --force')
+    print(
+        "Or run pipx from macOS Terminal.app (outside the IDE) "
+        "if the failure is terminal-specific."
+>>>>>>> upstream/main
     )
     return 1
 
@@ -41,6 +50,7 @@ def main() -> int:
 def _try_tls_pypi() -> bool:
     try:
         ctx = ssl.create_default_context()
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
         with socket.create_connection(("pypi.org", 443), timeout=15) as sock:
             with ctx.wrap_socket(sock, server_hostname="pypi.org") as tsock:
                 return bool(tsock.version())

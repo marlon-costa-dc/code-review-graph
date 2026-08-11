@@ -8,7 +8,11 @@ from .context_savings import (
     format_context_savings,
 )
 
+<<<<<<< HEAD
 __version__ = "2.4.0+dc1"
+=======
+__version__ = "2.3.7"
+>>>>>>> upstream/main
 
 __all__ = [
     "__version__",

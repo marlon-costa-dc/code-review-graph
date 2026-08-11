@@ -29,7 +29,7 @@ Review a PR or branch diff.
 ```
 full_rebuild: bool = False           # True for full re-parse
 repo_root: str | None                # Auto-detected
-base: str = "HEAD~1"                 # VCS diff base for incremental updates
+base: str | None = None              # Diff base; None auto-resolves to the last-synced commit
 postprocess: str = "full"            # "full", "minimal", or "none"
 recurse_submodules: bool | None      # Falls back to CRG_RECURSE_SUBMODULES
 ```
@@ -62,7 +62,7 @@ Relevant responses may include compact estimated `context_savings` metadata.
 
 #### `query_graph_tool`
 ```
-pattern: str    # callers_of, callees_of, imports_of, importers_of,
+pattern: str    # callers_of, references_to, callees_of, imports_of, importers_of,
                 # children_of, tests_for, inheritors_of, file_summary
 target: str     # Node name, qualified name, or file path
 repo_root: str | None
@@ -98,18 +98,24 @@ query: str           # Search string
 kind: str | None     # File, Class, Function, Type, Test
 limit: int = 20
 repo_root: str | None
+<<<<<<< HEAD
 model: str | None    # Embedding model (falls back to CRG_EMBEDDING_MODEL env var)
 provider: str | None # local, openai, google, minimax
 detail_level: str = "minimal"    # "minimal" (default) or "standard"
+=======
+model: str | None    # Embedding model (falls back to provider-specific env vars)
+provider: str | None # local, openai, google, minimax, voyage
+detail_level: str = "standard"
+>>>>>>> upstream/main
 ```
 
 #### `embed_graph_tool`
 ```
 repo_root: str | None
 model: str | None    # Embedding model name
-provider: str | None # local, openai, google, minimax
+provider: str | None # local, openai, google, minimax, voyage
 ```
-Local embeddings require: `pip install code-review-graph[embeddings]`. Cloud providers use stdlib HTTP clients and require their provider environment variables.
+Local embeddings require: `pip install "code-review-graph[embeddings]"`. Cloud providers use stdlib HTTP clients and require their provider environment variables.
 
 #### `list_graph_stats_tool`
 ```
@@ -304,6 +310,8 @@ base: str = "HEAD~1"
 code-review-graph install           # Configure detected AI coding platforms (alias: init)
 code-review-graph install --dry-run # Preview without writing files
 code-review-graph install --platform codex  # Configure one platform
+code-review-graph uninstall                 # Remove all CRG configs, hooks, skills, and data
+code-review-graph uninstall --platform codex  # Unbind one platform (keeps graph data + others)
 
 # Build and update
 code-review-graph build                        # Full build
@@ -314,7 +322,11 @@ code-review-graph update --base origin/main    # Custom base ref
 code-review-graph update --brief               # Update graph + show risk panel
 code-review-graph update --brief --verify      # ...and cross-check vs tiktoken
 code-review-graph postprocess                  # Re-run flows, communities, FTS
+code-review-graph forget PATH [PATH ...]       # Drop parsed files from the graph (no full rebuild)
+code-review-graph forget src/legacy --dry-run  # Preview which files would be forgotten
 code-review-graph embed --provider local       # Compute vector embeddings for semantic search
+code-review-graph update --embedding-provider local --embedding-model all-MiniLM-L6-v2
+                                                # Explicitly refresh an existing index (default: off)
 
 # Monitor and inspect
 code-review-graph status                       # Graph statistics
@@ -329,6 +341,7 @@ code-review-graph detect-changes               # Risk-scored change analysis
 code-review-graph detect-changes --base HEAD~3 # Custom base ref
 code-review-graph detect-changes --brief       # Compact panel with token-savings estimate
 code-review-graph detect-changes --brief --verify  # ...and cross-check vs tiktoken
+code-review-graph detect-changes --churn       # Add opt-in change-frequency risk
 
 # detect-changes vs update --brief — which one?
 # • detect-changes --brief: read-only. Asks "what's the impact of my current

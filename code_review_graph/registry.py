@@ -14,18 +14,31 @@ import threading
 from collections import OrderedDict
 from pathlib import Path
 
+from .constants import crg_home
+
 logger = logging.getLogger(__name__)
 
+<<<<<<< HEAD
 # Default registry path
 _REGISTRY_DIR = Path.home() / ".code-review-graph"
 _REGISTRY_PATH = _REGISTRY_DIR / "registry.json"
 _REGISTRY_PATH_ENV = "CRG_REGISTRY_PATH"
+=======
+def default_registry_path() -> Path:
+    """Return the full path to ``registry.json``.
+
+    Lives under :func:`~code_review_graph.constants.crg_home`, so ``$CRG_HOME``
+    redirects it along with the rest of the per-user state.
+    """
+    return crg_home() / "registry.json"
+>>>>>>> upstream/main
 
 
 class Registry:
     """Manages a JSON-based registry of code-review-graph repositories.
 
     Each entry stores the repo path and an optional alias.
+<<<<<<< HEAD
     The registry lives at ``~/.code-review-graph/registry.json``.
     Set ``CRG_REGISTRY_PATH`` to isolate the registry for a distinct runtime,
     such as a test process.
@@ -40,6 +53,14 @@ class Registry:
                 Path(configured_path).expanduser().resolve() if configured_path else _REGISTRY_PATH
             )
         )
+=======
+    The registry lives at ``~/.code-review-graph/registry.json``, or under
+    ``$CRG_HOME`` when that is set.
+    """
+
+    def __init__(self, path: Path | None = None) -> None:
+        self._path = path or default_registry_path()
+>>>>>>> upstream/main
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
         self._repos: list[dict[str, str]] = []
@@ -61,7 +82,13 @@ class Registry:
         """Write registry to disk."""
         self._path.parent.mkdir(parents=True, exist_ok=True)
         data = {"repos": self._repos}
+<<<<<<< HEAD
         self._path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+=======
+        self._path.write_text(
+            json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+        )
+>>>>>>> upstream/main
 
     def register(
         self,
