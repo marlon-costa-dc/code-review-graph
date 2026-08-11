@@ -140,7 +140,7 @@ def _tool_impl(name: str) -> Any:
 
 def _find_project_root(start: Path | None = None) -> Path:
     env_override = os.environ.get("CRG_REPO_ROOT", "").strip()
-    if env_override:
+    if start is None and env_override:
         root = Path(env_override).expanduser().resolve()
         if root.exists():
             return root
@@ -149,21 +149,27 @@ def _find_project_root(start: Path | None = None) -> Path:
     if root.is_file():
         root = root.parent
     candidates = (root, *root.parents)
-    for candidate in candidates:
-        if (candidate / ".git").exists():
-            return candidate
-
     # SVN working copy: return the topmost continuous .svn directory.
     # Stop as soon as the chain is broken so unrelated .svn directories
     # further up the filesystem do not steal the result.
     svn_candidate: Path | None = None
+    first_non_svn: Path | None = None
     for candidate in candidates:
         if (candidate / ".svn").exists():
             svn_candidate = candidate
         else:
+            first_non_svn = candidate
             break
+    if first_non_svn is not None and (first_non_svn / ".git").exists():
+        return first_non_svn
     if svn_candidate is not None:
         return svn_candidate
+    git_root = next(
+        (candidate for candidate in candidates if (candidate / ".git").exists()),
+        None,
+    )
+    if git_root is not None:
+        return git_root
     return start or Path.cwd()
 
 

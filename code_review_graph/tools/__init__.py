@@ -11,6 +11,9 @@ from __future__ import annotations
 from importlib import import_module
 from typing import Any
 
+from ..changes import parse_diff_ranges, parse_git_diff_ranges, parse_svn_diff_ranges
+from ..incremental import get_changed_files, get_staged_and_unstaged
+
 # -- _common ----------------------------------------------------------------
 from ._common import (
     _BUILTIN_CALL_NAMES,
@@ -19,8 +22,15 @@ from ._common import (
     with_provenance,
 )
 
-__all__ = sorted(_EXPORTS)
+from .analysis_tools import (
+    get_bridge_nodes_func,
+    get_hub_nodes_func,
+    get_knowledge_gaps_func,
+    get_suggested_questions_func,
+    get_surprising_connections_func,
+)
 
+from .build import build_or_update_graph, run_postprocess
 
 # -- community_tools --------------------------------------------------------
 from .community_tools import (
