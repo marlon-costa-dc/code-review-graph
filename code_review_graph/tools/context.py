@@ -13,6 +13,16 @@ from ._common import _get_store_for_read, _not_built_response, compact_response
 logger = logging.getLogger(__name__)
 
 
+def _not_ready(reason: str, summary: str) -> dict[str, Any]:
+    """Return a compact response that directs callers to initialize the graph."""
+    return {
+        "status": "not_ready",
+        "reason": reason,
+        "summary": summary,
+        "next_tool_suggestions": ["build_or_update_graph"],
+    }
+
+
 def _has_git_changes(root: Path, base: str) -> bool:
     """Quick check for uncommitted or diffed changes."""
     try:
@@ -51,6 +61,10 @@ def get_minimal_context(
         changed_files: Explicit changed files. Auto-detected from git if None.
         repo_root: Repository root path. Auto-detected if None.
         base: Git ref for diff comparison.
+
+    Returns:
+        Compact graph context, or ``status: not_ready`` when the graph is
+        missing, empty, or known to have been built at a different Git commit.
     """
     store, root, not_built = _get_store_for_read(repo_root)
     if store is None or root is None:
@@ -58,6 +72,19 @@ def get_minimal_context(
     try:
         # 1. Quick stats
         stats = store.get_stats()
+        if stats.total_nodes == 0:
+            return _not_ready(
+                "empty_graph",
+                "The graph database contains no nodes. Build the graph before requesting context.",
+            )
+
+        provenance = graph_provenance(str(root))
+        if provenance and provenance.get("head_matches_build") is False:
+            return _not_ready(
+                "stale_graph",
+                "The graph was built at a different Git commit. "
+                "Update it before requesting context.",
+            )
 
         # 2. Risk from changed files
         risk = "unknown"
@@ -73,7 +100,7 @@ def get_minimal_context(
                 if not files:
                     files = _get_changed(root, base)
                 if files:
-                    abs_files = [str(root / f) for f in files]
+                    abs_files = [normalize_file_path(root / f) for f in files]
                     analysis = analyze_changes(
                         store, abs_files, repo_root=str(root), base=base,
                     )

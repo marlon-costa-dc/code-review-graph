@@ -8,22 +8,92 @@ Supports multiple rendering modes for large graphs:
 - ``full``  — render every node (default, current behavior)
 - ``community`` — aggregate by community; double-click to drill down
 - ``file``  — aggregate by file; each file is a node
-- ``auto``  — choose community mode when node count exceeds threshold
+- ``auto``  — choose an aggregated mode when the rendered node count or
+  edge count exceeds its threshold (community when community data exists,
+  file otherwise)
 """
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import logging
 import sqlite3
 from collections import Counter, defaultdict
 from dataclasses import asdict
+from importlib import resources
 from pathlib import Path
 from typing import Any
 
 from .graph import GraphStore, _sanitize_name, edge_to_dict, node_to_dict
 
 logger = logging.getLogger(__name__)
+
+# Pinned D3 build vendored with the package (issue #475). The generated HTML
+# loads this same-origin copy first so `visualize --serve` works on offline or
+# filtered networks, and only falls back to the CDN — still SRI-pinned — when
+# the local copy is unavailable. Both references carry the same integrity hash.
+D3_LOCAL_FILENAME = "d3.v7.min.js"
+D3_CDN_URL = "https://d3js.org/d3.v7.min.js"
+D3_SRI_HASH = "sha384-CjloA8y00+1SDAUkjs099PVfnY2KmDC2BZnws9kh8D/lX1s46w6EPhpXdqMfjK6i"
+
+
+def _d3_script_tags() -> str:
+    """Build the D3 loader tags: same-origin script plus SRI-pinned CDN fallback.
+
+    The fallback uses ``document.write`` so it loads *synchronously* during
+    parsing — the rest of the page's inline scripts use ``d3`` immediately.
+    """
+    local_tag = f'<script src="{D3_LOCAL_FILENAME}" integrity="{D3_SRI_HASH}"></script>'
+    cdn_tag = (
+        f'<script src="{D3_CDN_URL}" integrity="{D3_SRI_HASH}" crossorigin="anonymous">'
+        "<\\/script>"
+    )
+    fallback_tag = f"<script>window.d3 || document.write('{cdn_tag}');</script>"
+    return local_tag + "\n" + fallback_tag
+
+
+def _write_d3_asset(directory: Path) -> Path | None:
+    """Copy the vendored D3 build next to the generated HTML.
+
+    The copy is verified against the pinned SRI hash before writing. Returns
+    the written path, or ``None`` if the bundled asset is missing, corrupt, or
+    unwritable — the generated page then loads D3 via the SRI-pinned CDN
+    fallback tag instead.
+    """
+    dest = directory / D3_LOCAL_FILENAME
+    try:
+        asset = resources.files("code_review_graph") / "assets" / D3_LOCAL_FILENAME
+        data = asset.read_bytes()
+    except OSError as exc:
+        logger.warning("Bundled D3 asset unavailable (%s); page will use the CDN fallback.", exc)
+        return None
+    digest = base64.b64encode(hashlib.sha384(data).digest()).decode()
+    if f"sha384-{digest}" != D3_SRI_HASH:
+        logger.error(
+            "Bundled D3 asset does not match the pinned SRI hash; refusing to write %s. "
+            "The page will use the CDN fallback.",
+            dest,
+        )
+        return None
+    try:
+        dest.write_bytes(data)
+    except OSError as exc:
+        logger.warning("Could not write %s (%s); page will use the CDN fallback.", dest, exc)
+        return None
+    return dest
+
+# Auto-mode thresholds for the full D3 force layout. Rendering cost scales
+# with both counts: every simulation tick runs an O(E) link force on top of
+# the O(N log N) many-body force, and the SVG DOM holds one element per node
+# *and* one per edge. The long-standing 3000-node cap implicitly tolerated
+# the ~3 edges per node typical of graphs at that size (~9000 rendered SVG
+# edge elements), so the edge cap is derived from the same rendering budget:
+# 3x the node cap. Issue #609 (2792 nodes / 17488 edges) stalled because
+# only nodes were checked.
+DEFAULT_MAX_FULL_NODES = 3000
+DEFAULT_MAX_FULL_EDGES = 3 * DEFAULT_MAX_FULL_NODES
 
 
 def _build_name_index(nodes: list[dict], seen_qn: set[str]) -> dict[str, list[str]]:
@@ -385,11 +455,40 @@ def _aggregate_file(data: dict) -> dict:
     }
 
 
+def _has_community_data(data: dict) -> bool:
+    """Return True if the exported graph carries any community assignment."""
+    if data.get("communities"):
+        return True
+    return any(n.get("community_id") is not None for n in data["nodes"])
+
+
+def _resolve_auto_mode(
+    node_count: int,
+    edge_count: int,
+    max_full_nodes: int,
+    max_full_edges: int,
+    has_communities: bool,
+) -> str:
+    """Pick the effective rendering mode for ``mode="auto"``.
+
+    The full force layout is only viable while *both* rendered counts stay
+    within budget (see DEFAULT_MAX_FULL_NODES / DEFAULT_MAX_FULL_EDGES).
+    When aggregation is needed, prefer community mode; fall back to file
+    aggregation when no community data is available (otherwise every node
+    would collapse into a single "Uncategorized" super-node whose drill-down
+    re-renders the entire graph).
+    """
+    if node_count <= max_full_nodes and edge_count <= max_full_edges:
+        return "full"
+    return "community" if has_communities else "file"
+
+
 def generate_html(
     store: GraphStore,
     output_path: str | Path,
     mode: str = "auto",
-    max_full_nodes: int = 3000,
+    max_full_nodes: int = DEFAULT_MAX_FULL_NODES,
+    max_full_edges: int = DEFAULT_MAX_FULL_EDGES,
 ) -> Path:
     """Generate a self-contained interactive HTML visualization.
 
@@ -397,9 +496,12 @@ def generate_html(
         store: The GraphStore to read graph data from.
         output_path: Path for the output HTML file.
         mode: Rendering mode — ``"auto"``, ``"full"``, ``"community"``,
-              or ``"file"``.  ``"auto"`` switches to ``"community"`` when
-              the node count exceeds *max_full_nodes*.
-        max_full_nodes: Threshold for auto-switching to community mode.
+              or ``"file"``.  ``"auto"`` switches to an aggregated mode
+              (community, or file when no community data exists) when the
+              rendered node count exceeds *max_full_nodes* or the rendered
+              edge count exceeds *max_full_edges*.
+        max_full_nodes: Rendered-node threshold for auto-switching.
+        max_full_edges: Rendered-edge threshold for auto-switching.
 
     Writes the HTML file to *output_path* and returns the resolved Path.
     """
@@ -423,17 +525,25 @@ def generate_html(
         agg = _aggregate_community(data)
         # Escape </script> inside JSON to prevent premature tag closure
         data_json = json.dumps(agg, default=str).replace("</", "<\\/")
-        html = _AGGREGATED_HTML_TEMPLATE.replace("__GRAPH_DATA__", data_json)
+        template = _AGGREGATED_HTML_TEMPLATE
     elif effective_mode == "file":
         agg = _aggregate_file(data)
         data_json = json.dumps(agg, default=str).replace("</", "<\\/")
-        html = _AGGREGATED_HTML_TEMPLATE.replace("__GRAPH_DATA__", data_json)
+        template = _AGGREGATED_HTML_TEMPLATE
     else:
         # full mode — original behavior
         data_json = json.dumps(data, default=str).replace("</", "<\\/")
-        html = _HTML_TEMPLATE.replace("__GRAPH_DATA__", data_json)
+        template = _HTML_TEMPLATE
 
+    # Substitute the script tags into the trusted template BEFORE the graph
+    # data: graph content is repo-derived, and running a replace over it would
+    # let a node literally named __D3_SCRIPTS__ inject markup into the page.
+    html = template.replace("__D3_SCRIPTS__", _d3_script_tags())
+    html = html.replace("__GRAPH_DATA__", data_json)
     output_path.write_text(html, encoding="utf-8")
+    # Ship the vendored D3 build alongside the HTML so the same-origin script
+    # reference resolves both under `visualize --serve` and file:// opens.
+    _write_d3_asset(output_path.parent)
     return output_path
 
 
@@ -451,7 +561,7 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Code Review Graph</title>
-<script src="https://d3js.org/d3.v7.min.js" integrity="sha384-CjloA8y00+1SDAUkjs099PVfnY2KmDC2BZnws9kh8D/lX1s46w6EPhpXdqMfjK6i" crossorigin="anonymous"></script>
+__D3_SCRIPTS__
 <style>
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
   html, body { width: 100%; height: 100%; overflow: hidden; }
@@ -882,8 +992,11 @@ function moveTooltip(ev) {
   tooltip.style.left = x + "px"; tooltip.style.top = y + "px";
 }
 function hideTooltip() { tooltip.classList.remove("visible"); }
-var W = innerWidth, H = innerHeight;
-var svg = d3.select("svg").attr("viewBox", [0, 0, W, H]);
+var svgEl = document.getElementById("graph-svg");
+function getW() { return svgEl.clientWidth || window.innerWidth || 800; }
+function getH() { return svgEl.clientHeight || window.innerHeight || 600; }
+var W = getW(), H = getH();
+var svg = d3.select("#graph-svg").attr("viewBox", [0, 0, W, H]);
 var gRoot = svg.append("g");
 var currentTransform = d3.zoomIdentity;
 var zoomBehavior = d3.zoom()
@@ -1098,13 +1211,27 @@ if (N > 2000) {
   nodes.forEach(function(n) { if (n.kind === "File") collapsedFiles.add(n.qualified_name); });
 }
 updateNodes();
-function fitGraph() {
+function syncViewport() {
+  W = getW(); H = getH();
+  svg.attr("viewBox", [0, 0, W, H]);
+  simulation.force("center", d3.forceCenter(W / 2, H / 2));
+  simulation.force("x", d3.forceX(W / 2).strength(0.03));
+  simulation.force("y", d3.forceY(H / 2).strength(0.03));
+}
+function fitGraph(retries) {
+  if (retries === undefined) retries = 10;
   var b = gRoot.node().getBBox();
-  if (b.width === 0 || b.height === 0) return;
+  if (b.width === 0 || b.height === 0) {
+    if (retries > 0) requestAnimationFrame(function() { fitGraph(retries - 1); });
+    return;
+  }
   var pad = 0.1;
   var fw = b.width * (1 + 2*pad), fh = b.height * (1 + 2*pad);
-  var s = Math.min(W / fw, H / fh, 2.5);
-  var tx = W/2 - (b.x + b.width/2)*s, ty = H/2 - (b.y + b.height/2)*s;
+  var cw = getW(), ch = getH();
+  W = cw; H = ch;
+  svg.attr("viewBox", [0, 0, W, H]);
+  var s = Math.min(cw / fw, ch / fh, 2.5);
+  var tx = cw/2 - (b.x + b.width/2)*s, ty = ch/2 - (b.y + b.height/2)*s;
   svg.transition().duration(600).call(zoomBehavior.transform, d3.zoomIdentity.translate(tx, ty).scale(s));
 }
 var loadingOverlay = document.getElementById("loading-overlay");
@@ -1115,7 +1242,12 @@ if (nodes.length === 0) {
 }
 simulation.on("end", function() {
   loadingOverlay.classList.add("hidden");
-  fitGraph();
+  syncViewport();
+  requestAnimationFrame(function() { fitGraph(); });
+});
+window.addEventListener("resize", function() {
+  syncViewport();
+  requestAnimationFrame(function() { fitGraph(); });
 });
 function zoomToNode(qn) {
   var nd = nodeById.get(qn);
@@ -1124,7 +1256,7 @@ function zoomToNode(qn) {
   var tx = W/2 - nd.x*s, ty = H/2 - nd.y*s;
   svg.transition().duration(600).call(zoomBehavior.transform, d3.zoomIdentity.translate(tx, ty).scale(s));
 }
-document.getElementById("btn-fit").addEventListener("click", fitGraph);
+document.getElementById("btn-fit").addEventListener("click", function() { fitGraph(); });
 document.getElementById("btn-labels").addEventListener("click", function() {
   showLabels = !showLabels;
   this.classList.toggle("active");
@@ -1462,7 +1594,7 @@ _AGGREGATED_HTML_TEMPLATE = r"""<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Code Review Graph (Aggregated)</title>
-<script src="https://d3js.org/d3.v7.min.js" integrity="sha384-CjloA8y00+1SDAUkjs099PVfnY2KmDC2BZnws9kh8D/lX1s46w6EPhpXdqMfjK6i" crossorigin="anonymous"></script>
+__D3_SCRIPTS__
 <style>
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
   html, body { width: 100%; height: 100%; overflow: hidden; }
@@ -1632,7 +1764,7 @@ _AGGREGATED_HTML_TEMPLATE = r"""<!DOCTYPE html>
 <div id="stats-bar" role="status" aria-label="Graph statistics"></div>
 <div id="tooltip"></div>
 <button id="btn-back" aria-label="Back to overview">&larr; Back to Overview</button>
-<svg role="img" aria-label="Interactive code knowledge graph visualization (aggregated view)."></svg>
+<svg id="graph-svg" role="img" aria-label="Interactive code knowledge graph visualization (aggregated view)."></svg>
 <script>
 "use strict";
 var graphData = __GRAPH_DATA__;
@@ -1782,8 +1914,11 @@ function moveTooltip(ev) {
 function hideTooltip() { tooltip.classList.remove("visible"); }
 
 /* --- SVG setup --- */
-var W = innerWidth, H = innerHeight;
-var svg = d3.select("svg").attr("viewBox", [0, 0, W, H]);
+var svgEl = document.getElementById("graph-svg");
+function getW() { return svgEl.clientWidth || window.innerWidth || 800; }
+function getH() { return svgEl.clientHeight || window.innerHeight || 600; }
+var W = getW(), H = getH();
+var svg = d3.select("#graph-svg").attr("viewBox", [0, 0, W, H]);
 var gRoot = svg.append("g");
 var currentTransform = d3.zoomIdentity;
 var zoomBehavior = d3.zoom()
@@ -1949,7 +2084,10 @@ function renderGraph(nodesData, edgesData, drillDown) {
       .attr("y", function(d) { return d.y; });
   });
 
-  simulation.on("end", fitGraph);
+  simulation.on("end", function() {
+    syncViewport();
+    requestAnimationFrame(function() { fitGraph(); });
+  });
   updateLabelVisibility();
 }
 
@@ -2001,15 +2139,37 @@ function highlightConnected(d, on) {
   }
 }
 
-function fitGraph() {
+function syncViewport() {
+  W = getW(); H = getH();
+  svg.attr("viewBox", [0, 0, W, H]);
+  if (simulation) {
+    simulation.force("center", d3.forceCenter(W / 2, H / 2));
+    simulation.force("x", d3.forceX(W / 2).strength(0.03));
+    simulation.force("y", d3.forceY(H / 2).strength(0.03));
+  }
+}
+
+function fitGraph(retries) {
+  if (retries === undefined) retries = 10;
   var b = gRoot.node().getBBox();
-  if (b.width === 0 || b.height === 0) return;
+  if (b.width === 0 || b.height === 0) {
+    if (retries > 0) requestAnimationFrame(function() { fitGraph(retries - 1); });
+    return;
+  }
   var pad = 0.1;
   var fw = b.width * (1 + 2 * pad), fh = b.height * (1 + 2 * pad);
-  var s = Math.min(W / fw, H / fh, 2.5);
-  var tx = W / 2 - (b.x + b.width / 2) * s, ty = H / 2 - (b.y + b.height / 2) * s;
+  var cw = getW(), ch = getH();
+  W = cw; H = ch;
+  svg.attr("viewBox", [0, 0, W, H]);
+  var s = Math.min(cw / fw, ch / fh, 2.5);
+  var tx = cw / 2 - (b.x + b.width / 2) * s, ty = ch / 2 - (b.y + b.height / 2) * s;
   svg.transition().duration(600).call(zoomBehavior.transform, d3.zoomIdentity.translate(tx, ty).scale(s));
 }
+
+window.addEventListener("resize", function() {
+  syncViewport();
+  requestAnimationFrame(function() { fitGraph(); });
+});
 
 function zoomToNode(qn) {
   var nd = currentNodes.find(function(n) { return n.qualified_name === qn; });
@@ -2129,7 +2289,7 @@ document.getElementById("btn-back").addEventListener("click", function() {
 });
 
 /* --- Controls --- */
-document.getElementById("btn-fit").addEventListener("click", fitGraph);
+document.getElementById("btn-fit").addEventListener("click", function() { fitGraph(); });
 document.getElementById("btn-labels").addEventListener("click", function() {
   showLabels = !showLabels;
   this.classList.toggle("active");

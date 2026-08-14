@@ -41,6 +41,7 @@ def main() -> int:
 def _try_tls_pypi() -> bool:
     try:
         ctx = ssl.create_default_context()
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
         with socket.create_connection(("pypi.org", 443), timeout=15) as sock:
             with ctx.wrap_socket(sock, server_hostname="pypi.org") as tsock:
                 return bool(tsock.version())

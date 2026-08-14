@@ -42,22 +42,22 @@ Or use PostToolUse (Write|Edit|Bash) hooks for automatic background updates.
 </section>
 
 <section name="embeddings">
-Optional: pip install code-review-graph[embeddings]
+Optional: pip install "code-review-graph[embeddings]"
 Then call embed_graph_tool to compute vectors.
 semantic_search_nodes_tool auto-uses vectors when available, falls back to keyword + FTS5.
-Providers: local sentence-transformers, OpenAI-compatible endpoints, Google Gemini, and MiniMax.
-Configure via provider/model parameters, CRG_EMBEDDING_MODEL for local, or CRG_OPENAI_* for OpenAI-compatible endpoints.
+Providers: local sentence-transformers, OpenAI-compatible endpoints, Google Gemini, MiniMax, and Voyage.
+Configure via provider/model parameters, CRG_EMBEDDING_MODEL for local, CRG_OPENAI_* for OpenAI-compatible endpoints, or VOYAGE_API_KEY plus optional CRG_VOYAGE_MODEL for Voyage.
 </section>
 
 <section name="languages">
-Supported: Python, JavaScript/TypeScript/TSX, Go, Rust, Java, C/C++, C#, Ruby, Kotlin, Swift, PHP, Scala, Solidity, Dart, R, Perl, Lua/Luau, Objective-C, shell scripts, Elixir, Zig, PowerShell, Julia, ReScript, GDScript, Nix, Verilog/SystemVerilog, SQL, Vue/Svelte SFCs, Astro files parsed through the TypeScript parser, Jupyter/Databricks notebooks, and Perl XS files.
+Supported: Python, JavaScript/TypeScript/TSX, Go, Rust, Java, C/C++, C#, VB.NET, Ruby, Kotlin, Swift, PHP, Scala, Solidity, Dart, R, Perl, Lua/Luau, Objective-C, shell scripts, Elixir, Zig, PowerShell, Julia, ReScript, GDScript, Nix, Verilog/SystemVerilog, SQL, Terraform/OpenTofu structure (`.tf`; generic `.hcl` files are recognized as file nodes), Ansible playbooks/roles/tasks, Vue/Svelte SFCs, Astro files parsed through the TypeScript parser, Jupyter/Databricks notebooks, and Perl XS files. Generic YAML is not treated as source code.
 Parser: Tree-sitter via tree-sitter-language-pack
 Custom languages: add .code-review-graph/languages.toml (extensions + node types per grammar) — no fork needed, see docs/CUSTOM_LANGUAGES.md. Built-ins cannot be overridden.
 </section>
 
 <section name="troubleshooting">
 DB lock: SQLite WAL mode, auto-recovers. Only one build at a time.
-Large repos: First build 30-60s. Incremental <2s. Add patterns to .code-review-graphignore.
+Large repos: first build ~40s at ~3,000 files; incremental ~2.5s on the hook path (measured, docs/REPRODUCING.md). Add patterns to .code-review-graphignore.
 Stale graph: Run /code-review-graph:build-graph manually.
 Missing nodes: Check language support + ignore patterns. Use full_rebuild=True.
 Windows/WSL: Use forward slashes in paths. Ensure uv is on PATH in WSL.

@@ -16,6 +16,7 @@ from typing import Optional
 
 from .constants import SECURITY_KEYWORDS as _SECURITY_KEYWORDS
 from .graph import FlowAdjacency, GraphNode, GraphStore, _sanitize_name
+from .parser import normalize_file_path
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +66,9 @@ _FRAMEWORK_DECORATOR_PATTERNS: list[re.Pattern[str]] = [
     # Java Spring
     re.compile(r"(Get|Post|Put|Delete|Patch|RequestMapping)Mapping", re.IGNORECASE),
     re.compile(r"(Scheduled|EventListener|Bean|Configuration)", re.IGNORECASE),
+    re.compile(r"KafkaListener", re.IGNORECASE),
+    # Temporal Java callbacks are invoked by the workflow runtime.
+    re.compile(r"(WorkflowMethod|ActivityMethod)", re.IGNORECASE),
     # JS/TS frameworks
     re.compile(r"(Component|Injectable|Controller|Module|Guard|Pipe)", re.IGNORECASE),
     re.compile(r"(Subscribe|Mutation|Query|Resolver)", re.IGNORECASE),
@@ -127,6 +131,14 @@ _ENTRY_NAME_PATTERNS: list[re.Pattern[str]] = [
     ),
 ]
 
+# Framework and language conventions that must not pollute other parsers.
+_LANGUAGE_ENTRY_NAME_PATTERNS: dict[str, tuple[re.Pattern[str], ...]] = {
+    "php": (
+        re.compile(r"^(boot|register)$"),
+        re.compile(r"^__invoke$"),
+    ),
+}
+
 
 # ---------------------------------------------------------------------------
 # Entry-point detection
@@ -150,6 +162,9 @@ def _has_framework_decorator(node: GraphNode) -> bool:
 def _matches_entry_name(node: GraphNode) -> bool:
     """Return True if *node*'s name matches a conventional entry-point pattern."""
     for pat in _ENTRY_NAME_PATTERNS:
+        if pat.search(node.name):
+            return True
+    for pat in _LANGUAGE_ENTRY_NAME_PATTERNS.get(node.language, ()):
         if pat.search(node.name):
             return True
     return False
@@ -193,6 +208,8 @@ def detect_entry_points(
 
     for node in candidate_nodes:
         if not include_tests and (node.is_test or _is_test_file(node.file_path)):
+            continue
+        if node.extra.get("verilog_kind"):
             continue
 
         is_entry = False
@@ -477,6 +494,9 @@ def incremental_trace_flows(
     if not changed_files:
         return 0
 
+    # Graph identity uses POSIX separators (#774); bridge native-separator
+    # caller paths before matching against stored file_path values.
+    changed_files = [normalize_file_path(p) for p in changed_files]
     conn = store._conn
     changed_file_set = set(changed_files)
 

@@ -12,7 +12,6 @@ import json
 import logging
 import os
 import platform
-import re
 import shutil
 import stat
 import subprocess
@@ -31,6 +30,101 @@ def _zed_settings_path() -> Path:
     if platform.system() == "Darwin":
         return Path.home() / "Library" / "Application Support" / "Zed" / "settings.json"
     return Path.home() / ".config" / "zed" / "settings.json"
+
+
+def _copilot_vscode_detected() -> bool:
+    """Return whether a GitHub Copilot extension is installed for VS Code."""
+    home = Path.home()
+    extension_dirs = [
+        home / ".vscode" / "extensions",
+        home / ".vscode-insiders" / "extensions",
+    ]
+
+    system = platform.system()
+    if system == "Darwin":
+        for applications_dir in (Path("/Applications"), home / "Applications"):
+            for app_name in (
+                "Visual Studio Code.app",
+                "Visual Studio Code - Insiders.app",
+            ):
+                extension_dirs.append(
+                    applications_dir
+                    / app_name
+                    / "Contents"
+                    / "Resources"
+                    / "app"
+                    / "extensions"
+                )
+    elif system == "Windows":
+        for env_name in ("LOCALAPPDATA", "PROGRAMFILES", "PROGRAMFILES(X86)"):
+            if install_root := os.environ.get(env_name):
+                for app_name in ("Microsoft VS Code", "Microsoft VS Code Insiders"):
+                    extension_dirs.append(
+                        Path(install_root)
+                        / app_name
+                        / "resources"
+                        / "app"
+                        / "extensions"
+                    )
+    elif system == "Linux":
+        extension_dirs.extend(
+            [
+                Path("/usr/share/code/resources/app/extensions"),
+                Path("/usr/share/code-insiders/resources/app/extensions"),
+                Path("/usr/lib/code/resources/app/extensions"),
+                Path("/opt/visual-studio-code/resources/app/extensions"),
+                Path("/snap/code/current/usr/share/code/resources/app/extensions"),
+            ]
+        )
+
+    for command in ("code", "code-insiders"):
+        if executable := shutil.which(command):
+            try:
+                parents = Path(executable).resolve().parents[:6]
+            except OSError:
+                continue
+            for parent in parents:
+                extension_dirs.extend(
+                    [
+                        parent / "extensions",
+                        parent / "resources" / "app" / "extensions",
+                        parent / "Resources" / "app" / "extensions",
+                    ]
+                )
+
+    for extensions_dir in dict.fromkeys(extension_dirs):
+        try:
+            extension_paths = list(extensions_dir.iterdir())
+        except OSError:
+            continue
+        for extension_path in extension_paths:
+            name = extension_path.name.lower()
+            if name.startswith("github.copilot-"):
+                return True
+            if "copilot" not in name:
+                continue
+            try:
+                manifest = json.loads(
+                    (extension_path / "package.json").read_text(encoding="utf-8")
+                )
+            except (OSError, json.JSONDecodeError):
+                continue
+            if (
+                str(manifest.get("publisher", "")).lower() == "github"
+                and str(manifest.get("name", "")).lower()
+                in {"copilot", "copilot-chat"}
+            ):
+                return True
+    return False
+
+
+def _opencode_config_path(repo_root: Path) -> Path:
+    """Return OpenCode's existing project config, preferring JSONC."""
+    for name in ("opencode.jsonc", "opencode.json"):
+        path = repo_root / name
+        if path.exists():
+            return path
+    return repo_root / "opencode.jsonc"
 
 
 PLATFORMS: dict[str, dict[str, Any]] = {
@@ -84,11 +178,11 @@ PLATFORMS: dict[str, dict[str, Any]] = {
     },
     "opencode": {
         "name": "OpenCode",
-        "config_path": lambda root: root / ".opencode.json",
-        "key": "mcpServers",
+        "config_path": _opencode_config_path,
+        "key": "mcp",
         "detect": lambda: True,
         "format": "object",
-        "needs_type": True,
+        "needs_type": False,
     },
     "antigravity": {
         "name": "Antigravity",
@@ -134,15 +228,29 @@ PLATFORMS: dict[str, dict[str, Any]] = {
         "name": "GitHub Copilot",
         "config_path": lambda root: root / ".vscode" / "mcp.json",
         "key": "servers",
-        "detect": lambda: (Path.home() / ".vscode").exists(),
+        "detect": _copilot_vscode_detected,
         "format": "object",
         "needs_type": True,
     },
     "copilot-cli": {
         "name": "GitHub Copilot CLI",
         "config_path": lambda root: Path.home() / ".copilot" / "mcp-config.json",
-        "key": "servers",
+        # Copilot CLI reads "mcpServers"; releases before #616 wrote
+        # "servers", which the client silently ignores.
+        "key": "mcpServers",
+        "legacy_keys": ("servers",),
         "detect": lambda: (Path.home() / ".copilot").exists(),
+        "format": "object",
+        "needs_type": True,
+        # Validated with the released Copilot CLI in #658.
+        "server_type": "local",
+        "entry_fields": {"tools": ["*"]},
+    },
+    "codebuddy": {
+        "name": "CodeBuddy Code",
+        "config_path": lambda root: root / ".mcp.json",
+        "key": "mcpServers",
+        "detect": lambda: True,
         "format": "object",
         "needs_type": True,
     },
@@ -235,15 +343,42 @@ def _build_server_entry(
 ) -> dict[str, Any]:
     """Build the MCP server entry for a platform."""
     command, args = _detect_serve_command()
+    if key == "opencode":
+        opencode_command = [command, *args]
+        if repo_root is not None:
+            opencode_command.extend(("--repo", str(repo_root)))
+        return {"type": "local", "command": opencode_command}
+
     entry: dict[str, Any] = {"command": command, "args": args}
     # Include cwd so the MCP server can find the graph database
     if repo_root is not None:
         entry["cwd"] = str(repo_root)
     if plat["needs_type"]:
-        entry["type"] = "stdio"
-    if key == "opencode":
-        entry["env"] = []
+        entry["type"] = plat.get("server_type", "stdio")
+    entry.update(plat.get("entry_fields", {}))
     return entry
+
+
+def _warn_legacy_opencode_config(repo_root: Path) -> None:
+    """Warn without modifying the obsolete Cursor-shaped OpenCode config."""
+    legacy = repo_root / ".opencode.json"
+    if not legacy.exists():
+        return
+    try:
+        parsed = json.loads(
+            _strip_jsonc(legacy.read_text(encoding="utf-8", errors="replace"))
+        )
+    except (json.JSONDecodeError, OSError):
+        return
+    if not isinstance(parsed, dict):
+        return
+    servers = parsed.get("mcpServers")
+    if isinstance(servers, dict) and "code-review-graph" in servers:
+        print(
+            f"  OpenCode: legacy config found at {legacy}; leaving it unchanged. "
+            "OpenCode now reads opencode.json or opencode.jsonc with a top-level "
+            "'mcp' setting."
+        )
 
 
 def _format_toml_value(value: Any) -> str:
@@ -290,6 +425,83 @@ def _merge_toml_mcp_server(
     return True
 
 
+def _strip_jsonc(text: str) -> str:
+    """Strip JSONC comments and trailing commas without corrupting string values.
+
+    Editors like Zed accept non-standard JSON (``//`` and ``/* */`` comments,
+    trailing commas). To merge such a config we must reduce it to strict JSON
+    first. A naive regex pass cannot tell structure from data: it would delete a
+    comma inside ``"foo, bar"`` or truncate a ``"https://..."`` URL at the
+    ``//``. This walks the text character by character, tracking whether we are
+    inside a double-quoted string (respecting ``\\`` escapes), and only removes
+    comments and trailing commas that appear in structural position. Content
+    inside string values is preserved verbatim. (GH #553)
+    """
+
+    def _skip_comment(s: str, idx: int) -> int | None:
+        """If a comment starts at ``idx``, return the index just past it."""
+        if s[idx] != "/" or idx + 1 >= len(s):
+            return None
+        nxt = s[idx + 1]
+        if nxt == "/":
+            idx += 2
+            while idx < len(s) and s[idx] != "\n":
+                idx += 1
+            return idx
+        if nxt == "*":
+            idx += 2
+            while idx + 1 < len(s) and not (s[idx] == "*" and s[idx + 1] == "/"):
+                idx += 1
+            return idx + 2  # consume the closing */ (or run off the end if unterminated)
+        return None
+
+    out: list[str] = []
+    i = 0
+    n = len(text)
+    in_string = False
+    while i < n:
+        ch = text[i]
+        if in_string:
+            out.append(ch)
+            if ch == "\\" and i + 1 < n:
+                out.append(text[i + 1])  # escaped char is data, never a delimiter
+                i += 2
+                continue
+            if ch == '"':
+                in_string = False
+            i += 1
+            continue
+        # Outside a string.
+        if ch == '"':
+            in_string = True
+            out.append(ch)
+            i += 1
+            continue
+        past = _skip_comment(text, i)
+        if past is not None:
+            i = past
+            continue
+        if ch == ",":
+            # Trailing comma if the next significant char (skipping whitespace
+            # and comments) closes an object or array.
+            j = i + 1
+            while j < n:
+                if text[j] in " \t\r\n":
+                    j += 1
+                    continue
+                past = _skip_comment(text, j)
+                if past is not None:
+                    j = past
+                    continue
+                break
+            if j < n and text[j] in "}]":
+                i += 1  # drop the trailing comma
+                continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
 def install_platform_configs(
     repo_root: Path,
     target: str = "all",
@@ -305,11 +517,30 @@ def install_platform_configs(
     Returns:
         List of platform names that were configured.
     """
+    shared_aliases: dict[str, tuple[str, ...]] = {}
     if target == "all":
         platforms_to_install = {k: v for k, v in PLATFORMS.items() if v["detect"]()}
         # Workspace-level Kiro detection
         if "kiro" not in platforms_to_install and (repo_root / ".kiro").is_dir():
             platforms_to_install["kiro"] = PLATFORMS["kiro"]
+
+        # Claude Code and CodeBuddy intentionally share the official project
+        # .mcp.json/mcpServers contract. Process that exact pair once, but do
+        # not deduplicate arbitrary clients merely because a config path
+        # happens to match: their keys or entry schemas may differ.
+        claude = platforms_to_install.get("claude")
+        codebuddy = platforms_to_install.get("codebuddy")
+        if claude is not None and codebuddy is not None:
+            same_contract = (
+                claude["config_path"](repo_root) == codebuddy["config_path"](repo_root)
+                and all(
+                    claude[field] == codebuddy[field]
+                    for field in ("key", "format", "needs_type")
+                )
+            )
+            if same_contract:
+                shared_aliases["claude"] = ("codebuddy",)
+                del platforms_to_install["codebuddy"]
     else:
         if target not in PLATFORMS:
             logger.error("Unknown platform: %s", target)
@@ -318,7 +549,13 @@ def install_platform_configs(
 
     configured: list[str] = []
 
+    def _record_configured(key: str, plat: dict[str, Any]) -> None:
+        configured.append(plat["name"])
+        configured.extend(PLATFORMS[alias]["name"] for alias in shared_aliases.get(key, ()))
+
     for key, plat in platforms_to_install.items():
+        if key == "opencode":
+            _warn_legacy_opencode_config(repo_root)
         config_path: Path = plat["config_path"](repo_root)
         server_key = plat["key"]
         server_entry = _build_server_entry(plat, key=key, repo_root=repo_root)
@@ -332,50 +569,89 @@ def install_platform_configs(
             )
             if not changed:
                 print(f"  {plat['name']}: already configured in {config_path}")
-                configured.append(plat["name"])
+                _record_configured(key, plat)
                 continue
             if dry_run:
                 print(f"  [dry-run] {plat['name']}: would write {config_path}")
             else:
                 print(f"  {plat['name']}: configured {config_path}")
-            configured.append(plat["name"])
+            _record_configured(key, plat)
             continue
 
         # Read existing config
         existing: dict[str, Any] = {}
         if config_path.exists():
             raw = config_path.read_text(encoding="utf-8", errors="replace")
-            # Strip single-line comments and trailing commas (JSONC compat
-            # for editors like Zed that allow non-standard JSON).
-            stripped = re.sub(r'//.*?$', '', raw, flags=re.MULTILINE)
-            stripped = re.sub(r',(\s*[}\]])', r'\1', stripped)
-            try:
-                existing = json.loads(stripped)
-            except (json.JSONDecodeError, OSError):
-                print(f"  {plat['name']}: {config_path} contains "
-                      f"unparseable JSON — skipping to avoid data loss. "
-                      f"Please add the MCP config manually.")
-                continue
+            # Strip comments and trailing commas (JSONC compat for editors like
+            # Zed that allow non-standard JSON) without corrupting string values.
+            stripped = _strip_jsonc(raw)
+            if not stripped.strip():
+                # An empty (or comment-only) file is a valid empty config,
+                # not a parse failure — proceed and write a fresh one rather
+                # than mis-flagging it "unparseable" and skipping. See #344.
+                existing = {}
+            else:
+                try:
+                    parsed = json.loads(stripped)
+                except (json.JSONDecodeError, OSError):
+                    print(f"  {plat['name']}: {config_path} contains "
+                          f"unparseable JSON — skipping to avoid data loss. "
+                          f"Please add the MCP config manually.")
+                    continue
+                if not isinstance(parsed, dict):
+                    # Valid JSON, but the top level is a list/scalar rather
+                    # than an object. Writing our server object would clobber
+                    # the user's data, and the ``.get()`` calls below would
+                    # raise AttributeError. Refuse and skip. See #344.
+                    print(f"  {plat['name']}: {config_path} is valid JSON but "
+                          f"not a top-level object "
+                          f"({type(parsed).__name__}) — skipping to avoid "
+                          f"data loss. Please add the MCP config manually.")
+                    continue
+                existing = parsed
+
+        expected_container = list if plat["format"] == "array" else dict
+        if server_key in existing and not isinstance(
+            existing[server_key], expected_container
+        ):
+            expected_name = "array" if expected_container is list else "object"
+            actual_name = type(existing[server_key]).__name__
+            print(
+                f"  {plat['name']}: {config_path} setting {server_key!r} "
+                f"is {actual_name}; expected a JSON {expected_name} — "
+                f"skipping to avoid data loss. Please repair that setting "
+                f"or add the MCP config manually."
+            )
+            continue
 
         if plat["format"] == "array":
             arr = existing.get(server_key, [])
-            if not isinstance(arr, list):
-                arr = []
             # Check if already present
             if any(isinstance(s, dict) and s.get("name") == "code-review-graph" for s in arr):
                 print(f"  {plat['name']}: already configured in {config_path}")
-                configured.append(plat["name"])
+                _record_configured(key, plat)
                 continue
             arr_entry = {"name": "code-review-graph", **server_entry}
             arr.append(arr_entry)
             existing[server_key] = arr
         else:
+            # Remove entries written under keys the client never read, then
+            # install the validated entry under the current key.
+            migrated = False
+            for legacy_key in plat.get("legacy_keys", ()):
+                legacy = existing.get(legacy_key)
+                if (
+                    isinstance(legacy, dict)
+                    and "code-review-graph" in legacy
+                ):
+                    del legacy["code-review-graph"]
+                    if not legacy:
+                        del existing[legacy_key]
+                    migrated = True
             servers = existing.get(server_key, {})
-            if not isinstance(servers, dict):
-                servers = {}
-            if "code-review-graph" in servers:
+            if "code-review-graph" in servers and not migrated:
                 print(f"  {plat['name']}: already configured in {config_path}")
-                configured.append(plat["name"])
+                _record_configured(key, plat)
                 continue
             servers["code-review-graph"] = server_entry
             existing[server_key] = servers
@@ -384,10 +660,12 @@ def install_platform_configs(
             print(f"  [dry-run] {plat['name']}: would write {config_path}")
         else:
             config_path.parent.mkdir(parents=True, exist_ok=True)
-            config_path.write_text(json.dumps(existing, indent=2) + "\n", encoding="utf-8")
+            config_path.write_text(
+                json.dumps(existing, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+            )
             print(f"  {plat['name']}: configured {config_path}")
 
-        configured.append(plat["name"])
+        _record_configured(key, plat)
 
     return configured
 
@@ -396,7 +674,7 @@ def install_platform_configs(
 
 _SKILLS: dict[str, dict[str, str]] = {
     "explore-codebase.md": {
-        "name": "Explore Codebase",
+        "name": "explore-codebase",
         "description": "Navigate and understand codebase structure using the knowledge graph",
         "body": (
             "## Explore Codebase\n\n"
@@ -424,7 +702,7 @@ _SKILLS: dict[str, dict[str, str]] = {
         ),
     },
     "review-changes.md": {
-        "name": "Review Changes",
+        "name": "review-changes",
         "description": "Perform a structured code review using change detection and impact",
         "body": (
             "## Review Changes\n\n"
@@ -452,7 +730,7 @@ _SKILLS: dict[str, dict[str, str]] = {
         ),
     },
     "debug-issue.md": {
-        "name": "Debug Issue",
+        "name": "debug-issue",
         "description": "Systematically debug issues using graph-powered code navigation",
         "body": (
             "## Debug Issue\n\n"
@@ -478,7 +756,7 @@ _SKILLS: dict[str, dict[str, str]] = {
         ),
     },
     "refactor-safely.md": {
-        "name": "Refactor Safely",
+        "name": "refactor-safely",
         "description": "Plan and execute safe refactoring using dependency analysis",
         "body": (
             "## Refactor Safely\n\n"
@@ -526,11 +804,11 @@ def generate_skills(repo_root: Path, skills_dir: Path | None = None) -> Path:
     skills_dir.mkdir(parents=True, exist_ok=True)
 
     for filename, skill in _SKILLS.items():
-        # Claude Code expects skills at .claude/skills/<name>/skill.md
+        # Claude Code expects skills at .claude/skills/<name>/SKILL.md
         skill_name = filename.removesuffix(".md")
         skill_subdir = skills_dir / skill_name
         skill_subdir.mkdir(parents=True, exist_ok=True)
-        path = skill_subdir / "skill.md"
+        path = skill_subdir / "SKILL.md"
         content = (
             "---\n"
             f"name: {skill['name']}\n"
@@ -550,21 +828,28 @@ def generate_hooks_config(repo_root: Path) -> dict[str, Any]:
     Hooks use the v1.x+ schema: each entry needs a ``matcher`` and a nested
     ``hooks`` array. Timeouts are in seconds. ``PreCommit`` is not a valid
     Claude Code event — pre-commit checks are handled by ``install_git_hook``.
+
+    The ``repo_root`` parameter is retained for backward compatibility but is
+    not embedded in hook commands. Instead, the repo root is resolved at
+    runtime via ``git rev-parse --show-toplevel`` so that ``settings.json``
+    is shareable across collaborators with different checkout paths.
+    A PATH guard ensures the hook exits silently when the binary is not on
+    ``$PATH`` (e.g. installed in a project venv).
     """
-    repo_arg = json.dumps(repo_root.resolve().as_posix())
     return {
         "hooks": {
             "PostToolUse": [
                 {
-                    "matcher": "Edit|Write|Bash",
+                    "matcher": "Edit|Write",
                     "hooks": [
                         {
                             "type": "command",
                             "command": (
                                 "cat >/dev/null || true; "
+                                "command -v code-review-graph >/dev/null 2>&1 || exit 0; "
                                 "git rev-parse --git-dir >/dev/null 2>&1"
-                                f" && code-review-graph update --skip-flows"
-                                f" --repo {repo_arg}"
+                                " && code-review-graph update --skip-flows"
+                                " --repo \"$(git rev-parse --show-toplevel 2>/dev/null)\""
                                 " || true"
                             ),
                             "timeout": 30,
@@ -580,8 +865,10 @@ def generate_hooks_config(repo_root: Path) -> dict[str, Any]:
                             "type": "command",
                             "command": (
                                 "cat >/dev/null || true; "
+                                "command -v code-review-graph >/dev/null 2>&1 || exit 0; "
                                 "git rev-parse --git-dir >/dev/null 2>&1"
-                                f" && code-review-graph status --repo {repo_arg}"
+                                " && code-review-graph status"
+                                " --repo \"$(git rev-parse --show-toplevel 2>/dev/null)\""
                                 " || echo 'Not a git repo, skipping'"
                             ),
                             "timeout": 10,
@@ -707,21 +994,11 @@ fi
     return hook_path
 
 
-def install_hooks(repo_root: Path, platform: str = "claude") -> None:
-    """Write hooks config to platform-specific settings.json.
-
-    Merges new hook entries into existing settings, preserving both
-    non-hook configuration and user-defined hooks.  A backup of the
-    original file is created before any modifications.
-
-    Args:
-        repo_root: Repository root directory.
-        platform: Target platform ("claude" or "qoder").
-    """
-    if platform == "qoder":
-        settings_dir = repo_root / ".qoder"
-    else:
-        settings_dir = repo_root / ".claude"
+def _merge_hooks_into_settings(
+    settings_dir: Path,
+    hooks_config: dict[str, Any],
+) -> Path:
+    """Merge hook entries into a project settings file without clobbering users."""
     settings_dir.mkdir(parents=True, exist_ok=True)
     settings_path = settings_dir / "settings.json"
 
@@ -735,7 +1012,6 @@ def install_hooks(repo_root: Path, platform: str = "claude") -> None:
         except (json.JSONDecodeError, OSError) as exc:
             logger.warning("Could not read existing %s: %s", settings_path, exc)
 
-    hooks_config = generate_hooks_config(repo_root)
     existing_hooks = existing.get("hooks", {})
     if not isinstance(existing_hooks, dict):
         logger.warning("Existing hooks config is not a dict; replacing with defaults")
@@ -754,8 +1030,48 @@ def install_hooks(repo_root: Path, platform: str = "claude") -> None:
 
     existing["hooks"] = merged_hooks
 
-    settings_path.write_text(json.dumps(existing, indent=2) + "\n", encoding="utf-8")
+    settings_path.write_text(
+        json.dumps(existing, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
     logger.info("Wrote hooks config: %s", settings_path)
+    return settings_path
+
+
+def install_hooks(repo_root: Path, platform: str = "claude") -> None:
+    """Write hooks config to platform-specific settings.json.
+
+    Merges new hook entries into existing settings, preserving both
+    non-hook configuration and user-defined hooks.  A backup of the
+    original file is created before any modifications.
+
+    Args:
+        repo_root: Repository root directory.
+        platform: Target platform ("claude" or "qoder").
+    """
+    if platform == "qoder":
+        settings_dir = repo_root / ".qoder"
+    else:
+        settings_dir = repo_root / ".claude"
+    _merge_hooks_into_settings(settings_dir, generate_hooks_config(repo_root))
+
+
+def install_codebuddy_hooks(repo_root: Path) -> Path:
+    """Install runtime-resolved POSIX hooks in .codebuddy/settings.json.
+
+    CodeBuddy uses the same nested hook schema and POSIX-shell execution
+    model as the existing project hooks. The shared generator deliberately
+    resolves the checkout at hook runtime instead of embedding the installer's
+    absolute path, so committed settings work for every collaborator.
+    """
+    hooks_config = generate_hooks_config(repo_root)
+    # CodeBuddy's Bash tool can create or rewrite files without going through
+    # Edit/Write, so its PostToolUse contract also observes Bash. The command
+    # itself still resolves the repository dynamically at hook runtime.
+    hooks_config["hooks"]["PostToolUse"][0]["matcher"] = "Edit|Write|Bash"
+    return _merge_hooks_into_settings(
+        repo_root / ".codebuddy",
+        hooks_config,
+    )
 
 
 def install_codex_hooks(repo_root: Path) -> Path:
@@ -809,7 +1125,9 @@ def install_codex_hooks(repo_root: Path) -> Path:
             merged_hooks[hook_name] = hook_entries
 
     existing["hooks"] = merged_hooks
-    hooks_path.write_text(json.dumps(existing, indent=2) + "\n", encoding="utf-8")
+    hooks_path.write_text(
+        json.dumps(existing, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
     logger.info("Wrote Codex hooks config: %s", hooks_path)
     return hooks_path
 
@@ -907,8 +1225,13 @@ cover what you need.
 """
 
 # Maps instruction file path → (marker, section) for files that need content
-# different from the default _CLAUDE_MD_SECTION.
+# different from the default _CLAUDE_MD_SECTION. Legacy paths remain here so
+# uninstall can identify sections written by older releases.
 _PLATFORM_INSTRUCTION_CUSTOM_SECTIONS: dict[str, tuple[str, str]] = {
+    ".github/instructions/code-review-graph.instructions.md": (
+        _CLAUDE_MD_SECTION_MARKER,
+        _COPILOT_SECTION,
+    ),
     ".github/code-review-graph.instruction.md": (_CLAUDE_MD_SECTION_MARKER, _COPILOT_SECTION),
 }
 
@@ -950,17 +1273,45 @@ def inject_claude_md(repo_root: Path) -> None:
 # Used to filter writes when the user passes --platform <X>: only files
 # whose owner set includes the target (or "all") are written.
 _PLATFORM_INSTRUCTION_FILES: dict[str, tuple[str, ...]] = {
-    "AGENTS.md": ("cursor", "opencode", "antigravity"),
+    "AGENTS.md": ("cursor", "opencode", "antigravity", "codex"),
     "GEMINI.md": ("antigravity", "gemini-cli"),
     ".cursorrules": ("cursor",),
     ".windsurfrules": ("windsurf",),
     "QODER.md": ("qoder",),
     ".kiro/steering/code-review-graph.md": ("kiro",),
+    ".github/instructions/code-review-graph.instructions.md": ("copilot", "copilot-cli"),
+    "CODEBUDDY.md": ("codebuddy",),
+}
+
+# Superseded paths written by older releases. Reinstall removes only the exact
+# generated section and leaves any user-authored content intact.
+_LEGACY_PLATFORM_INSTRUCTION_FILES: dict[str, tuple[str, ...]] = {
     ".github/code-review-graph.instruction.md": ("copilot", "copilot-cli"),
 }
 
 
+def _remove_legacy_instruction_file(path: Path) -> None:
+    """Strip an exact generated section from a superseded instruction file."""
+    if not path.exists():
+        return
+    content = path.read_text(encoding="utf-8", errors="replace")
+    if _CLAUDE_MD_SECTION_MARKER not in content:
+        return
+    for section in (_COPILOT_SECTION, _CLAUDE_MD_SECTION):
+        content = content.replace(section, "")
+    if _CLAUDE_MD_SECTION_MARKER in content:
+        return
+    if content.strip():
+        path.write_text(content.rstrip() + "\n", encoding="utf-8")
+        logger.info("Removed legacy instruction section from %s", path)
+    else:
+        path.unlink()
+        logger.info("Removed legacy instruction file %s", path)
+
+
 # --- Gemini CLI hooks + skills (workspace-level: .gemini/) ---
+
+_GEMINI_CLI_HOOK_FILENAMES = ("crg-session-start.sh", "crg-update.sh")
 
 
 def install_gemini_cli_hooks(repo_root: Path) -> Path:
@@ -1022,11 +1373,11 @@ exit 0
 """
     update_script = update_script.replace("__CRG_REPO__", repo_arg)
 
-    session_start_path = hooks_dir / "crg-session-start.sh"
+    session_start_path = hooks_dir / _GEMINI_CLI_HOOK_FILENAMES[0]
     session_start_path.write_text(session_start_script, encoding="utf-8")
     session_start_path.chmod(0o755)
 
-    update_path = hooks_dir / "crg-update.sh"
+    update_path = hooks_dir / _GEMINI_CLI_HOOK_FILENAMES[1]
     update_path.write_text(update_script, encoding="utf-8")
     update_path.chmod(0o755)
 
@@ -1076,20 +1427,22 @@ exit 0
     _ensure_group(
         event_name="SessionStart",
         matcher="",
-        hook_command="bash .gemini/hooks/crg-session-start.sh",
+        hook_command=f"bash .gemini/hooks/{_GEMINI_CLI_HOOK_FILENAMES[0]}",
         name="code-review-graph status",
         timeout=10_000,
     )
     _ensure_group(
         event_name="AfterTool",
         matcher="write_file|replace",
-        hook_command="bash .gemini/hooks/crg-update.sh",
+        hook_command=f"bash .gemini/hooks/{_GEMINI_CLI_HOOK_FILENAMES[1]}",
         name="code-review-graph update",
         timeout=30_000,
     )
 
     existing["hooks"] = hooks_obj
-    settings_path.write_text(json.dumps(existing, indent=2) + "\n", encoding="utf-8")
+    settings_path.write_text(
+        json.dumps(existing, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
     logger.info("Wrote Gemini CLI hooks config: %s", settings_path)
     return settings_path
 
@@ -1117,6 +1470,29 @@ def install_gemini_cli_skills(repo_root: Path) -> Path:
     return skills_root
 
 
+def install_codebuddy_skills(repo_root: Path) -> Path:
+    """Install project skills in .codebuddy/skills/<name>/SKILL.md."""
+    skills_root = repo_root / ".codebuddy" / "skills"
+    skills_root.mkdir(parents=True, exist_ok=True)
+
+    for filename, skill in _SKILLS.items():
+        slug = filename.rsplit(".", 1)[0]
+        skill_dir = skills_root / slug
+        skill_dir.mkdir(parents=True, exist_ok=True)
+        skill_path = skill_dir / "SKILL.md"
+        content = (
+            "---\n"
+            f"name: {slug}\n"
+            f"description: {skill['description']}\n"
+            "---\n\n"
+            f"{skill['body']}\n"
+        )
+        skill_path.write_text(content, encoding="utf-8")
+        logger.info("Wrote CodeBuddy skill: %s", skill_path)
+
+    return skills_root
+
+
 def inject_platform_instructions(repo_root: Path, target: str = "all") -> list[str]:
     """Inject 'use graph first' instructions into platform rule files.
 
@@ -1126,7 +1502,7 @@ def inject_platform_instructions(repo_root: Path, target: str = "all") -> list[s
     - ``"all"`` (default): writes every file — matches pre-filter behavior.
     - ``"claude"``: writes nothing (CLAUDE.md is handled by ``inject_claude_md``).
     - any other platform key (``cursor``, ``windsurf``, ``antigravity``,
-      ``opencode``): writes only the files associated with that platform.
+      ``opencode``, ``codex``): writes only the files associated with that platform.
 
     Returns list of filenames that were created or updated.
     """
@@ -1141,6 +1517,10 @@ def inject_platform_instructions(repo_root: Path, target: str = "all") -> list[s
             marker, section = _CLAUDE_MD_SECTION_MARKER, _CLAUDE_MD_SECTION
         if _inject_instructions(path, marker, section):
             updated.append(filename)
+    for filename, owners in _LEGACY_PLATFORM_INSTRUCTION_FILES.items():
+        if target != "all" and target not in owners:
+            continue
+        _remove_legacy_instruction_file(repo_root / filename)
     return updated
 
 
@@ -1317,7 +1697,7 @@ def install_cursor_hooks() -> Path:
 
     cursor_dir.mkdir(parents=True, exist_ok=True)
     hooks_json_path.write_text(
-        json.dumps(existing, indent=2) + "\n",
+        json.dumps(existing, indent=2, ensure_ascii=False) + "\n",
         encoding="utf-8",
     )
     logger.info("Wrote Cursor hooks config: %s", hooks_json_path)

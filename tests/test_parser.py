@@ -3,6 +3,8 @@
 import tempfile
 from pathlib import Path
 
+from code_review_graph.graph import GraphStore
+from code_review_graph.incremental import full_build
 from code_review_graph.parser import CodeParser
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -158,6 +160,44 @@ class TestCodeParser:
         for n in nodes:
             assert n.language == "bash"
 
+    def test_parse_bytes_shebang_language_from_snapshot_not_disk(self, tmp_path):
+        """Regression for #746: ``parse_bytes`` must derive the language from
+        the byte snapshot it was given, not from a re-read of the file.
+
+        Simulates a save racing the indexer: an editor's truncate+rewrite save
+        has just emptied the extension-less script on disk while the indexer
+        parses its complete snapshot. If the shebang probe re-reads the disk it
+        sees an empty file, detects no language, and a complete snapshot parses
+        to zero nodes — stored under the snapshot's (final) file hash.
+        """
+        p = self._write_shebang_file(
+            tmp_path, "tool",
+            "#!/usr/bin/env python3\n\ndef damaged():\n    return 1\n",
+        )
+        snapshot = p.read_bytes()
+        p.write_bytes(b"")  # the racing save has truncated the file
+
+        nodes, _ = self.parser.parse_bytes(p, snapshot)
+
+        func_names = {n.name for n in nodes if n.kind == "Function"}
+        assert "damaged" in func_names
+        for n in nodes:
+            assert n.language == "python"
+
+    def test_detect_language_uses_provided_source_over_disk(self, tmp_path):
+        """With pre-read source bytes, shebang detection must not touch disk."""
+        p = tmp_path / "tool"
+        p.write_bytes(b"")  # on-disk content is mid-save (empty)
+        source = b"#!/usr/bin/env python3\nprint(1)\n"
+        assert self.parser.detect_language(p, source) == "python"
+
+    def test_detect_language_without_source_still_probes_disk(self, tmp_path):
+        """Path-only callers (file filters) keep the on-disk shebang probe."""
+        p = self._write_shebang_file(
+            tmp_path, "runner", "#!/usr/bin/env bash\necho hi\n",
+        )
+        assert self.parser.detect_language(p) == "bash"
+
     def test_parse_python_file(self):
         nodes, edges = self.parser.parse_file(FIXTURES / "sample_python.py")
 
@@ -178,6 +218,31 @@ class TestCodeParser:
         assert "authenticate" in func_names
         assert "create_auth_service" in func_names
         assert "process_request" in func_names
+
+    def test_parse_python_class_decorators_persisted(self):
+        """Stacked Python class decorators reach downstream metadata consumers."""
+        from code_review_graph.flows import _has_framework_decorator
+
+        source = b"""
+@Component(\"widget-card\")
+@dataclass(frozen=True)
+class Widget:
+    pass
+
+class Plain:
+    pass
+"""
+        nodes, _ = self.parser.parse_bytes(Path("models.py"), source)
+        widget = next(node for node in nodes if node.name == "Widget")
+        plain = next(node for node in nodes if node.name == "Plain")
+
+        expected = ["Component(\"widget-card\")", "dataclass(frozen=True)"]
+        assert widget.kind == "Class"
+        assert widget.modifiers == ",".join(expected)
+        assert widget.extra["decorators"] == expected
+        assert _has_framework_decorator(widget)
+        assert plain.modifiers is None
+        assert "decorators" not in plain.extra
 
     def test_parse_python_edges(self):
         nodes, edges = self.parser.parse_file(FIXTURES / "sample_python.py")
@@ -232,7 +297,7 @@ class TestCodeParser:
         """Call targets defined in the same file should be qualified."""
         nodes, edges = self.parser.parse_file(FIXTURES / "sample_python.py")
         calls = [e for e in edges if e.kind == "CALLS"]
-        file_path = str(FIXTURES / "sample_python.py")
+        file_path = (FIXTURES / "sample_python.py").as_posix()
 
         # create_auth_service() calls AuthService() — a class defined in the same file
         auth_service_calls = [
@@ -245,7 +310,7 @@ class TestCodeParser:
         _, edges = self.parser.parse_file(FIXTURES / "caller_example.py")
         calls = [e for e in edges if e.kind == "CALLS"]
 
-        sample_path = str((FIXTURES / "sample_python.py").resolve())
+        sample_path = (FIXTURES / "sample_python.py").resolve().as_posix()
         # setup_and_run() calls create_auth_service(), imported from sample_python
         resolved_calls = [
             e for e in calls if e.target == f"{sample_path}::create_auth_service"
@@ -264,7 +329,7 @@ class TestCodeParser:
         """Decorated functions should be in defined_names and resolvable as call targets."""
         _, edges = self.parser.parse_file(FIXTURES / "sample_python.py")
         calls = [e for e in edges if e.kind == "CALLS"]
-        file_path = str(FIXTURES / "sample_python.py")
+        file_path = (FIXTURES / "sample_python.py").as_posix()
 
         # guarded_process() calls process_request() — both in the same file,
         # but guarded_process is wrapped in a decorated_definition node
@@ -302,7 +367,7 @@ class TestCodeParser:
         try:
             _, edges = self.parser.parse_file(tmp)
             calls = [e for e in edges if e.kind == "CALLS"]
-            module_scope_calls = [e for e in calls if e.source == str(tmp)]
+            module_scope_calls = [e for e in calls if e.source == tmp.as_posix()]
             assert any(
                 "helper" in e.target for e in module_scope_calls
             ), f"Expected module-scope CALLS edge to helper(); got: {[(e.source, e.target) for e in calls]}"
@@ -336,7 +401,7 @@ class TestCodeParser:
             _, edges = self.parser.parse_file(tmp)
             calls = [e for e in edges if e.kind == "CALLS"]
             assert any(
-                "do_work" in e.target and e.source == str(tmp) for e in calls
+                "do_work" in e.target and e.source == tmp.as_posix() for e in calls
             ), f"Expected notebook CALLS edge to do_work(); got: {[(e.source, e.target) for e in calls]}"
         finally:
             tmp.unlink()
@@ -551,7 +616,7 @@ class TestCodeParser:
         nodes, edges = self.parser.parse_file(FIXTURES / "sample.dart")
         contains = [e for e in edges if e.kind == "CONTAINS"]
         # File should contain top-level classes and functions
-        file_path = str(FIXTURES / "sample.dart")
+        file_path = (FIXTURES / "sample.dart").as_posix()
         file_contains = [e for e in contains if e.source == file_path]
         assert len(file_contains) >= 1
         # Dog class should contain its methods
@@ -656,7 +721,7 @@ class TestCodeParser:
         ]
         assert len(it_tests) >= 2
 
-        file_path = str(FIXTURES / "sample_vitest.test.ts")
+        file_path = (FIXTURES / "sample_vitest.test.ts").as_posix()
         describe_qualified = {f"{file_path}::{n.name}" for n in describe_nodes}
         contains_sources = {e.source for e in edges if e.kind == "CONTAINS"}
         assert describe_qualified & contains_sources
@@ -667,7 +732,7 @@ class TestCodeParser:
         calls = [e for e in edges if e.kind == "CALLS"]
         assert len(calls) >= 1
         test_names = {n.name for n in nodes if n.kind == "Test"}
-        file_path = str(FIXTURES / "sample_vitest.test.ts")
+        file_path = (FIXTURES / "sample_vitest.test.ts").as_posix()
         test_qualified = {f"{file_path}::{name}" for name in test_names}
         call_sources = {e.source for e in calls}
         assert call_sources & test_qualified
@@ -842,10 +907,10 @@ class TestCodeParser:
         _, edges = self.parser.parse_bytes(path, source)
 
         calls = [e for e in edges if e.kind == "CALLS"]
-        expected_target = f"{str((FIXTURES / 'MarkdownMsg.tsx').resolve())}::MarkdownMsg"
+        expected_target = f"{(FIXTURES / 'MarkdownMsg.tsx').resolve().as_posix()}::MarkdownMsg"
         jsx_calls = [
             e for e in calls
-            if e.source == f"{path}::BookWorkspace" and e.target == expected_target
+            if e.source == f"{path.as_posix()}::BookWorkspace" and e.target == expected_target
         ]
         assert len(jsx_calls) == 1
 
@@ -875,7 +940,7 @@ class TestCodeParser:
         calls = [e for e in edges if e.kind == "CALLS"]
         jsx_calls = [
             e for e in calls
-            if e.source == f"{path}::BookWorkspace" and e.target == "MarkdownMsg"
+            if e.source == f"{path.as_posix()}::BookWorkspace" and e.target == "MarkdownMsg"
         ]
         assert len(jsx_calls) == 1
 
@@ -891,10 +956,10 @@ class TestCodeParser:
         _, edges = self.parser.parse_bytes(path, source)
 
         calls = [e for e in edges if e.kind == "CALLS"]
-        expected_target = f"{str((FIXTURES / 'MarkdownMsg.tsx').resolve())}::MarkdownMsg"
+        expected_target = f"{(FIXTURES / 'MarkdownMsg.tsx').resolve().as_posix()}::MarkdownMsg"
         jsx_calls = [
             e for e in calls
-            if e.source == f"{path}::BookWorkspace" and e.target == expected_target
+            if e.source == f"{path.as_posix()}::BookWorkspace" and e.target == expected_target
         ]
         assert len(jsx_calls) == 1
 
@@ -910,10 +975,10 @@ class TestCodeParser:
         _, edges = self.parser.parse_bytes(path, source)
 
         calls = [e for e in edges if e.kind == "CALLS"]
-        expected_target = f"{str((FIXTURES / 'MarkdownMsg.tsx').resolve())}::MarkdownMsg"
+        expected_target = f"{(FIXTURES / 'MarkdownMsg.tsx').resolve().as_posix()}::MarkdownMsg"
         jsx_calls = [
             e for e in calls
-            if e.source == f"{path}::BookWorkspace" and e.target == expected_target
+            if e.source == f"{path.as_posix()}::BookWorkspace" and e.target == expected_target
         ]
         assert len(jsx_calls) == 1
 
@@ -941,12 +1006,13 @@ class TestCodeParser:
 
             calls = [e for e in edges if e.kind == "CALLS"]
             expected_target = (
-                f"{str((root / 'components' / 'MarkdownMsg.tsx').resolve())}"
+                f"{(root / 'components' / 'MarkdownMsg.tsx').resolve().as_posix()}"
                 "::MarkdownMsg"
             )
             jsx_calls = [
                 e for e in calls
-                if e.source == f"{consumer}::BookWorkspace" and e.target == expected_target
+                if e.source == f"{consumer.as_posix()}::BookWorkspace"
+                and e.target == expected_target
             ]
             assert len(jsx_calls) == 1
 
@@ -974,12 +1040,13 @@ class TestCodeParser:
 
             calls = [e for e in edges if e.kind == "CALLS"]
             expected_target = (
-                f"{str((root / 'components' / 'MarkdownMsg.tsx').resolve())}"
+                f"{(root / 'components' / 'MarkdownMsg.tsx').resolve().as_posix()}"
                 "::MarkdownMsg"
             )
             jsx_calls = [
                 e for e in calls
-                if e.source == f"{consumer}::BookWorkspace" and e.target == expected_target
+                if e.source == f"{consumer.as_posix()}::BookWorkspace"
+                and e.target == expected_target
             ]
             assert len(jsx_calls) == 1
 
@@ -1007,12 +1074,13 @@ class TestCodeParser:
 
             calls = [e for e in edges if e.kind == "CALLS"]
             expected_target = (
-                f"{str((root / 'components' / 'MarkdownMsg.tsx').resolve())}"
+                f"{(root / 'components' / 'MarkdownMsg.tsx').resolve().as_posix()}"
                 "::MarkdownMsg"
             )
             jsx_calls = [
                 e for e in calls
-                if e.source == f"{consumer}::BookWorkspace" and e.target == expected_target
+                if e.source == f"{consumer.as_posix()}::BookWorkspace"
+                and e.target == expected_target
             ]
             assert len(jsx_calls) == 1
 
@@ -1055,7 +1123,7 @@ class TestCodeParser:
             _, edges = self.parser.parse_file(consumer)
 
             expected_target = (
-                f"{str((components / 'MarkdownMsg.jsx').resolve())}::MarkdownMsg"
+                f"{(components / 'MarkdownMsg.jsx').resolve().as_posix()}::MarkdownMsg"
             )
             jsx_calls = [
                 e for e in edges
@@ -1065,8 +1133,8 @@ class TestCodeParser:
             for edge in jsx_calls:
                 by_source[edge.source] = by_source.get(edge.source, 0) + 1
             assert by_source == {
-                f"{consumer}::BookDashboard": 3,
-                f"{consumer}::AIPanel": 2,
+                f"{consumer.as_posix()}::BookDashboard": 3,
+                f"{consumer.as_posix()}::AIPanel": 2,
             }
 
     def test_nested_barrel_chain_resolves_component_to_origin_file(self):
@@ -1098,12 +1166,12 @@ class TestCodeParser:
             _, edges = self.parser.parse_file(consumer)
 
             expected_target = (
-                f"{str((messages / 'MarkdownMsg.jsx').resolve())}::MarkdownMsg"
+                f"{(messages / 'MarkdownMsg.jsx').resolve().as_posix()}::MarkdownMsg"
             )
             jsx_calls = [
                 e for e in edges
                 if e.kind == "CALLS"
-                and e.source == f"{consumer}::BookDashboard"
+                and e.source == f"{consumer.as_posix()}::BookDashboard"
                 and e.target == expected_target
             ]
             assert len(jsx_calls) == 1
@@ -1286,7 +1354,7 @@ class TestValueReferences:
         """REFERENCES edges should have resolved (qualified) targets for local funcs."""
         nodes, edges = self.parser.parse_file(FIXTURES / "sample_map_dispatch.ts")
         refs = [e for e in edges if e.kind == "REFERENCES"]
-        file_path = str(FIXTURES / "sample_map_dispatch.ts")
+        file_path = (FIXTURES / "sample_map_dispatch.ts").as_posix()
         # At least some targets should be fully qualified
         qualified_refs = [e for e in refs if "::" in e.target]
         assert len(qualified_refs) > 0
@@ -1317,7 +1385,7 @@ class TestModuleScopeCalls:
         calls = [e for e in edges if e.kind == "CALLS"]
         top_level = [
             e for e in calls
-            if e.source == str(path) and e.target.endswith("worker")
+            if e.source == path.as_posix() and e.target.endswith("worker")
         ]
         assert len(top_level) == 1
         # Edge originates at the call site (line 4), not the def (line 1).
@@ -1337,7 +1405,7 @@ class TestModuleScopeCalls:
         calls = [e for e in edges if e.kind == "CALLS"]
         top_level = [
             e for e in calls
-            if e.source == str(path) and e.target.endswith("run_job")
+            if e.source == path.as_posix() and e.target.endswith("run_job")
         ]
         assert len(top_level) == 1
         # Edge originates inside the `if __name__` block (line 5).
@@ -1358,7 +1426,7 @@ class TestModuleScopeCalls:
         calls = [e for e in edges if e.kind == "CALLS"]
         top_level = [
             e for e in calls
-            if e.source == str(path) and e.target.endswith("App")
+            if e.source == path.as_posix() and e.target.endswith("App")
         ]
         assert len(top_level) == 1
         # Edge originates at the JSX site (line 3), not the import (line 1).
@@ -1380,7 +1448,7 @@ class TestModuleScopeCalls:
         top_level = [
             e for e in edges
             if e.kind == "CALLS"
-            and e.source == str(path)
+            and e.source == path.as_posix()
             and e.target.endswith("worker")
         ]
         assert len(top_level) == 1
@@ -1395,7 +1463,7 @@ class TestModuleScopeCalls:
         top_level = [
             e for e in edges
             if e.kind == "CALLS"
-            and e.source == str(path)
+            and e.source == path.as_posix()
             and e.target.endswith("puts")
         ]
         assert len(top_level) == 1
@@ -1520,3 +1588,493 @@ class TestCppScopedFunctionName:
         fns = [n for n in nodes if n.kind == "Function"]
         assert len(fns) == 1
         assert fns[0].name == "get_obj_fingerprint"
+
+
+class TestJsMemberAssignedFunctions:
+    """Member-assigned function expressions in JS/TS.
+
+    ``obj.method = function () {}`` / ``Foo.prototype.bar = () => {}`` are the
+    prototype- and module-augmentation patterns that Express, Koa and many
+    older JS libraries use for their entire public API. Only ``const x = fn``
+    (variable_declarator) and class fields were captured before, so these
+    definitions produced no Function node at all.
+    """
+
+    def setup_method(self):
+        self.parser = CodeParser()
+
+    def test_js_object_method_assignment_captured(self):
+        nodes, _ = self.parser.parse_bytes(
+            Path("/test/application.js"),
+            b"app.handle = function handle(req, res, next) {\n"
+            b"  next();\n"
+            b"};\n",
+        )
+        fns = {n.name for n in nodes if n.kind == "Function"}
+        assert "app.handle" in fns
+
+    def test_js_arrow_member_assignment_captured(self):
+        nodes, _ = self.parser.parse_bytes(
+            Path("/test/router.js"),
+            b"router.dispatch = (req, res) => {\n"
+            b"  return res;\n"
+            b"};\n",
+        )
+        fns = {n.name for n in nodes if n.kind == "Function"}
+        assert "router.dispatch" in fns
+
+    def test_ts_prototype_assignment_captured(self):
+        nodes, _ = self.parser.parse_bytes(
+            Path("/test/proto.ts"),
+            b"Router.prototype.handle = function (req: Request): void {\n"
+            b"  this.stack.forEach((layer) => layer.handle(req));\n"
+            b"};\n",
+        )
+        fns = {n.name for n in nodes if n.kind == "Function"}
+        assert "Router.prototype.handle" in fns
+
+    def test_member_function_qualified_name_and_contains(self):
+        """Qualified name is ``file::obj.method`` and a CONTAINS edge links it."""
+        path = Path("/test/application.js")
+        nodes, edges = self.parser.parse_bytes(
+            path,
+            b"app.handle = function handle(req, res) {};\n",
+        )
+        contains = [
+            e for e in edges
+            if e.kind == "CONTAINS" and e.target == f"{path.as_posix()}::app.handle"
+        ]
+        assert len(contains) == 1
+        assert contains[0].source == path.as_posix()
+
+    def test_non_function_member_assignment_not_captured(self):
+        """``obj.prop = <non-function>`` must not create a Function node."""
+        nodes, _ = self.parser.parse_bytes(
+            Path("/test/config.js"),
+            b"app.settings = { trust_proxy: false };\n"
+            b"app.locals = {};\n",
+        )
+        fns = {n.name for n in nodes if n.kind == "Function"}
+        assert "app.settings" not in fns
+        assert "app.locals" not in fns
+
+    def test_function_local_member_assignments_are_not_module_definitions(self):
+        """Sibling local assignments must not collide as ``file::x.run``."""
+        path = Path("/test/local_assignments.js")
+        nodes, edges = self.parser.parse_bytes(
+            path,
+            b"function a() { x.run = function () {}; }\n"
+            b"function b() { x.run = function () {}; }\n",
+        )
+        functions = [n for n in nodes if n.kind == "Function"]
+        assert {n.name for n in functions} == {"a", "b"}
+        assert all(n.name != "x.run" for n in functions)
+        assert all(
+            not (e.kind == "CONTAINS" and e.target == f"{path.as_posix()}::x.run")
+            for e in edges
+        )
+
+    def test_sibling_top_level_blocks_do_not_share_member_identity(self):
+        """Block-local objects must not collapse into one module definition."""
+        path = Path("/test/block_assignments.js")
+        nodes, edges = self.parser.parse_bytes(
+            path,
+            b"{ const x = {}; x.run = function () {}; }\n"
+            b"{ const x = {}; x.run = function () {}; }\n",
+        )
+        functions = [n for n in nodes if n.kind == "Function"]
+        assert all(n.name != "x.run" for n in functions)
+        assert all(
+            not (e.kind == "CONTAINS" and e.target == f"{path.as_posix()}::x.run")
+            for e in edges
+        )
+
+    def test_dynamic_receiver_assignment_is_not_a_stable_definition(self):
+        """A fresh object returned by a call has no stable member identity."""
+        path = Path("/test/dynamic_assignment.js")
+        nodes, edges = self.parser.parse_bytes(
+            path,
+            b"factory().handle = function () {};\n",
+        )
+        functions = [n for n in nodes if n.kind == "Function"]
+        assert all(n.name != "factory().handle" for n in functions)
+        assert all(
+            not (
+                e.kind == "CONTAINS"
+                and e.target == f"{path.as_posix()}::factory().handle"
+            )
+            for e in edges
+        )
+
+    def test_dynamic_receiver_call_does_not_resolve_as_static_member(self):
+        """Separate factory calls must not be linked as one member."""
+        path = Path("/test/dynamic_call.js")
+        _, edges = self.parser.parse_bytes(
+            path,
+            b"factory().handle = function () {};\n"
+            b"function start() { factory().handle(); }\n",
+        )
+        calls = [
+            e for e in edges
+            if e.kind == "CALLS" and e.source == f"{path.as_posix()}::start"
+        ]
+        assert len(calls) == 2
+        handle_call = next(e for e in calls if e.target == "handle")
+        assert "member_call" not in handle_call.extra
+
+    def test_member_function_body_calls_still_attributed(self):
+        """Calls inside a member-assigned function attribute to that function."""
+        path = Path("/test/application.js")
+        _, edges = self.parser.parse_bytes(
+            path,
+            b"function helper() { return 1; }\n"
+            b"app.handle = function handle() {\n"
+            b"  helper();\n"
+            b"};\n",
+        )
+        calls = [
+            e for e in edges
+            if e.kind == "CALLS"
+            and e.source == f"{path.as_posix()}::app.handle"
+            and e.target.endswith("helper")
+        ]
+        assert len(calls) == 1
+
+    def test_member_call_resolves_to_member_assigned_function(self):
+        """A static member call resolves to its same-file member definition."""
+        path = Path("/test/application.js")
+        _, edges = self.parser.parse_bytes(
+            path,
+            b"app.handle = function () {};\n"
+            b"function start() { app.handle(); }\n",
+        )
+        calls = [
+            e for e in edges
+            if e.kind == "CALLS" and e.source == f"{path.as_posix()}::start"
+        ]
+        assert len(calls) == 1
+        assert calls[0].target == f"{path.as_posix()}::app.handle"
+
+    def test_optional_member_call_resolves_to_member_assigned_function(self):
+        """Optional chaining retains the same static member-call target."""
+        path = Path("/test/application.js")
+        _, edges = self.parser.parse_bytes(
+            path,
+            b"app.handle = function () {};\n"
+            b"function start() { app?.handle(); }\n",
+        )
+        calls = [
+            e for e in edges
+            if e.kind == "CALLS" and e.source == f"{path.as_posix()}::start"
+        ]
+        assert len(calls) == 1
+        assert calls[0].target == f"{path.as_posix()}::app.handle"
+
+    def test_member_assignment_survives_full_build_with_resolved_caller(
+        self,
+        tmp_path: Path,
+        monkeypatch,
+    ) -> None:
+        """The definition and resolved call persist through a real graph build."""
+        monkeypatch.setenv("CRG_SERIAL_PARSE", "1")
+        source = tmp_path / "application.js"
+        source.write_text(
+            "app.handle = function () { return 1; };\n"
+            "function start() { return app.handle(); }\n",
+            encoding="utf-8",
+        )
+        member_qn = f"{source.as_posix()}::app.handle"
+        caller_qn = f"{source.as_posix()}::start"
+
+        with GraphStore(tmp_path / "graph.db") as store:
+            built = full_build(tmp_path, store)
+            assert built["errors"] == []
+
+            member = store.get_node(member_qn)
+            callers = [
+                edge
+                for edge in store.get_edges_by_target(member_qn)
+                if edge.kind == "CALLS"
+            ]
+
+        assert member is not None
+        assert member.kind == "Function"
+        assert member.name == "app.handle"
+        assert len(callers) == 1
+        assert callers[0].source_qualified == caller_qn
+class TestTypeScriptTypeDeclarations:
+    """TS interfaces / type aliases / enums are graph nodes, and type positions
+    are dependencies.
+
+    Before this, ``_CLASS_TYPES`` covered only ``class_declaration`` for TS, so a
+    types-only module produced zero symbol nodes and its blast radius collapsed
+    to whole-file ``IMPORTS_FROM`` fan-out. Java/C#/PHP already indexed
+    ``interface_declaration``. See: #737
+    """
+
+    def setup_method(self):
+        self.parser = CodeParser()
+
+    def _project(self, root: Path) -> tuple[Path, Path]:
+        types = root / "types.ts"
+        types.write_text(
+            "export interface Finding {\n"
+            "  id: string;\n"
+            "}\n\n"
+            "export type Verdict = 'ok' | 'bad';\n\n"
+            "export enum Severity {\n"
+            "  Low,\n"
+            "  High,\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        use = root / "use.ts"
+        use.write_text(
+            "import { Finding, Verdict, Severity } from './types';\n\n"
+            "export function summarize(items: Finding[]): Verdict {\n"
+            "  const cache: Map<string, Severity> = new Map();\n"
+            "  return cache.size ? 'bad' : 'ok';\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        return types, use
+
+    def test_interface_type_alias_and_enum_become_nodes(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            types, _ = self._project(Path(tmp_dir))
+
+            nodes, _ = self.parser.parse_file(types)
+
+            names = {n.name for n in nodes if n.kind == "Class"}
+            assert {"Finding", "Verdict", "Severity"} <= names
+
+    def test_declaration_name_is_not_a_reference_to_itself(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            types, _ = self._project(Path(tmp_dir))
+
+            _, edges = self.parser.parse_file(types)
+
+            refs = [e for e in edges if e.kind == "REFERENCES"]
+            assert not [e for e in refs if e.source == e.target]
+
+    def test_type_annotation_emits_reference_to_the_declaring_file(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            types, use = self._project(root)
+
+            _, edges = self.parser.parse_file(use)
+
+            refs = {
+                (e.source, e.target)
+                for e in edges
+                if e.kind == "REFERENCES"
+            }
+            summarize = f"{use.as_posix()}::summarize"
+            assert (summarize, f"{types.resolve().as_posix()}::Finding") in refs
+            assert (summarize, f"{types.resolve().as_posix()}::Verdict") in refs
+
+    def test_aliased_type_import_resolves_to_exported_symbol(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            types, _ = self._project(root)
+            use = root / "aliased.ts"
+            use.write_text(
+                "import type { Finding as ImportedFinding } from './types';\n\n"
+                "export function summarize(item: ImportedFinding): string {\n"
+                "  return item.id;\n"
+                "}\n",
+                encoding="utf-8",
+            )
+
+            _, edges = self.parser.parse_file(use)
+
+            refs = {
+                (edge.source, edge.target)
+                for edge in edges
+                if edge.kind == "REFERENCES"
+            }
+            assert (
+                f"{use.as_posix()}::summarize",
+                f"{types.resolve().as_posix()}::Finding",
+            ) in refs
+            assert not any(
+                target == f"{types.resolve().as_posix()}::ImportedFinding"
+                for _, target in refs
+            )
+
+    def test_type_argument_inside_a_generic_is_a_reference(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            types, use = self._project(root)
+
+            _, edges = self.parser.parse_file(use)
+
+            # Severity appears only as Map<string, Severity>.
+            assert any(
+                e.kind == "REFERENCES"
+                and e.source == f"{use.as_posix()}::summarize"
+                and e.target == f"{types.resolve().as_posix()}::Severity"
+                for e in edges
+            )
+
+    def test_unknown_and_builtin_types_do_not_emit_references(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            _, use = self._project(root)
+
+            _, edges = self.parser.parse_file(use)
+
+            bare = {e.target.split("::")[-1] for e in edges if e.kind == "REFERENCES"}
+            # Neither a predefined type nor an unimported global becomes an edge.
+            assert "string" not in bare
+            assert "Map" not in bare
+
+    def test_interface_member_attributes_to_the_interface_not_the_file(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            types, _ = self._project(root)
+            wrapper = root / "wrapper.ts"
+            wrapper.write_text(
+                "import { Verdict } from './types';\n\n"
+                "export interface Wrapper {\n"
+                "  nested: Verdict;\n"
+                "}\n",
+                encoding="utf-8",
+            )
+
+            _, edges = self.parser.parse_file(wrapper)
+
+            assert any(
+                e.kind == "REFERENCES"
+                and e.source == f"{wrapper.as_posix()}::Wrapper"
+                and e.target == f"{types.resolve().as_posix()}::Verdict"
+                for e in edges
+            )
+
+    def test_class_heritage_emits_inherits_edges(self):
+        """`class C extends B implements I` nests its clauses under
+        class_heritage, so scanning only direct children found no bases at all.
+        """
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            base = root / "base.ts"
+            base.write_text(
+                "export class Base {}\n"
+                "export interface Findable { id: string }\n",
+                encoding="utf-8",
+            )
+            impl = root / "impl.ts"
+            impl.write_text(
+                "import { Base, Findable } from './base';\n\n"
+                "export class Impl extends Base implements Findable {\n"
+                "  id = 'x';\n"
+                "}\n",
+                encoding="utf-8",
+            )
+
+            _, edges = self.parser.parse_file(impl)
+
+            inherits = {
+                (e.source, e.target) for e in edges if e.kind == "INHERITS"
+            }
+            assert (f"{impl.as_posix()}::Impl", "Base") in inherits
+            assert (f"{impl.as_posix()}::Impl", "Findable") in inherits
+
+    def test_interface_extends_emits_inherits_edge(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            base = root / "base.ts"
+            base.write_text("export interface Findable { id: string }\n", encoding="utf-8")
+            wrapper = root / "wrapper.ts"
+            wrapper.write_text(
+                "import { Findable } from './base';\n\n"
+                "export interface Wrapper extends Findable {\n"
+                "  extra: string;\n"
+                "}\n",
+                encoding="utf-8",
+            )
+
+            _, edges = self.parser.parse_file(wrapper)
+
+            inherits = {(e.source, e.target) for e in edges if e.kind == "INHERITS"}
+            assert (f"{wrapper.as_posix()}::Wrapper", "Findable") in inherits
+
+    def test_heritage_does_not_double_emit_a_reference(self):
+        """A base is already an INHERITS edge; it must not also be REFERENCES."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            base = root / "base.ts"
+            base.write_text("export interface Findable { id: string }\n", encoding="utf-8")
+            wrapper = root / "wrapper.ts"
+            wrapper.write_text(
+                "import { Findable } from './base';\n\n"
+                "export interface Wrapper extends Findable {\n"
+                "  extra: string;\n"
+                "}\n",
+                encoding="utf-8",
+            )
+
+            _, edges = self.parser.parse_file(wrapper)
+
+            bare = {e.target.split("::")[-1] for e in edges if e.kind == "REFERENCES"}
+            assert "Findable" not in bare
+
+    def test_generic_heritage_does_not_double_emit_a_reference(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            base = root / "base.ts"
+            base.write_text(
+                "export interface Box<T> { value: T }\n"
+                "export interface Payload { value: string }\n",
+                encoding="utf-8",
+            )
+            wrapper = root / "wrapper.ts"
+            wrapper.write_text(
+                "import { Box, Payload } from './base';\n\n"
+                "export class BoxImpl implements Box<Payload> {\n"
+                "  value = { value: 'x' };\n"
+                "}\n\n"
+                "export interface StringBox extends Box<string> {}\n",
+                encoding="utf-8",
+            )
+
+            _, edges = self.parser.parse_file(wrapper)
+
+            inherits = [
+                edge for edge in edges
+                if edge.kind == "INHERITS" and edge.target == "Box"
+            ]
+            references = [
+                edge for edge in edges
+                if edge.kind == "REFERENCES"
+                and edge.target == f"{base.resolve().as_posix()}::Box"
+            ]
+            assert len(inherits) == 2
+            assert references == []
+            assert any(
+                edge.kind == "REFERENCES"
+                and edge.target == f"{base.resolve().as_posix()}::Payload"
+                for edge in edges
+            )
+
+    def test_tsx_type_positions_are_also_covered(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            types, _ = self._project(root)
+            panel = root / "Panel.tsx"
+            panel.write_text(
+                "import { Finding } from './types';\n\n"
+                "export function Panel({ finding }: { finding: Finding }) {\n"
+                "  return null;\n"
+                "}\n",
+                encoding="utf-8",
+            )
+
+            _, edges = self.parser.parse_file(panel)
+
+            assert any(
+                e.kind == "REFERENCES"
+                and e.source == f"{panel.as_posix()}::Panel"
+                and e.target == f"{types.resolve().as_posix()}::Finding"
+                for e in edges
+            )

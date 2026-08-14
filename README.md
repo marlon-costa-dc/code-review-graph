@@ -1,9 +1,19 @@
 <h1 align="center">code-review-graph</h1>
 
 <p align="center">
-  <strong>Stop burning tokens. Start reviewing smarter.</strong>
+  <a href="https://trendshift.io/repositories/23329?utm_source=repository-badge&amp;utm_medium=badge&amp;utm_campaign=badge-repository-23329"
+     target="_blank"
+     rel="noopener noreferrer">
+    <img src="https://trendshift.io/api/badge/repositories/23329"
+         alt="tirth8205%2Fcode-review-graph | Trendshift"
+         width="250"
+         height="55" />
+  </a>
 </p>
 
+<p align="center">
+  <strong>Stop burning tokens. Start reviewing smarter.</strong>
+</p>
 <p align="center">
   <a href="README.md">English</a> |
   <a href="README.zh-CN.md">简体中文</a> |
@@ -42,7 +52,7 @@ AI coding tools can end up re-reading large parts of your codebase on review tas
 Where retrieval tools focus on navigation, CRG is review-native — risk-scored change analysis, impact radius, and a PR-review GitHub Action — token-efficient, local, and free, with no waitlist.
 
 <p align="center">
-  <img src="diagrams/diagram1_before_vs_after.png" alt="The Token Problem: 38x to 528x token reduction across 6 real repositories" width="85%" />
+  <img src="diagrams/diagram1_before_vs_after.png" alt="The Token Problem: reading flask's whole corpus costs 143,594 tokens, a graph answer costs 2,196 — 71.0x fewer" width="85%" />
 </p>
 
 ---
@@ -78,7 +88,7 @@ code-review-graph doctor           # verify the install is healthy
 One command sets up everything. `install` detects which AI coding tools you have, writes the correct MCP configuration for each one, installs platform-native hooks/skills where supported, and injects graph-aware instructions into your platform rules. It auto-detects whether you installed via `uvx` or `pip`/`pipx` and generates the right config. Restart your editor/tool after installing.
 
 <p align="center">
-  <img src="diagrams/diagram8_supported_platforms.png" alt="One Install, Every Platform: auto-detects Codex, Claude Code, Cursor, Windsurf, Zed, Continue, OpenCode, Antigravity, Gemini CLI, Qwen, Qoder, Kiro, and GitHub Copilot" width="85%" />
+  <img src="diagrams/diagram8_supported_platforms.png" alt="One Install, Every Platform: auto-detects Codex, Claude Code, CodeBuddy Code, Cursor, Windsurf, Zed, Continue, OpenCode, Antigravity, Gemini CLI, Qwen, Qoder, Kiro, GitHub Copilot, and GitHub Copilot CLI" width="85%" />
 </p>
 
 To target a specific platform:
@@ -88,12 +98,36 @@ code-review-graph install --platform codex       # configure only Codex
 code-review-graph install --platform cursor      # configure only Cursor
 code-review-graph install --platform claude-code  # configure only Claude Code
 code-review-graph install --platform gemini-cli   # configure only Gemini CLI
+code-review-graph install --platform antigravity   # configure only Antigravity
+code-review-graph install --platform windsurf     # configure only Windsurf
+code-review-graph install --platform zed          # configure only Zed
+code-review-graph install --platform continue     # configure only Continue
+code-review-graph install --platform opencode     # configure only OpenCode
+code-review-graph install --platform qwen         # configure only Qwen
+code-review-graph install --platform qoder        # configure only Qoder
 code-review-graph install --platform kiro         # configure only Kiro
 code-review-graph install --platform copilot      # configure only GitHub Copilot (VS Code)
 code-review-graph install --platform copilot-cli  # configure only GitHub Copilot CLI
+code-review-graph install --platform codebuddy    # configure only CodeBuddy Code
 ```
 
 Requires Python 3.10+. For the best experience, install [uv](https://docs.astral.sh/uv/) (the MCP config will use `uvx` if available, otherwise falls back to the `code-review-graph` command directly).
+
+To remove CRG from a Git or SVN project, use the symmetric uninstall command
+from anywhere inside its working tree. The target is normalized to the working
+tree root, and non-repository directories are refused. It removes only
+CRG-owned files and entries; unrelated MCP servers, hooks, skills, and JSONC
+comments remain untouched. Shared configuration changes use atomic replacement
+so a failed write leaves the original file intact.
+
+```bash
+code-review-graph uninstall --dry-run    # preview every action; write nothing
+code-review-graph uninstall              # preview, ask for confirmation, then apply
+code-review-graph uninstall --yes        # apply without prompting
+code-review-graph uninstall --all-repos  # also clean every registered repository
+code-review-graph uninstall --keep-data  # remove integrations but keep graph databases
+code-review-graph uninstall --keep-user-configs --repo .  # clean this project only
+```
 
 Then open your project and ask your AI assistant:
 
@@ -124,29 +158,34 @@ When a file changes, the graph traces every caller, dependent, and test that cou
   <img src="diagrams/diagram3_blast_radius.png" alt="Blast radius visualization showing how a change to login() propagates to callers, dependents, and tests" width="70%" />
 </p>
 
-### Incremental updates in < 2 seconds
+### Incremental updates in seconds
 
-When hooks or watch mode are enabled, file saves and supported commit hooks trigger incremental updates. The graph diffs changed files, finds their dependents via SHA-256 hash checks, and re-parses only what changed. A 2,900-file project re-indexes in under 2 seconds.
+When hooks or watch mode are enabled, file saves and supported commit hooks trigger incremental updates. The graph diffs changed files, finds their dependents through the graph's own import and call edges, and re-parses only the files whose SHA-256 hash actually changed. On a ~3,000-file project (django) a two-file edit re-indexes in about 2.5 seconds on the path the hooks use, of which ~1.4 s is process start-up; a no-op update costs only that start-up. See [Incremental update latency](docs/REPRODUCING.md#incremental-update-latency) for the full measurement.
 
 <p align="center">
-  <img src="diagrams/diagram4_incremental_update.png" alt="Incremental update flow: supported hook or watch update triggers diff, finds dependents, re-parses only 5 files while 2,910 are skipped" width="90%" />
+  <img src="diagrams/diagram4_incremental_update.png" alt="Incremental update flow: a supported hook or watch update triggers a git diff, dependents are found through graph edges, and only files whose SHA-256 hash changed are re-parsed" width="90%" />
 </p>
 
-### The monorepo problem, solved
+### Whole codebase or targeted answer?
 
-Large monorepos are where token waste is most painful. The graph cuts through the noise — 27,700+ files excluded from review context, only ~15 files actually read.
+The bigger the repository, the more token waste hurts. Instead of feeding a whole corpus to the model, the graph returns an answer-shaped slice of it: on this repository, 208,821 source tokens become ~3,190 tokens per question.
 
 <p align="center">
-  <img src="diagrams/diagram6_monorepo_funnel.png" alt="code-review-graph repo: 208,821 source tokens funnel down to ~2,495 token graph responses — 93x fewer tokens per question" width="80%" />
+  <img src="diagrams/diagram6_monorepo_funnel.png" alt="code-review-graph repo: 208,821 source tokens funnel down to ~3,190 token graph responses — 68x fewer tokens per question" width="80%" />
 </p>
 
 ### Broad language coverage + Jupyter notebooks
 
 <p align="center">
-  <img src="diagrams/diagram9_language_coverage.png" alt="Language coverage organized by category: Web, Backend, Systems, Mobile, Scripting, Config, plus Jupyter and Databricks notebook support" width="90%" />
+  <img src="diagrams/diagram9_language_coverage.png" alt="Language coverage organized by category: Web, Backend, Systems, Mobile, Scripting, Shells, Domain, and Other, plus Jupyter and Databricks notebook support" width="90%" />
 </p>
 
-Parser support covers functions, classes, imports, call sites, inheritance, and test detection across the current parser surface, using Tree-sitter where available and targeted fallbacks where needed. Current support includes Python, JavaScript/TypeScript/TSX, Go, Rust, Java, C/C++, C#, Ruby, Kotlin, Swift, PHP, Scala, Solidity, Dart, R, Perl, Lua/Luau, Objective-C, shell scripts, Elixir, Zig, PowerShell, Julia, ReScript, GDScript, Nix, Verilog/SystemVerilog, SQL, Vue/Svelte SFCs, Astro files parsed through the TypeScript parser, Jupyter/Databricks notebooks (`.ipynb`), and Perl XS files (`.xs`).
+Parser support covers functions, classes, imports, call sites, inheritance, and test detection across the current parser surface, using Tree-sitter where available and targeted fallbacks where needed. Current support includes Python, JavaScript/TypeScript/TSX, Go, Rust, Java, C/C++, C#, VB.NET, Ruby, Kotlin, Swift, PHP, Scala, Solidity, Dart, R, Perl, Lua/Luau, Objective-C, shell scripts, Elixir, Zig, PowerShell, Julia, ReScript, GDScript, Nix, Verilog/SystemVerilog, SQL, Terraform/OpenTofu structure (`.tf`; generic `.hcl` files are recognized as file nodes), Ansible playbooks/roles/tasks, Vue/Svelte SFCs, Astro files parsed through the TypeScript parser, Jupyter/Databricks notebooks (`.ipynb`), and Perl XS files (`.xs`). Generic YAML is not treated as source code.
+
+PHP projects additionally get repository-bounded Composer PSR-4 resolution,
+Blade template references, and Laravel Route/Eloquent semantic edges when the
+source includes explicit framework imports, model inheritance, and receiver
+evidence.
 
 ### Add your own language (no fork needed)
 
@@ -181,7 +220,7 @@ jobs:
   review:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: tirth8205/code-review-graph@v2.3.6
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
@@ -194,29 +233,31 @@ See [docs/GITHUB_ACTION.md](docs/GITHUB_ACTION.md) for inputs, risk levels, and 
 ## Benchmarks
 
 <p align="center">
-  <img src="diagrams/diagram5_benchmark_board.png" alt="Benchmarks across 6 real repositories: ~82x median per-question token reduction (528x max), 0.71 average impact F1 against graph-derived ground truth" width="85%" />
+  <img src="diagrams/diagram5_benchmark_board.png" alt="Benchmarks across 6 real repositories: ~65x median per-question token reduction (376x max), 0.69 average impact F1 against graph-derived ground truth" width="85%" />
 </p>
 
-**Headline number: the median per-question token reduction across the 6 repos is ~82x** (whole-corpus baseline vs graph query). The frequently quoted **528x is the maximum** — a single best-case repo (fastapi) — not the typical result.
+**Headline number: the median per-question token reduction across the 6 repos is ~65x** (whole-corpus baseline vs graph query). The **376x maximum** is a single best-case repo (fastapi, the largest corpus) — not the typical result.
 
 All numbers come from the automated evaluation runner against 6 real open-source repositories (13 commits total). Every config pins an upstream SHA, the Leiden community detector runs with a fixed seed, and embeddings are deterministic on CPU — so two runs on different machines produce identical numbers. The full reproduction recipe with expected outputs is in [`docs/REPRODUCING.md`](docs/REPRODUCING.md). A weekly report-only run on the two smallest configs lives in [`.github/workflows/eval.yml`](.github/workflows/eval.yml); it publishes the **median per-question token reduction** for that run as a table in the job summary and uploads the raw CSVs as an artifact. The [`benchmarks: reproducible`](https://github.com/tirth8205/code-review-graph/actions/workflows/eval.yml) badge links to those runs — the badge asserts the pipeline is reproducible; the canonical numbers live here and in [`docs/REPRODUCING.md`](docs/REPRODUCING.md), never auto-committed from CI.
 
 <details>
-<summary><strong>Token efficiency: ~82x median per-question reduction (range 38x – 528x; whole-corpus vs graph query)</strong></summary>
+<summary><strong>Token efficiency: ~65x median per-question reduction (range 36x – 376x; whole-corpus vs graph query)</strong></summary>
 <br>
 
 For a typical agent question (`"how does authentication work"`, `"what is the main entry point"`, etc.), the graph returns ~2,000–3,500 tokens of targeted search hits + neighbor edges instead of forcing the agent to read every source file. The table below averages over the 5 sample questions defined in `code_review_graph/token_benchmark.py`.
 
 | Repo | Snapshot SHA | naive_corpus_tokens | avg graph_tokens | Reduction |
 |------|---|-----------------:|----------------:|----------:|
-| fastapi | `0227991a` | 951,071 | 2,169 | **528.4x** |
-| code-review-graph | `84bde354` | 208,821 | 2,495 | **93.0x** |
-| gin | `5c00df8a` | 166,868 | 1,990 | **91.8x** |
-| flask | `a29f88ce` | 125,022 | 1,986 | **71.4x** |
-| express | `b4ab7d65` | 135,955 | 3,465 | **40.6x** |
-| httpx | `b55d4635` | 89,492 | 2,438 | **38.0x** |
+| fastapi | `22381558` | 948,793 | 2,653 | **375.6x** |
+| flask | `a29f88ce` | 143,594 | 2,196 | **71.0x** |
+| code-review-graph | `84bde354` | 208,821 | 3,190 | **68.1x** |
+| gin | `5c00df8a` | 166,868 | 2,766 | **61.9x** |
+| httpx | `b55d4635` | 142,356 | 2,661 | **60.6x** |
+| express | `b4ab7d65` | 136,052 | 3,936 | **36.0x** |
 
-Median per-question reduction across the 6 repos: **~82x**. The range is 38x – 528x, where **528x is the best case** (fastapi, the largest corpus), not the headline.
+Median per-question reduction across the 6 repos: **~65x**. The range is 36x – 376x, where **376x is the best case** (fastapi, the largest corpus), not the headline.
+
+> Re-captured 2026-08-02 from clean clones at the pinned SHAs (crg 2.3.7, local `all-MiniLM-L6-v2` embeddings). These numbers are lower than the 2026-05-25 capture they replace: the graph response grew as node embedding text became richer, so `avg graph_tokens` rose across every repo. fastapi is now measured at its current pin `22381558` rather than the retired `0227991a`.
 
 The whole-corpus baseline above is an upper bound no real agent pays: a competent agent greps for identifiers and reads only the best-matching files. The `agent_baseline` eval benchmark measures that realistic baseline — a pure-python grep over the corpus, top-3 files by match count, token-counted and compared to the graph query cost (`evaluate/results/<repo>_agent_baseline_*.csv`).
 
@@ -227,22 +268,22 @@ Since v2.3.4, review and impact tools attach a compact `context_savings` estimat
 </details>
 
 <details>
-<summary><strong>Impact accuracy: 0.71 average F1 against graph-derived ground truth (recall 1.0 is a circular upper bound, not "100% recall")</strong></summary>
+<summary><strong>Impact accuracy: 0.69 average F1 against graph-derived ground truth (recall 1.0 is a circular upper bound, not "100% recall")</strong></summary>
 <br>
 
 Blast-radius analysis recovers every file in the ground truth on all 13 evaluation commits — **but read that as an upper bound, not as "100% recall"**: in this mode the ground truth (changed files + files with call/import edges into them) is derived from the same graph the predictor traverses, so it is circular by construction. The over-prediction visible in the precision column is a deliberate trade-off: better to flag too many files than miss a broken dependency.
 
 | Repo | Commits | Avg F1 | Avg Precision | Recall (graph-derived upper bound) |
 |------|--------:|-------:|--------------:|-------:|
-| httpx | 2 | 0.864 | 0.786 | 1.0 |
-| fastapi | 2 | 0.834 | 0.750 | 1.0 |
+| httpx | 2 | 0.863 | 0.785 | 1.0 |
 | code-review-graph | 2 | 0.734 | 0.584 | 1.0 |
+| fastapi | 2 | 0.697 | 0.539 | 1.0 |
 | express | 2 | 0.667 | 0.500 | 1.0 |
-| flask | 2 | 0.628 | 0.481 | 1.0 |
+| flask | 2 | 0.633 | 0.485 | 1.0 |
 | gin | 3 | 0.609 | 0.439 | 1.0 |
-| **Average** | **13** | **0.714** | **0.578** | **1.000** |
+| **Average** | **13** | **0.693** | **0.546** | **1.000** |
 
-The benchmark also runs an honest **co-change mode**: the predictor is seeded with a single changed file and graded against the *other* files the author actually touched in the same commit — independent-ish evidence from git history, not from the graph. Both modes appear side by side in the result CSVs (`ground_truth_mode` column). Co-change numbers will be added to the canonical stats once captured by the eval runner; we do not quote them before measuring.
+The benchmark also runs an honest **co-change mode**: the predictor is seeded with a single changed file and graded against the *other* files the author actually touched in the same commit — independent-ish evidence from git history, not from the graph. Both modes appear side by side in the result CSVs (`ground_truth_mode` column). As of the 2026-08-02 capture that mode returns `predicted_files = 0` on every graded commit, so it is not yet a usable measurement and no co-change number is quoted here — the harness needs fixing before the mode says anything about accuracy.
 
 </details>
 
@@ -265,7 +306,7 @@ The benchmark also runs an honest **co-change mode**: the predictor is seeded wi
 - **Impact "recall 1.0" is graph-derived and circular:** the historical ground truth comes from the same graph edges the predictor walks, so it is an upper bound by construction. The honest co-change mode (grade against files actually co-changed in the same commit) is measured alongside it; expect those numbers to be substantially lower.
 - **Small single-file changes:** Graph context can exceed naive file reads for trivial edits (see express results above). The overhead is the structural metadata that enables multi-file analysis.
 - **Search quality (MRR 0.35):** Keyword search finds the right result in the top-4 for most queries, but ranking needs improvement. Express queries return 0 hits due to module-pattern naming.
-- **Flow detection (33% recall):** Only reliably detects entry points in Python repos (fastapi, httpx) where framework patterns are recognized. JavaScript and Go flow detection needs work.
+- **Flow detection (33% recall):** Framework and conventional entry patterns are strongest for Python and PHP/Laravel. JavaScript and Go flow detection needs work.
 - **Precision vs recall trade-off:** Impact analysis is deliberately conservative. It flags files that *might* be affected, which means some false positives in large dependency graphs.
 
 ---
@@ -274,8 +315,9 @@ The benchmark also runs an honest **co-change mode**: the predictor is seeded wi
 
 | Feature | Details |
 |---------|---------|
-| **Incremental updates** | Re-parses only changed files. Subsequent updates complete in under 2 seconds. |
-| **Broad language + notebook support** | Python, JavaScript/TypeScript/TSX, Go, Rust, Java, C/C++, C#, Ruby, Kotlin, Swift, PHP, Scala, Solidity, Dart, R, Perl, Lua/Luau, Objective-C, shell scripts, Elixir, Zig, PowerShell, Julia, ReScript, GDScript, Nix, Verilog/SystemVerilog, SQL, Vue/Svelte SFCs, Astro files parsed through the TypeScript parser, Jupyter/Databricks (.ipynb), and Perl XS (.xs) |
+| **Incremental updates** | Re-parses only the files whose hash changed. On a ~3,000-file repo a two-file edit takes ~2.5s on the hook path ([measured](docs/REPRODUCING.md#incremental-update-latency)). |
+| **Broad language + notebook support** | Python, JavaScript/TypeScript/TSX, Go, Rust, Java, C/C++, C#, VB.NET, Ruby, Kotlin, Swift, PHP, Scala, Solidity, Dart, R, Perl, Lua/Luau, Objective-C, shell scripts, Elixir, Zig, PowerShell, Julia, ReScript, GDScript, Nix, Verilog/SystemVerilog, SQL, Terraform/OpenTofu structure (`.tf`; generic `.hcl` files are file-only), Ansible playbooks/roles/tasks, Vue/Svelte SFCs, Astro files parsed through the TypeScript parser, Jupyter/Databricks (.ipynb), and Perl XS (.xs) |
+| **Framework-aware PHP parsing** | Repository-bounded Composer PSR-4 imports, Blade template references, and evidence-gated Laravel Route-to-controller and Eloquent relationship edges |
 | **Blast-radius analysis** | Shows which functions, classes, and files are likely affected by a change |
 | **Auto-update hooks** | Hooks and watch mode can update the graph on file saves and supported commit hooks |
 | **Semantic search** | Optional vector embeddings via sentence-transformers, Google Gemini, MiniMax, or any OpenAI-compatible endpoint (real OpenAI, Azure, new-api, LiteLLM, vLLM, LocalAI) |
@@ -330,11 +372,13 @@ The benchmark also runs an honest **co-change mode**: the predictor is seeded wi
 ```bash
 code-review-graph install          # Auto-detect and configure all platforms
 code-review-graph install --platform <name>  # Target a specific platform
+code-review-graph uninstall --dry-run  # Preview safe removal of installed artifacts
 code-review-graph build            # Parse entire codebase
 code-review-graph update           # Incremental update (changed files only)
 code-review-graph status           # Graph statistics
 code-review-graph watch            # Auto-update on file changes
 code-review-graph visualize        # Generate interactive HTML graph
+code-review-graph visualize --format json      # Export local graph data as JSON
 code-review-graph visualize --format graphml   # Export as GraphML
 code-review-graph visualize --format svg       # Export as SVG
 code-review-graph visualize --format obsidian  # Export as Obsidian vault
@@ -352,6 +396,10 @@ code-review-graph daemon status    # Show daemon status and repos
 code-review-graph eval             # Run evaluation benchmarks
 code-review-graph serve            # Start MCP server
 ```
+
+JSON exports stay inside the local graph data directory, which Git ignores by
+default. They can contain absolute paths and code-structure metadata, so inspect
+and sanitize an export before publishing it outside your machine.
 
 </details>
 
@@ -498,13 +546,13 @@ Note: in git repos, only tracked files are indexed (`git ls-files`), so gitignor
 Optional dependency groups:
 
 ```bash
-pip install code-review-graph[embeddings]          # Local vector embeddings (sentence-transformers)
-pip install code-review-graph[google-embeddings]   # Google Gemini embeddings
-pip install code-review-graph[communities]         # Community detection (igraph)
-pip install code-review-graph[enrichment]          # Python call-resolution enrichment (Jedi)
-pip install code-review-graph[eval]                # Evaluation benchmarks (matplotlib)
-pip install code-review-graph[wiki]                # Wiki generation with LLM summaries (ollama)
-pip install code-review-graph[all]                 # All optional dependencies
+pip install "code-review-graph[embeddings]"          # Local vector embeddings (sentence-transformers)
+pip install "code-review-graph[google-embeddings]"   # Google Gemini embeddings
+pip install "code-review-graph[communities]"         # Community detection (igraph)
+pip install "code-review-graph[enrichment]"          # Python call-resolution enrichment (Jedi)
+pip install "code-review-graph[eval]"                # Evaluation benchmarks (matplotlib)
+pip install "code-review-graph[wiki]"                # Wiki generation with LLM summaries (ollama)
+pip install "code-review-graph[all]"                 # All optional dependencies
 ```
 
 ### Environment Variables
@@ -527,6 +575,13 @@ pip install code-review-graph[all]                 # All optional dependencies
 | `CRG_TOOLS` | Comma-separated allowlist of MCP tools to expose when serving | - |
 | `GOOGLE_API_KEY` | API key for Google Gemini embeddings | - |
 | `MINIMAX_API_KEY` | API key for MiniMax embeddings | - |
+| `VOYAGE_API_KEY` | API key for Voyage embeddings | - |
+| `CRG_VOYAGE_MODEL` | Model name for Voyage embeddings | `voyage-code-3` |
+| `CRG_VOYAGE_OUTPUT_DIMENSION` | Output dimension for Voyage embeddings | `1024` |
+| `CRG_VOYAGE_OUTPUT_DTYPE` | Output dtype for Voyage embeddings | `float` |
+| `CRG_VOYAGE_BASE_URL` | Voyage embeddings endpoint | `https://api.voyageai.com/v1` |
+| `CRG_VOYAGE_BATCH_SIZE` | Batch size for Voyage embedding requests | `100` |
+| `CRG_VOYAGE_MIN_INTERVAL_SEC` | Minimum delay between Voyage requests | `0` |
 | `CRG_OPENAI_BASE_URL` | OpenAI-compatible embeddings endpoint | - |
 | `CRG_OPENAI_API_KEY` | API key for OpenAI-compatible embeddings | - |
 | `CRG_OPENAI_MODEL` | Model name for OpenAI-compatible embeddings | - |
@@ -551,6 +606,15 @@ export CRG_OPENAI_BATCH_SIZE=100                        # lower for gateways wit
 The cloud-egress warning is auto-skipped when the base URL points to localhost
 (`127.0.0.1`, `localhost`, `0.0.0.0`, `::1`).
 
+Voyage embeddings need no extra install. Set `VOYAGE_API_KEY` and pass
+`provider="voyage"` to `embed_graph`; the default model is `voyage-code-3`:
+
+```bash
+export VOYAGE_API_KEY=pa-...
+export CRG_ACCEPT_CLOUD_EMBEDDINGS=1
+code-review-graph embed --provider voyage --model voyage-code-3
+```
+
 > **Model selection tip.** Avoid `-preview` / `-beta` / `-exp` model IDs
 > (e.g. `google/gemini-embedding-2-preview`) for anything you plan to keep
 > long-term — preview models can change weights (different dimension → full
@@ -560,12 +624,14 @@ The cloud-egress warning is auto-skipped when the base URL points to localhost
 > `gemini-embedding-001` (via the native Gemini provider, which requires
 > `GOOGLE_API_KEY` instead of the OpenAI-compatible path).
 >
-> Also note: `code-review-graph` currently embeds **function signatures only**
-> (~10 tokens per node, e.g. `"parse_file function (path: str) returns Tree"`).
-> Models whose headline quality comes from long-context body understanding
-> (such as Gemini 2 or Qwen3-8B at their MTEB-code SOTA scores) will see a
-> much narrower quality gap against smaller models at this input length.
-> Body/docstring embedding is tracked as a follow-up enhancement.
+> `code-review-graph` embeds identifiers, signatures, structural context, and a
+> bounded first-paragraph docstring/doc-comment summary. It does not transmit
+> function bodies. Graphs created before documentation extraction was added
+> need one full `code-review-graph build` before re-embedding so every file is
+> reparsed. Routine builds never refresh embeddings by default. To refresh an
+> existing index after a build, explicitly pass both `--embedding-provider`
+> and `--embedding-model`; cloud choices may transmit this source-derived text
+> and incur API cost.
 
 #### Tool Filtering (lean by default)
 
@@ -691,5 +757,5 @@ MIT. See [LICENSE](LICENSE).
 <br>
 <a href="https://code-review-graph.com">code-review-graph.com</a><br><br>
 <code>pip install code-review-graph && code-review-graph install</code><br>
-<sub>Works with Codex, Claude Code, Cursor, Windsurf, Zed, Continue, OpenCode, Antigravity, Gemini CLI, Qwen, Qoder, Kiro, GitHub Copilot, and GitHub Copilot CLI</sub>
+<sub>Works with Codex, Claude Code, CodeBuddy Code, Cursor, Windsurf, Zed, Continue, OpenCode, Antigravity, Gemini CLI, Qwen, Qoder, Kiro, GitHub Copilot, and GitHub Copilot CLI</sub>
 </p>

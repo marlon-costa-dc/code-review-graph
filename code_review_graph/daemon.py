@@ -32,15 +32,71 @@ else:
     except ImportError:
         tomllib = None  # type: ignore[assignment]
 
+from .constants import crg_home
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Config file location
 # ---------------------------------------------------------------------------
 
-CONFIG_PATH: Path = Path.home() / ".code-review-graph" / "watch.toml"
-PID_PATH: Path = Path.home() / ".code-review-graph" / "daemon.pid"
-STATE_PATH: Path = Path.home() / ".code-review-graph" / "daemon-state.json"
+def default_config_path() -> Path:
+    """Path to ``watch.toml`` under the per-user state directory."""
+    return crg_home() / "watch.toml"
+
+
+def default_pid_path() -> Path:
+    """Path to the daemon PID file."""
+    return crg_home() / "daemon.pid"
+
+
+def default_state_path() -> Path:
+    """Path to the persisted daemon state."""
+    return crg_home() / "daemon-state.json"
+
+
+def default_log_dir() -> Path:
+    """Directory for per-repo daemon logs."""
+    return crg_home() / "logs"
+
+
+# These four were module-level constants built from Path.home(). They resolve
+# per call now so $CRG_HOME can redirect them: an import-time constant is
+# frozen before any caller — a test fixture, a sandboxed run — gets the chance
+# to set the variable, which is how the test suite ended up writing into the
+# real home directory of whoever ran it.
+#
+# The PEP 562 shim below keeps the old attribute names working for anything
+# that already imported them: both ``daemon.CONFIG_PATH`` and
+# ``from …daemon import CONFIG_PATH`` route through ``__getattr__``, and
+# ``__dir__`` keeps them visible to introspection. Not covered: ``import *``
+# (this module defines no ``__all__``, and adding one would change what the
+# star exports for every other name) and static analysers, which cannot see
+# dynamic attributes. Both are acceptable — these were never public API, and
+# the alternative is deleting the names outright.
+_LAZY_PATHS = {
+    "CONFIG_PATH": default_config_path,
+    "PID_PATH": default_pid_path,
+    "STATE_PATH": default_state_path,
+}
+
+
+def __getattr__(name: str) -> Path:
+    if name in _LAZY_PATHS:
+        return _LAZY_PATHS[name]()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__() -> list[str]:
+    """Include the lazy names so ``dir()`` and tab-completion still find them.
+
+    ``__getattr__`` alone covers attribute access and ``from … import X``,
+    but names absent from module globals are otherwise invisible to
+    ``dir()``, ``from … import *`` and static analysers.
+    """
+    return sorted(set(globals()) | set(_LAZY_PATHS))
+
+
 _HEALTH_CHECK_INTERVAL = 30
 
 # ---------------------------------------------------------------------------
@@ -66,7 +122,7 @@ class DaemonConfig:
     session_name: str = "crg-watch"
     """Logical daemon name (used in log messages and status output)."""
 
-    log_dir: Path = field(default_factory=lambda: Path.home() / ".code-review-graph" / "logs")
+    log_dir: Path = field(default_factory=default_log_dir)
     """Directory for per-repo log files."""
 
     poll_interval: int = 2
@@ -85,7 +141,7 @@ def load_config(path: Path | None = None) -> DaemonConfig:
     """Load daemon configuration from a TOML file.
 
     Args:
-        path: Explicit config path.  Falls back to :data:`CONFIG_PATH`.
+        path: Explicit config path.  Falls back to :func:`default_config_path`.
 
     Returns:
         A fully-validated :class:`DaemonConfig`.
@@ -99,7 +155,7 @@ def load_config(path: Path | None = None) -> DaemonConfig:
             "Install it with:  pip install tomli"
         )
 
-    config_path = path or CONFIG_PATH
+    config_path = path or default_config_path()
 
     if not config_path.exists():
         logger.info("Config file not found at %s — using defaults", config_path)
@@ -164,6 +220,40 @@ def load_config(path: Path | None = None) -> DaemonConfig:
 # ---------------------------------------------------------------------------
 
 
+# TOML basic strings have named escapes for these; everything else in
+# the control range must use the \uXXXX form.
+_TOML_SHORT_ESCAPES = {
+    "\\": "\\\\",
+    '"': '\\"',
+    "\b": "\\b",
+    "\t": "\\t",
+    "\n": "\\n",
+    "\f": "\\f",
+    "\r": "\\r",
+}
+
+
+def _toml_str(value: object) -> str:
+    """Render *value* as a TOML basic string.
+
+    Backslashes and double quotes are escape characters in TOML basic
+    strings, so Windows paths like ``C:\\Users\\x`` must be escaped or
+    the file fails to parse on the next load. Control characters
+    (U+0000-U+001F, U+007F) are forbidden unescaped by the TOML spec,
+    so they are escaped too — ``tomllib`` rejects the file otherwise.
+    """
+    chars: list[str] = []
+    for ch in str(value):
+        esc = _TOML_SHORT_ESCAPES.get(ch)
+        if esc is not None:
+            chars.append(esc)
+        elif ord(ch) < 0x20 or ord(ch) == 0x7F:
+            chars.append(f"\\u{ord(ch):04X}")
+        else:
+            chars.append(ch)
+    return '"' + "".join(chars) + '"'
+
+
 def _serialize_toml(config: DaemonConfig) -> str:
     """Serialize a :class:`DaemonConfig` to TOML text.
 
@@ -171,15 +261,15 @@ def _serialize_toml(config: DaemonConfig) -> str:
     """
     lines: list[str] = [
         "[daemon]",
-        f'session_name = "{config.session_name}"',
-        f'log_dir = "{config.log_dir}"',
+        f"session_name = {_toml_str(config.session_name)}",
+        f"log_dir = {_toml_str(config.log_dir)}",
         f"poll_interval = {config.poll_interval}",
     ]
     for repo in config.repos:
         lines.append("")
         lines.append("[[repos]]")
-        lines.append(f'path = "{repo.path}"')
-        lines.append(f'alias = "{repo.alias}"')
+        lines.append(f"path = {_toml_str(repo.path)}")
+        lines.append(f"alias = {_toml_str(repo.alias)}")
     lines.append("")  # trailing newline
     return "\n".join(lines)
 
@@ -191,9 +281,9 @@ def save_config(config: DaemonConfig, path: Path | None = None) -> None:
 
     Args:
         config: The daemon configuration to persist.
-        path:   Explicit config path.  Falls back to :data:`CONFIG_PATH`.
+        path:   Explicit config path.  Falls back to :func:`default_config_path`.
     """
-    config_path = path or CONFIG_PATH
+    config_path = path or default_config_path()
     config_path.parent.mkdir(parents=True, exist_ok=True)
     config_path.write_text(_serialize_toml(config), encoding="utf-8")
     logger.info("Config saved to %s", config_path)
@@ -214,7 +304,7 @@ def add_repo_to_config(
     Args:
         repo_path:   Path to the repository (will be resolved to absolute).
         alias:       Optional short name.  Derived from dirname if *None*.
-        config_path: Explicit config file path.  Falls back to :data:`CONFIG_PATH`.
+        config_path: Explicit config file path.  Falls back to :func:`default_config_path`.
 
     Returns:
         The updated :class:`DaemonConfig`.
@@ -260,7 +350,7 @@ def remove_repo_from_config(
 
     Args:
         path_or_alias: Either the absolute/relative repo path or its alias.
-        config_path:   Explicit config file path.  Falls back to :data:`CONFIG_PATH`.
+        config_path:   Explicit config file path.  Falls back to :func:`default_config_path`.
 
     Returns:
         The updated :class:`DaemonConfig`.
@@ -289,14 +379,14 @@ def remove_repo_from_config(
 
 def write_pid(pid: int | None = None, path: Path | None = None) -> None:
     """Write the current (or given) PID to the PID file."""
-    pid_path = path or PID_PATH
+    pid_path = path or default_pid_path()
     pid_path.parent.mkdir(parents=True, exist_ok=True)
     pid_path.write_text(str(pid or os.getpid()), encoding="utf-8")
 
 
 def read_pid(path: Path | None = None) -> int | None:
     """Read the daemon PID from disk. Returns None if missing/invalid."""
-    pid_path = path or PID_PATH
+    pid_path = path or default_pid_path()
     if not pid_path.exists():
         return None
     try:
@@ -307,7 +397,7 @@ def read_pid(path: Path | None = None) -> int | None:
 
 def clear_pid(path: Path | None = None) -> None:
     """Remove the PID file."""
-    pid_path = path or PID_PATH
+    pid_path = path or default_pid_path()
     try:
         pid_path.unlink(missing_ok=True)
     except OSError:
@@ -316,8 +406,10 @@ def clear_pid(path: Path | None = None) -> None:
 
 # Win32 constants for the OpenProcess-based liveness check (#511).
 _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+_SYNCHRONIZE = 0x00100000
 _ERROR_ACCESS_DENIED = 5
 _WAIT_OBJECT_0 = 0x0
+_WAIT_FAILED = 0xFFFFFFFF
 
 
 def _pid_alive_windows(
@@ -327,6 +419,11 @@ def _pid_alive_windows(
 ) -> bool:
     """Win32 PID liveness check via OpenProcess/WaitForSingleObject.
 
+    The access mask must include SYNCHRONIZE: a handle opened with only
+    PROCESS_QUERY_LIMITED_INFORMATION cannot be waited on, so
+    WaitForSingleObject returns WAIT_FAILED (ERROR_ACCESS_DENIED) and
+    every exited process reads as alive.
+
     The kernel32 interface is injected so tests can drive handle/wait
     outcomes on non-Windows platforms. *get_last_error* defaults to
     ``kernel32.GetLastError``; the real caller passes
@@ -334,14 +431,24 @@ def _pid_alive_windows(
     """
     if get_last_error is None:
         get_last_error = kernel32.GetLastError
-    handle = kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    handle = kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION | _SYNCHRONIZE, False, pid)
     if not handle:
         # NULL handle: process is dead, or we lack access. ACCESS_DENIED
         # means it exists but is owned by another user — treat as alive.
         return get_last_error() == _ERROR_ACCESS_DENIED
     try:
+        result = kernel32.WaitForSingleObject(handle, 0)
+        if result == _WAIT_FAILED:
+            # The wait itself errored — we cannot prove the process dead,
+            # so err alive, consistent with the ACCESS_DENIED branch.
+            logger.debug(
+                "WaitForSingleObject on PID %d failed (error %d); presuming alive",
+                pid,
+                get_last_error(),
+            )
+            return True
         # WAIT_OBJECT_0 means the process handle is signaled (it exited).
-        return kernel32.WaitForSingleObject(handle, 0) != _WAIT_OBJECT_0
+        return result != _WAIT_OBJECT_0
     finally:
         kernel32.CloseHandle(handle)
 
@@ -355,8 +462,18 @@ def pid_alive(pid: int) -> bool:
     """
     if sys.platform == "win32":
         import ctypes
+        from ctypes import wintypes
 
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        # Explicit prototypes: ctypes otherwise defaults every argument and
+        # return value to c_int, which truncates 64-bit HANDLEs and returns
+        # WAIT_FAILED as -1 — never equal to the unsigned 0xFFFFFFFF constant.
+        kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+        kernel32.WaitForSingleObject.restype = wintypes.DWORD
+        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        kernel32.CloseHandle.restype = wintypes.BOOL
         return _pid_alive_windows(pid, kernel32, ctypes.get_last_error)
     try:
         os.kill(pid, 0)  # signal 0 = existence check
@@ -394,7 +511,7 @@ def load_state(path: Path | None = None) -> dict[str, Any]:
     Returns a dict mapping alias to ``{"pid": int, "path": str}``.
     Returns an empty dict if the file is missing or corrupt.
     """
-    state_path = path or STATE_PATH
+    state_path = path or default_state_path()
     if not state_path.exists():
         return {}
     try:
@@ -538,8 +655,8 @@ class WatchDaemon:
         config_path: Path | None = None,
     ) -> None:
         self._config: DaemonConfig = config or load_config(config_path)
-        self._config_path: Path = config_path or CONFIG_PATH
-        self._state_path: Path = STATE_PATH
+        self._config_path: Path = config_path or default_config_path()
+        self._state_path: Path = default_state_path()
         self._children: dict[str, subprocess.Popen[bytes]] = {}
         self._current_repos: dict[str, WatchRepo] = {}
         self._config_watcher: ConfigWatcher | None = None

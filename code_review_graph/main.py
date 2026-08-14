@@ -3,7 +3,9 @@
 Run as: code-review-graph serve
 Communicates via stdio (standard MCP transport), or use
 ``code-review-graph serve --http`` for Streamable HTTP on localhost (port 5555
-by default).
+by default). The HTTP transport validates ``Host`` and ``Origin`` so the loopback
+endpoint cannot be driven cross-origin (e.g. via DNS rebinding); see
+``code_review_graph.http_origin_guard``.
 """
 
 from __future__ import annotations
@@ -224,9 +226,11 @@ mcp = FastMCP(
 async def build_or_update_graph_tool(
     full_rebuild: bool = False,
     repo_root: Optional[str] = None,
-    base: str = "HEAD~1",
+    base: Optional[str] = None,
     postprocess: str = "full",
     recurse_submodules: Optional[bool] = None,
+    embedding_provider: Optional[str] = None,
+    embedding_model: Optional[str] = None,
 ) -> dict:
     """Build or incrementally update the code knowledge graph.
 
@@ -244,11 +248,18 @@ async def build_or_update_graph_tool(
     Args:
         full_rebuild: If True, re-parse all files. Default: False (incremental).
         repo_root: Repository root path. Auto-detected from current directory if omitted.
-        base: Git ref to diff against for incremental updates. Default: HEAD~1.
+        base: Git ref to diff against for incremental updates. When omitted,
+            resolves automatically to the commit the graph was last built at,
+            so one update catches everything since the last sync (not just the
+            latest commit). Pass an explicit ref to override.
         postprocess: Post-processing level: "full" (default), "minimal" (signatures+FTS only),
                      or "none" (skip all post-processing). Use "minimal" for faster builds.
         recurse_submodules: If True, include files from git submodules.
             When None (default), falls back to CRG_RECURSE_SUBMODULES env var.
+        embedding_provider: Exact provider for an explicit post-build embedding
+            refresh. Must be supplied with embedding_model. Default: disabled.
+        embedding_model: Exact model for an explicit post-build embedding
+            refresh. Must be supplied with embedding_provider. Default: disabled.
     """
     return await asyncio.to_thread(
         _tool_impl("build_or_update_graph"),
@@ -266,6 +277,8 @@ async def run_postprocess_tool(
     communities: bool = True,
     fts: bool = True,
     repo_root: Optional[str] = None,
+    embedding_provider: Optional[str] = None,
+    embedding_model: Optional[str] = None,
 ) -> dict:
     """Run post-processing on existing graph (flows, communities, FTS index).
 
@@ -281,6 +294,10 @@ async def run_postprocess_tool(
         communities: Run community detection. Default: True.
         fts: Rebuild FTS index. Default: True.
         repo_root: Repository root path. Auto-detected if omitted.
+        embedding_provider: Exact provider for an explicit embedding refresh.
+            Must be supplied with embedding_model. Default: disabled.
+        embedding_model: Exact model for an explicit embedding refresh.
+            Must be supplied with embedding_provider. Default: disabled.
     """
     return await asyncio.to_thread(
         _tool_impl("run_postprocess"),
@@ -302,7 +319,9 @@ def get_minimal_context_tool(
 
     Returns graph stats, risk score, top communities/flows, and suggested
     next tools in a single compact response. Use this as the entry point
-    before any other graph tool to minimize token usage.
+    before any other graph tool to minimize token usage. Returns
+    ``status: not_ready`` with a build suggestion when the graph is missing,
+    empty, or known to have been built at a different Git commit.
 
     Args:
         task: What you are doing (e.g. "review PR #42", "debug login timeout").
@@ -359,12 +378,20 @@ def query_graph_tool(
 
     Available patterns:
     - callers_of: Find functions that call the target
+    - references_to: Find nodes that reference the target
     - callees_of: Find functions called by the target
     - imports_of: Find what the target imports
     - importers_of: Find files that import the target
     - children_of: Find nodes contained in a file or class
     - tests_for: Find tests for the target
     - inheritors_of: Find classes inheriting from the target
+    - triggers_of: Find methods invoked by a scheduler or other trigger
+    - triggered_by: Find schedulers or other triggers that invoke the target
+    - publishers_of: Find methods that publish an event
+    - listeners_of: Find methods that listen for an event
+    - handlers_of: Find methods that handle an endpoint
+    - endpoints_for: Find endpoints handled by a method
+    - consumers_of: Find classes that consume a Spring configuration property
     - file_summary: Get all nodes in a file
 
     Args:
@@ -439,9 +466,9 @@ def semantic_search_nodes_tool(
 
     Uses vector embeddings for semantic search when available (run embed_graph_tool
     first, with a provider of your choice: "local" needs sentence-transformers,
-    "openai" / "google" / "minimax" need their respective env vars). Falls back
-    to FTS5 / keyword matching when no matching embeddings exist for the given
-    provider.
+    "openai" / "google" / "minimax" / "voyage" need their respective env vars).
+    Falls back to FTS5 / keyword matching when no matching embeddings exist for
+    the given provider.
 
     Args:
         query: Search string to match against node names.
@@ -450,7 +477,7 @@ def semantic_search_nodes_tool(
         repo_root: Repository root path. Auto-detected if omitted.
         model: Embedding model for query vectors. Must match the model used
                during embed_graph. Falls back to CRG_EMBEDDING_MODEL env var
-               (local) or CRG_OPENAI_MODEL (openai).
+               (local), CRG_OPENAI_MODEL (openai), or CRG_VOYAGE_MODEL (voyage).
         provider: Embedding provider: "local" (default), "openai", "google",
                   or "minimax". Must match the provider used during embed_graph.
         detail_level: "minimal" (default) for a compact summary; "standard" for full output.
@@ -478,7 +505,7 @@ async def embed_graph_tool(
     cloud providers use stdlib urllib).
     Default provider: local. Default model: all-MiniLM-L6-v2.
     Override provider via `provider` param, model via `model` param or
-    CRG_EMBEDDING_MODEL / CRG_OPENAI_MODEL env vars.
+    CRG_EMBEDDING_MODEL / CRG_OPENAI_MODEL / CRG_VOYAGE_MODEL env vars.
     Changing the model or provider re-embeds all nodes automatically.
 
     After running this, semantic_search_nodes_tool will use vector similarity
@@ -493,12 +520,15 @@ async def embed_graph_tool(
         repo_root: Repository root path. Auto-detected if omitted.
         model: Embedding model. For local: HuggingFace ID/path; for openai:
                model ID (e.g. "text-embedding-3-small"); for google: Gemini
-               model ID. Falls back to CRG_EMBEDDING_MODEL / CRG_OPENAI_MODEL
-               env vars as appropriate.
-        provider: "local" (default), "openai", "google", or "minimax".
+               model ID; for voyage: Voyage model ID (e.g. "voyage-code-3").
+               Falls back to CRG_EMBEDDING_MODEL / CRG_OPENAI_MODEL /
+               CRG_VOYAGE_MODEL env vars as appropriate.
+        provider: "local" (default), "openai", "google", "minimax", or "voyage".
                   "openai" requires CRG_OPENAI_BASE_URL + CRG_OPENAI_API_KEY +
                   CRG_OPENAI_MODEL env vars and accepts any OpenAI-compatible
                   endpoint (real OpenAI, Azure, new-api, LiteLLM, vLLM, etc.).
+                  "voyage" requires VOYAGE_API_KEY and defaults to voyage-code-3
+                  unless a model arg or CRG_VOYAGE_MODEL is supplied.
     """
     return await asyncio.to_thread(
         _tool_impl("embed_graph"),
@@ -603,7 +633,7 @@ def list_flows_tool(
         limit=limit,
         kind=kind,
         detail_level=detail_level,
-    )
+    ), root)
 
 
 @mcp.tool()
@@ -684,7 +714,7 @@ def list_communities_tool(
         sort_by=sort_by,
         min_size=min_size,
         detail_level=detail_level,
-    )
+    ), root)
 
 
 @mcp.tool()
@@ -737,7 +767,7 @@ def get_architecture_overview_tool(
     return _tool_impl("get_architecture_overview_func")(
         repo_root=_resolve_repo_root(repo_root),
         detail_level=detail_level,
-    )
+    ), root)
 
 
 @mcp.tool()
@@ -793,11 +823,12 @@ async def detect_changes_tool(
                 "Reduce scope with CRG_MAX_CHANGED_FUNCS / CRG_MAX_TRANSITIVE_FRONTIER, "
                 "or increase CRG_TOOL_TIMEOUT."
             )
-            return {
+            error_response = {
                 "status": "error",
                 "error": message,
                 "summary": message,
             }
+            return await asyncio.to_thread(with_provenance, error_response, root)
     return await coro
 
 
@@ -869,7 +900,7 @@ def apply_refactor_tool(
         refactor_id=refactor_id,
         repo_root=_resolve_repo_root(repo_root),
         dry_run=dry_run,
-    )
+    ), root)
 
 
 @mcp.tool()
@@ -1044,8 +1075,8 @@ def traverse_graph_tool(
         mode=mode,
         depth=depth,
         token_budget=token_budget,
-        repo_root=_resolve_repo_root(repo_root) or "",
-    )
+        repo_root=root or "",
+    ), root)
 
 
 @mcp.tool()
@@ -1066,8 +1097,10 @@ def cross_repo_search_tool(
 ) -> dict:
     """Search for code entities across all registered repositories.
 
-    Runs hybrid search on each registered repo's graph database and merges
-    the results by score. Register repos first with the CLI 'register' command.
+    Runs hybrid search on each registered repo's graph database and interleaves
+    results by repository-local rank. Equal ranks follow registry order, and up
+    to ``limit`` results per searched repo may be returned. Register repos first
+    with the CLI 'register' command.
 
     Args:
         query: Search string to match against node names.
@@ -1318,6 +1351,25 @@ def main(
         prewarm_local_embeddings()
 
     try:
+        if auto_watch:
+            watch_store = GraphStore(get_db_path(root))
+            thread = start_watch_thread(root, watch_store, daemon=True)
+            if thread is None:
+                logger.warning("Auto-watch was requested but could not be started")
+
+        if sys.platform == "win32":
+            asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+            # Pre-warm sentence-transformers on the main thread before fastmcp's
+            # event loop starts. Lazy-loading ``torch`` + tokenizers inside an
+            # executor worker thread deadlocks ``semantic_search_nodes_tool`` on
+            # Windows stdio MCP (DLL init / OpenMP thread-pool registration grabs
+            # locks the loop needs). #385 added ``asyncio.to_thread`` to peer
+            # tools but cannot fix this case — the dangerous initialization has
+            # to happen on the main thread before any worker thread is spawned.
+            from .embeddings import prewarm_local_embeddings
+
+            prewarm_local_embeddings()
+
         if transport == "stdio":
             # Stdio MCP must keep stdout strictly JSON-RPC. FastMCP's banner/update
             # notices corrupt the handshake stream on clients like Codex CLI.
@@ -1325,12 +1377,25 @@ def main(
         elif transport == "streamable-http":
             if host is None or port is None:
                 raise ValueError("streamable-http transport requires host and port")
-            mcp.run(transport="streamable-http", host=host, port=port)
+            # Validate Host/Origin on the loopback HTTP endpoint. Without it a web
+            # page the user visits can point a hostname it controls at 127.0.0.1
+            # (DNS rebinding) and drive the tools, which read the user's code.
+            # Non-browser MCP clients send no Origin and are unaffected; see
+            # code_review_graph.http_origin_guard.
+            from .http_origin_guard import build_http_middleware
+
+            mcp.run(
+                transport="streamable-http",
+                host=host,
+                port=port,
+                middleware=build_http_middleware(host, port),
+            )
         else:
             raise ValueError(f"unsupported transport: {transport!r}")
     finally:
         if watch_store is not None:
             watch_store.close()
+        _incremental._MCP_STDIO_ACTIVE = previous_stdio_state
 
 
 if __name__ == "__main__":

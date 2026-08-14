@@ -14,6 +14,8 @@ import threading
 from collections import OrderedDict
 from pathlib import Path
 
+from .constants import crg_home
+
 logger = logging.getLogger(__name__)
 
 # Default registry path

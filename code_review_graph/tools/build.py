@@ -7,10 +7,44 @@ import sqlite3
 import time
 from typing import Any
 
-from ..incremental import full_build, incremental_update
+from ..incremental import (
+    full_build,
+    incremental_update,
+    resolve_incremental_base,
+)
 from ._common import _get_store
 
 logger = logging.getLogger(__name__)
+
+
+def _run_embedding_refresh(
+    store: Any,
+    result: dict[str, Any],
+    warnings: list[str],
+    *,
+    provider: str | None,
+    model: str | None,
+) -> None:
+    """Run a provider-scoped embedding refresh only when explicitly requested."""
+    if provider is None and model is None:
+        return
+    if not provider or not model:
+        warning = "Embedding refresh requires both an explicit provider and model."
+        logger.warning(warning)
+        warnings.append(warning)
+        return
+    try:
+        from code_review_graph.embeddings import refresh_embeddings
+
+        refreshed = refresh_embeddings(store, provider=provider, model=model)
+        if refreshed is not None:
+            result["embeddings_refreshed"] = refreshed["embedded"]
+            result["embeddings_purged"] = refreshed["purged"]
+    except Exception as exc:
+        logger.warning("Embedding refresh failed: %s", exc)
+        warnings.append(
+            f"Embedding refresh failed: {type(exc).__name__}: {exc}",
+        )
 
 
 def _run_postprocess(
@@ -19,11 +53,18 @@ def _run_postprocess(
     postprocess: str,
     full_rebuild: bool = False,
     changed_files: list[str] | None = None,
+    embedding_provider: str | None = None,
+    embedding_model: str | None = None,
 ) -> list[str]:
     """Run post-build steps based on *postprocess* level.
 
     When *full_rebuild* is False and *changed_files* are available,
     uses incremental flow/community detection for faster updates.
+
+    Records structured stage durations in ``build_result["postprocess_timing"]``.
+    Minimal processing reports ``signatures_s`` and ``fts_s``; full processing
+    additionally reports ``flows_s``, ``communities_s``, and ``summaries_s``.
+    Each duration is a nonnegative float measured in seconds.
 
     Returns a list of warning strings (empty on success).
     """
@@ -31,9 +72,32 @@ def _run_postprocess(
     build_result["postprocess_level"] = postprocess
 
     if postprocess == "none":
+        _run_embedding_refresh(
+            store,
+            build_result,
+            warnings,
+            provider=embedding_provider,
+            model=embedding_model,
+        )
         return warnings
 
+    # Resolve bare and C++ scoped call targets before derived graph steps.
+    try:
+        resolved = store.resolve_bare_call_targets()
+        resolved += store.resolve_bare_tested_by_sources()
+        build_result["bare_edges_resolved"] = resolved
+        build_result["cpp_scoped_edges_resolved"] = (
+            store.resolve_cpp_scoped_call_targets()
+        )
+    except sqlite3.OperationalError as e:
+        logger.warning("Call-target resolution failed: %s", e)
+        warnings.append(
+            f"Call-target resolution failed: {type(e).__name__}: {e}"
+        )
+
     # -- Signatures + FTS (fast, always run unless "none") --
+    timing: dict[str, float] = {}
+    stage_started = time.perf_counter()
     try:
         rows = store.get_nodes_without_signature()
         sig_updates: list[tuple[str, int]] = []
@@ -60,7 +124,12 @@ def _run_postprocess(
     except (sqlite3.OperationalError, TypeError, KeyError) as e:
         logger.warning("Signature computation failed: %s", e)
         warnings.append(f"Signature computation failed: {type(e).__name__}: {e}")
+    timing["signatures_s"] = max(
+        0.0,
+        round(time.perf_counter() - stage_started, 6),
+    )
 
+    stage_started = time.perf_counter()
     try:
         from code_review_graph.search import rebuild_fts_index
 
@@ -70,13 +139,26 @@ def _run_postprocess(
     except (sqlite3.OperationalError, ImportError) as e:
         logger.warning("FTS index rebuild failed: %s", e)
         warnings.append(f"FTS index rebuild failed: {type(e).__name__}: {e}")
+    timing["fts_s"] = max(
+        0.0,
+        round(time.perf_counter() - stage_started, 6),
+    )
 
     if postprocess == "minimal":
+        _run_embedding_refresh(
+            store,
+            build_result,
+            warnings,
+            provider=embedding_provider,
+            model=embedding_model,
+        )
+        build_result["postprocess_timing"] = timing
         return warnings
 
     # -- Expensive: flows + communities (only for "full") --
     use_incremental = not full_rebuild and bool(changed_files)
 
+    stage_started = time.perf_counter()
     try:
         if use_incremental:
             from code_review_graph.flows import incremental_trace_flows
@@ -92,7 +174,12 @@ def _run_postprocess(
     except (sqlite3.OperationalError, ImportError) as e:
         logger.warning("Flow detection failed: %s", e)
         warnings.append(f"Flow detection failed: {type(e).__name__}: {e}")
+    timing["flows_s"] = max(
+        0.0,
+        round(time.perf_counter() - stage_started, 6),
+    )
 
+    stage_started = time.perf_counter()
     try:
         if use_incremental:
             from code_review_graph.communities import (
@@ -114,14 +201,31 @@ def _run_postprocess(
     except (sqlite3.OperationalError, ImportError) as e:
         logger.warning("Community detection failed: %s", e)
         warnings.append(f"Community detection failed: {type(e).__name__}: {e}")
+    timing["communities_s"] = max(
+        0.0,
+        round(time.perf_counter() - stage_started, 6),
+    )
 
     # -- Compute pre-computed summary tables --
+    stage_started = time.perf_counter()
     try:
         _compute_summaries(store)
         build_result["summaries_computed"] = True
     except (sqlite3.OperationalError, Exception) as e:
         logger.warning("Summary computation failed: %s", e)
         warnings.append(f"Summary computation failed: {type(e).__name__}: {e}")
+    timing["summaries_s"] = max(
+        0.0,
+        round(time.perf_counter() - stage_started, 6),
+    )
+    _run_embedding_refresh(
+        store,
+        build_result,
+        warnings,
+        provider=embedding_provider,
+        model=embedding_model,
+    )
+    build_result["postprocess_timing"] = timing
 
     store.set_metadata(
         "last_postprocessed_at",
@@ -363,9 +467,11 @@ def _compute_summaries(store: Any) -> None:
 def build_or_update_graph(
     full_rebuild: bool = False,
     repo_root: str | None = None,
-    base: str = "HEAD~1",
+    base: str | None = None,
     postprocess: str = "full",
     recurse_submodules: bool | None = None,
+    embedding_provider: str | None = None,
+    embedding_model: str | None = None,
 ) -> dict[str, Any]:
     """Build or incrementally update the code knowledge graph.
 
@@ -373,7 +479,11 @@ def build_or_update_graph(
         full_rebuild: If True, re-parse every file. If False (default),
                       only re-parse files changed since ``base``.
         repo_root: Path to the repository root. Auto-detected if omitted.
-        base: Git ref for incremental diff (default: HEAD~1).
+        base: Git ref for the incremental diff. When None (default), the base
+              is resolved automatically to the commit the graph was last built
+              at, so a single update reconciles everything since the last sync
+              rather than only the most recent commit. Pass an explicit ref to
+              override. Ignored when full_rebuild is True.
         postprocess: Post-processing level after build:
             ``"full"`` (default) — signatures, FTS, flows, communities.
             ``"minimal"`` — signatures + FTS only (fast, keeps search working).
@@ -382,37 +492,60 @@ def build_or_update_graph(
             via ``git ls-files --recurse-submodules``. When None
             (default), falls back to the CRG_RECURSE_SUBMODULES
             environment variable. Default: disabled.
+        embedding_provider: Exact provider to use for an explicitly requested
+            post-build refresh. Must be supplied together with
+            ``embedding_model``; omitted by default so builds never transmit
+            source-derived text or load an embedding model unexpectedly.
+        embedding_model: Exact model for an explicitly requested post-build
+            embedding refresh. Must be supplied with ``embedding_provider``.
 
     Returns:
         Summary with files_parsed/updated, node/edge counts, and errors.
     """
     store, root = _get_store(repo_root)
     try:
+        if not full_rebuild and not store.has_nodes():
+            full_rebuild = True
+
+        # An automatic (base is None) incremental update resolves its diff base
+        # to the last-synced commit. When no usable anchor exists, fall back to
+        # a full rebuild rather than a wrong HEAD~1 diff that could report the
+        # graph as up to date while it is actually stale.
+        base_resolved: str | None = base
+        if not full_rebuild and base is None:
+            base_resolved = resolve_incremental_base(root, store)
+            if base_resolved is None:
+                full_rebuild = True
+
         if full_rebuild:
             result = full_build(root, store, recurse_submodules)
             build_result = {
+                **result,
                 "status": "ok",
                 "build_type": "full",
+                "base_resolved": None,
                 "summary": (
                     f"Full build complete: parsed {result['files_parsed']} files, "
                     f"created {result['total_nodes']} nodes and "
                     f"{result['total_edges']} edges."
                 ),
-                **result,
             }
         else:
-            result = incremental_update(root, store, base=base)
+            result = incremental_update(root, store, base=base_resolved)
             if result["files_updated"] == 0:
                 return {
+                    **result,
                     "status": "ok",
                     "build_type": "incremental",
+                    "base_resolved": base_resolved,
                     "summary": "No changes detected. Graph is up to date.",
                     "postprocess_level": postprocess,
-                    **result,
                 }
             build_result = {
+                **result,
                 "status": "ok",
                 "build_type": "incremental",
+                "base_resolved": base_resolved,
                 "summary": (
                     f"Incremental update: {result['files_updated']} files re-parsed, "
                     f"{result['total_nodes']} nodes and "
@@ -420,7 +553,6 @@ def build_or_update_graph(
                     f"Changed: {result['changed_files']}. "
                     f"Dependents also updated: {result['dependent_files']}."
                 ),
-                **result,
             }
 
         # Pass changed_files for incremental flow/community detection
@@ -431,6 +563,8 @@ def build_or_update_graph(
             postprocess,
             full_rebuild=full_rebuild,
             changed_files=changed,
+            embedding_provider=embedding_provider,
+            embedding_model=embedding_model,
         )
         if warnings:
             build_result["warnings"] = warnings
@@ -444,6 +578,8 @@ def run_postprocess(
     communities: bool = True,
     fts: bool = True,
     repo_root: str | None = None,
+    embedding_provider: str | None = None,
+    embedding_model: str | None = None,
 ) -> dict[str, Any]:
     """Run post-processing steps on an existing graph.
 
@@ -456,6 +592,10 @@ def run_postprocess(
         communities: Run community detection. Default: True.
         fts: Rebuild FTS index. Default: True.
         repo_root: Repository root path. Auto-detected if omitted.
+        embedding_provider: Exact provider for an explicit refresh. Must be
+            supplied with ``embedding_model``. Default: disabled.
+        embedding_model: Exact model for an explicit refresh. Must be supplied
+            with ``embedding_provider``. Default: disabled.
 
     Returns:
         Summary of what was computed.
@@ -465,6 +605,19 @@ def run_postprocess(
     warnings: list[str] = []
 
     try:
+        try:
+            resolved = store.resolve_bare_call_targets()
+            resolved += store.resolve_bare_tested_by_sources()
+            result["bare_edges_resolved"] = resolved
+            result["cpp_scoped_edges_resolved"] = (
+                store.resolve_cpp_scoped_call_targets()
+            )
+        except sqlite3.OperationalError as e:
+            logger.warning("Call-target resolution failed: %s", e)
+            warnings.append(
+                f"Call-target resolution failed: {type(e).__name__}: {e}"
+            )
+
         try:
             rows = store.get_nodes_without_signature()
             sig_updates: list[tuple[str, int]] = []
@@ -532,6 +685,14 @@ def run_postprocess(
                 store.rollback()
                 logger.warning("Community detection failed: %s", e)
                 warnings.append(f"Community detection failed: {type(e).__name__}: {e}")
+
+        _run_embedding_refresh(
+            store,
+            result,
+            warnings,
+            provider=embedding_provider,
+            model=embedding_model,
+        )
 
         store.set_metadata(
             "last_postprocessed_at",

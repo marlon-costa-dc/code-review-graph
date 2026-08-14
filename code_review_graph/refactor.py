@@ -137,7 +137,11 @@ def rename_preview(
             })
 
     # Also search by bare name for unqualified edges.
-    bare_edges = store.search_edges_by_target_name(old_name, kind="CALLS")
+    bare_edges = store.search_edges_by_target_name(
+        old_name,
+        kind="CALLS",
+        language=node.language or None,
+    )
     seen = {(e["file"], e["line"]) for e in edits}
     for edge in bare_edges:
         key = (edge.file_path, edge.line)
@@ -1158,7 +1162,10 @@ def suggest_refactorings(store: GraphStore) -> list[dict[str, Any]]:
         }
 
         # Check functions called only by members of a different community.
-        all_funcs = store.get_nodes_by_kind(["Function"])
+        all_funcs = [
+            node for node in store.get_nodes_by_kind(["Function"])
+            if not node.extra.get("verilog_kind")
+        ]
 
         for fnode in all_funcs:
             f_community = node_community.get(fnode.qualified_name)
