@@ -61,7 +61,6 @@ crg-daemon = "code_review_graph.daemon_cli:main"
 # dependencies (see [project.dependencies]). These extras remain as
 # no-op back-compat aliases so existing `pip install code-review-graph[...]`
 # invocations keep working.
-embeddings = []
 communities = []
 enrichment = []
 google-embeddings = [
