@@ -814,6 +814,212 @@ class TestFindDeadCodeNewHeuristics:
         assert "User" not in dead_names
         assert "full_name" not in dead_names
 
+    def test_examples_directory_files_not_dead(self):
+        """Files inside examples/ directories are treated as entry points."""
+        self.store.upsert_node(NodeInfo(
+            kind="Function", name="demo_run", file_path="/repo/examples/demo.py",
+            line_start=1, line_end=5, language="python",
+        ))
+        self.store.commit()
+        dead = find_dead_code(self.store)
+        dead_names = {d["name"] for d in dead}
+        assert "demo_run" not in dead_names
+
+    def test_tests_directory_files_not_dead(self):
+        """All files under tests/ directories are excluded from dead-code analysis."""
+        self.store.upsert_node(NodeInfo(
+            kind="Function", name="helper", file_path="/repo/tests/helpers.py",
+            line_start=1, line_end=5, language="python",
+        ))
+        self.store.commit()
+        dead = find_dead_code(self.store)
+        dead_names = {d["name"] for d in dead}
+        assert "helper" not in dead_names
+
+    def test_protocol_module_class_not_dead(self):
+        """Classes and methods in _protocols/ modules are interface contracts."""
+        self.store.upsert_node(NodeInfo(
+            kind="Class", name="IRepository", file_path="/repo/_protocols/repo.py",
+            line_start=1, line_end=10, language="python",
+        ))
+        self.store.upsert_node(NodeInfo(
+            kind="Function", name="get", file_path="/repo/_protocols/repo.py",
+            line_start=2, line_end=3, language="python", parent_name="IRepository",
+        ))
+        self.store.commit()
+        dead = find_dead_code(self.store)
+        dead_names = {d["name"] for d in dead}
+        assert "IRepository" not in dead_names
+        assert "get" not in dead_names
+
+    def test_inheritance_hierarchy_method_not_dead(self):
+        """Methods of classes in an inheritance hierarchy are not flagged dead."""
+        self.store.upsert_node(NodeInfo(
+            kind="Class", name="BasePart", file_path="/repo/parts/part_01.py",
+            line_start=1, line_end=10, language="python",
+        ))
+        self.store.upsert_node(NodeInfo(
+            kind="Class", name="FinalPart", file_path="/repo/parts/part_02.py",
+            line_start=1, line_end=10, language="python",
+        ))
+        self.store.upsert_edge(EdgeInfo(
+            kind="INHERITS", source="/repo/parts/part_02.py::FinalPart",
+            target="BasePart", file_path="/repo/parts/part_02.py", line=1,
+        ))
+        self.store.upsert_node(NodeInfo(
+            kind="Function", name="shared_method", file_path="/repo/parts/part_01.py",
+            line_start=2, line_end=3, language="python", parent_name="BasePart",
+        ))
+        self.store.commit()
+        dead = find_dead_code(self.store)
+        dead_names = {d["name"] for d in dead}
+        assert "shared_method" not in dead_names
+
+    def test_override_method_not_dead(self):
+        """Methods overriding a base-class method are not flagged dead."""
+        self.store.upsert_node(NodeInfo(
+            kind="Class", name="Greeter", file_path="/repo/protocols.py",
+            line_start=1, line_end=10, language="python",
+        ))
+        self.store.upsert_node(NodeInfo(
+            kind="Function", name="greet", file_path="/repo/protocols.py",
+            line_start=2, line_end=3, language="python", parent_name="Greeter",
+        ))
+        self.store.upsert_node(NodeInfo(
+            kind="Class", name="EnglishGreeter", file_path="/repo/impl.py",
+            line_start=1, line_end=10, language="python",
+        ))
+        self.store.upsert_edge(EdgeInfo(
+            kind="INHERITS", source="/repo/impl.py::EnglishGreeter",
+            target="Greeter", file_path="/repo/impl.py", line=1,
+        ))
+        self.store.upsert_node(NodeInfo(
+            kind="Function", name="greet", file_path="/repo/impl.py",
+            line_start=2, line_end=3, language="python", parent_name="EnglishGreeter",
+        ))
+        self.store.commit()
+        dead = find_dead_code(self.store)
+        dead_names = {d["name"] for d in dead}
+        # The override in the subclass should not be dead.
+        assert "greet" not in dead_names
+
+    def test_pydantic_validator_not_dead(self):
+        """Pydantic-style validators on framework classes are not dead code."""
+        self.store.upsert_node(NodeInfo(
+            kind="Class", name="User", file_path="/repo/schemas.py",
+            line_start=1, line_end=20, language="python",
+        ))
+        self.store.upsert_edge(EdgeInfo(
+            kind="INHERITS", source="/repo/schemas.py::User",
+            target="BaseModel", file_path="/repo/schemas.py", line=1,
+        ))
+        for name in ("validate_email", "model_post_init"):
+            self.store.upsert_node(NodeInfo(
+                kind="Function", name=name, file_path="/repo/schemas.py",
+                line_start=3, line_end=5, language="python", parent_name="User",
+            ))
+        self.store.commit()
+        dead = find_dead_code(self.store)
+        dead_names = {d["name"] for d in dead}
+        assert "validate_email" not in dead_names
+        assert "model_post_init" not in dead_names
+
+    def test_facade_alias_inheritance_framework_class(self):
+        """Classes inheriting via facade aliases (e.g. ``m.ManagedModel``)
+        are recognized as framework-managed."""
+        self.store.upsert_node(NodeInfo(
+            kind="Class", name="ManagedModel", file_path="/repo/models/base.py",
+            line_start=1, line_end=10, language="python",
+        ))
+        self.store.upsert_edge(EdgeInfo(
+            kind="INHERITS", source="/repo/models/base.py::ManagedModel",
+            target="BaseModel", file_path="/repo/models/base.py", line=1,
+        ))
+        self.store.upsert_node(NodeInfo(
+            kind="Class", name="User", file_path="/repo/schemas.py",
+            line_start=1, line_end=20, language="python",
+        ))
+        self.store.upsert_edge(EdgeInfo(
+            kind="INHERITS", source="/repo/schemas.py::User",
+            target="m.ManagedModel", file_path="/repo/schemas.py", line=1,
+        ))
+        self.store.commit()
+        dead = find_dead_code(self.store)
+        dead_names = {d["name"] for d in dead}
+        assert "User" not in dead_names
+
+    def test_nested_class_of_framework_class_not_dead(self):
+        """Nested classes inside a framework class are not flagged dead."""
+        self.store.upsert_node(NodeInfo(
+            kind="Class", name="Base", file_path="/repo/models.py",
+            line_start=1, line_end=30, language="python",
+        ))
+        self.store.upsert_edge(EdgeInfo(
+            kind="INHERITS", source="/repo/models.py::Base",
+            target="BaseModel", file_path="/repo/models.py", line=1,
+        ))
+        self.store.upsert_node(NodeInfo(
+            kind="Class", name="Nested", file_path="/repo/models.py",
+            line_start=5, line_end=10, language="python", parent_name="Base",
+        ))
+        self.store.commit()
+        dead = find_dead_code(self.store)
+        dead_names = {d["name"] for d in dead}
+        assert "Nested" not in dead_names
+
+    def test_ast_visitor_method_not_dead(self):
+        """AST ``visit_*`` methods are invoked reflectively by NodeVisitor."""
+        self.store.upsert_node(NodeInfo(
+            kind="Function", name="visit_Call", file_path="/repo/visitor.py",
+            line_start=1, line_end=5, language="python",
+        ))
+        self.store.commit()
+        dead = find_dead_code(self.store)
+        dead_names = {d["name"] for d in dead}
+        assert "visit_Call" not in dead_names
+
+    def test_constants_namespace_class_not_dead(self):
+        """Classes named ``Constants`` holding only constants are namespaces."""
+        self.store.upsert_node(NodeInfo(
+            kind="Class", name="Constants", file_path="/repo/config.py",
+            line_start=1, line_end=20, language="python",
+        ))
+        self.store.commit()
+        dead = find_dead_code(self.store)
+        dead_names = {d["name"] for d in dead}
+        assert "Constants" not in dead_names
+
+    def test_model_validator_in_models_module_not_dead(self):
+        """Validators in model modules are treated as framework hooks."""
+        self.store.upsert_node(NodeInfo(
+            kind="Class", name="User", file_path="/repo/_models/user.py",
+            line_start=1, line_end=20, language="python",
+        ))
+        self.store.upsert_node(NodeInfo(
+            kind="Function", name="validate_email", file_path="/repo/_models/user.py",
+            line_start=3, line_end=5, language="python", parent_name="User",
+        ))
+        self.store.commit()
+        dead = find_dead_code(self.store)
+        dead_names = {d["name"] for d in dead}
+        assert "validate_email" not in dead_names
+
+    def test_protocols_py_file_not_dead(self):
+        """Classes and methods in ``protocols.py`` files are interface contracts."""
+        self.store.upsert_node(NodeInfo(
+            kind="Class", name="IStore", file_path="/repo/protocols.py",
+            line_start=1, line_end=10, language="python",
+        ))
+        self.store.upsert_node(NodeInfo(
+            kind="Function", name="get", file_path="/repo/protocols.py",
+            line_start=2, line_end=3, language="python", parent_name="IStore",
+        ))
+        self.store.commit()
+        dead = find_dead_code(self.store)
+        dead_names = {d["name"] for d in dead}
+        assert "IStore" not in dead_names
+        assert "get" not in dead_names
+
 
 class TestSuggestRefactorings:
     """Tests for suggest_refactorings."""

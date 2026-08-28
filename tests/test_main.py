@@ -186,6 +186,7 @@ class TestFindProjectRoot:
         child = root / "subdir"
         child.mkdir(parents=True)
         (root / ".git").mkdir()
+        (root / ".git" / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
         (child / ".svn").mkdir()
 
         assert crg_main._find_project_root(child) == root

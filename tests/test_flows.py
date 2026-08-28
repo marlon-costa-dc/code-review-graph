@@ -111,82 +111,20 @@ class TestFlows:
         assert "handle_request" in ep_names
         assert "regular_func" not in ep_names
 
-    def test_php_entry_names_are_language_scoped(self):
-        """PHP framework and magic method names must not pollute other languages."""
-        names = ("boot", "register", "__invoke")
-        for name in names:
-            self._add_func(name, path="app.php", language="php")
-            self._add_func(name, path="app.py", language="python")
-            self._add_call("app.php::caller", f"app.php::{name}", "app.php")
-            self._add_call("app.py::caller", f"app.py::{name}", "app.py")
-
-        entries = detect_entry_points(self.store)
-        php_entries = {
-            node.name for node in entries
-            if node.file_path == "app.php"
-        }
-        python_entries = {
-            node.name for node in entries
-            if node.file_path == "app.py"
-        }
-
-        assert php_entries == set(names)
-        assert python_entries.isdisjoint(names)
-
-    # ---------------------------------------------------------------
-    # detect_entry_points -- expanded decorator patterns
-    # ---------------------------------------------------------------
-
-    def test_detect_entry_points_pytest_fixture(self):
-        """pytest.fixture decorator marks function as entry point."""
-        self._add_func("my_fixture", extra={"decorators": ["pytest.fixture"]})
+    def test_detect_entry_points_pytest_hooks(self):
+        """pytest plugin hooks are entry points (wired by pytest)."""
+        for name in (
+            "pytest_configure", "pytest_collection_modifyitems",
+            "pytest_sessionstart", "pytest_terminal_summary",
+        ):
+            self._add_func(name)
         eps = detect_entry_points(self.store)
         ep_names = {ep.name for ep in eps}
-        assert "my_fixture" in ep_names
-
-    def test_detect_entry_points_django_receiver(self):
-        """Django signal receiver decorator marks function as entry point."""
-        self._add_func("on_save", extra={"decorators": ["receiver(post_save)"]})
-        eps = detect_entry_points(self.store)
-        ep_names = {ep.name for ep in eps}
-        assert "on_save" in ep_names
-
-    def test_detect_entry_points_spring_scheduled(self):
-        """Java Spring @Scheduled marks function as entry point."""
-        self._add_func("cleanup_job", extra={"decorators": ["Scheduled(cron='0 0 * * *')"]})
-        eps = detect_entry_points(self.store)
-        ep_names = {ep.name for ep in eps}
-        assert "cleanup_job" in ep_names
-
-    def test_detect_entry_points_celery_task(self):
-        """Bare @task decorator marks function as entry point."""
-        self._add_func("process_data", extra={"decorators": ["task"]})
-        eps = detect_entry_points(self.store)
-        ep_names = {ep.name for ep in eps}
-        assert "process_data" in ep_names
-
-    def test_detect_entry_points_agent_tool(self):
-        """@agent.tool decorator marks function as entry point."""
-        self._add_func("query_health", extra={"decorators": ["health_agent.tool"]})
-        eps = detect_entry_points(self.store)
-        ep_names = {ep.name for ep in eps}
-        assert "query_health" in ep_names
-
-    def test_detect_entry_points_alembic(self):
-        """upgrade/downgrade functions are entry points."""
-        self._add_func("upgrade")
-        self._add_func("downgrade")
-        eps = detect_entry_points(self.store)
-        ep_names = {ep.name for ep in eps}
-        assert "upgrade" in ep_names
-        assert "downgrade" in ep_names
-
-    def test_detect_entry_points_lifespan(self):
-        """FastAPI lifespan function is an entry point."""
-        self._add_func("lifespan")
-        eps = detect_entry_points(self.store)
-        ep_names = {ep.name for ep in eps}
-        assert "lifespan" in ep_names
+        for name in (
+            "pytest_configure", "pytest_collection_modifyitems",
+            "pytest_sessionstart", "pytest_terminal_summary",
+        ):
+            assert name in ep_names
 
     # ---------------------------------------------------------------
     # detect_entry_points -- expanded decorator patterns

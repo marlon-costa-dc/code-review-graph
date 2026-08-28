@@ -10259,14 +10259,12 @@ class CodeParser:
             # Kafka: emit CONSUMES/PRODUCES edges for Kafka field declarations
             self._emit_kafka_edges_from_class(child, name, file_path, edges)
 
-        # Recurse into class body
-        if language == "julia":
-            recursive_class = self._julia_scope_join(enclosing_class, name)
-        else:
-            recursive_class = name
+        # Recurse into class body using the fully-qualified nested class name
+        # so that grandchildren get the correct parent_name chain.
+        nested_class_scope = f"{enclosing_class}.{name}" if enclosing_class else name
         self._extract_from_tree(
             child, source, language, file_path, nodes, edges,
-            enclosing_class=recursive_class, enclosing_func=None,
+            enclosing_class=nested_class_scope, enclosing_func=None,
             import_map=import_map, defined_names=defined_names,
             _depth=_depth + 1,
         )
@@ -10400,10 +10398,13 @@ class CodeParser:
         qualified = self._qualify(identity_name, file_path, parent_name)
         ret_type = self._get_return_type(child, language, source)
 
-        # Java: detect Temporal method-level annotations and Kafka listeners
+        # Persist decorators so downstream analysis (dead-code filters,
+        # framework detection) can use them regardless of language.
         method_extra: dict = {}
-        if julia_qualifier:
-            method_extra["julia_module_qualifier"] = julia_qualifier
+        if deco_list:
+            method_extra["decorators"] = decorators
+
+        # Java: detect Temporal method-level annotations and Kafka listeners
         if language == "java" and deco_list:
             endpoint_count = self._emit_spring_endpoint_nodes(
                 child,
@@ -12172,10 +12173,15 @@ class CodeParser:
         import_map: dict[str, str],
         defined_names: set[str],
     ) -> None:
-        """Extract REFERENCES from array/list elements that are identifiers."""
+        """Extract REFERENCES from array/list elements that are identifiers.
+
+        Also handles member expressions like ``self.handler`` (Python) or
+        ``obj.handler`` (JS/TS) so dispatch tables built from method lists
+        keep their targets alive.
+        """
         for ch in array_node.children:
-            if ch.type == "identifier":
-                name = ch.text.decode("utf-8", errors="replace")
+            name = self._ref_name_from_value_node(ch, language)
+            if name:
                 self._emit_reference_if_known(
                     name, language, file_path, caller, edges,
                     import_map, defined_names,
@@ -12195,13 +12201,39 @@ class CodeParser:
     ) -> None:
         """Extract REFERENCES from identifier arguments (callbacks)."""
         for ch in args_node.children:
-            if ch.type == "identifier":
-                name = ch.text.decode("utf-8", errors="replace")
+            name = self._ref_name_from_value_node(ch, language)
+            if name:
                 self._emit_reference_if_known(
                     name, language, file_path, caller, edges,
                     import_map, defined_names,
                     line=ch.start_point[0] + 1,
                 )
+
+    def _ref_name_from_value_node(
+        self,
+        node,
+        language: str,
+    ) -> Optional[str]:
+        """Return a referenceable name from a value node, or None."""
+        if node.type == "identifier":
+            return node.text.decode("utf-8", errors="replace")
+        # Python: self.method_name
+        if node.type == "attribute":
+            attr = None
+            for sub in reversed(node.children):
+                if sub.type == "identifier":
+                    attr = sub.text.decode("utf-8", errors="replace")
+                    break
+            return attr
+        # JS/TS: obj.method_name
+        if node.type == "member_expression" and language in ("javascript", "typescript", "tsx"):
+            prop = None
+            for sub in reversed(node.children):
+                if sub.type == "property_identifier":
+                    prop = sub.text.decode("utf-8", errors="replace")
+                    break
+            return prop
+        return None
 
     def _extract_solidity_constructs(
         self,

@@ -104,6 +104,8 @@ _ENTRY_NAME_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"^downgrade$"),
     # unittest / pytest lifecycle hooks (often live in production helper mixins)
     re.compile(r"^(setUp|tearDown|setUpClass|tearDownClass|asyncSetUp|asyncTearDown|doCleanups)$"),
+    # pytest plugin hooks (wired by pytest itself)
+    re.compile(r"^pytest_"),
     # FastAPI lifecycle / dependency injection
     re.compile(r"^lifespan$"),
     re.compile(r"^get_db$"),
@@ -114,6 +116,8 @@ _ENTRY_NAME_PATTERNS: list[re.Pattern[str]] = [
     # Python BaseHTTPRequestHandler
     re.compile(r"^do_(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)$"),
     re.compile(r"^log_message$"),
+    # CLI command handlers (e.g. argparse subcommands, promoted_main callbacks)
+    re.compile(r"_command$"),
     # Express middleware signature
     re.compile(r"^(middleware|errorHandler)$"),
     # Angular lifecycle hooks

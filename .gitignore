@@ -103,3 +103,10 @@ PRESENTATION_BRIEF.md
 # Beads / Dolt files (added by bd init)
 .beads/proxieddb/
 .omo/
+# --- ai-hub workspace local environment cache ---
+.direnv/
+
+# Agent/runtime artifacts
+.cursor/
+.envrc
+.mise.toml
