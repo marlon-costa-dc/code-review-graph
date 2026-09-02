@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "code-review-graph"
-version = "2.4.0+dc1"
+version = "2.3.8-dc.1"
 description = "Local-first knowledge graph for token-efficient code review through MCP and CLI"
 readme = {file = "README.md", content-type = "text/markdown"}
 license = "MIT"
@@ -65,7 +65,7 @@ embeddings = []
 communities = []
 enrichment = []
 google-embeddings = [
-    "google-generativeai>=0.8.0,<1",
+    "google-genai>=1.0.0,<3",
 ]
 eval = [
     "matplotlib>=3.7.0",
@@ -75,7 +75,10 @@ wiki = [
     "ollama>=0.1.0",
 ]
 all = [
+    "code-review-graph[embeddings]",
     "code-review-graph[google-embeddings]",
+    "code-review-graph[communities]",
+    "code-review-graph[enrichment]",
     "code-review-graph[eval]",
     "code-review-graph[wiki]",
 ]
@@ -103,6 +106,14 @@ include = [
     "README.md",
     "pyproject.toml",
 ]
+# Hatch adds readme- and licence-named files from anywhere in the tree on top
+# of `include`, which pulled the issue tracker's hooks and the VS Code
+# extension's own README and LICENSE into the source distribution. (Hatchling
+# always ships `.gitignore`; that one cannot be excluded.)
+exclude = [
+    ".beads/",
+    "code-review-graph-vscode/",
+]
 
 [tool.ruff]
 line-length = 100
@@ -117,6 +128,7 @@ select = ["E", "F", "I", "N", "W"]
 
 [tool.ruff.lint.per-file-ignores]
 "code_review_graph/visualization.py" = ["E501"]  # embedded HTML/JS template
+"code_review_graph/_legacy_instructions.py" = ["E501"]  # verbatim past output, must not be reflowed
 "tests/fixtures/sample_databricks_export.py" = ["F841", "W292"]  # intentional fixture patterns
 "tests/fixtures/sample_notebook.ipynb" = ["F401", "I001"]  # fixture imports: intentionally unused, split across cells
 "tests/test_multilang.py" = ["E501"]  # long assertions with explanatory comments
