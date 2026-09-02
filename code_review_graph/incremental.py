@@ -260,6 +260,30 @@ DEFAULT_IGNORE_PATTERNS = [
     "*.sqlite",
     "*.db-journal",
     "*.db-wal",
+    # Generated reports / artifacts
+    ".reports/**",
+    "htmlcov/**",
+    "playwright-report/**",
+    "test-results/**",
+    "site/**",
+    # Local tool caches / workspaces
+    ".mypy_cache/**",
+    ".pytest_cache/**",
+    ".ruff_cache/**",
+    ".tox/**",
+    "*.egg-info/**",
+    "rope_ws/**",
+    ".beads/**",
+    ".benchmarks/**",
+    # Coverage data files
+    ".coverage",
+    ".coverage.*",
+    "coverage.xml",
+    "nosetests.xml",
+    # Temporary / artifact files with unusual names
+    "*{}*",
+    "*.tmp",
+    "*.log",
 ]
 
 # Build-output directories that ``DEFAULT_IGNORE_PATTERNS`` only anchors at the
@@ -1077,29 +1101,14 @@ def _get_svn_all_tracked_files(repo_root: Path) -> list[str]:
     return []
 
 
-def collect_all_files(
+def _filter_parseable_files(
     repo_root: Path,
-    recurse_submodules: bool | None = None,
+    candidates: list[str],
+    ignore_patterns: list[str],
+    parser: CodeParser,
 ) -> list[str]:
-    """Collect all parseable files in the repo, respecting ignore patterns.
-
-    Args:
-        repo_root: Repository root directory.
-        recurse_submodules: If True, include files from git submodules.
-            When *None*, falls back to ``CRG_RECURSE_SUBMODULES`` env var.
-    """
-    ignore_patterns = _load_ignore_patterns(repo_root)
-    parser = CodeParser(repo_root)
-    files = []
-
-    # Prefer git ls-files for tracked files
-    tracked = get_all_tracked_files(repo_root, recurse_submodules)
-    if tracked:
-        candidates = tracked
-    else:
-        # Fallback: walk directory
-        candidates = [str(p.relative_to(repo_root)) for p in repo_root.rglob("*") if p.is_file()]
-
+    """Filter candidate paths to parseable, non-ignored files."""
+    files: list[str] = []
     for rel_path in candidates:
         if _should_ignore(rel_path, ignore_patterns):
             continue
@@ -1122,44 +1131,61 @@ def collect_all_files(
         if _is_binary(full_path):
             continue
         files.append(rel_path)
-
     return files
 
 
-def _reconcile_stale_files(
+# Ratio threshold for auto-switching from git-tracked files to a full
+# directory walk.  Some repos use aggressive .gitignore whitelists and keep
+# most source files untracked; in that case ``git ls-files`` returns far
+# fewer files than actually exist.  When tracked files are fewer than this
+# fraction of the parseable files found by walking, we prefer the walk.
+_WALK_FALLBACK_RATIO = float(os.environ.get("CRG_WALK_FALLBACK_RATIO", "0.25"))
+
+
+def collect_all_files(
     repo_root: Path,
-    store: GraphStore,
-    current_files: list[str] | None = None,
+    recurse_submodules: bool | None = None,
 ) -> list[str]:
-    """Remove graph files absent from the current parseable repository inventory."""
-    stored_files = set(store.get_all_files())
-    current_paths: set[str]
-    if current_files is not None:
-        current_paths = {
-            normalize_file_path(repo_root / file_path) for file_path in current_files
-        }
-    else:
-        ignore_patterns = _load_ignore_patterns(repo_root)
-        parser = CodeParser(repo_root)
-        current_paths = set()
-        for stored_file in stored_files:
-            path = Path(stored_file)
-            try:
-                relative = str(path.relative_to(repo_root))
-            except ValueError:
-                continue
-            if (
-                path.is_file()
-                and not path.is_symlink()
-                and not _should_ignore(relative, ignore_patterns)
-                and parser.detect_language(path) is not None
-                and not _is_binary(path)
-            ):
-                current_paths.add(stored_file)
-    stale_files = sorted(stored_files - current_paths)
-    if stale_files:
-        store.remove_files_permanently(stale_files)
-    return stale_files
+    """Collect all parseable files in the repo, respecting ignore patterns.
+
+    Args:
+        repo_root: Repository root directory.
+        recurse_submodules: If True, include files from git submodules.
+            When *None*, falls back to ``CRG_RECURSE_SUBMODULES`` env var.
+    """
+    ignore_patterns = _load_ignore_patterns(repo_root)
+    parser = CodeParser(repo_root)
+
+    force_walk = os.environ.get("CRG_FORCE_WALK", "").lower() in ("1", "true", "yes")
+
+    tracked: list[str] = []
+    if not force_walk:
+        tracked = get_all_tracked_files(repo_root, recurse_submodules)
+
+    if force_walk or not tracked:
+        # Fallback: walk directory
+        candidates = [str(p.relative_to(repo_root)) for p in repo_root.rglob("*") if p.is_file()]
+        return _filter_parseable_files(repo_root, candidates, ignore_patterns, parser)
+
+    # Heuristic: if the tracked file list is much smaller than what a
+    # directory walk would discover, the repo likely uses an aggressive
+    # whitelist .gitignore and keeps source files untracked.  In that case
+    # walking the tree gives a more useful graph.
+    tracked_files = _filter_parseable_files(repo_root, tracked, ignore_patterns, parser)
+    walk_candidates = [
+        str(p.relative_to(repo_root)) for p in repo_root.rglob("*") if p.is_file()
+    ]
+    walk_files = _filter_parseable_files(repo_root, walk_candidates, ignore_patterns, parser)
+
+    if len(tracked_files) < _WALK_FALLBACK_RATIO * max(len(walk_files), 1):
+        logger.info(
+            "Tracked files (%d) are far fewer than walkable files (%d); "
+            "using directory walk for %s",
+            len(tracked_files), len(walk_files), repo_root,
+        )
+        return walk_files
+
+    return tracked_files
 
 
 def _assert_graph_matches_root(repo_root: Path, store: GraphStore) -> None:
@@ -1321,7 +1347,24 @@ def full_build(
     repo_root = _canonical_repo_root(repo_root)
     parser = CodeParser(repo_root)
     files = collect_all_files(repo_root, recurse_submodules)
-    stale_files = _reconcile_stale_files(repo_root, store, files)
+
+    # Purge stale data from files no longer on disk.
+    # Use all distinct file_path values (not just File-kind nodes) so that
+    # leftover function/class nodes from previously deleted files are also
+    # cleaned up.  get_all_files() only returns File nodes, which can miss
+    # orphans when the File node was removed but other nodes were not.
+    existing_files = {
+        r["file_path"]
+        for r in store._conn.execute("SELECT DISTINCT file_path FROM nodes").fetchall()
+    }
+    current_abs = {str(repo_root / f) for f in files}
+    stale_files = existing_files - current_abs
+    for stale in stale_files:
+        store.remove_file_data(stale)
+    # Ensure deletions are persisted before store_file_nodes_edges()
+    # starts its own explicit transaction via BEGIN IMMEDIATE.
+    if stale_files:
+        store.commit()
 
     total_nodes = 0
     total_edges = 0

@@ -139,6 +139,25 @@ def _tool_impl(name: str) -> Any:
     return getattr(import_module(module_name), attr_name)
 
 
+def _is_git_repo(candidate: Path) -> bool:
+    """Return True if *candidate* contains a real git repository.
+
+    Rejects empty ``.git`` directories left behind by broken tooling or
+    test fixtures so they do not steal project-root detection from real
+    repositories further up the filesystem.
+    """
+    git_path = candidate / ".git"
+    if not git_path.exists():
+        return False
+    if git_path.is_dir():
+        return (git_path / "HEAD").exists() or (git_path / "packed-refs").exists()
+    # Worktree pointer file.
+    try:
+        return git_path.read_text(encoding="utf-8").startswith("gitdir:")
+    except (OSError, UnicodeDecodeError):
+        return False
+
+
 def _find_project_root(start: Path | None = None) -> Path:
     env_override = os.environ.get("CRG_REPO_ROOT", "").strip()
     if start is None and env_override:
@@ -150,6 +169,10 @@ def _find_project_root(start: Path | None = None) -> Path:
     if root.is_file():
         root = root.parent
     candidates = (root, *root.parents)
+    for candidate in candidates:
+        if _is_git_repo(candidate):
+            return candidate
+
     # SVN working copy: return the topmost continuous .svn directory.
     # Stop as soon as the chain is broken so unrelated .svn directories
     # further up the filesystem do not steal the result.
