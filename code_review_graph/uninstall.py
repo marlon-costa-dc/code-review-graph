@@ -571,7 +571,7 @@ def _remove_yaml_entry(
         (
             index
             for index in range(header + 1, section_end)
-            if lines[index].rstrip("\n") == entry_prefix.rstrip()
+            if lines[index].rstrip("\r\n") == entry_prefix.rstrip()
             or lines[index].startswith(entry_prefix)
         ),
         None,
