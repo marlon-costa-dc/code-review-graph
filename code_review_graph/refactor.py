@@ -33,6 +33,8 @@ _FRAMEWORK_BASE_CLASSES = frozenset({
     # Protocol classes are interface definitions; their methods are contract,
     # not dead code.
     "Protocol", "typing.Protocol",
+    # Abstract base classes define contracts implemented by subclasses.
+    "ABC", "abc.ABC",
     # Test framework bases -- test helpers and TestCase subclasses are wired by runner.
     "TestCase", "unittest.TestCase", "AsyncTestCase", "IsolatedAsyncioTestCase",
     # Python stdlib handlers -- instantiated by the HTTP server framework.
@@ -257,15 +259,25 @@ def _is_entry_point(node: Any) -> bool:
 # Matches identifiers inside type annotations (e.g. "GoalCreate" in
 # "body: GoalCreate", "Optional[UserResponse]", "list[Item]").
 _TEST_FILE_RE = re.compile(
-    r"([\\/]__tests__[\\/]|\.spec\.[jt]sx?$|\.test\.[jt]sx?$|[\\/]test_[^/\\]*\.py$"
+    r"([\\/]__tests__[\\/]|[\\/]tests?[\\/]|[\\/][^/\\]*_tests?[\\/]|[\\/]test[_-]?utils?[\\/]"
+    r"|\.spec\.[jt]sx?$|\.test\.[jt]sx?$|[\\/]test_[^/\\]*\.py$"
     r"|[\\/][^/\\]*_tests?\.py$|[\\/]conftest\.py$"
-    r"|[\\/]e2e[_-]?tests?[\\/]|[\\/]test[_-]utils?[\\/])"
+    r"|[\\/]e2e[_-]?tests?[\\/])"
 )
+
+# Standalone example/demo directories contain entry-point-like scripts that
+# are meant to be run directly, not called by production code.
+_EXAMPLES_RE = re.compile(r"[\\/]examples?[\\/]")
 
 
 def _is_test_file(file_path: str) -> bool:
     """Return True if *file_path* looks like a test file."""
     return bool(_TEST_FILE_RE.search(file_path))
+
+
+def _is_example_file(file_path: str) -> bool:
+    """Return True if *file_path* lives in an examples/ directory."""
+    return bool(_EXAMPLES_RE.search(file_path))
 
 
 _MIN_PKG_SEGMENT_LEN = 4  # ignore short dirs like "src", "lib", "app"
@@ -334,6 +346,19 @@ class _DeadCodeContext:
         self.class_children = self._build_class_children(all_nodes)
         self.class_method_names = self._build_class_method_names(all_nodes)
         self.class_qn_to_node = self._build_class_qn_to_node(all_nodes)
+        # MRO-component method index for override detection.
+        self.mro_component_method_names = self._build_mro_component_method_names()
+
+    def _build_mro_component_method_names(self) -> dict[str, set[str]]:
+        """Map class qualified_name -> set of method names in its MRO component."""
+        result: dict[str, set[str]] = {}
+        for class_qn in self.class_bases:
+            component = self.mro_resolver.component(class_qn)
+            methods: set[str] = set()
+            for member_qn in component:
+                methods.update(self.class_method_names.get(member_qn, set()))
+            result[class_qn] = methods
+        return result
 
     def _build_class_qn_to_node(self, nodes: list[Any]) -> dict[str, Any]:
         """Map class qualified_name -> class node for O(1) class lookups."""
@@ -658,6 +683,10 @@ class _NodeFilter:
         if node.is_test or _is_test_file(node.file_path):
             return True
 
+        # Skip example/demo files -- they are standalone entry points.
+        if _is_example_file(node.file_path):
+            return True
+
         # Skip ambient type declarations (.d.ts) — they describe external APIs.
         if node.file_path.endswith(".d.ts"):
             return True
@@ -712,6 +741,17 @@ class _NodeFilter:
         if node.kind == "Class" and self._is_namespace_class(node):
             return True
 
+        # Skip protocol/ABC classes defined in protocol modules (fallback when
+        # INHERITS edges to Protocol/ABC are absent or unresolved).
+        if self._is_protocol_module_class(node):
+            return True
+
+        # Skip methods of classes that participate in an inheritance hierarchy.
+        # Mixin/part classes and ordinary subclasses expose their methods via
+        # the inherited interface even when no direct CALLS edge exists.
+        if node.kind == "Function" and self._is_inheritance_hierarchy_method(node):
+            return True
+
         # Skip methods/functions registered as event/dispatch handlers.
         # Names like `_handle_*`, `_format_*`, `_process_*` are conventionally
         # wired by reflection/dispatch tables, not direct CALLS edges.
@@ -721,6 +761,10 @@ class _NodeFilter:
         # Skip methods of @dataclass classes -- they are typically helpers or
         # properties on data containers and are kept alive by the class usage.
         if node.kind == "Function" and self._is_dataclass_method(node):
+            return True
+
+        # Skip Pydantic/model validators and hooks -- invoked by the framework.
+        if node.kind == "Function" and self._is_model_validator(node):
             return True
 
         # Skip decorated functions/classes that are invoked implicitly rather
@@ -744,9 +788,9 @@ class _NodeFilter:
                 if any("dataclass" in d for d in decorators):
                     return True
 
-        # Skip methods that override an @abstractmethod in a base class --
+        # Skip methods that override a same-named method in a base class --
         # they are called polymorphically via the base class reference.
-        if self._is_abstract_override(node):
+        if self._is_override(node):
             return True
 
         return False
@@ -785,15 +829,18 @@ class _NodeFilter:
     def _is_namespace_class(self, node: Any) -> bool:
         """Return True if the class is a pure namespace (nested types/constants only).
 
-        Namespace classes contain nested classes or type aliases but no
-        callable methods.  They are referenced as containers, not instantiated.
+        Namespace classes contain nested classes, type aliases, or constant
+        assignments but no callable methods.  They are referenced as containers,
+        not instantiated.
         """
         if node.kind != "Class":
             return False
         class_qn = self._class_qn_for(node)
         children = self.context.class_children.get(class_qn, [])
+        # No parsed children at all often means the class only holds constant
+        # assignments (e.g. ``class Constants: ...``).
         if not children:
-            return False
+            return True
         # Allow nested classes/types; reject callable members.
         for child in children:
             if child.kind in ("Class", "Type"):
@@ -815,6 +862,9 @@ class _NodeFilter:
         if node.kind != "Function":
             return False
         name = node.name
+        # AST visitor methods are invoked reflectively by ``ast.NodeVisitor``.
+        if name.startswith("visit_"):
+            return True
         # Require a leading underscore so we only flag conventionally-private
         # helper methods that are wired by reflection/dispatch tables.  Public
         # names like ``format_date`` are regular utilities and must remain
@@ -826,7 +876,11 @@ class _NodeFilter:
         if any(name.startswith(p) for p in prefixes):
             return True
         # Common bare handler names used by plugin/dispatch systems.
-        bare = {"_handle", "_format", "_process", "_dispatch", "_route", "_emit"}
+        bare = {
+            "_handle", "_format", "_process", "_dispatch", "_route", "_emit",
+            # Flask / web framework request lifecycle hooks
+            "_before_request_hook", "_after_request_hook", "_error_handler",
+        }
         return name in bare
 
     def _is_dataclass_method(self, node: Any) -> bool:
@@ -842,6 +896,80 @@ class _NodeFilter:
             return False
         return any("dataclass" in d for d in decorators)
 
+    def _is_protocol_module_class(self, node: Any) -> bool:
+        """Return True if the node lives in a protocol/contract module.
+
+        Modules named ``_protocols/`` or ``protocols.py`` typically contain
+        interface definitions (typing.Protocol, abc.ABC, or documentation
+        protocols).  Their classes and methods are contract surface, not dead
+        code.
+        """
+        if node.kind not in ("Class", "Function"):
+            return False
+        norm = node.file_path.replace("\\", "/")
+        if "/_protocols/" in norm or "/protocols/" in norm:
+            return True
+        if norm.endswith("/protocols.py") or norm.endswith("/_protocols.py"):
+            return True
+        return False
+
+    def _is_inheritance_hierarchy_method(self, node: Any) -> bool:
+        """Return True if the method belongs to a class in an inheritance hierarchy.
+
+        Mixin/part classes and subclasses expose methods via polymorphism and
+        composition even when static analysis cannot find a direct CALLS edge.
+        """
+        if node.kind != "Function" or not node.parent_name:
+            return False
+        class_qn = self._class_qn_for(node)
+        if not class_qn:
+            return False
+        component = self.context.mro_resolver.component(class_qn)
+        if len(component) > 1:
+            return True
+        # Part/mixin modules contain classes composed via inheritance even when
+        # the base is an unresolved external/framework alias (e.g. ``m.Model``).
+        norm = node.file_path.replace("\\", "/")
+        if (
+            "/_parts/" in norm
+            or "/_mixins/" in norm
+            or "_part_" in norm
+            or "_mixin_" in norm
+        ):
+            return bool(self.context.class_bases.get(class_qn))
+        return False
+
+    def _is_model_validator(self, node: Any) -> bool:
+        """Return True if the method is a Pydantic/dataclass validator hook.
+
+        Detects ``model_post_init``, ``validate_*``, ``field_validator``,
+        ``model_validator``, ``_serialize`` and ``_*_default`` (default
+        factories) methods on framework-managed model classes.
+        """
+        if node.kind != "Function" or not node.parent_name:
+            return False
+        name = node.name
+        is_validator_name = (
+            name == "model_post_init"
+            or name.startswith("validate_")
+            or name in ("field_validator", "model_validator")
+            or name.startswith(("field_validator_", "model_validator_"))
+            # Pydantic field serializer, custom normalizer and default-factory helpers.
+            or name.startswith("serialize_")
+            or name.startswith("_normalize_")
+            or name == "_serialize"
+            or name.endswith("_default")
+        )
+        if not is_validator_name:
+            return False
+        if self._is_framework_class(node):
+            return True
+        # Fallback: validators in model modules are conventionally framework hooks.
+        norm = node.file_path.replace("\\", "/")
+        if "/_models/" in norm or "/models/" in norm or norm.endswith("/models.py"):
+            return True
+        return False
+
     def _class_qn_for(self, node: Any) -> Optional[str]:
         """Return the qualified name of the class a node belongs to."""
         if node.kind == "Class":
@@ -853,45 +981,76 @@ class _NodeFilter:
         return None
 
     def _is_framework_class(self, node: Any) -> bool:
-        """Return True if the node (or its parent class) inherits a known framework base."""
-        _check_qn = node.qualified_name if node.kind == "Class" else (
-            node.qualified_name.rsplit(".", 1)[0] if node.parent_name else None
-        )
-        if _check_qn:
-            outgoing = self.context.store.get_edges_by_source(_check_qn)
-            base_names = {
-                e.target_qualified.rsplit("::", 1)[-1]
-                for e in outgoing if e.kind == "INHERITS"
-            }
-            if base_names & _FRAMEWORK_BASE_CLASSES:
+        """Return True if the node (or its parent class) inherits a known framework base.
+
+        Checks both direct bases and the transitive inheritance chain so that
+        intermediate base classes (e.g. ``_ArgoModel`` inheriting from
+        Pydantic's ``BaseModel``) still mark subclasses as framework-managed.
+        Also handles facade aliases like ``m.ManagedModel`` and nested classes
+        inside framework parents.
+        """
+        class_qn = self._class_qn_for(node)
+        if not class_qn:
+            return False
+
+        def _is_framework_base(base: str) -> bool:
+            if base in _FRAMEWORK_BASE_CLASSES:
                 return True
+            # Facade aliases: ``m.ManagedModel`` -> ``ManagedModel``
+            bare = base.rsplit(".", 1)[-1]
+            if bare != base and bare in _FRAMEWORK_BASE_CLASSES:
+                return True
+            return False
+
+        seen: set[str] = set()
+        stack: list[str] = [class_qn]
+        # Nested classes inherit the framework status of their enclosing class.
+        if node.kind == "Class" and node.parent_name:
+            parent_qn = f"{node.file_path}::{node.parent_name}"
+            if parent_qn != class_qn:
+                stack.append(parent_qn)
+        while stack:
+            cur = stack.pop()
+            if cur in seen:
+                continue
+            seen.add(cur)
+            class_node = self.context.class_qn_to_node.get(cur)
+            if class_node is None:
+                continue
+            # Direct INHERITS edges from this class.
+            for base in self.context.class_bases.get(cur, ()):
+                if _is_framework_base(base):
+                    return True
+                # Resolve bare base name to continue traversal.
+                for base_qn in self.context.class_name_to_qns.get(base, ()):
+                    stack.append(base_qn)
+                # Also resolve facade-alias base names (e.g. ``m.ManagedModel``).
+                bare_base = base.rsplit(".", 1)[-1]
+                if bare_base != base:
+                    for base_qn in self.context.class_name_to_qns.get(bare_base, ()):
+                        stack.append(base_qn)
         return False
 
-    def _is_abstract_override(self, node: Any) -> bool:
-        """Return True if *node* overrides an @abstractmethod in a base class."""
+    def _is_override(self, node: Any) -> bool:
+        """Return True if *node* overrides a same-named method in a base class.
+
+        This generalizes the previous @abstractmethod-only check: any method
+        that shadows a base-class method is reachable polymorphically via the
+        base reference, including typing.Protocol and abc.ABC implementations.
+        """
         if node.kind != "Function" or not node.parent_name:
             return False
-        parent_qn = node.qualified_name.rsplit(".", 1)[0]
-        parent_edges = self.context.store.get_edges_by_source(parent_qn)
-        base_class_names = [
-            e.target_qualified for e in parent_edges if e.kind == "INHERITS"
-        ]
-        for base_name in base_class_names:
-            # Try fully-qualified base first, then bare name match
-            base_method_qn = f"{base_name}.{node.name}"
-            base_nodes = self.context.store.get_node(base_method_qn)
-            if base_nodes is None:
-                # Base class may be bare name -- search in same file
-                base_method_qn2 = (
-                    node.file_path + "::" + base_name + "." + node.name
-                )
-                base_nodes = self.context.store.get_node(base_method_qn2)
-            if base_nodes is not None:
-                base_decos = base_nodes.extra.get("decorators", ())
-                if isinstance(base_decos, (list, tuple)) and any(
-                    "abstractmethod" in d for d in base_decos
-                ):
-                    return True
+        class_qn = self._class_qn_for(node)
+        if not class_qn:
+            return False
+        component = self.context.mro_resolver.component(class_qn)
+        if len(component) <= 1:
+            return False
+        for other_qn in component:
+            if other_qn == class_qn:
+                continue
+            if node.name in self.context.class_method_names.get(other_qn, set()):
+                return True
         return False
 
 
