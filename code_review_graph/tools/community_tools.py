@@ -74,7 +74,7 @@ def list_communities_func(
         max_results: Maximum communities to return (default 50, capped at
                      200). ``total`` reports the untruncated count.
         max_members: Maximum member names listed per community in standard
-                     mode (default 10, capped at 100). Each community's
+                     mode (default 10, capped at 25). Each community's
                      ``size`` still reports its true member count.
 
     Returns:
