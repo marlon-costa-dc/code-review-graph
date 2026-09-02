@@ -2,14 +2,13 @@
 
 import io
 import json
-import logging
 import sys
 from importlib.metadata import PackageNotFoundError
 from pathlib import Path
 from unittest.mock import MagicMock, patch
-
 from code_review_graph import cli
 
+import pytest
 
 def test_main_handles_legacy_stdio_encoding(monkeypatch):
     """Unicode CLI output must not crash when stdio starts as cp1252."""
@@ -31,44 +30,22 @@ def test_main_handles_legacy_stdio_encoding(monkeypatch):
     assert "Commands:" in output
 
 
-def test_get_version_falls_back_to_package_attr_when_metadata_missing(
-    monkeypatch, caplog,
-):
-    """When importlib.metadata can't find the dist, fall back to __version__.
+def test_get_version_returns_distribution_metadata(monkeypatch):
+    monkeypatch.setattr(cli, "pkg_version", lambda _dist_name: "2.4.0+dc1")
 
-    This matters on filesystems where iCloud / OneDrive leave orphan
-    dist-info dirs that confuse the metadata lookup. Before v2.3.5 the
-    fallback returned the literal string "dev", which produced confusing
-    output for installed users whose lookup happened to fail.
-    """
+    version = cli._get_version()
+
+    assert version == "2.4.0+dc1"
+
+
+def test_get_version_raises_when_metadata_missing(monkeypatch):
     def _raise_package_not_found(_dist_name: str) -> str:
         raise PackageNotFoundError("code-review-graph")
 
     monkeypatch.setattr(cli, "pkg_version", _raise_package_not_found)
 
-    with caplog.at_level(logging.DEBUG, logger="code_review_graph.cli"):
-        version = cli._get_version()
-
-    # Falls back to the package's __version__, not "dev"
-    from code_review_graph import __version__ as expected
-    assert version == expected
-    assert "Package metadata unavailable" in caplog.text
-
-
-def test_get_version_returns_dev_when_both_sources_fail(monkeypatch, caplog):
-    """The literal "dev" fallback still fires when __version__ also fails."""
-    def _raise_package_not_found(_dist_name: str) -> str:
-        raise PackageNotFoundError("code-review-graph")
-
-    monkeypatch.setattr(cli, "pkg_version", _raise_package_not_found)
-
-    import code_review_graph
-    monkeypatch.delattr(code_review_graph, "__version__", raising=False)
-
-    with caplog.at_level(logging.DEBUG, logger="code_review_graph.cli"):
-        version = cli._get_version()
-
-    assert version == "dev"
+    with pytest.raises(PackageNotFoundError):
+        cli._get_version()
 
 
 class TestServeCommand:
@@ -88,6 +65,7 @@ class TestServeCommand:
             repo_root=str(Path("repo-root").resolve()),
             auto_watch=True,
             tools=None,
+            detail_level=None,
         )
 
     def test_mcp_alias_maps_to_serve(self):

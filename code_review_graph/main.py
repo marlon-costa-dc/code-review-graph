@@ -14,8 +14,9 @@ import asyncio
 import logging
 import os
 import sys
+from importlib import import_module
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from fastmcp import FastMCP
 
@@ -66,6 +67,113 @@ from .tools import (
 
 logger = logging.getLogger(__name__)
 
+_TOOL_IMPLS: dict[str, tuple[str, str]] = {
+    "apply_refactor_func": (
+        "code_review_graph.tools.refactor_tools",
+        "apply_refactor_func",
+    ),
+    "build_or_update_graph": ("code_review_graph.tools.build", "build_or_update_graph"),
+    "cross_repo_search_func": (
+        "code_review_graph.tools.registry_tools",
+        "cross_repo_search_func",
+    ),
+    "detect_changes_func": ("code_review_graph.tools.review", "detect_changes_func"),
+    "embed_graph": ("code_review_graph.tools.docs", "embed_graph"),
+    "find_large_functions": ("code_review_graph.tools.query", "find_large_functions"),
+    "generate_wiki_func": ("code_review_graph.tools.docs", "generate_wiki_func"),
+    "get_affected_flows_func": (
+        "code_review_graph.tools.review",
+        "get_affected_flows_func",
+    ),
+    "get_architecture_overview_func": (
+        "code_review_graph.tools.community_tools",
+        "get_architecture_overview_func",
+    ),
+    "get_bridge_nodes_func": (
+        "code_review_graph.tools.analysis_tools",
+        "get_bridge_nodes_func",
+    ),
+    "get_community_func": (
+        "code_review_graph.tools.community_tools",
+        "get_community_func",
+    ),
+    "get_docs_section": ("code_review_graph.tools.docs", "get_docs_section"),
+    "get_flow": ("code_review_graph.tools.flows_tools", "get_flow"),
+    "get_hub_nodes_func": (
+        "code_review_graph.tools.analysis_tools",
+        "get_hub_nodes_func",
+    ),
+    "get_impact_radius": ("code_review_graph.tools.query", "get_impact_radius"),
+    "get_knowledge_gaps_func": (
+        "code_review_graph.tools.analysis_tools",
+        "get_knowledge_gaps_func",
+    ),
+    "get_minimal_context": ("code_review_graph.tools.context", "get_minimal_context"),
+    "get_review_context": ("code_review_graph.tools.review", "get_review_context"),
+    "get_suggested_questions_func": (
+        "code_review_graph.tools.analysis_tools",
+        "get_suggested_questions_func",
+    ),
+    "get_surprising_connections_func": (
+        "code_review_graph.tools.analysis_tools",
+        "get_surprising_connections_func",
+    ),
+    "get_wiki_page_func": ("code_review_graph.tools.docs", "get_wiki_page_func"),
+    "list_communities_func": (
+        "code_review_graph.tools.community_tools",
+        "list_communities_func",
+    ),
+    "list_flows": ("code_review_graph.tools.flows_tools", "list_flows"),
+    "list_graph_stats": ("code_review_graph.tools.query", "list_graph_stats"),
+    "list_repos_func": ("code_review_graph.tools.registry_tools", "list_repos_func"),
+    "query_graph": ("code_review_graph.tools.query", "query_graph"),
+    "refactor_func": ("code_review_graph.tools.refactor_tools", "refactor_func"),
+    "run_postprocess": ("code_review_graph.tools.build", "run_postprocess"),
+    "semantic_search_nodes": ("code_review_graph.tools.query", "semantic_search_nodes"),
+    "traverse_graph_func": ("code_review_graph.tools.query", "traverse_graph_func"),
+}
+
+
+def _tool_impl(name: str) -> Any:
+    module_name, attr_name = _TOOL_IMPLS[name]
+    return getattr(import_module(module_name), attr_name)
+
+
+def _find_project_root(start: Path | None = None) -> Path:
+    env_override = os.environ.get("CRG_REPO_ROOT", "").strip()
+    if start is None and env_override:
+        root = Path(env_override).expanduser().resolve()
+        if root.exists():
+            return root
+
+    root = (start or Path.cwd()).resolve()
+    if root.is_file():
+        root = root.parent
+    candidates = (root, *root.parents)
+    # SVN working copy: return the topmost continuous .svn directory.
+    # Stop as soon as the chain is broken so unrelated .svn directories
+    # further up the filesystem do not steal the result.
+    svn_candidate: Path | None = None
+    first_non_svn: Path | None = None
+    for candidate in candidates:
+        if (candidate / ".svn").exists():
+            svn_candidate = candidate
+        else:
+            first_non_svn = candidate
+            break
+    if first_non_svn is not None and (first_non_svn / ".git").exists():
+        return first_non_svn
+    if svn_candidate is not None:
+        return svn_candidate
+    git_root = next(
+        (candidate for candidate in candidates if (candidate / ".git").exists()),
+        None,
+    )
+    if git_root is not None:
+        return git_root
+    return start or Path.cwd()
+
+
 # NOTE: Thread-safe for stdio MCP (single-threaded). If adding HTTP/SSE
 # transport with concurrent requests, replace with contextvars.ContextVar.
 _default_repo_root: str | None = None
@@ -85,6 +193,66 @@ def _resolve_repo_root(repo_root: Optional[str]) -> Optional[str]:
     ``get_docs_section_tool``. See: #222.
     """
     return repo_root if repo_root else _default_repo_root
+
+
+# The curated "lean" allow-list, available on demand via ``--tools lean`` /
+# ``CRG_TOOLS=lean``.  CRG registers ~30 MCP tools and exposes them all by
+# default (upstream behavior); shipping every description costs ~8k tokens per
+# LLM turn, so token-constrained clients can opt into this smaller set that
+# still covers every documented workflow (see CLAUDE.md "When to use graph
+# tools FIRST" and the prompt templates in prompts.py):
+#
+#   - get_minimal_context_tool   : the mandated entry point (~100 tokens).
+#   - query_graph_tool           : callers/callees/imports/tests tracing.
+#   - semantic_search_nodes_tool : find entities by name / keyword.
+#   - detect_changes_tool        : primary risk-scored review tool.
+#   - get_review_context_tool    : source snippets for review.
+#   - get_impact_radius_tool     : blast-radius analysis.
+#   - get_affected_flows_tool    : which execution paths a change touches.
+#
+# The full set (wiki, communities, refactor, viz, embeddings,
+# build/postprocess, cross-repo, analysis explorers, docs) is the default;
+# ``--tools lean`` / ``CRG_TOOLS=lean`` narrows to the 7 above.
+LEAN_TOOLS: tuple[str, ...] = (
+    "get_minimal_context_tool",
+    "query_graph_tool",
+    "semantic_search_nodes_tool",
+    "detect_changes_tool",
+    "get_review_context_tool",
+    "get_impact_radius_tool",
+    "get_affected_flows_tool",
+)
+
+# Valid detail levels accepted by the per-tool ``detail_level`` parameter and
+# the server-wide ``CRG_DETAIL_LEVEL`` / ``serve --detail`` override.
+_VALID_DETAIL_LEVELS = ("minimal", "standard", "verbose")
+
+# Server-wide detail-level override.  ``None`` means "use whatever the tool /
+# caller asked for".  Set from ``serve --detail`` or the ``CRG_DETAIL_LEVEL``
+# env var.  Tool wrappers route their ``detail_level`` argument through
+# ``_resolve_detail_level`` so a single flag can force every tool minimal.
+_detail_level_override: str | None = None
+
+
+def _resolve_detail_level(detail_level: str) -> str:
+    """Resolve the effective detail level for a tool call.
+
+    Precedence:
+    1. Server-wide override (``serve --detail`` / ``CRG_DETAIL_LEVEL``) when set.
+    2. The per-call ``detail_level`` argument (default ``"minimal"``).
+
+    Unknown values fall through unchanged — the underlying tool treats any
+    non-``"minimal"`` value as full output, so an invalid override never
+    silently expands the response.
+    """
+    override = _detail_level_override
+    if override is None:
+        override = os.environ.get("CRG_DETAIL_LEVEL") or None
+    if override:
+        override = override.strip().lower()
+        if override in _VALID_DETAIL_LEVELS:
+            return override
+    return detail_level
 
 
 mcp = FastMCP(
@@ -224,7 +392,7 @@ def get_impact_radius_tool(
     max_depth: int = 2,
     repo_root: Optional[str] = None,
     base: str = "HEAD~1",
-    detail_level: str = "standard",
+    detail_level: str = "minimal",
 ) -> dict:
     """Analyze the blast radius of changed files in the codebase.
 
@@ -236,12 +404,13 @@ def get_impact_radius_tool(
         max_depth: Number of hops to traverse in the dependency graph. Default: 2.
         repo_root: Repository root path. Auto-detected if omitted.
         base: Git ref for auto-detecting changes. Default: HEAD~1.
-        detail_level: "standard" for full output, "minimal" for compact summary. Default: standard.
+        detail_level: "minimal" (default) for a compact summary; "standard" for full output.
     """
     root = _resolve_repo_root(repo_root)
     return with_provenance(get_impact_radius(
         changed_files=changed_files, max_depth=max_depth,
-        repo_root=root, base=base, detail_level=detail_level,
+        repo_root=root, base=base,
+        detail_level=_resolve_detail_level(detail_level),
     ), root)
 
 
@@ -250,7 +419,7 @@ def query_graph_tool(
     pattern: str,
     target: str,
     repo_root: Optional[str] = None,
-    detail_level: str = "standard",
+    detail_level: str = "minimal",
     max_results: int = 100,
 ) -> dict:
     """Run a predefined graph query to explore code relationships.
@@ -277,13 +446,14 @@ def query_graph_tool(
         pattern: Query pattern name (see above).
         target: Node name, qualified name, or file path to query.
         repo_root: Repository root path. Auto-detected if omitted.
-        detail_level: "standard" for full output, "minimal" for compact summary. Default: standard.
-        max_results: Maximum results to return. Default: 100.
+        detail_level: "minimal" (default) for a compact summary; "standard" for full output.
+        max_results: Cap on results returned so callers_of/callees_of on a hot
+            symbol cannot return an unbounded payload. Default: 100.
     """
     root = _resolve_repo_root(repo_root)
     return with_provenance(query_graph(
         pattern=pattern, target=target, repo_root=root,
-        detail_level=detail_level, max_results=max_results,
+        detail_level=_resolve_detail_level(detail_level), max_results=max_results,
     ), root)
 
 
@@ -298,6 +468,7 @@ def get_review_context_tool(
     detail_level: str = "standard",
     max_results: int = 100,
     max_files: int = 25,
+    max_tokens: int = 6000,
 ) -> dict:
     """Generate a focused, token-efficient review context for code changes.
 
@@ -317,6 +488,9 @@ def get_review_context_tool(
             Default: 50. Each list reports its untruncated ``*_total``.
         max_files: Maximum files listed and given source snippets.
             Default: 25. Snippets share an 800-line budget.
+        max_tokens: Token budget for the response. When the full context would
+            exceed this, the lowest-risk source snippets are dropped first and
+            an honest ``omitted`` note is added. Default: 6000. Set 0 to disable.
     """
     root = _resolve_repo_root(repo_root)
     return with_provenance(get_review_context(
@@ -324,6 +498,7 @@ def get_review_context_tool(
         include_source=include_source, max_lines_per_file=max_lines_per_file,
         repo_root=root, base=base, detail_level=detail_level,
         max_results=max_results, max_files=max_files,
+        detail_level=_resolve_detail_level(detail_level), max_tokens=max_tokens,
     ), root)
 
 
@@ -335,7 +510,7 @@ def semantic_search_nodes_tool(
     repo_root: Optional[str] = None,
     model: Optional[str] = None,
     provider: Optional[str] = None,
-    detail_level: str = "standard",
+    detail_level: str = "minimal",
 ) -> dict:
     """Search for code entities by name, keyword, or semantic similarity.
 
@@ -356,12 +531,12 @@ def semantic_search_nodes_tool(
         provider: Embedding provider: "local" (default), "openai", "google",
                   "minimax", or "voyage". Must match the provider used during
                   embed_graph.
-        detail_level: "standard" for full output, "minimal" for compact summary. Default: standard.
+        detail_level: "minimal" (default) for a compact summary; "standard" for full output.
     """
     root = _resolve_repo_root(repo_root)
     return with_provenance(semantic_search_nodes(
         query=query, kind=kind, limit=limit, repo_root=root,
-        model=model, provider=provider, detail_level=detail_level,
+        model=model, provider=provider, detail_level=_resolve_detail_level(detail_level),
     ), root)
 
 
@@ -445,7 +620,7 @@ def get_docs_section_tool(
         section_name: The section to retrieve (e.g. "review-delta", "usage").
         repo_root: Repository root path. Auto-detected if omitted.
     """
-    return get_docs_section(
+    return _tool_impl("get_docs_section")(
         section_name=section_name,
         repo_root=_resolve_repo_root(repo_root),
     )
@@ -685,6 +860,7 @@ async def detect_changes_tool(
     detail_level: str = "standard",
     max_results: int = 25,
     max_flows: int = 20,
+    max_tokens: int = 6000,
 ) -> dict:
     """Detect changes and produce risk-scored, priority-ordered review guidance.
 
@@ -710,6 +886,10 @@ async def detect_changes_tool(
         max_flows: Maximum affected flows to embed. Embedded flows carry
             per-flow metadata only — use get_affected_flows_tool for step
             detail. Default: 20.
+        max_tokens: Token budget for the standard response. When the full
+            analysis would exceed this, the lowest-risk changed functions and
+            flows are dropped first and an honest ``omitted`` note is added.
+            Default: 6000. Set 0 to disable.
     """
     root = _resolve_repo_root(repo_root)
 
@@ -717,8 +897,9 @@ async def detect_changes_tool(
         return with_provenance(detect_changes_func(
             base=base, changed_files=changed_files,
             include_source=include_source, max_depth=max_depth,
-            repo_root=root, detail_level=detail_level,
+            repo_root=root, detail_level=_resolve_detail_level(detail_level),
             max_results=max_results, max_flows=max_flows,
+            max_tokens=max_tokens,
         ), root)
 
     coro = asyncio.to_thread(_run)
@@ -1028,7 +1209,7 @@ def list_repos_tool() -> dict:
     Returns the list of repos registered at ~/.code-review-graph/registry.json.
     Use the CLI 'register' command to add repos.
     """
-    return list_repos_func()
+    return _tool_impl("list_repos_func")()
 
 
 @mcp.tool()
@@ -1052,9 +1233,7 @@ def cross_repo_search_tool(
         max_results: Maximum merged results across all repos; total reports
             the untruncated merged count. Default: 50.
     """
-    return cross_repo_search_func(
-        query=query, kind=kind, limit=limit, max_results=max_results,
-    )
+    return _tool_impl("cross_repo_search_func")(query=query, kind=kind, limit=limit)
 
 
 @mcp.prompt()
@@ -1111,41 +1290,77 @@ def pre_merge_check(base: str = "HEAD~1") -> list[dict]:
     return pre_merge_check_prompt(base=base)
 
 
-def _apply_tool_filter(tools: str | None = None) -> None:
-    """Remove tools not listed in the allow-list.
+def _resolve_tool_allowlist(tools: str | None) -> set[str] | None:
+    """Resolve the requested tool spec into a concrete allow-list of names.
 
-    Accepts a comma-separated string of tool names to keep.  When set,
-    every registered MCP tool whose name is **not** in the list is
-    removed via ``FastMCP.remove_tool()``.
+    Returns ``None`` when **all** tools should remain (no trim).  Returns a
+    set of tool names to keep otherwise.
 
-    The allow-list can be supplied in two ways (first match wins):
+    Accepts (first match wins): the ``tools`` argument (``serve --tools``),
+    then the ``CRG_TOOLS`` env var, then defaults to the lean set.
 
-    1. ``tools`` argument (from ``serve --tools ...``).
-    2. ``CRG_TOOLS`` environment variable.
+    Recognised keywords (case-insensitive):
+    - ``"all"``   -> keep every registered tool (returns ``None``).
+    - ``"lean"``  -> the curated :data:`LEAN_TOOLS` set.
+    - anything else is parsed as a comma-separated list of tool names.
 
-    When neither is set, all tools remain available.
-
-    This is useful for token-constrained environments: CRG exposes 28+
-    tools by default (~8k description tokens per LLM turn).  Filtering
-    to a working set of 5-10 tools can reduce overhead by 70-85%.
-
-    Example::
-
-        # via CLI
-        code-review-graph serve --tools query_graph_tool,semantic_search_nodes_tool
-
-        # via env var
-        CRG_TOOLS=query_graph_tool,semantic_search_nodes_tool
+    An empty / whitespace-only spec also returns ``None`` (keep all): an
+    explicit empty value must never silently remove every tool.
     """
-    import asyncio
-    import os
-
-    raw = tools or os.environ.get("CRG_TOOLS")
+    raw = tools if tools is not None else os.environ.get("CRG_TOOLS")
+    if raw is None:
+        # Nothing specified anywhere -> expose ALL tools (upstream default).
+        # Token-lean mode is opt-in via ``--tools lean`` / ``CRG_TOOLS=lean``.
+        return None
+    raw = raw.strip()
     if not raw:
-        return
+        return None
+    if raw.lower() == "all":
+        return None
+    if raw.lower() == "lean":
+        return set(LEAN_TOOLS)
     allowed = {t.strip() for t in raw.split(",") if t.strip()}
     if not allowed:
+        return None
+    return allowed
+
+
+def _apply_tool_filter(tools: str | None = None) -> None:
+    """Trim registered MCP tools down to an allow-list.
+
+    CRG registers ~30 MCP tools.  By default **every** tool is exposed
+    (matching upstream).  For token-constrained clients, opt into the curated
+    :data:`LEAN_TOOLS` set with ``--tools lean`` / ``CRG_TOOLS=lean``.
+
+    The allow-list is resolved by :func:`_resolve_tool_allowlist` from, in
+    order: the ``tools`` argument (``serve --tools ...``), the ``CRG_TOOLS``
+    env var, then the all-tools default.  Pass ``"all"`` (CLI or env) to keep
+    every tool explicitly, ``"lean"`` for the curated 7-tool set, or a
+    list for a custom set.  Unknown names are ignored gracefully.
+
+    A one-line notice is written to **stderr** whenever tools are trimmed, so
+    a reduced tool list is never silent or confusing.  (stdout stays clean for
+    the JSON-RPC stdio transport.)
+
+    Examples::
+
+        # default — all 30 tools
+        code-review-graph serve
+
+        # token-lean set (7 tools)
+        code-review-graph serve --tools lean
+
+        # restore everything
+        code-review-graph serve --tools all
+        CRG_TOOLS=all
+
+        # custom set
+        code-review-graph serve --tools query_graph_tool,semantic_search_nodes_tool
+    """
+    allowed = _resolve_tool_allowlist(tools)
+    if allowed is None:
         return
+
     # FastMCP >=3 exposes tool enumeration via the async ``list_tools``
     # method.  ``_apply_tool_filter`` is typically called from
     # ``main()`` before the MCP event loop starts, but tests may invoke
@@ -1168,10 +1383,24 @@ def _apply_tool_filter(tools: str | None = None) -> None:
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
             return pool.submit(_runner).result()
 
-    for name in _list_tool_names():
+    registered = _list_tool_names()
+    removed = 0
+    for name in registered:
         if name not in allowed:
             mcp.local_provider.remove_tool(name)
+            removed += 1
 
+    if removed:
+        kept = len(registered) - removed
+        # Note: never write to stdout — the stdio transport speaks JSON-RPC
+        # there.  stderr is safe and visible to the user launching the server.
+        print(
+            f"[code-review-graph] lean tool mode: exposing {kept} of "
+            f"{len(registered)} tools "
+            f"(removed {removed}). Use --tools all or CRG_TOOLS=all "
+            f"for the full set.",
+            file=sys.stderr,
+        )
 
 
 def main(
@@ -1182,6 +1411,7 @@ def main(
     transport: str = "stdio",
     host: str | None = None,
     port: int | None = None,
+    detail_level: str | None = None,
 ) -> None:
     """Run the MCP server (stdio or HTTP).
 
@@ -1195,18 +1425,32 @@ def main(
 
     Args:
         repo_root: Default repository root for all tool calls.
-        tools: Comma-separated list of tool names to expose.
-            Falls back to ``CRG_TOOLS`` env var.  When unset, all
-            tools are available.
+        tools: Tool allow-list spec.  ``"all"`` exposes every tool,
+            ``"lean"`` the curated set, or a comma-separated list of names.
+            Falls back to ``CRG_TOOLS`` env var, then the lean default.
         auto_watch: Start filesystem watcher in a background daemon thread
             while the MCP server runs.
         transport: ``"stdio"`` (default) or ``"streamable-http"`` for local HTTP.
         host: Bind address when using HTTP (required for HTTP; set by CLI).
         port: Port when using HTTP (required for HTTP; set by CLI).
+        detail_level: Server-wide ``detail_level`` override
+            ("minimal"/"standard"/"verbose").  Falls back to the
+            ``CRG_DETAIL_LEVEL`` env var.  When set, it overrides each tool's
+            per-call ``detail_level`` argument.
     """
-    global _default_repo_root
-    root = Path(repo_root) if repo_root else find_project_root()
+    global _default_repo_root, _detail_level_override
+    root = Path(repo_root) if repo_root else _find_project_root()
     _default_repo_root = str(root)
+    if detail_level:
+        normalized = detail_level.strip().lower()
+        if normalized in _VALID_DETAIL_LEVELS:
+            _detail_level_override = normalized
+        else:
+            logger.warning(
+                "Ignoring unknown --detail %r (expected one of %s)",
+                detail_level,
+                ", ".join(_VALID_DETAIL_LEVELS),
+            )
     _apply_tool_filter(tools)
 
     previous_stdio_state = _incremental._MCP_STDIO_ACTIVE

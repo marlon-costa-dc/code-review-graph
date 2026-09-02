@@ -34,8 +34,10 @@ _FRAMEWORK_DECORATOR_PATTERNS: list[re.Pattern[str]] = [
     # CLI frameworks
     re.compile(r"click\.(command|group)", re.IGNORECASE),
     re.compile(r"\w+\.(command|group)\b", re.IGNORECASE),  # Click subgroups: @mygroup.command()
-    # Pydantic validators/serializers
+    # Pydantic validators/serializers/computed fields
     re.compile(r"(field|model)_(serializer|validator)", re.IGNORECASE),
+    re.compile(r"computed_field", re.IGNORECASE),
+    re.compile(r"validate_call", re.IGNORECASE),
     # Task queues
     re.compile(r"(celery\.)?(task|shared_task|periodic_task)", re.IGNORECASE),
     # Django
@@ -47,6 +49,20 @@ _FRAMEWORK_DECORATOR_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"(override_settings|modify_settings)", re.IGNORECASE),
     # SQLAlchemy / event systems
     re.compile(r"(event\.)?listens_for", re.IGNORECASE),
+    re.compile(r"orm\.validates", re.IGNORECASE),
+    # Django decorators
+    re.compile(r"csrf_exempt", re.IGNORECASE),
+    re.compile(r"require_http_methods", re.IGNORECASE),
+    re.compile(r"(permission|authentication|throttle)_classes", re.IGNORECASE),
+    # Flask app hooks
+    re.compile(r"app\.(errorhandler|before_request|after_request|teardown_request)", re.IGNORECASE),
+    # Click/Typer arguments/options (sub-decorators of command definitions)
+    re.compile(r"click\.(option|argument)", re.IGNORECASE),
+    re.compile(r"typer\.(callback|option|argument)", re.IGNORECASE),
+    # Legacy asyncio coroutine decorator
+    re.compile(r"asyncio\.coroutine", re.IGNORECASE),
+    # functools dispatch decorators
+    re.compile(r"(functools\.)?singledispatch(method)?", re.IGNORECASE),
     # Java Spring
     re.compile(r"(Get|Post|Put|Delete|Patch|RequestMapping)Mapping", re.IGNORECASE),
     re.compile(r"(Scheduled|EventListener|Bean|Configuration)", re.IGNORECASE),
@@ -86,6 +102,8 @@ _ENTRY_NAME_PATTERNS: list[re.Pattern[str]] = [
     # Alembic migration entry points
     re.compile(r"^upgrade$"),
     re.compile(r"^downgrade$"),
+    # unittest / pytest lifecycle hooks (often live in production helper mixins)
+    re.compile(r"^(setUp|tearDown|setUpClass|tearDownClass|asyncSetUp|asyncTearDown|doCleanups)$"),
     # FastAPI lifecycle / dependency injection
     re.compile(r"^lifespan$"),
     re.compile(r"^get_db$"),

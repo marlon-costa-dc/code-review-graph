@@ -21,8 +21,26 @@ from ..uncertainty import (
     empty_search_confidence,
 )
 from ._common import _BUILTIN_CALL_NAMES, _get_store, _resolve_graph_file_paths
+from ._common import (
+    _BUILTIN_CALL_NAMES,
+    _get_store_for_read,
+    _not_built_response,
+    _resolve_graph_file_paths,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def _count_embeddings(conn) -> int:
+    """Return stored embedding count without loading embedding providers."""
+    try:
+        return int(conn.execute("SELECT COUNT(*) FROM embeddings").fetchone()[0])
+    except sqlite3.OperationalError as exc:
+        if "no such table: embeddings" in str(exc).lower():
+            return 0
+        raise
+        return 0
+
 
 # ---------------------------------------------------------------------------
 # Tool 2: get_impact_radius
@@ -135,7 +153,9 @@ def get_impact_radius(
     if isinstance(max_results, bool) or max_results < 1:
         raise ValueError("max_results must be an integer greater than or equal to 1")
 
-    store, root = _get_store(repo_root)
+    store, root, not_built = _get_store_for_read(repo_root)
+    if store is None or root is None:
+        return not_built if not_built is not None else _not_built_response()
     try:
         if changed_files is None:
             changed_files = get_changed_files(root, base)
@@ -204,9 +224,7 @@ def get_impact_radius(
                 risk = "medium"
             else:
                 risk = "low"
-            key_entities = [
-                n["name"] for n in impacted_dicts[:5]
-            ]
+            key_entities = [n["name"] for n in impacted_dicts[:5]]
             minimal_response = {
                 "status": "ok",
                 "summary": "\n".join(summary_parts),
@@ -264,7 +282,8 @@ def query_graph(
         repo_root: Repository root path. Auto-detected if omitted.
         detail_level: "standard" (full output) or "minimal" (summary only).
         max_results: Maximum results to return. Minimal mode additionally caps
-            visible results at five and reports the exact omitted count.
+            visible results at five. Truncated responses report the exact total
+            and omitted counts.
 
     Returns:
         Matching nodes and their aligned edges, with total and omitted counts.
@@ -272,7 +291,9 @@ def query_graph(
     if isinstance(max_results, bool) or max_results < 1:
         raise ValueError("max_results must be an integer greater than or equal to 1")
 
-    store, root = _get_store(repo_root)
+    store, root, not_built = _get_store_for_read(repo_root)
+    if store is None or root is None:
+        return not_built if not_built is not None else _not_built_response()
     try:
         if pattern not in _QUERY_PATTERNS:
             return {
@@ -307,7 +328,9 @@ def query_graph(
             and "::" not in target
         ):
             return {
-                "status": "ok", "pattern": pattern, "target": target,
+                "status": "ok",
+                "pattern": pattern,
+                "target": target,
                 "description": _QUERY_PATTERNS[pattern],
                 "summary": (
                     f"'{target}' is a common builtin "
@@ -505,8 +528,7 @@ def query_graph(
             # Use resolve() to canonicalize the path, matching how
             # _resolve_module_to_file stores edge targets.
             abs_target = (
-                str((root / target).resolve()) if node is None
-                else node.file_path
+                str((root / target).resolve()) if node is None else node.file_path
             )
             seen_importers: set[str] = set()
             for e in store.iter_edges_by_target(abs_target):
@@ -676,6 +698,7 @@ def query_graph(
                     add_result(node_to_dict(n))
 
         results_omitted = max(0, total_results - len(results))
+        truncated = results_omitted > 0
         summary = (
             f"Found {total_results} result(s) "
             f"for {pattern}('{target}')"
@@ -716,7 +739,12 @@ def query_graph(
                 minimal_response["confidence"] = confidence
             return minimal_response
 
-        response: dict[str, Any] = {
+            if truncated:
+                response["truncated"] = True
+                response["total_results"] = total_results
+            return response
+
+        response = {
             "status": "ok",
             "pattern": pattern,
             "target": target,
@@ -729,6 +757,10 @@ def query_graph(
         }
         if confidence:
             response["confidence"] = confidence
+
+        if truncated:
+            response["truncated"] = True
+            response["total_results"] = total_results
         return response
     finally:
         store.close()
@@ -767,7 +799,9 @@ def semantic_search_nodes(
     Returns:
         Ranked list of matching nodes.
     """
-    store, root = _get_store(repo_root)
+    store, root, not_built = _get_store_for_read(repo_root)
+    if store is None or root is None:
+        return not_built if not_built is not None else _not_built_response()
     try:
         mode_out: list[str] = []
         results = hybrid_search(
@@ -789,14 +823,10 @@ def semantic_search_nodes(
 
         if detail_level == "minimal":
             minimal_results = [
-                {
-                    k: r[k]
-                    for k in ("name", "kind", "file_path", "score")
-                    if k in r
-                }
+                {k: r[k] for k in ("name", "kind", "file_path", "score") if k in r}
                 for r in results[:5]
             ]
-            minimal_response: dict[str, Any] = {
+            response: dict[str, Any] = {
                 "status": "ok",
                 "query": query,
                 "search_mode": search_mode,
@@ -806,8 +836,13 @@ def semantic_search_nodes(
                 "results_omitted": max(0, len(results) - len(minimal_results)),
             }
             if confidence:
-                minimal_response["confidence"] = confidence
-            return minimal_response
+                response["confidence"] = confidence
+
+            if embedding_status in {"failed", "unavailable"}:
+                response["embedding_warning"] = diagnostics.get(
+                    "embedding_warning", "embedding search unavailable"
+                )
+            return response
 
         result: dict[str, object] = {
             "status": "ok",
@@ -818,6 +853,10 @@ def semantic_search_nodes(
         }
         if confidence:
             result["confidence"] = confidence
+        if embedding_status in {"failed", "unavailable"}:
+            result["embedding_warning"] = diagnostics.get(
+                "embedding_warning", "embedding search unavailable"
+            )
         result["_hints"] = generate_hints(
             "semantic_search_nodes", result, get_session()
         )
@@ -840,7 +879,9 @@ def list_graph_stats(repo_root: str | None = None) -> dict[str, Any]:
     Returns:
         Total nodes, edges, breakdown by kind, languages, and last update time.
     """
-    store, root = _get_store(repo_root)
+    store, root, not_built = _get_store_for_read(repo_root)
+    if store is None or root is None:
+        return not_built if not_built is not None else _not_built_response()
     try:
         stats = store.get_stats()
 
@@ -861,18 +902,11 @@ def list_graph_stats(repo_root: str | None = None) -> dict[str, Any]:
         for kind, count in sorted(stats.edges_by_kind.items()):
             summary_parts.append(f"  {kind}: {count}")
 
-        # Add embedding info if available
-        emb_store = EmbeddingStore(get_db_path(root))
-        try:
-            emb_count = emb_store.count()
-            summary_parts.append("")
-            summary_parts.append(f"Embeddings: {emb_count} nodes embedded")
-            if not emb_store.available:
-                summary_parts.append(
-                    "  (install sentence-transformers for semantic search)"
-                )
-        finally:
-            emb_store.close()
+        # Count existing vectors directly. Stats is a read-only path and must
+        # not instantiate embedding providers, which can import torch.
+        emb_count = _count_embeddings(store._conn)
+        summary_parts.append("")
+        summary_parts.append(f"Embeddings: {emb_count} nodes embedded")
 
         return {
             "status": "ok",
@@ -917,7 +951,9 @@ def find_large_functions(
     Returns:
         Oversized nodes with line counts, ordered largest first.
     """
-    store, root = _get_store(repo_root)
+    store, root, not_built = _get_store_for_read(repo_root)
+    if store is None or root is None:
+        return not_built if not_built is not None else _not_built_response()
     try:
         nodes = store.get_nodes_by_size(
             min_lines=min_lines,
@@ -930,9 +966,7 @@ def find_large_functions(
         for n in nodes:
             d = node_to_dict(n)
             d["line_count"] = (
-                (n.line_end - n.line_start + 1)
-                if n.line_start and n.line_end
-                else 0
+                (n.line_end - n.line_start + 1) if n.line_start and n.line_end else 0
             )
             # Make file_path relative for readability
             try:
@@ -987,7 +1021,9 @@ def traverse_graph_func(
         token_budget: Approximate token limit for results.
         repo_root: Repository root path.
     """
-    store, root = _get_store(repo_root)
+    store, root, not_built = _get_store_for_read(repo_root)
+    if store is None or root is None:
+        return not_built if not_built is not None else _not_built_response()
     try:
         results = hybrid_search(store, query, limit=1)
         if not results:
@@ -1037,12 +1073,8 @@ def traverse_graph_func(
             traversal.append(entry)
 
             # Get neighbours
-            out_edges = store.get_edges_by_source(
-                current_qn
-            )
-            in_edges = store.get_edges_by_target(
-                current_qn
-            )
+            out_edges = store.get_edges_by_source(current_qn)
+            in_edges = store.get_edges_by_target(current_qn)
             for e in out_edges:
                 tgt = e.target_qualified
                 if tgt not in visited:
@@ -1060,10 +1092,8 @@ def traverse_graph_func(
             "traversal": traversal,
             "truncated": approx_tokens > token_budget,
             "next_tool_suggestions": [
-                "query_graph callers_of"
-                " -- focused relationship query",
-                "get_impact_radius"
-                " -- blast radius analysis",
+                "query_graph callers_of" " -- focused relationship query",
+                "get_impact_radius" " -- blast radius analysis",
             ],
         }
     finally:

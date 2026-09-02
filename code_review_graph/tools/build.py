@@ -100,6 +100,7 @@ def _run_postprocess(
     stage_started = time.perf_counter()
     try:
         rows = store.get_nodes_without_signature()
+        sig_updates: list[tuple[str, int]] = []
         for row in rows:
             node_id, name, kind, params, ret = (
                 row[0],
@@ -116,7 +117,8 @@ def _run_postprocess(
                 sig = f"class {name}"
             else:
                 sig = name
-            store.update_node_signature(node_id, sig[:512])
+            sig_updates.append((sig[:512], node_id))
+        store.update_node_signatures(sig_updates)
         store.commit()
         build_result["signatures_updated"] = True
     except (sqlite3.OperationalError, TypeError, KeyError) as e:
@@ -618,6 +620,7 @@ def run_postprocess(
 
         try:
             rows = store.get_nodes_without_signature()
+            sig_updates: list[tuple[str, int]] = []
             for row in rows:
                 node_id, name, kind, params, ret = (
                     row[0],
@@ -634,7 +637,8 @@ def run_postprocess(
                     sig = f"class {name}"
                 else:
                     sig = name
-                store.update_node_signature(node_id, sig[:512])
+                sig_updates.append((sig[:512], node_id))
+            store.update_node_signatures(sig_updates)
             store.commit()
             result["signatures_updated"] = True
         except (sqlite3.OperationalError, TypeError, KeyError) as e:

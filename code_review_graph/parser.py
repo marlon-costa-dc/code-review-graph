@@ -10177,6 +10177,8 @@ class CodeParser:
         # Tree-sitter maps struct/enum/actor/extension all to class_declaration;
         # protocol uses its own protocol_declaration node type.
         extra: dict = {}
+        if decorators:
+            extra["decorators"] = decorators
         if language == "swift":
             if child.type == "class_declaration":
                 _swift_keywords = {"class", "struct", "enum", "actor", "extension"}
@@ -11987,8 +11989,8 @@ class CodeParser:
     # AST node types that represent object literal key-value pairs.
     _PAIR_TYPES = frozenset({"pair"})
 
-    # AST node types for array/list containers.
-    _ARRAY_TYPES = frozenset({"array", "list"})
+    # AST node types for array/list/tuple containers.
+    _ARRAY_TYPES = frozenset({"array", "list", "tuple"})
 
     # AST node types for call argument containers. JS/TS uses ``arguments``;
     # Python uses ``argument_list``. Both share the same identifier-child shape

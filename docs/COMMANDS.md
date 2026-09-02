@@ -56,7 +56,7 @@ changed_files: list[str] | None  # Auto-detected from VCS
 max_depth: int = 2               # Hops in graph
 repo_root: str | None
 base: str = "HEAD~1"
-detail_level: str = "standard"   # "standard" or "minimal"
+detail_level: str = "minimal"    # "minimal" (default) or "standard"
 ```
 Relevant responses may include compact estimated `context_savings` metadata.
 
@@ -103,7 +103,7 @@ limit: int = 20
 repo_root: str | None
 model: str | None    # Embedding model (falls back to provider-specific env vars)
 provider: str | None # local, openai, google, minimax, voyage
-detail_level: str = "standard"
+detail_level: str = "minimal"    # "minimal" (default) or "standard"
 ```
 
 #### `embed_graph_tool`
@@ -247,6 +247,7 @@ repo_root: str | None
 detail_level: str = "standard"
 max_results: int = 25        # Changed functions, test gaps, changed files (max 100)
 max_flows: int = 20          # Affected flows embedded (max 200)
+max_tokens: int = 6000           # Token budget; drops lowest-risk items, reports omissions
 ```
 Primary tool for code review. Maps changed files to affected functions, flows, communities, and test coverage gaps. Returns risk scores and prioritized review items.
 Embedded flows carry per-flow metadata only — use `get_affected_flows_tool` for
@@ -375,8 +376,9 @@ code-review-graph update --embedding-provider local --embedding-model all-MiniLM
 
 # Monitor and inspect
 code-review-graph status                       # Graph statistics (no graph → exit 1, does not create DB)
+code-review-graph doctor                       # Health checklist (✓/✗ + next-step hints)
 code-review-graph watch                        # Auto-update on file changes (requires existing graph)
-code-review-graph visualize                    # Generate interactive HTML graph (requires existing graph)
+code-review-graph visualize                    # Generate interactive HTML graph
 code-review-graph visualize --format graphml   # Export GraphML
 code-review-graph visualize --serve            # Serve graph.html on localhost:8765
 
@@ -420,10 +422,38 @@ code-review-graph daemon remove <path_or_alias>     # Remove a repo from daemon 
 code-review-graph eval                         # Run evaluation benchmarks
 
 # Server
-code-review-graph serve                        # Start MCP server (stdio)
+code-review-graph serve                        # Start MCP server (stdio); lean 7-tool set by default
 code-review-graph serve --http                 # Streamable HTTP on localhost:5555
-code-review-graph serve --tools query_graph_tool,detect_changes_tool  # Tool allowlist
+code-review-graph serve --tools all            # Expose all 30 tools
+code-review-graph serve --tools query_graph_tool,detect_changes_tool  # Custom allowlist
+code-review-graph serve --detail minimal       # Force minimal detail_level server-wide
 code-review-graph mcp                          # Alias for serve
+```
+
+### `doctor` — verify your install
+
+`code-review-graph doctor` runs a fast, read-only health checklist and prints a
+`✓`/`✗` line per check with an actionable next-step hint. It exits non-zero when a
+**critical** check fails (no graph, MCP server won't import) so it can gate CI and
+install scripts; warnings such as a stale graph or missing embeddings are surfaced
+but never fail the exit code.
+
+Checks:
+
+1. **graph** — `graph.db` exists and has nodes (critical → run `build`)
+2. **freshness** — stored `git_head_sha` vs current `HEAD` (warning → run `update`)
+3. **mcp-config** — at least one repo-local MCP config file present (warning → `install`)
+4. **serve-cmd** — the detected `serve` launcher resolves (`uvx`/`uv run`/python)
+5. **server** — `code_review_graph.main` imports and registers > 0 tools (critical)
+6. **hooks** — platform-native or git pre-commit hooks installed (warning → `install`)
+7. **embeddings** — present, or a note that semantic search falls back to keyword (FTS5)
+
+When a graph exists, the closing line surfaces the latest `detect-changes`
+Token Savings number as a "see your savings" proof.
+
+```bash
+code-review-graph doctor                       # check the current repo
+code-review-graph doctor --repo /path/to/repo  # check a specific repo
 ```
 
 ## Standalone Daemon CLI (`crg-daemon`)

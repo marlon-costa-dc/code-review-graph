@@ -9,6 +9,7 @@ Usage:
     code-review-graph forget PATH [PATH ...] [--dry-run]
     code-review-graph watch
     code-review-graph status
+    code-review-graph doctor [--repo PATH]
     code-review-graph serve [--auto-watch] [--http] [--host ADDR] [--port PORT]
     code-review-graph mcp [--auto-watch]
     code-review-graph visualize
@@ -44,7 +45,6 @@ import json
 import logging
 import os
 from functools import partial
-from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as pkg_version
 from pathlib import Path
 from typing import Iterable, TypedDict
@@ -65,28 +65,13 @@ class _EmbeddingRefreshKwargs(TypedDict, total=False):
 
 
 def _get_version() -> str:
-    """Get the installed package version.
+    """Get the installed package version from distribution metadata.
 
-    Tries ``importlib.metadata`` first (canonical source from the installed
-    dist-info), falling back to the package's ``__version__`` attribute if
-    metadata is unavailable or corrupt. This matters for editable installs
-    on filesystems where iCloud / OneDrive can leave orphan dist-info dirs
-    behind that confuse importlib.metadata's lookup.
+    The canonical version is read from the installed ``dist-info`` via
+    ``importlib.metadata``. This always reflects the version defined in
+    ``pyproject.toml``, regardless of how the package was installed.
     """
-    try:
-        v = pkg_version("code-review-graph")
-        if v:
-            return v
-    except PackageNotFoundError as exc:
-        logger.debug("Package metadata unavailable: %s", exc)
-    # Fallback: read __version__ directly from the package.
-    try:
-        from . import __version__ as fallback_version
-        if fallback_version:
-            return fallback_version
-    except ImportError:
-        pass
-    return "dev"
+    return pkg_version("code-review-graph")
 
 
 def _supports_color() -> bool:
@@ -140,6 +125,7 @@ def _print_banner() -> None:
     {g}update{r}      Incremental update {d}(changed files only){r}
     {g}watch{r}       Auto-update on file changes
     {g}status{r}      Show graph statistics
+    {g}doctor{r}      Health checklist {d}(verify your install){r}
     {g}visualize{r}   Generate interactive HTML graph
     {g}wiki{r}        Generate markdown wiki from communities
     {g}detect-changes{r} Analyze change impact {d}(risk-scored review){r}
@@ -452,7 +438,8 @@ def _handle_init(args: argparse.Namespace) -> None:
     print()
     print("Next steps:")
     print("  1. code-review-graph build    # build the knowledge graph")
-    print("  2. Restart your AI coding tool to pick up the new config")
+    print("  2. code-review-graph doctor   # verify the install is healthy")
+    print("  3. Restart your AI coding tool to pick up the new config")
 
 
 def _handle_data_dir_option(args, repo_root: Path) -> None:
@@ -675,6 +662,17 @@ def _run_graph_tool_command(args, repo_root: Path) -> None:
             repo_root=root,
         )
     print(json.dumps(result, indent=2, default=str))
+
+
+def _handle_doctor(args: argparse.Namespace) -> None:
+    """Run the health checklist and exit non-zero on any critical failure."""
+    from .doctor import print_report, run_doctor
+    from .incremental import find_project_root
+
+    repo_root = Path(args.repo) if args.repo else find_project_root()
+    results, exit_code = run_doctor(repo_root)
+    print_report(results, repo_root=repo_root)
+    sys.exit(exit_code)
 
 
 def main() -> None:
@@ -1021,6 +1019,13 @@ def main() -> None:
     # repos
     sub.add_parser("repos", help="List registered repositories")
 
+    # doctor
+    doctor_cmd = sub.add_parser(
+        "doctor",
+        help="Run a health checklist and print next-step hints",
+    )
+    doctor_cmd.add_argument("--repo", default=None, help="Repository root (auto-detected)")
+
     # eval
     eval_cmd = sub.add_parser("eval", help="Run evaluation benchmarks")
     eval_cmd.add_argument(
@@ -1242,11 +1247,21 @@ def main() -> None:
     )
     serve_cmd.add_argument(
         "--tools", default=None,
+        metavar="all|lean|<csv>",
         help=(
-            "Comma-separated list of tool names to expose "
-            "(e.g. query_graph_tool,semantic_search_nodes_tool). "
-            "Unlisted tools are removed. Falls back to CRG_TOOLS env var. "
-            "When unset, all tools are available."
+            "Which MCP tools to expose. 'all' = every tool (~30, default), "
+            "'lean' = the curated low-token set (7), or a comma-separated list "
+            "(e.g. query_graph_tool,semantic_search_nodes_tool). Unlisted tools "
+            "are removed. Falls back to CRG_TOOLS env var, then 'all'."
+        ),
+    )
+    serve_cmd.add_argument(
+        "--detail", default=None,
+        choices=["minimal", "standard", "verbose"],
+        help=(
+            "Server-wide detail_level override for all tools. Forces every "
+            "tool's response to this verbosity, overriding per-call defaults. "
+            "Falls back to the CRG_DETAIL_LEVEL env var."
         ),
     )
     serve_cmd.add_argument(
@@ -1426,9 +1441,13 @@ def main() -> None:
                     host=host,
                     port=port,
                     tools=args.tools,
+                    detail_level=args.detail,
                 )
             else:
-                serve_main(repo_root=args.repo, auto_watch=auto_watch, tools=args.tools)
+                serve_main(
+                    repo_root=args.repo, auto_watch=auto_watch,
+                    tools=args.tools, detail_level=args.detail,
+                )
         else:
             serve_main(repo_root=args.repo, auto_watch=auto_watch)
         return
@@ -1569,6 +1588,10 @@ def main() -> None:
 
     if args.command in ("init", "install"):
         _handle_init(args)
+        return
+
+    if args.command == "doctor":
+        _handle_doctor(args)
         return
 
     if args.command in ("register", "unregister", "repos"):

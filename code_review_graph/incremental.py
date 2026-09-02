@@ -14,6 +14,7 @@ import logging
 import os
 import re
 import signal
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -38,6 +39,9 @@ _MCP_STDIO_ACTIVE = False
 # both cases and avoids rebuilding CodeParser (including its grammar probes and
 # parser caches) for every file in a parallel build.
 _PARSE_WORKER_STATE = threading.local()
+
+# Files stored per write transaction during parallel builds/updates.
+_STORE_BATCH_SIZE = int(os.environ.get("CRG_STORE_BATCH_SIZE", "50"))
 
 
 def _select_executor_kind() -> str:
@@ -90,25 +94,33 @@ def _run_python_resolver(store: GraphStore) -> Optional[dict]:
 
 
 def _run_rescript_resolver(store: GraphStore) -> Optional[dict]:
-    """Run the ReScript cross-module resolver, swallowing any failure so
-    build never fails because of it. Returns stats or None on error.
+    """Run the ReScript cross-module resolver.
+
+    Best-effort post-pass: only ``sqlite3.Error`` is caught so the build
+    continues when the database is transiently unavailable. Programming
+    errors propagate and fail the build, which is the intended behaviour.
+    Returns stats or None on database error.
     """
     try:
         from .rescript_resolver import resolve_rescript_cross_module
         return resolve_rescript_cross_module(store)
-    except Exception as exc:  # noqa: BLE001 - best-effort post-pass
+    except sqlite3.Error as exc:
         logger.warning("ReScript cross-module resolver failed: %s", exc)
         return None
 
 
 def _run_spring_resolver(store: GraphStore) -> Optional[dict]:
-    """Run the Spring DI call resolver, swallowing any failure so
-    build never fails because of it. Returns stats or None on error.
+    """Run the Spring DI call resolver.
+
+    Best-effort post-pass: only ``sqlite3.Error`` is caught so the build
+    continues when the database is transiently unavailable. Programming
+    errors propagate and fail the build, which is the intended behaviour.
+    Returns stats or None on database error.
     """
     try:
         from .spring_resolver import resolve_spring_di_calls
         return resolve_spring_di_calls(store)
-    except Exception as exc:  # noqa: BLE001 - best-effort post-pass
+    except sqlite3.Error as exc:
         logger.warning("Spring DI resolver failed: %s", exc)
         return None
 
@@ -124,13 +136,17 @@ def _run_spring_event_resolver(store: GraphStore) -> Optional[dict]:
 
 
 def _run_temporal_resolver(store: GraphStore) -> Optional[dict]:
-    """Run the Temporal workflow/activity call resolver, swallowing any failure so
-    build never fails because of it. Returns stats or None on error.
+    """Run the Temporal workflow/activity call resolver.
+
+    Best-effort post-pass: only ``sqlite3.Error`` is caught so the build
+    continues when the database is transiently unavailable. Programming
+    errors propagate and fail the build, which is the intended behaviour.
+    Returns stats or None on database error.
     """
     try:
         from .temporal_resolver import resolve_temporal_calls
         return resolve_temporal_calls(store)
-    except Exception as exc:  # noqa: BLE001 - best-effort post-pass
+    except sqlite3.Error as exc:
         logger.warning("Temporal resolver failed: %s", exc)
         return None
 
@@ -154,6 +170,43 @@ def _run_scoped_resolver(store: GraphStore) -> Optional[dict]:
         logger.warning("Scoped call resolver failed: %s", exc)
         return None
 
+
+def _run_jedi_resolver(store: GraphStore, repo_root: Path) -> Optional[dict]:
+    """Run the Jedi Python call resolver.
+
+    Recovers lowercase-receiver method calls (obj.method()) that tree-sitter
+    drops, removing OO dead-code false positives.
+
+    Best-effort post-pass: only ``sqlite3.Error`` is caught so the build
+    continues when the database is transiently unavailable. Programming
+    errors propagate and fail the build, which is the intended behaviour.
+    Returns stats or None on database error.
+    """
+    try:
+        from .jedi_resolver import enrich_jedi_calls
+        return enrich_jedi_calls(store, repo_root)
+    except sqlite3.Error as exc:
+        logger.warning("Jedi Python resolver failed: %s", exc)
+        return None
+
+
+def _run_bare_target_resolver(store: GraphStore) -> Optional[int]:
+    """Resolve bare cross-file CALLS/INHERITS targets to qualified nodes.
+
+    Ensures every command (impact radius, query_graph, detect_changes, flows)
+    traverses calls and inheritance correctly. Runs last so it only mops up
+    edges the language-aware resolvers left unresolved.
+
+    Best-effort post-pass: only ``sqlite3.Error`` is caught so the build
+    continues when the database is transiently unavailable. Programming
+    errors propagate and fail the build, which is the intended behaviour.
+    Returns the resolved-edge count or None on database error.
+    """
+    try:
+        return store.resolve_bare_call_targets()
+    except sqlite3.Error as exc:
+        logger.warning("Bare-target resolver failed: %s", exc)
+        return None
 
 # Default ignore patterns (in addition to .gitignore).
 #
@@ -1307,6 +1360,9 @@ def full_build(
         # orphan workers (issues #46, #136, PR #615). Override via
         # CRG_PARSE_EXECUTOR env.
         args_list = [(rel_path, str(repo_root)) for rel_path in files]
+        # Group stored files into batches: one transaction per ~50 files
+        # instead of one per file (each commit pays a WAL fsync).
+        batch: list[tuple[str, list, list, str]] = []
         with _make_executor(_MAX_PARSE_WORKERS) as executor:
             for i, (rel_path, nodes, edges, error, fhash) in enumerate(
                 executor.map(_parse_single_file, args_list, chunksize=20),
@@ -1319,16 +1375,16 @@ def full_build(
                         cpp_errors.add(str(rel_path))
                     continue
                 full_path = repo_root / rel_path
-                store.store_file_nodes_edges(
-                    str(full_path),
-                    nodes,
-                    edges,
-                    fhash,
-                )
+                batch.append((str(full_path), nodes, edges, fhash))
+                if len(batch) >= _STORE_BATCH_SIZE:
+                    store.store_file_batch(batch)
+                    batch.clear()
                 total_nodes += len(nodes)
                 total_edges += len(edges)
                 if i % 200 == 0 or i == file_count:
                     logger.info("Progress: %d/%d files parsed", i, file_count)
+            if batch:
+                store.store_file_batch(batch)
 
     store.set_metadata("last_updated", time.strftime("%Y-%m-%dT%H:%M:%S"))
     store.set_metadata("last_build_type", "full")
@@ -1344,6 +1400,10 @@ def full_build(
     temporal_stats = _run_temporal_resolver(store)
     hcl_stats = _run_hcl_resolver(store)
     scoped_stats = _run_scoped_resolver(store)
+    jedi_stats = _run_jedi_resolver(store, repo_root)
+    # Generic name-based bare-target resolution runs LAST so it only mops up
+    # edges the language-aware resolvers above left unresolved.
+    _run_bare_target_resolver(store)
 
     return {
         "files_parsed": len(files),
@@ -1358,6 +1418,7 @@ def full_build(
         "temporal_resolution": temporal_stats,
         "hcl_resolution": hcl_stats,
         "scoped_resolution": scoped_stats,
+        "python_enrichment": jedi_stats,
     }
 
 
@@ -1482,6 +1543,7 @@ def incremental_update(
     else:
         # See full-build comment above for executor kind rationale.
         args_list = [(rel_path, str(repo_root)) for rel_path in to_parse]
+        batch: list[tuple[str, list, list, str]] = []
         with _make_executor(_MAX_PARSE_WORKERS) as executor:
             for rel_path, nodes, edges, error, fhash in executor.map(
                 _parse_single_file,
@@ -1492,15 +1554,15 @@ def incremental_update(
                     logger.warning("Error parsing %s: %s", rel_path, error)
                     errors.append({"file": rel_path, "error": error})
                     continue
-                store.store_file_nodes_edges(
-                    str(repo_root / rel_path),
-                    nodes,
-                    edges,
-                    fhash,
-                )
+                batch.append((str(repo_root / rel_path), nodes, edges, fhash))
+                if len(batch) >= _STORE_BATCH_SIZE:
+                    store.store_file_batch(batch)
+                    batch.clear()
                 parsed_files += 1
                 total_nodes += len(nodes)
                 total_edges += len(edges)
+            if batch:
+                store.store_file_batch(batch)
 
     removed_files = store.remove_files_permanently(sorted(missing_paths)) if missing_paths else 0
     files_updated = parsed_files + len(stale_files) + removed_files
@@ -1541,6 +1603,11 @@ def incremental_update(
     hcl_stats = _run_hcl_resolver(store) if hcl_changed else None
     scoped_changed = any(rp.endswith((".php", ".rs", ".cs")) for rp in all_files)
     scoped_stats = _run_scoped_resolver(store) if scoped_changed else None
+    py_changed = any(rp.endswith(".py") for rp in all_files)
+    jedi_stats = _run_jedi_resolver(store, repo_root) if py_changed else None
+    # Generic name-based bare-target resolution runs LAST so it only mops up
+    # edges the language-aware resolvers above left unresolved.
+    _run_bare_target_resolver(store)
 
     return {
         "files_updated": files_updated,
@@ -1557,6 +1624,7 @@ def incremental_update(
         "temporal_resolution": temporal_stats,
         "hcl_resolution": hcl_stats,
         "scoped_resolution": scoped_stats,
+        "python_enrichment": jedi_stats,
     }
 
 

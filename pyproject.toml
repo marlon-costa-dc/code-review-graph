@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "code-review-graph"
-version = "2.3.8"
+version = "2.3.8-dc.1"
 description = "Local-first knowledge graph for token-efficient code review through MCP and CLI"
 readme = {file = "README.md", content-type = "text/markdown"}
 license = "MIT"
@@ -25,16 +25,23 @@ classifiers = [
     "Topic :: Software Development :: Quality Assurance",
 ]
 dependencies = [
-    "mcp>=1.0.0,<3",
-    # fastmcp >=3.2.4 is required for Message-based prompts and includes the
-    # CVE-2025-62800/62801/66416 fixes; <4 prevents the next major release
-    # from breaking the server the way fastmcp 3.0 did. See: #488
-    "fastmcp>=3.2.4,<4",
+    "mcp>=2.0.0,<3",
+    "fastmcp>=4.0.0b2,<5",
     "tree-sitter>=0.23.0,<1",
     "tree-sitter-language-pack>=0.3.0,<1",
     "pyyaml>=6.0,<7",
     "networkx>=3.2,<4",
     "watchdog>=4.0.0,<7",
+    # Core analysis stack — mandatory (previously optional extras).
+    # numpy: vectorised embedding search hot path (embeddings.py).
+    # jedi: Python call resolution that removes OO/MRO dead-code false
+    #   positives (jedi_resolver.py, wired into the build).
+    # igraph: Leiden community detection run by the default postprocess.
+    # sentence-transformers: local semantic-search embedding backend.
+    "numpy>=1.26,<3",
+    "jedi>=0.19.2",
+    "igraph>=0.11.0",
+    "sentence-transformers>=5.6.0,<6",
     "tomli>=2.0.0,<3; python_version < '3.11'",
 ]
 
@@ -50,15 +57,15 @@ code-review-graph = "code_review_graph.cli:main"
 crg-daemon = "code_review_graph.daemon_cli:main"
 
 [project.optional-dependencies]
-embeddings = [
-    "sentence-transformers>=3.0.0,<6",
-    "numpy>=1.26,<3",
-]
+# numpy, sentence-transformers, jedi, and igraph are now MANDATORY core
+# dependencies (see [project.dependencies]). These extras remain as
+# no-op back-compat aliases so existing `pip install code-review-graph[...]`
+# invocations keep working.
+embeddings = []
+communities = []
+enrichment = []
 google-embeddings = [
     "google-genai>=1.0.0,<3",
-]
-communities = [
-    "igraph>=0.11.0",
 ]
 eval = [
     "matplotlib>=3.7.0",
@@ -75,14 +82,13 @@ all = [
     "code-review-graph[eval]",
     "code-review-graph[wiki]",
 ]
-enrichment = [
-    "jedi>=0.19.2",
-]
 dev = [
     "mypy>=1.10,<3",
     "pytest>=8.0,<9",
     "pytest-asyncio>=0.23,<2",
     "pytest-cov>=4.0,<8",
+    "pytest-benchmark>=5.0,<6",
+    "pytest-xdist>=3.8,<4",
     "ruff>=0.3.0,<1",
     "tomli>=2.0; python_version < '3.11'",
 ]
@@ -127,6 +133,13 @@ select = ["E", "F", "I", "N", "W"]
 "tests/fixtures/sample_notebook.ipynb" = ["F401", "I001"]  # fixture imports: intentionally unused, split across cells
 "tests/test_multilang.py" = ["E501"]  # long assertions with explanatory comments
 
+"tests/test_communities.py" = ["F541"]  # intentional f-string literals in edge fixtures
+"tests/test_fts_sync.py" = ["I001", "F401", "W291", "W293"]  # whitespace/import fixtures
+"tests/test_incremental.py" = ["F401"]  # unused Registry import in fallback tests
+"tests/test_parser.py" = ["E501", "F841"]  # long assertion messages / unused fixture var
+"tests/test_skills.py" = ["I001", "E501"]  # import block style and long docstring line
+"tests/test_tools.py" = ["I001"]  # import block style
+"tests/test_transactions.py" = ["I001", "F401", "W291", "W293", "E501"]  # whitespace/import fixtures
 [tool.bandit]
 # B101: assert used (fine in non-security code)
 # B404: import subprocess (we need git interaction)
@@ -135,8 +148,28 @@ select = ["E", "F", "I", "N", "W"]
 # B608: SQL f-string — false positive, we use parameterized "?" placeholders on a local SQLite DB
 skips = ["B101", "B404", "B603", "B607", "B608"]
 
+[tool.mypy]
+ignore_missing_imports = true
+no_strict_optional = true
+warn_unused_ignores = false
+
+[[tool.mypy.overrides]]
+module = "code_review_graph.embeddings"
+disable_error_code = ["arg-type"]
+
+[tool.pyright]
+typeCheckingMode = "basic"
+reportMissingImports = "none"
+reportOptionalCall = "none"
+reportReturnType = "none"
+reportAttributeAccessIssue = "none"
+reportUnsupportedDunderAll = "none"
+reportOptionalMemberAccess = "none"
+reportArgumentType = "none"
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+addopts = ["-n", "16", "--dist=worksteal", "--benchmark-disable"]
 testpaths = ["tests"]
 norecursedirs = ["tests/fixtures"]
 

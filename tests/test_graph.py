@@ -1288,3 +1288,83 @@ class TestResolveBareEndpoints:
         self.store.commit()
 
         assert self.store.get_transitive_tests(hub_qn, max_depth=1) == []
+
+
+class TestResolveBareTargets:
+    """Bare cross-file CALLS and INHERITS targets must be resolved to node
+    qualified_names so every graph command (impact radius, query_graph,
+    detect_changes, flows) traverses inheritance correctly."""
+
+    def setup_method(self):
+        self.store = GraphStore(":memory:")
+        for f in ("/r/base.py", "/r/impl.py", "/r/app.py"):
+            self.store.upsert_node(NodeInfo(
+                kind="File", name=f, file_path=f,
+                line_start=1, line_end=50, language="python",
+            ))
+
+    def teardown_method(self):
+        self.store.close()
+
+    def _node(self, kind, name, file_path, parent=None):
+        self.store.upsert_node(NodeInfo(
+            kind=kind, name=name, file_path=file_path,
+            line_start=1, line_end=5, language="python", parent_name=parent,
+        ))
+
+    def test_resolves_bare_inherits_target_cross_file(self):
+        self._node("Class", "BaseHandler", "/r/base.py")
+        self._node("Class", "JsonHandler", "/r/impl.py")
+        # Cross-file INHERITS stored with a bare base name (parser behavior).
+        self.store.upsert_edge(EdgeInfo(
+            kind="INHERITS", source="/r/impl.py::JsonHandler",
+            target="BaseHandler", file_path="/r/impl.py", line=1,
+        ))
+        self.store.upsert_edge(EdgeInfo(
+            kind="IMPORTS_FROM", source="/r/impl.py",
+            target="/r/base.py", file_path="/r/impl.py", line=1,
+        ))
+        self.store.commit()
+        self.store.resolve_bare_call_targets()
+        targets = [
+            e.target_qualified
+            for e in self.store.get_edges_by_source("/r/impl.py::JsonHandler")
+            if e.kind == "INHERITS"
+        ]
+        assert "/r/base.py::BaseHandler" in targets
+        assert "BaseHandler" not in targets
+
+    def test_resolves_bare_calls_target_cross_file(self):
+        self._node("Function", "handle", "/r/base.py", parent="BaseHandler")
+        self._node("Function", "run", "/r/app.py")
+        self.store.upsert_edge(EdgeInfo(
+            kind="CALLS", source="/r/app.py::run",
+            target="handle", file_path="/r/app.py", line=2,
+        ))
+        self.store.commit()
+        self.store.resolve_bare_call_targets()
+        targets = [
+            e.target_qualified
+            for e in self.store.get_edges_by_source("/r/app.py::run")
+            if e.kind == "CALLS"
+        ]
+        assert any(t.endswith("::handle") or t.endswith(".handle") for t in targets)
+
+    def test_ambiguous_bare_inherits_left_unresolved(self):
+        # Two classes named Base in different files, no import disambiguation.
+        self._node("Class", "Base", "/r/base.py")
+        self._node("Class", "Base", "/r/app.py")
+        self._node("Class", "Child", "/r/impl.py")
+        self.store.upsert_edge(EdgeInfo(
+            kind="INHERITS", source="/r/impl.py::Child",
+            target="Base", file_path="/r/impl.py", line=1,
+        ))
+        self.store.commit()
+        self.store.resolve_bare_call_targets()
+        targets = [
+            e.target_qualified
+            for e in self.store.get_edges_by_source("/r/impl.py::Child")
+            if e.kind == "INHERITS"
+        ]
+        # Ambiguous -> stays bare, never guesses.
+        assert targets == ["Base"]

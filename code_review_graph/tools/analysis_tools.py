@@ -12,6 +12,7 @@ from ..analysis import (
     generate_suggested_questions,
 )
 from ._common import _bounded, _get_store, _shown_of, _validate_positive_int
+from ._common import _get_store_for_read, _not_built_response
 
 # The ranking helpers already score every candidate before slicing, so asking
 # for "all" costs nothing extra and lets the tool report an honest ``total``.
@@ -58,7 +59,9 @@ def get_hub_nodes_func(
     """
     _validate_positive_int(top_n, "top_n")
 
-    store, _root = _get_store(repo_root or None)
+    store, _root, not_built = _get_store_for_read(repo_root or None)
+    if store is None:
+        return not_built if not_built is not None else _not_built_response()
     try:
         hubs, total, truncated = _bounded(
             find_hub_nodes(store, top_n=_FETCH_ALL), top_n, _MAX_HUB_NODES,
@@ -108,7 +111,9 @@ def get_bridge_nodes_func(
     """
     _validate_positive_int(top_n, "top_n")
 
-    store, _root = _get_store(repo_root or None)
+    store, _root, not_built = _get_store_for_read(repo_root or None)
+    if store is None:
+        return not_built if not_built is not None else _not_built_response()
     try:
         bridges, total, truncated = _bounded(
             find_bridge_nodes(store, top_n=_FETCH_ALL), top_n, _MAX_BRIDGE_NODES,
@@ -160,7 +165,9 @@ def get_knowledge_gaps_func(
     """
     _validate_positive_int(max_per_category, "max_per_category")
 
-    store, _root = _get_store(repo_root or None)
+    store, _root, not_built = _get_store_for_read(repo_root or None)
+    if store is None:
+        return not_built if not_built is not None else _not_built_response()
     try:
         raw = find_knowledge_gaps(store)
         # Totals must come from the untruncated lists: the summary counts are
@@ -217,7 +224,9 @@ def get_surprising_connections_func(
     """
     _validate_positive_int(top_n, "top_n")
 
-    store, _root = _get_store(repo_root or None)
+    store, _root, not_built = _get_store_for_read(repo_root or None)
+    if store is None:
+        return not_built if not_built is not None else _not_built_response()
     try:
         surprises, total, truncated = _bounded(
             find_surprising_connections(store, top_n=_FETCH_ALL),
@@ -262,7 +271,9 @@ def get_suggested_questions_func(
     Args:
         repo_root: Repository root (auto-detected if omitted).
     """
-    store, _root = _get_store(repo_root or None)
+    store, _root, not_built = _get_store_for_read(repo_root or None)
+    if store is None:
+        return not_built if not_built is not None else _not_built_response()
     try:
         questions = generate_suggested_questions(store)
         by_priority: dict[str, list[dict[str, Any]]] = {

@@ -12,6 +12,9 @@ from ._common import (
     _get_store,
     _resolve_root,
     _validate_positive_int,
+    _get_store_for_read,
+    _not_built_response,
+    _resolve_root,
     _validate_repo_root,
 )
 
@@ -223,7 +226,9 @@ def generate_wiki_func(
     from ..incremental import get_data_dir
     from ..wiki import generate_wiki
 
-    store, root = _get_store(repo_root)
+    store, root, not_built = _get_store_for_read(repo_root)
+    if store is None or root is None:
+        return not_built if not_built is not None else _not_built_response()
     try:
         wiki_dir = get_data_dir(root) / "wiki"
         result = generate_wiki(store, wiki_dir, force=force)

@@ -67,6 +67,10 @@ def _bridge_qualified_name(qualified_name: str) -> str:
     return normalize_file_path(path_part) + sep + symbol_part
 
 
+_CONTROL_CHAR_DELETE_TABLE = dict.fromkeys(
+    codepoint for codepoint in range(0x20) if codepoint not in (0x09, 0x0A)
+)
+
 # ---------------------------------------------------------------------------
 # Schema
 # ---------------------------------------------------------------------------
@@ -195,6 +199,12 @@ class GraphStore:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA busy_timeout=5000")
+        # NORMAL is the documented safe pairing with WAL (a power loss can
+        # roll back the last transaction but cannot corrupt the DB) and
+        # avoids a full fsync on every commit.
+        self._conn.execute("PRAGMA synchronous=NORMAL")
+        self._conn.execute("PRAGMA cache_size=-64000")  # 64 MiB page cache
+        self._conn.execute("PRAGMA temp_store=MEMORY")
         self._init_schema()
         # Ensure schema_version is set, then run pending migrations
         if get_schema_version(self._conn) < 1:
@@ -445,6 +455,16 @@ class GraphStore:
         )
         for row in rows:
             yield self._row_to_node(row)
+
+    def get_all_nodes(self, exclude_files: bool = True) -> list[GraphNode]:
+        """Return all nodes, optionally excluding File nodes."""
+        if exclude_files:
+            rows = self._conn.execute(
+                "SELECT * FROM nodes WHERE kind != 'File'"
+            ).fetchall()
+        else:
+            rows = self._conn.execute("SELECT * FROM nodes").fetchall()
+        return [self._row_to_node(r) for r in rows]
 
     def get_all_nodes(self, exclude_files: bool = True) -> list[GraphNode]:
         """Return all nodes, optionally excluding File nodes."""
@@ -1184,6 +1204,197 @@ class GraphStore:
             )
         return resolved
 
+    def get_transitive_tests(
+        self, qualified_name: str, max_depth: int = 1,
+    ) -> list[dict]:
+        """Find tests covering a node, including indirect (transitive) coverage.
+
+        1. Direct: TESTED_BY edges targeting this node (+ bare-name fallback).
+        2. Indirect: follow outgoing CALLS edges up to *max_depth* hops,
+           then collect TESTED_BY edges on each callee.
+
+        Returns a list of dicts with node fields plus ``indirect: bool``.
+        """
+        conn = self._conn
+        seen: set[str] = set()
+        results: list[dict] = []
+
+        # If the input is a class, expand to its methods first.
+        input_qns = [qualified_name]
+        row = conn.execute(
+            "SELECT kind FROM nodes WHERE qualified_name = ?",
+            (qualified_name,),
+        ).fetchone()
+        if row and row["kind"] == "Class":
+            for mrow in conn.execute(
+                "SELECT target_qualified FROM edges "
+                "WHERE source_qualified = ? AND kind = 'CONTAINS'",
+                (qualified_name,),
+            ).fetchall():
+                input_qns.append(mrow["target_qualified"])
+
+        def _node_dict(qn: str, indirect: bool) -> dict | None:
+            row = conn.execute(
+                "SELECT * FROM nodes WHERE qualified_name = ?", (qn,)
+            ).fetchone()
+            if not row:
+                return None
+            return {
+                "name": row["name"],
+                "qualified_name": row["qualified_name"],
+                "file_path": row["file_path"],
+                "kind": row["kind"],
+                "indirect": indirect,
+            }
+
+        # Direct TESTED_BY
+        for qn in input_qns:
+            for row in conn.execute(
+                "SELECT source_qualified FROM edges "
+                "WHERE target_qualified = ? AND kind = 'TESTED_BY'",
+                (qn,),
+            ).fetchall():
+                src = row["source_qualified"]
+                if src not in seen:
+                    seen.add(src)
+                    d = _node_dict(src, indirect=False)
+                    if d:
+                        results.append(d)
+
+        # Bare-name fallback for direct
+        bare = qualified_name.rsplit("::", 1)[-1] if "::" in qualified_name else qualified_name
+        for row in conn.execute(
+            "SELECT source_qualified FROM edges "
+            "WHERE target_qualified = ? AND kind = 'TESTED_BY'",
+            (bare,),
+        ).fetchall():
+            src = row["source_qualified"]
+            if src not in seen:
+                seen.add(src)
+                d = _node_dict(src, indirect=False)
+                if d:
+                    results.append(d)
+
+        # Transitive: follow CALLS edges, then collect TESTED_BY on callees
+        frontier = set(input_qns)
+        for _ in range(max_depth):
+            next_frontier: set[str] = set()
+            for qn in frontier:
+                for row in conn.execute(
+                    "SELECT target_qualified FROM edges "
+                    "WHERE source_qualified = ? AND kind = 'CALLS'",
+                    (qn,),
+                ).fetchall():
+                    next_frontier.add(row["target_qualified"])
+            for callee in next_frontier:
+                for row in conn.execute(
+                    "SELECT source_qualified FROM edges "
+                    "WHERE target_qualified = ? AND kind = 'TESTED_BY'",
+                    (callee,),
+                ).fetchall():
+                    src = row["source_qualified"]
+                    if src not in seen:
+                        seen.add(src)
+                        d = _node_dict(src, indirect=True)
+                        if d:
+                            results.append(d)
+            frontier = next_frontier
+
+        return results
+
+    def resolve_bare_call_targets(self) -> int:
+        """Batch-resolve bare-name CALLS and INHERITS targets against nodes.
+
+        After parsing, some CALLS and INHERITS edges have bare targets (no
+        ``::`` separator) because the parser could not resolve them
+        cross-file.  This method matches them against the global node table
+        and rewrites unambiguous matches in place, so every downstream
+        command (impact radius, query_graph, detect_changes, flows) can
+        traverse calls and inheritance across files.
+
+        Disambiguation strategy:
+          1. Single node with that name -> resolve directly
+          2. Multiple candidates -> prefer one whose file is imported by the
+             source file (via IMPORTS_FROM edges)
+        INHERITS targets resolve against Class nodes only; CALLS targets
+        resolve against Function/Test/Class nodes.
+
+        Returns the number of resolved edges (CALLS + INHERITS).
+        """
+        conn = self._conn
+
+        bare_edges = conn.execute(
+            "SELECT id, kind, source_qualified, target_qualified, file_path "
+            "FROM edges WHERE kind IN ('CALLS', 'INHERITS') "
+            "AND target_qualified NOT LIKE '%::%'"
+        ).fetchall()
+        if not bare_edges:
+            return 0
+
+        # bare_name -> list of qualified_names
+        # bare_name -> list of qualified_names, split by the kinds each edge
+        # type may target. CALLS may hit any callable/class; INHERITS only
+        # a class.
+        call_lookup: dict[str, list[str]] = {}
+        class_lookup: dict[str, list[str]] = {}
+        for row in conn.execute(
+            "SELECT name, qualified_name, kind FROM nodes "
+            "WHERE kind IN ('Function', 'Test', 'Class')"
+        ).fetchall():
+            call_lookup.setdefault(row["name"], []).append(row["qualified_name"])
+            if row["kind"] == "Class":
+                class_lookup.setdefault(row["name"], []).append(
+                    row["qualified_name"]
+                )
+
+        # source_file -> set of imported files (for disambiguation)
+        import_targets: dict[str, set[str]] = {}
+        for row in conn.execute(
+            "SELECT DISTINCT file_path, target_qualified FROM edges "
+            "WHERE kind = 'IMPORTS_FROM'"
+        ).fetchall():
+            target = row["target_qualified"]
+            target_file = target.split("::", 1)[0] if "::" in target else target
+            import_targets.setdefault(row["file_path"], set()).add(target_file)
+
+        resolved = 0
+        for edge in bare_edges:
+            bare_name = edge["target_qualified"]
+            lookup = class_lookup if edge["kind"] == "INHERITS" else call_lookup
+            candidates = lookup.get(bare_name, [])
+            if not candidates:
+                continue
+
+            if len(candidates) == 1:
+                qualified = candidates[0]
+            else:
+                # Disambiguate via imports
+                src_qn = edge["source_qualified"]
+                src_file = (
+                    src_qn.split("::", 1)[0] if "::" in src_qn
+                    else edge["file_path"]
+                )
+                imported_files = import_targets.get(src_file, set())
+                imported = [
+                    c for c in candidates
+                    if c.split("::", 1)[0] in imported_files
+                ]
+                if len(imported) == 1:
+                    qualified = imported[0]
+                else:
+                    continue
+
+            conn.execute(
+                "UPDATE edges SET target_qualified = ? WHERE id = ?",
+                (qualified, edge["id"]),
+            )
+            resolved += 1
+
+        if resolved:
+            conn.commit()
+            logger.info("Resolved %d bare-name CALLS/INHERITS targets", resolved)
+        return resolved
+
     def get_all_files(self) -> list[str]:
         # A partially failed file update can leave Function/Class nodes or
         # edges behind after their File marker is gone. Reconciliation must see
@@ -1884,6 +2095,27 @@ class GraphStore:
             (signature, node_id),
         )
 
+    def update_node_signatures(
+        self, updates: list[tuple[str, int]],
+    ) -> None:
+        """Set the ``signature`` column for many nodes in one transaction.
+
+        With the connection in autocommit mode, per-row updates each pay a
+        full WAL commit; batching them keeps postprocess signature writes
+        to a single transaction.
+        """
+        if not updates:
+            return
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            self._conn.executemany(
+                "UPDATE nodes SET signature = ? WHERE id = ?", updates,
+            )
+            self._conn.commit()
+        except BaseException:
+            self._conn.rollback()
+            raise
+
     def get_all_community_ids(self) -> dict[str, int | None]:
         """Return a mapping of *all* qualified names to their community_id.
 
@@ -2228,12 +2460,7 @@ def _sanitize_name(s: str, max_len: int = 256) -> str:
     that names flowing through MCP tool responses cannot easily influence AI
     agent behaviour.
     """
-    # Strip control chars 0x00-0x1F except \t (0x09) and \n (0x0A)
-    cleaned = "".join(
-        ch for ch in s
-        if ch in ("\t", "\n") or ord(ch) >= 0x20
-    )
-    return cleaned[:max_len]
+    return s.translate(_CONTROL_CHAR_DELETE_TABLE)[:max_len]
 
 
 def node_to_dict(n: GraphNode) -> dict:

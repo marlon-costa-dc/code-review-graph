@@ -14,6 +14,7 @@ uv sync --extra dev
 
 # Verify setup
 uv run pytest tests/ --tb=short -q
+uv run pytest -n 0 --benchmark-enable --benchmark-only tests/test_refactor.py::TestFindDeadCodePerformance::test_find_dead_code_performance
 ```
 
 ## Running Tests
