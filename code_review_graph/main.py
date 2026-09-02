@@ -519,7 +519,7 @@ def get_review_context_tool(
     return with_provenance(get_review_context(
         changed_files=changed_files, max_depth=max_depth,
         include_source=include_source, max_lines_per_file=max_lines_per_file,
-        repo_root=root, base=base, detail_level=detail_level,
+        repo_root=root, base=base,
         max_results=max_results, max_files=max_files,
         detail_level=_resolve_detail_level(detail_level), max_tokens=max_tokens,
     ), root)
