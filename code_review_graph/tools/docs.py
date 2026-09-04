@@ -10,11 +10,10 @@ from ..embeddings import EmbeddingStore, embed_all_nodes
 from ..incremental import find_project_root, get_db_path
 from ._common import (
     _get_store,
-    _resolve_root,
-    _validate_positive_int,
     _get_store_for_read,
     _not_built_response,
     _resolve_root,
+    _validate_positive_int,
     _validate_repo_root,
 )
 

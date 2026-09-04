@@ -5,8 +5,9 @@ FILE ?=
 MATCH ?=
 APPLY ?= N
 REPO ?= .
+TEST_TMPDIR ?= $(if $(XDG_CACHE_HOME),$(XDG_CACHE_HOME),$(HOME)/.cache)/code-review-graph/pytest
 
-.PHONY: help setup deps check test profile
+.PHONY: help setup deps check fix test profile
 
 help:
 	@printf '%s\n' \
@@ -14,6 +15,7 @@ help:
 	  '  setup' \
 	  '  deps WHAT=check|lock APPLY=Y' \
 	  '  check WHAT=all|lint|mypy|duplication' \
+	  '  fix FILE=<path> APPLY=Y' \
 	  '  test [FILE=<path>] [MATCH=<pytest-expression>]' \
 	  '  profile FILE=<profile-output> REPO=<repository>'
 
@@ -36,8 +38,13 @@ check:
 	  *) echo 'ERROR: WHAT must be all|lint|mypy|duplication' >&2; exit 2 ;; \
 	esac
 
+fix:
+	@test "$(APPLY)" = Y || { echo 'ERROR: fix requires APPLY=Y' >&2; exit 2; }
+	uv run ruff check --fix $(if $(FILE),$(FILE),code_review_graph tests)
+
 test:
-	uv run pytest $(if $(FILE),$(FILE),tests) $(if $(MATCH),-k $(MATCH),)
+	@mkdir -p "$(TEST_TMPDIR)"
+	TMPDIR="$(TEST_TMPDIR)" uv run pytest $(if $(FILE),$(FILE),tests) $(if $(MATCH),-k '$(MATCH)',)
 
 profile:
 	@test -n "$(FILE)" || { echo 'ERROR: FILE must name the cProfile output' >&2; exit 2; }

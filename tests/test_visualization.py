@@ -1,10 +1,12 @@
 """Tests for graph visualization export."""
 
 import base64
+import builtins
 import hashlib
 import json
 import re
 import shutil
+import sqlite3
 import subprocess
 from html.parser import HTMLParser
 from importlib import resources

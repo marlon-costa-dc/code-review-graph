@@ -12,7 +12,6 @@ Supports multiple providers:
 from __future__ import annotations
 
 import hashlib
-import importlib.util
 import logging
 import os
 import re
@@ -181,7 +180,7 @@ class LocalEmbeddingProvider(EmbeddingProvider):
 class GoogleEmbeddingProvider(EmbeddingProvider):
     def __init__(self, api_key: str, model: str = "gemini-embedding-001") -> None:
         try:
-            from google import genai
+            import google.genai as genai
 
             self._client = genai.Client(api_key=api_key)
             self.model = model

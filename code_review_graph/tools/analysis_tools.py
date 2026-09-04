@@ -11,8 +11,13 @@ from ..analysis import (
     find_surprising_connections,
     generate_suggested_questions,
 )
-from ._common import _bounded, _get_store, _shown_of, _validate_positive_int
-from ._common import _get_store_for_read, _not_built_response
+from ._common import (
+    _bounded,
+    _get_store_for_read,
+    _not_built_response,
+    _shown_of,
+    _validate_positive_int,
+)
 
 # The ranking helpers already score every candidate before slicing, so asking
 # for "all" costs nothing extra and lets the tool report an honest ``total``.

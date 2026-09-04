@@ -9,8 +9,13 @@ from ..communities import get_architecture_overview, get_communities
 from ..context_savings import attach_context_savings
 from ..graph import node_to_dict
 from ..hints import generate_hints, get_session
-from ._common import _bounded, _get_store, _shown_of, _validate_positive_int
-from ._common import _get_store_for_read, _not_built_response
+from ._common import (
+    _bounded,
+    _get_store_for_read,
+    _not_built_response,
+    _shown_of,
+    _validate_positive_int,
+)
 
 # ---------------------------------------------------------------------------
 # Tool 13: list_communities  [EXPLORE]

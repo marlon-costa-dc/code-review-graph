@@ -4,6 +4,7 @@ import json
 import os
 import threading
 import time
+from email.message import Message
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import MagicMock, patch
 

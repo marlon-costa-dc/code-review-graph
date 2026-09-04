@@ -19,11 +19,12 @@ from pathlib import Path
 from typing import Any, Optional
 
 from fastmcp import FastMCP
+from fastmcp.prompts import Message
 
 from . import __version__
 from . import incremental as _incremental
 from .graph import GraphStore
-from .incremental import find_project_root, get_db_path, start_watch_thread
+from .incremental import get_db_path, start_watch_thread
 from .prompts import (
     architecture_map_prompt,
     debug_issue_prompt,
@@ -34,7 +35,6 @@ from .prompts import (
 from .tools import (
     apply_refactor_func,
     build_or_update_graph,
-    cross_repo_search_func,
     detect_changes_func,
     embed_graph,
     find_large_functions,
@@ -43,7 +43,6 @@ from .tools import (
     get_architecture_overview_func,
     get_bridge_nodes_func,
     get_community_func,
-    get_docs_section,
     get_flow,
     get_hub_nodes_func,
     get_impact_radius,
@@ -56,7 +55,6 @@ from .tools import (
     list_communities_func,
     list_flows,
     list_graph_stats,
-    list_repos_func,
     query_graph,
     refactor_func,
     run_postprocess,
@@ -880,7 +878,7 @@ async def detect_changes_tool(
     include_source: bool = False,
     max_depth: int = 2,
     repo_root: Optional[str] = None,
-    detail_level: str = "standard",
+    detail_level: str = "minimal",
     max_results: int = 25,
     max_flows: int = 20,
     max_tokens: int = 6000,
@@ -1260,7 +1258,7 @@ def cross_repo_search_tool(
 
 
 @mcp.prompt()
-def review_changes(base: str = "HEAD~1") -> list[dict]:
+def review_changes(base: str = "HEAD~1") -> list[Message]:
     """Pre-commit review workflow using detect_changes, affected_flows, and test gaps.
 
     Produces a structured code review with risk levels and actionable findings.
@@ -1272,7 +1270,7 @@ def review_changes(base: str = "HEAD~1") -> list[dict]:
 
 
 @mcp.prompt()
-def architecture_map() -> list[dict]:
+def architecture_map() -> list[Message]:
     """Architecture documentation using communities, flows, and Mermaid diagrams.
 
     Generates a comprehensive architecture map with module summaries and coupling warnings.
@@ -1281,7 +1279,7 @@ def architecture_map() -> list[dict]:
 
 
 @mcp.prompt()
-def debug_issue(description: str = "") -> list[dict]:
+def debug_issue(description: str = "") -> list[Message]:
     """Guided debugging using search, flow tracing, and recent changes.
 
     Systematic debugging workflow that traces execution paths and identifies root causes.
@@ -1293,7 +1291,7 @@ def debug_issue(description: str = "") -> list[dict]:
 
 
 @mcp.prompt()
-def onboard_developer() -> list[dict]:
+def onboard_developer() -> list[Message]:
     """New developer orientation using stats, architecture, and critical flows.
 
     Creates an onboarding guide covering codebase structure, key modules, and patterns.
@@ -1302,7 +1300,7 @@ def onboard_developer() -> list[dict]:
 
 
 @mcp.prompt()
-def pre_merge_check(base: str = "HEAD~1") -> list[dict]:
+def pre_merge_check(base: str = "HEAD~1") -> list[Message]:
     """PR readiness check with risk scoring, test gaps, and dead code detection.
 
     Produces a merge readiness report with risk assessment and recommendations.

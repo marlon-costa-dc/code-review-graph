@@ -386,6 +386,7 @@ def hybrid_search(
     # ------ Phase 1: Gather ranked lists ------
     fts_results: list[tuple[int, float]] = []
     emb_results: list[tuple[int, float]] = []
+    diagnostics: dict[str, Any] = {}
 
     # Try FTS5 search
     try:

@@ -15,12 +15,12 @@ from ..incremental import get_changed_files, get_staged_and_unstaged
 from ..parser import normalize_file_path
 from ._common import (
     _bounded,
-    _get_store,
+    _get_store_for_read,
+    _not_built_response,
     _resolve_graph_file_paths,
     _shown_of,
     _validate_positive_int,
 )
-from ._common import _get_store_for_read, _not_built_response, _resolve_graph_file_paths
 
 logger = logging.getLogger(__name__)
 
@@ -107,6 +107,7 @@ def get_review_context(
     detail_level: str = "standard",
     max_results: int = 50,
     max_files: int = 25,
+    max_tokens: int = 0,
 ) -> dict[str, Any]:
     """Generate a focused review context from changed files.
 

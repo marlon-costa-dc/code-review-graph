@@ -4,15 +4,15 @@ from __future__ import annotations
 
 import logging
 import re
+import sqlite3
 from pathlib import Path
 from typing import Any
 
 from ..config_keys import normalize_spring_config_key
 from ..context_savings import attach_context_savings, estimate_file_tokens
-from ..embeddings import EmbeddingStore
 from ..graph import GraphNode, GraphStore, _sanitize_name, edge_to_dict, node_to_dict
 from ..hints import generate_hints, get_session
-from ..incremental import get_changed_files, get_db_path, get_staged_and_unstaged
+from ..incremental import get_changed_files, get_staged_and_unstaged
 from ..parser import normalize_file_path
 from ..search import hybrid_search
 from ..uncertainty import (
@@ -20,7 +20,6 @@ from ..uncertainty import (
     empty_query_confidence,
     empty_search_confidence,
 )
-from ._common import _BUILTIN_CALL_NAMES, _get_store, _resolve_graph_file_paths
 from ._common import (
     _BUILTIN_CALL_NAMES,
     _get_store_for_read,
@@ -739,11 +738,6 @@ def query_graph(
                 minimal_response["confidence"] = confidence
             return minimal_response
 
-            if truncated:
-                response["truncated"] = True
-                response["total_results"] = total_results
-            return response
-
         response = {
             "status": "ok",
             "pattern": pattern,
@@ -838,10 +832,6 @@ def semantic_search_nodes(
             if confidence:
                 response["confidence"] = confidence
 
-            if embedding_status in {"failed", "unavailable"}:
-                response["embedding_warning"] = diagnostics.get(
-                    "embedding_warning", "embedding search unavailable"
-                )
             return response
 
         result: dict[str, object] = {
@@ -853,10 +843,6 @@ def semantic_search_nodes(
         }
         if confidence:
             result["confidence"] = confidence
-        if embedding_status in {"failed", "unavailable"}:
-            result["embedding_warning"] = diagnostics.get(
-                "embedding_warning", "embedding search unavailable"
-            )
         result["_hints"] = generate_hints(
             "semantic_search_nodes", result, get_session()
         )

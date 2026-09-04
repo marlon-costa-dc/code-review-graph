@@ -6,9 +6,11 @@ import sys
 from importlib.metadata import PackageNotFoundError
 from pathlib import Path
 from unittest.mock import MagicMock, patch
-from code_review_graph import cli
 
 import pytest
+
+from code_review_graph import cli
+
 
 def test_main_handles_legacy_stdio_encoding(monkeypatch):
     """Unicode CLI output must not crash when stdio starts as cp1252."""

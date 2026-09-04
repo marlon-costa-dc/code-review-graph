@@ -1271,7 +1271,12 @@ def find_dead_code(
     )
 
     # Build set of class names referenced in function type annotations.
-    type_ref_names = _collect_type_referenced_names(store)
+    type_ref_names: set[str] = set()
+    for node in store.get_all_nodes():
+        if node.kind in ("Function", "Test"):
+            for text in (node.params, node.return_type):
+                if text:
+                    type_ref_names.update(_TYPE_IDENT_RE.findall(text))
 
     # Build class hierarchy: class_qualified_name -> [bare_base_names]
     class_bases: dict[str, list[str]] = {}

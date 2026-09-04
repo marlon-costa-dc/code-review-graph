@@ -8,9 +8,6 @@ heavy libraries that short read-only paths do not need.
 
 from __future__ import annotations
 
-from importlib import import_module
-from typing import Any
-
 from ..changes import parse_diff_ranges, parse_git_diff_ranges, parse_svn_diff_ranges
 from ..incremental import get_changed_files, get_staged_and_unstaged
 
@@ -21,7 +18,6 @@ from ._common import (
     _validate_repo_root,
     with_provenance,
 )
-
 from .analysis_tools import (
     get_bridge_nodes_func,
     get_hub_nodes_func,
@@ -29,7 +25,6 @@ from .analysis_tools import (
     get_suggested_questions_func,
     get_surprising_connections_func,
 )
-
 from .build import build_or_update_graph, run_postprocess
 
 # -- community_tools --------------------------------------------------------
