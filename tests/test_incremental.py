@@ -24,6 +24,7 @@ from code_review_graph.incremental import (
     _run_temporal_resolver,
     _should_ignore,
     _single_hop_dependents,
+    collect_all_files,
     ensure_repo_gitignore_excludes_crg,
     find_dependents,
     find_project_root,
@@ -300,6 +301,16 @@ class TestIgnorePatterns:
         # Negative: similarly-named dirs that aren't a match
         assert not _should_ignore("src/node_modules_helper/foo.py", patterns)
         assert not _should_ignore("src/venv_tools/bar.py", patterns)
+
+    def test_should_ignore_wildcard_directory_component(self):
+        patterns = ["**/.venv.*/**"]
+
+        assert _should_ignore(
+            ".venv.bkp-a8705326fe4beb8a/lib/python3.13/site-packages/example.py",
+            patterns,
+        )
+        assert _should_ignore("packages/api/.venv.cache/bin/tool.py", patterns)
+        assert not _should_ignore("packages/api/.venv_tools/tool.py", patterns)
 
     def test_should_ignore_framework_defaults(self):
         """Default patterns should cover Laravel, Gradle, Flutter, and caches."""
@@ -703,6 +714,34 @@ class TestGitOperations:
         assert result == ["a.py"]
         cmd = mock_run.call_args[0][0]
         assert "--recurse-submodules" not in cmd
+
+    @patch("code_review_graph.incremental.subprocess.run")
+    def test_get_all_tracked_files_propagates_git_failure(self, mock_run, tmp_path):
+        mock_run.return_value = MagicMock(returncode=128, stdout="", stderr="fatal")
+
+        with pytest.raises(subprocess.CalledProcessError) as raised:
+            get_all_tracked_files(tmp_path)
+
+        assert raised.value.returncode == 128
+
+    def test_collect_all_files_in_git_repo_never_walks_untracked_tree(self, tmp_path):
+        tracked = tmp_path / "tracked.py"
+        tracked.write_text("def tracked():\n    return 1\n")
+        ignored = tmp_path / ".venv.bkp-test" / "lib"
+        ignored.mkdir(parents=True)
+        (ignored / "untracked.py").write_text("def untracked():\n    return 2\n")
+
+        with (
+            patch("code_review_graph.incremental.detect_vcs", return_value="git"),
+            patch(
+                "code_review_graph.incremental.get_all_tracked_files",
+                return_value=["tracked.py"],
+            ),
+            patch.object(Path, "rglob", side_effect=AssertionError("walked git tree")),
+        ):
+            files = collect_all_files(tmp_path)
+
+        assert files == ["tracked.py"]
 
 
 class TestFullBuild:

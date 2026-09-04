@@ -505,17 +505,18 @@ def build_or_update_graph(
     store, root = _get_store(repo_root)
     try:
         if not full_rebuild and not store.has_nodes():
-            full_rebuild = True
+            raise RuntimeError(
+                "incremental update requires an existing graph; run build explicitly"
+            )
 
-        # An automatic (base is None) incremental update resolves its diff base
-        # to the last-synced commit. When no usable anchor exists, fall back to
-        # a full rebuild rather than a wrong HEAD~1 diff that could report the
-        # graph as up to date while it is actually stale.
+        # An automatic update must have an authoritative last-synced commit.
         base_resolved: str | None = base
         if not full_rebuild and base is None:
             base_resolved = resolve_incremental_base(root, store)
             if base_resolved is None:
-                full_rebuild = True
+                raise RuntimeError(
+                    "incremental update has no usable Git base; run build explicitly"
+                )
 
         if full_rebuild:
             result = full_build(root, store, recurse_submodules)

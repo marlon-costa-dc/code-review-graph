@@ -1578,6 +1578,35 @@ class TestBuildPostprocess:
         import shutil
         shutil.rmtree(self.tmp, ignore_errors=True)
 
+    def test_incremental_update_requires_existing_graph(self):
+        from code_review_graph.tools.build import build_or_update_graph
+
+        with pytest.raises(RuntimeError, match="requires an existing graph"):
+            build_or_update_graph(
+                full_rebuild=False,
+                repo_root=str(self.root),
+                postprocess="none",
+            )
+
+    def test_incremental_update_requires_authoritative_base(self):
+        from unittest.mock import patch
+
+        from code_review_graph.tools.build import build_or_update_graph
+
+        with (
+            patch(
+                "code_review_graph.tools.build.resolve_incremental_base",
+                return_value=None,
+            ),
+            patch("code_review_graph.graph.GraphStore.has_nodes", return_value=True),
+            pytest.raises(RuntimeError, match="no usable Git base"),
+        ):
+            build_or_update_graph(
+                full_rebuild=False,
+                repo_root=str(self.root),
+                postprocess="none",
+            )
+
     def test_postprocess_none_produces_nodes_no_flows(self):
         from unittest.mock import patch
 

@@ -597,7 +597,7 @@ def _should_ignore(path: str, patterns: list[str]) -> bool:
 
         if candidate.startswith("**/") and candidate.endswith("/**"):
             segment = candidate[3:-3]
-            if segment and segment in parts:
+            if segment and any(fnmatch.fnmatchcase(part, segment) for part in parts):
                 return True
             continue
 
@@ -1060,45 +1060,41 @@ def get_all_tracked_files(
     if recurse_submodules:
         cmd.append("--recurse-submodules")
 
-    try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True, encoding='utf-8', errors='replace',
-            cwd=str(repo_root),
-            timeout=_GIT_TIMEOUT,
-            stdin=subprocess.DEVNULL,
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True, encoding='utf-8', errors='replace',
+        cwd=str(repo_root),
+        timeout=_GIT_TIMEOUT,
+        stdin=subprocess.DEVNULL,
+    )
+    if result.returncode != 0:
+        raise subprocess.CalledProcessError(
+            result.returncode, cmd, output=result.stdout, stderr=result.stderr
         )
-        return [f.strip() for f in result.stdout.splitlines() if f.strip()]
-    except (FileNotFoundError, subprocess.TimeoutExpired, UnicodeDecodeError):
-        return []
+    return [f.strip() for f in result.stdout.splitlines() if f.strip()]
 
 def _get_svn_all_tracked_files(repo_root: Path) -> list[str]:
     """Return SVN-versioned files by walking the working copy.
 
-    Uses ``svn list -R`` to get the server-side file list, falling back to
-    a filesystem walk (which is also the fallback in :func:`collect_all_files`).
+    Uses ``svn list -R`` to get the server-side file list.
     """
-    try:
-        result = subprocess.run(
-            ["svn", "list", "--recursive", "--non-interactive"],
-            capture_output=True, text=True, encoding="utf-8", errors="replace",
-            cwd=str(repo_root), timeout=60,  # svn list queries the server
-            stdin=subprocess.DEVNULL,
+    cmd = ["svn", "list", "--recursive", "--non-interactive"]
+    result = subprocess.run(
+        cmd,
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        cwd=str(repo_root), timeout=60,
+        stdin=subprocess.DEVNULL,
+    )
+    if result.returncode != 0:
+        raise subprocess.CalledProcessError(
+            result.returncode, cmd, output=result.stdout, stderr=result.stderr
         )
-        if result.returncode == 0:
-            # svn list returns paths relative to the WC URL; directories end with "/"
-            files = [
-                f.strip()
-                for f in result.stdout.splitlines()
-                if f.strip() and not f.strip().endswith("/")
-            ]
-            if files:
-                return files
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        pass
-    # Fallback: let collect_all_files do a filesystem walk
-    return []
+    return [
+        f.strip()
+        for f in result.stdout.splitlines()
+        if f.strip() and not f.strip().endswith("/")
+    ]
 
 
 def _filter_parseable_files(
@@ -1134,12 +1130,22 @@ def _filter_parseable_files(
     return files
 
 
-# Ratio threshold for auto-switching from git-tracked files to a full
-# directory walk.  Some repos use aggressive .gitignore whitelists and keep
-# most source files untracked; in that case ``git ls-files`` returns far
-# fewer files than actually exist.  When tracked files are fewer than this
-# fraction of the parseable files found by walking, we prefer the walk.
-_WALK_FALLBACK_RATIO = float(os.environ.get("CRG_WALK_FALLBACK_RATIO", "0.25"))
+def _walk_unversioned_files(repo_root: Path, patterns: list[str]) -> list[str]:
+    """Walk a non-VCS tree while pruning ignored and symlinked directories."""
+    candidates: list[str] = []
+    for current, directories, filenames in os.walk(repo_root, topdown=True):
+        current_path = Path(current)
+        kept: list[str] = []
+        for directory in directories:
+            path = current_path / directory
+            relative = path.relative_to(repo_root).as_posix()
+            if path.is_symlink() or _should_ignore(f"{relative}/__crg__", patterns):
+                continue
+            kept.append(directory)
+        directories[:] = kept
+        for filename in filenames:
+            candidates.append((current_path / filename).relative_to(repo_root).as_posix())
+    return candidates
 
 
 def collect_all_files(
@@ -1156,36 +1162,46 @@ def collect_all_files(
     ignore_patterns = _load_ignore_patterns(repo_root)
     parser = CodeParser(repo_root)
 
-    force_walk = os.environ.get("CRG_FORCE_WALK", "").lower() in ("1", "true", "yes")
+    if detect_vcs(repo_root) != "none":
+        candidates = get_all_tracked_files(repo_root, recurse_submodules)
+    else:
+        candidates = _walk_unversioned_files(repo_root, ignore_patterns)
+    return _filter_parseable_files(repo_root, candidates, ignore_patterns, parser)
 
-    tracked: list[str] = []
-    if not force_walk:
-        tracked = get_all_tracked_files(repo_root, recurse_submodules)
 
-    if force_walk or not tracked:
-        # Fallback: walk directory
-        candidates = [str(p.relative_to(repo_root)) for p in repo_root.rglob("*") if p.is_file()]
-        return _filter_parseable_files(repo_root, candidates, ignore_patterns, parser)
-
-    # Heuristic: if the tracked file list is much smaller than what a
-    # directory walk would discover, the repo likely uses an aggressive
-    # whitelist .gitignore and keeps source files untracked.  In that case
-    # walking the tree gives a more useful graph.
-    tracked_files = _filter_parseable_files(repo_root, tracked, ignore_patterns, parser)
-    walk_candidates = [
-        str(p.relative_to(repo_root)) for p in repo_root.rglob("*") if p.is_file()
-    ]
-    walk_files = _filter_parseable_files(repo_root, walk_candidates, ignore_patterns, parser)
-
-    if len(tracked_files) < _WALK_FALLBACK_RATIO * max(len(walk_files), 1):
-        logger.info(
-            "Tracked files (%d) are far fewer than walkable files (%d); "
-            "using directory walk for %s",
-            len(tracked_files), len(walk_files), repo_root,
-        )
-        return walk_files
-
-    return tracked_files
+def _reconcile_stale_files(
+    repo_root: Path,
+    store: GraphStore,
+    current_files: list[str] | None = None,
+) -> list[str]:
+    """Remove graph files absent from the current parseable repository inventory."""
+    stored_files = set(store.get_all_files())
+    if current_files is not None:
+        current_paths = {
+            normalize_file_path(repo_root / file_path) for file_path in current_files
+        }
+    else:
+        ignore_patterns = _load_ignore_patterns(repo_root)
+        parser = CodeParser(repo_root)
+        current_paths = set()
+        for stored_file in stored_files:
+            path = Path(stored_file)
+            try:
+                relative = str(path.relative_to(repo_root))
+            except ValueError:
+                continue
+            if (
+                path.is_file()
+                and not path.is_symlink()
+                and not _should_ignore(relative, ignore_patterns)
+                and parser.detect_language(path) is not None
+                and not _is_binary(path)
+            ):
+                current_paths.add(stored_file)
+    stale_files = sorted(stored_files - current_paths)
+    if stale_files:
+        store.remove_files_permanently(stale_files)
+    return stale_files
 
 
 def _assert_graph_matches_root(repo_root: Path, store: GraphStore) -> None:
@@ -1353,18 +1369,11 @@ def full_build(
     # leftover function/class nodes from previously deleted files are also
     # cleaned up.  get_all_files() only returns File nodes, which can miss
     # orphans when the File node was removed but other nodes were not.
-    existing_files = {
-        r["file_path"]
-        for r in store._conn.execute("SELECT DISTINCT file_path FROM nodes").fetchall()
-    }
+    existing_files = set(store.get_all_files())
     current_abs = {str(repo_root / f) for f in files}
     stale_files = existing_files - current_abs
-    for stale in stale_files:
-        store.remove_file_data(stale)
-    # Ensure deletions are persisted before store_file_nodes_edges()
-    # starts its own explicit transaction via BEGIN IMMEDIATE.
     if stale_files:
-        store.commit()
+        store.remove_files_permanently(sorted(stale_files))
 
     total_nodes = 0
     total_edges = 0
