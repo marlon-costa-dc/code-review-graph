@@ -569,6 +569,8 @@ def build_or_update_graph(
         )
         if warnings:
             build_result["warnings"] = warnings
+        if full_rebuild:
+            store.compact()
         return build_result
     finally:
         store.close()
