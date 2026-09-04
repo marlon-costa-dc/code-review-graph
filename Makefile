@@ -7,6 +7,7 @@ APPLY ?= N
 REPO ?= .
 TEST_TMPDIR ?= $(if $(XDG_CACHE_HOME),$(XDG_CACHE_HOME),$(HOME)/.cache)/code-review-graph/pytest
 PROFILE_LIMIT ?= 30
+DUPLICATION_ROOT ?= .
 
 .PHONY: help setup deps check fix test profile
 
@@ -15,7 +16,7 @@ help:
 	  'code-review-graph' \
 	  '  setup' \
 	  '  deps WHAT=check|lock|vscode-lock|vscode-security APPLY=Y' \
-	  '  check WHAT=all|lint|mypy|duplication' \
+	  '  check WHAT=all|lint|mypy|duplication [DUPLICATION_ROOT=<snapshot>]' \
 	  '  fix FILE=<path> APPLY=Y' \
 	  '  test [FILE=<path>] [MATCH=<pytest-expression>]' \
 	  '  profile FILE=<profile-output> REPO=<repository>'
@@ -37,7 +38,7 @@ check:
 	  all) uv run ruff check code_review_graph tests; uv run mypy code_review_graph --ignore-missing-imports --no-strict-optional; $(MAKE) check WHAT=duplication ;; \
 	  lint) uv run ruff check $(if $(FILE),$(FILE),code_review_graph tests) ;; \
 	  mypy) uv run mypy $(if $(FILE),$(FILE),code_review_graph) --ignore-missing-imports --no-strict-optional ;; \
-	  duplication) npx --yes jscpd@5.1.2 --min-lines 8 --mode strict --reporters ai --summary code_review_graph tests ;; \
+	  duplication) npx --yes jscpd@5.1.2 --min-lines 8 --mode strict --reporters ai --summary "$(DUPLICATION_ROOT)/code_review_graph" "$(DUPLICATION_ROOT)/tests" ;; \
 	  *) echo 'ERROR: WHAT must be all|lint|mypy|duplication' >&2; exit 2 ;; \
 	esac
 

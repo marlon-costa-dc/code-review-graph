@@ -1177,6 +1177,7 @@ def _reconcile_stale_files(
     repo_root: Path,
     store: GraphStore,
     current_files: list[str] | None = None,
+    remove: bool = True,
 ) -> list[str]:
     """Remove graph files absent from the current parseable repository inventory."""
     stored_files = set(store.get_all_files())
@@ -1203,7 +1204,7 @@ def _reconcile_stale_files(
             ):
                 current_paths.add(stored_file)
     stale_files = sorted(stored_files - current_paths)
-    if stale_files:
+    if stale_files and remove:
         store.remove_files_permanently(stale_files)
     return stale_files
 
@@ -1368,7 +1369,7 @@ def full_build(
     parser = CodeParser(repo_root)
     files = collect_all_files(repo_root, recurse_submodules)
 
-    # Purge stale data from files no longer on disk.
+    # Discover stale data now; apply it only after every file parsed cleanly.
     # Use all distinct file_path values (not just File-kind nodes) so that
     # leftover function/class nodes from previously deleted files are also
     # cleaned up.  get_all_files() only returns File nodes, which can miss
@@ -1376,14 +1377,12 @@ def full_build(
     existing_files = set(store.get_all_files())
     current_abs = {str(repo_root / f) for f in files}
     stale_files = existing_files - current_abs
-    if stale_files:
-        store.remove_files_permanently(sorted(stale_files))
-
     total_nodes = 0
     total_edges = 0
     errors = []
     cpp_errors: set[str] = set()
     file_count = len(files)
+    parsed_batch: list[tuple[str, list, list, str]] = []
 
     use_serial = os.environ.get("CRG_SERIAL_PARSE", "") == "1"
 
@@ -1395,7 +1394,7 @@ def full_build(
                 source = full_path.read_bytes()
                 fhash = hashlib.sha256(source).hexdigest()
                 nodes, edges = parser.parse_bytes(full_path, source)
-                store.store_file_nodes_edges(str(full_path), nodes, edges, fhash)
+                parsed_batch.append((str(full_path), nodes, edges, fhash))
                 total_nodes += len(nodes)
                 total_edges += len(edges)
             except (OSError, PermissionError) as e:
@@ -1416,9 +1415,6 @@ def full_build(
         # orphan workers (issues #46, #136, PR #615). Override via
         # CRG_PARSE_EXECUTOR env.
         args_list = [(rel_path, str(repo_root)) for rel_path in files]
-        # Group stored files into batches: one transaction per ~50 files
-        # instead of one per file (each commit pays a WAL fsync).
-        batch: list[tuple[str, list, list, str]] = []
         with _make_executor(_MAX_PARSE_WORKERS) as executor:
             for i, (rel_path, nodes, edges, error, fhash) in enumerate(
                 executor.map(_parse_single_file, args_list, chunksize=20),
@@ -1431,23 +1427,19 @@ def full_build(
                         cpp_errors.add(str(rel_path))
                     continue
                 full_path = repo_root / rel_path
-                batch.append((str(full_path), nodes, edges, fhash))
-                if len(batch) >= _STORE_BATCH_SIZE:
-                    store.store_file_batch(batch)
-                    batch.clear()
+                parsed_batch.append((str(full_path), nodes, edges, fhash))
                 total_nodes += len(nodes)
                 total_edges += len(edges)
                 if i % 200 == 0 or i == file_count:
                     logger.info("Progress: %d/%d files parsed", i, file_count)
-            if batch:
-                store.store_file_batch(batch)
-
     if errors:
         first = errors[0]
         raise RuntimeError(
             f"parsing failed for {len(errors)} file(s); first: "
             f"{first['file']}: {first['error']}"
         )
+
+    store.apply_file_changes_atomic(parsed_batch, sorted(stale_files))
 
     store.set_metadata("last_updated", time.strftime("%Y-%m-%dT%H:%M:%S"))
     store.set_metadata("last_build_type", "full")
@@ -1526,7 +1518,11 @@ def incremental_update(
     # Determine changed files
     if changed_files is None:
         changed_files = get_changed_files(repo_root, base)
-    stale_files = _reconcile_stale_files(repo_root, store) if reconcile_stale else []
+    stale_files = (
+        _reconcile_stale_files(repo_root, store, remove=False)
+        if reconcile_stale
+        else []
+    )
 
     if not changed_files and not stale_files:
         return {
@@ -1586,6 +1582,7 @@ def incremental_update(
     # explicit transaction — avoids nested transaction errors.
     use_serial = os.environ.get("CRG_SERIAL_PARSE", "") == "1"
     parsed_files = 0
+    parsed_batch: list[tuple[str, list, list, str]] = []
 
     if use_serial or len(to_parse) < 8:
         for rel_path in to_parse:
@@ -1594,7 +1591,7 @@ def incremental_update(
                 source = abs_path.read_bytes()
                 fhash = hashlib.sha256(source).hexdigest()
                 nodes, edges = parser.parse_bytes(abs_path, source)
-                store.store_file_nodes_edges(str(abs_path), nodes, edges, fhash)
+                parsed_batch.append((str(abs_path), nodes, edges, fhash))
                 parsed_files += 1
                 total_nodes += len(nodes)
                 total_edges += len(edges)
@@ -1606,7 +1603,6 @@ def incremental_update(
     else:
         # See full-build comment above for executor kind rationale.
         args_list = [(rel_path, str(repo_root)) for rel_path in to_parse]
-        batch: list[tuple[str, list, list, str]] = []
         with _make_executor(_MAX_PARSE_WORKERS) as executor:
             for rel_path, nodes, edges, error, fhash in executor.map(
                 _parse_single_file,
@@ -1617,16 +1613,10 @@ def incremental_update(
                     logger.warning("Error parsing %s: %s", rel_path, error)
                     errors.append({"file": rel_path, "error": error})
                     continue
-                batch.append((str(repo_root / rel_path), nodes, edges, fhash))
-                if len(batch) >= _STORE_BATCH_SIZE:
-                    store.store_file_batch(batch)
-                    batch.clear()
+                parsed_batch.append((str(repo_root / rel_path), nodes, edges, fhash))
                 parsed_files += 1
                 total_nodes += len(nodes)
                 total_edges += len(edges)
-            if batch:
-                store.store_file_batch(batch)
-
     if errors:
         first = errors[0]
         raise RuntimeError(
@@ -1634,8 +1624,11 @@ def incremental_update(
             f"{first['file']}: {first['error']}"
         )
 
-    removed_files = store.remove_files_permanently(sorted(missing_paths)) if missing_paths else 0
-    files_updated = parsed_files + len(stale_files) + removed_files
+    removed_files = store.apply_file_changes_atomic(
+        parsed_batch,
+        sorted(set(stale_files) | missing_paths),
+    )
+    files_updated = parsed_files + removed_files
     if files_updated:
         store.set_metadata("last_updated", time.strftime("%Y-%m-%dT%H:%M:%S"))
         store.set_metadata("last_build_type", "incremental")
@@ -1745,6 +1738,11 @@ _WATCH_SPLIT_MIN_DIRS = int(os.environ.get("CRG_WATCH_SPLIT_MIN_DIRS", "4"))
 _WATCH_HEALTH_INTERVAL = float(os.environ.get("CRG_WATCH_HEALTH_INTERVAL", "10"))
 _WATCH_STOP_TIMEOUT = 10.0
 _WATCH_TICK_SECONDS = 1.0
+
+
+def _sleep_watch_tick(seconds: float) -> None:
+    """Sleep between watch ticks without replacing process-wide time.sleep."""
+    time.sleep(seconds)
 
 
 def _watch_child_dirs(
@@ -2416,6 +2414,7 @@ def _create_watch_handler(
                     _raise_watch_postprocess_warnings(postprocess_result)
             except BaseException as exc:
                 self.failure = exc
+                logger.exception("Watch batch processing failed")
 
         def raise_if_failed(self) -> None:
             if self.failure is not None:
@@ -2561,14 +2560,12 @@ def watch(
     logger.info("Watching %s for changes... (Ctrl+C to stop)", repo_root)
     restore_sigterm = _install_sigterm_interrupt()
     try:
-        import time as _time
-
         while True:
             if stop_event is not None:
                 if stop_event.wait(_WATCH_TICK_SECONDS):
                     break
             else:
-                _time.sleep(_WATCH_TICK_SECONDS)
+                _sleep_watch_tick(_WATCH_TICK_SECONDS)
             handler.raise_if_failed()
             _sync_watch_tree(supervisor, handler)
             dead, repaired = supervisor.check_liveness()

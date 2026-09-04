@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 import re
 import sqlite3
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 from .graph import GraphStore, _sanitize_name
 from .parser import normalize_file_path
@@ -193,17 +193,13 @@ def _fts_search(
     # Sanitize: wrap in double quotes to prevent FTS5 operator injection
     safe_query = '"' + query.replace('"', '""') + '"'
 
-    try:
-        rows = conn.execute(
-            "SELECT rowid, rank FROM nodes_fts WHERE nodes_fts MATCH ? "
-            "ORDER BY rank LIMIT ?",
-            (safe_query, limit),
-        ).fetchall()
-        # FTS5 rank is negative BM25 (lower = better), negate for consistency
-        return [(row[0], -row[1]) for row in rows]
-    except sqlite3.OperationalError as e:
-        logger.warning("FTS5 search failed: %s", e)
-        return []
+    rows = conn.execute(
+        "SELECT rowid, rank FROM nodes_fts WHERE nodes_fts MATCH ? "
+        "ORDER BY rank LIMIT ?",
+        (safe_query, limit),
+    ).fetchall()
+    # FTS5 rank is negative BM25 (lower = better), negate for consistency
+    return [(row[0], -row[1]) for row in rows]
 
 
 # ---------------------------------------------------------------------------
@@ -239,54 +235,41 @@ def _embedding_search(
 ) -> list[tuple[int, float]]:
     """Run a vector similarity search using the embedding store.
 
-    Returns list of ``(node_id, similarity_score)`` tuples.
-    Gracefully returns an empty list if embeddings are not available.
+    Returns list of ``(node_id, similarity_score)`` tuples.  A graph with no
+    embedding rows returns no semantic matches.  A selected but unusable
+    embedding provider raises its original error.
     """
     if not _has_embedding_rows(store._conn):
         if diagnostics is not None:
             diagnostics["embedding_status"] = "absent"
         return []
-    try:
-        from .embeddings import EmbeddingStore
-    except ImportError as exc:
-        logger.warning("Embedding search unavailable: %s", exc)
-        if diagnostics is not None:
-            diagnostics["embedding_status"] = "unavailable"
-            diagnostics["embedding_warning"] = str(exc)
-        return []
+    from .embeddings import EmbeddingStore
 
+    emb_store = EmbeddingStore(store.db_path, provider=provider, model=model)
     try:
-        emb_store = EmbeddingStore(store.db_path, provider=provider, model=model)
-        try:
-            if not emb_store.available or emb_store.count() == 0:
-                if diagnostics is not None:
-                    diagnostics["embedding_status"] = "unavailable"
-                return []
-
-            results = emb_store.search(query, limit=limit)
+        if not emb_store.available:
+            raise RuntimeError("embedding provider is unavailable")
+        if emb_store.count() == 0:
             if diagnostics is not None:
-                diagnostics["embedding_status"] = "used"
-            # Map qualified names back to node IDs
-            id_scores: list[tuple[int, float]] = []
-            for qn, score in results:
-                node = store.get_node(qn)
-                if node:
-                    id_scores.append((node.id, score))
-            return id_scores
-        finally:
-            emb_store.close()
-    except sqlite3.OperationalError:
-        raise
-    except Exception as e:
-        logger.warning("Embedding search failed: %s", e)
+                diagnostics["embedding_status"] = "absent"
+            return []
+
+        results = emb_store.search(query, limit=limit)
         if diagnostics is not None:
-            diagnostics["embedding_status"] = "failed"
-            diagnostics["embedding_warning"] = str(e)
-        return []
+            diagnostics["embedding_status"] = "used"
+        # Map qualified names back to node IDs
+        id_scores: list[tuple[int, float]] = []
+        for qn, score in results:
+            node = store.get_node(qn)
+            if node:
+                id_scores.append((node.id, score))
+        return id_scores
+    finally:
+        emb_store.close()
 
 
 # ---------------------------------------------------------------------------
-# Keyword LIKE fallback
+# Explicit keyword LIKE search
 # ---------------------------------------------------------------------------
 
 
@@ -295,7 +278,7 @@ def _keyword_search(
     query: str,
     limit: int = 50,
 ) -> list[tuple[int, float]]:
-    """Fall back to simple LIKE keyword matching.
+    """Run simple LIKE keyword matching.
 
     Each word in the query must match independently (AND logic).
     Returns ``(node_id, score)`` tuples with a basic relevance score.
@@ -314,10 +297,7 @@ def _keyword_search(
     params.append(limit)
     sql = f"SELECT id, name, qualified_name FROM nodes WHERE {where} LIMIT ?"  # nosec B608
 
-    try:
-        rows = conn.execute(sql, params).fetchall()
-    except sqlite3.OperationalError:
-        return []
+    rows = conn.execute(sql, params).fetchall()
 
     # Assign a simple relevance score: exact name match > prefix > contains
     q_lower = query.lower()
@@ -349,12 +329,10 @@ def hybrid_search(
     context_files: Optional[list[str]] = None,
     model: Optional[str] = None,
     provider: Optional[str] = None,
+    mode: Literal["hybrid", "fts", "semantic", "keyword"] = "hybrid",
     _out_mode: Optional[list[str]] = None,
 ) -> list[dict[str, Any]]:
-    """Hybrid search combining FTS5 BM25 and vector embeddings via RRF.
-
-    Attempts FTS5 + embedding search first, falling back to FTS5-only,
-    then keyword LIKE matching if FTS5 is unavailable.
+    """Search through one explicitly selected retrieval mode.
 
     Args:
         store: The graph store to search.
@@ -363,11 +341,13 @@ def hybrid_search(
         limit: Maximum results to return (default 20).
         context_files: Optional list of file paths. Nodes in these files
             receive a 1.5x score boost.
+        mode: Retrieval owner. ``hybrid`` merges FTS and available embeddings;
+            ``fts``, ``semantic``, and ``keyword`` select exactly one engine.
         _out_mode: Optional output list. If provided, a single string is
             appended indicating which search path(s) contributed:
             ``"hybrid"`` (FTS + embeddings), ``"fts"`` (FTS only),
-            ``"semantic"`` (embeddings only), ``"keyword"`` (LIKE fallback),
-            or ``"none"`` (empty query, or all search paths returned 0 results).
+            ``"semantic"`` (embeddings only), ``"keyword"`` (LIKE), or
+            ``"none"`` (empty query).
 
     Returns:
         List of dicts with node metadata and ``score`` field.
@@ -383,52 +363,44 @@ def hybrid_search(
     conn = store._conn
     fetch_limit = limit * 3  # Fetch extra to allow for filtering and boosting
 
+    if mode not in {"hybrid", "fts", "semantic", "keyword"}:
+        raise ValueError(f"unsupported search mode: {mode}")
+
     # ------ Phase 1: Gather ranked lists ------
     fts_results: list[tuple[int, float]] = []
     emb_results: list[tuple[int, float]] = []
     diagnostics: dict[str, Any] = {}
 
-    # Try FTS5 search
-    try:
+    if mode in {"hybrid", "fts"}:
         fts_results = _fts_search(conn, query, limit=fetch_limit)
-    except Exception as e:
-        logger.warning("FTS5 unavailable, will use fallback: %s", e)
+    if mode in {"hybrid", "semantic"}:
+        emb_results = _embedding_search(
+            store,
+            query,
+            limit=fetch_limit,
+            model=model,
+            provider=provider,
+            diagnostics=diagnostics,
+        )
 
-    # Try embedding search
-    emb_results = _embedding_search(
-        store,
-        query,
-        limit=fetch_limit,
-        model=model,
-        provider=provider,
-        diagnostics=diagnostics,
-    )
-
-    # ------ Phase 2: Merge via RRF or fallback ------
-    if fts_results or emb_results:
-        lists_to_merge = []
-        if fts_results:
-            lists_to_merge.append(fts_results)
-        if emb_results:
-            lists_to_merge.append(emb_results)
-        merged = rrf_merge(*lists_to_merge)
-        if _out_mode is not None:
-            if fts_results and emb_results:
-                _out_mode.append("hybrid")
-            elif fts_results:
-                _out_mode.append("fts")
-            else:
-                _out_mode.append("semantic")
+    # ------ Phase 2: Merge exactly the selected result owners ------
+    if mode == "keyword":
+        merged = _keyword_search(conn, query, limit=fetch_limit)
+    elif mode == "fts":
+        merged = fts_results
+    elif mode == "semantic":
+        merged = emb_results
     else:
-        # Fallback: keyword LIKE matching
-        keyword_results = _keyword_search(conn, query, limit=fetch_limit)
-        if not keyword_results:
-            if _out_mode is not None:
-                _out_mode.append("none")
-            return []
-        if _out_mode is not None:
-            _out_mode.append("keyword")
-        merged = keyword_results
+        merged = rrf_merge(fts_results, emb_results)
+    if _out_mode is not None:
+        if mode == "hybrid" and fts_results and not emb_results:
+            _out_mode.append("fts")
+        elif mode == "hybrid" and emb_results and not fts_results:
+            _out_mode.append("semantic")
+        else:
+            _out_mode.append(mode)
+    if not merged:
+        return []
 
     # ------ Phase 3+4: Batch-fetch nodes, apply boosting and kind filter ------
     kind_boosts = detect_query_kind_boost(query)

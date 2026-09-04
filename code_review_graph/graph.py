@@ -241,7 +241,8 @@ class GraphStore:
     def upsert_node(self, node: NodeInfo, file_hash: str = "") -> int:
         """Insert or update a node. Returns the node ID."""
         now = time.time()
-        qualified = self._make_qualified(node)
+        qualified = _bridge_qualified_name(self._make_qualified(node))
+        file_path = normalize_file_path(node.file_path)
         extra = json.dumps(node.extra) if node.extra else "{}"
 
         self._conn.execute(
@@ -260,7 +261,7 @@ class GraphStore:
                  extra=excluded.extra, updated_at=excluded.updated_at
             """,
             (
-                node.kind, node.name, qualified, node.file_path,
+                node.kind, node.name, qualified, file_path,
                 node.line_start, node.line_end, node.language,
                 node.parent_name, node.params, node.return_type,
                 node.modifiers, int(node.is_test), file_hash,
@@ -275,6 +276,9 @@ class GraphStore:
     def upsert_edge(self, edge: EdgeInfo) -> int:
         """Insert or update an edge."""
         now = time.time()
+        source = _bridge_qualified_name(edge.source) if "::" in edge.source else edge.source
+        target = _bridge_qualified_name(edge.target) if "::" in edge.target else edge.target
+        file_path = normalize_file_path(edge.file_path)
         extra_dict = edge.extra if edge.extra else {}
         confidence = float(extra_dict.get("confidence", 1.0))
         confidence_tier = str(extra_dict.get("confidence_tier", "EXTRACTED"))
@@ -285,7 +289,7 @@ class GraphStore:
             """SELECT id FROM edges
                WHERE kind=? AND source_qualified=? AND target_qualified=?
                      AND file_path=? AND line=?""",
-            (edge.kind, edge.source, edge.target, edge.file_path, edge.line),
+            (edge.kind, source, target, file_path, edge.line),
         ).fetchone()
 
         if existing:
@@ -301,7 +305,7 @@ class GraphStore:
                (kind, source_qualified, target_qualified, file_path, line, extra,
                 confidence, confidence_tier, updated_at)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (edge.kind, edge.source, edge.target, edge.file_path, edge.line, extra,
+            (edge.kind, source, target, file_path, edge.line, extra,
              confidence, confidence_tier, now),
         )
         return self._conn.execute("SELECT last_insert_rowid()").fetchone()[0]
@@ -325,41 +329,46 @@ class GraphStore:
     def remove_files_permanently(self, file_paths: list[str]) -> int:
         """Atomically remove deleted files and graph references to their nodes."""
         file_paths = [normalize_file_path(p) for p in file_paths]
-        changed = 0
-        has_embeddings = self._conn.execute(
-            "SELECT 1 FROM sqlite_master "
-            "WHERE type = 'table' AND name = 'embeddings'",
-        ).fetchone()
         self._begin_immediate()
         try:
-            for file_path in dict.fromkeys(file_paths):
-                exists = self._conn.execute(
-                    "SELECT EXISTS(SELECT 1 FROM nodes WHERE file_path = ?) OR "
-                    "EXISTS(SELECT 1 FROM edges WHERE file_path = ?)",
-                    (file_path, file_path),
-                ).fetchone()[0]
-                if not exists:
-                    continue
-                changed += 1
-                if has_embeddings is not None:
-                    self._conn.execute(
-                        "DELETE FROM embeddings WHERE qualified_name IN "
-                        "(SELECT qualified_name FROM nodes WHERE file_path = ?)",
-                        (file_path,),
-                    )
-                self._conn.execute(
-                    "DELETE FROM edges WHERE file_path = ? OR source_qualified IN "
-                    "(SELECT qualified_name FROM nodes WHERE file_path = ?) OR "
-                    "target_qualified IN "
-                    "(SELECT qualified_name FROM nodes WHERE file_path = ?)",
-                    (file_path, file_path, file_path),
-                )
-                self._conn.execute("DELETE FROM nodes WHERE file_path = ?", (file_path,))
+            changed = self._remove_files_data(file_paths)
             self._conn.commit()
         except BaseException:
             self._conn.rollback()
             raise
         self._invalidate_cache()
+        return changed
+
+    def _remove_files_data(self, file_paths: list[str]) -> int:
+        """Remove file-owned graph rows inside the caller's transaction."""
+        changed = 0
+        has_embeddings = self._conn.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'embeddings'",
+        ).fetchone()
+        for file_path in dict.fromkeys(file_paths):
+            exists = self._conn.execute(
+                "SELECT EXISTS(SELECT 1 FROM nodes WHERE file_path = ?) OR "
+                "EXISTS(SELECT 1 FROM edges WHERE file_path = ?)",
+                (file_path, file_path),
+            ).fetchone()[0]
+            if not exists:
+                continue
+            changed += 1
+            if has_embeddings is not None:
+                self._conn.execute(
+                    "DELETE FROM embeddings WHERE qualified_name IN "
+                    "(SELECT qualified_name FROM nodes WHERE file_path = ?)",
+                    (file_path,),
+                )
+            self._conn.execute(
+                "DELETE FROM edges WHERE file_path = ? OR source_qualified IN "
+                "(SELECT qualified_name FROM nodes WHERE file_path = ?) OR "
+                "target_qualified IN "
+                "(SELECT qualified_name FROM nodes WHERE file_path = ?)",
+                (file_path, file_path, file_path),
+            )
+            self._conn.execute("DELETE FROM nodes WHERE file_path = ?", (file_path,))
         return changed
 
     def _begin_immediate(self) -> None:
@@ -405,6 +414,31 @@ class GraphStore:
             self._conn.rollback()
             raise
         self._invalidate_cache()
+
+    def apply_file_changes_atomic(
+        self,
+        batch: list[tuple[str, list[NodeInfo], list[EdgeInfo], str]],
+        removed_file_paths: list[str] | None = None,
+    ) -> int:
+        """Apply one complete indexing mutation in a single transaction."""
+        removed_file_paths = [
+            normalize_file_path(path) for path in (removed_file_paths or [])
+        ]
+        self._begin_immediate()
+        try:
+            changed_removed = self._remove_files_data(removed_file_paths)
+            for file_path, nodes, edges, fhash in batch:
+                self.remove_file_data(file_path)
+                for node in nodes:
+                    self.upsert_node(node, file_hash=fhash)
+                for edge in edges:
+                    self.upsert_edge(edge)
+            self._conn.commit()
+        except BaseException:
+            self._conn.rollback()
+            raise
+        self._invalidate_cache()
+        return changed_removed
 
     def set_metadata(self, key: str, value: str) -> None:
         self._conn.execute(

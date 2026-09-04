@@ -38,6 +38,7 @@ from code_review_graph.incremental import (
     start_watch_thread,
     watch,
 )
+from code_review_graph.parser import CodeParser, NodeInfo
 
 
 class TestParseExecutorSelection:
@@ -1189,6 +1190,44 @@ class TestParallelParsing:
         assert serial_nodes == parallel_nodes
         assert serial_edges == parallel_edges
 
+    def test_full_build_parse_failure_preserves_existing_graph(self, tmp_path):
+        """A parse failure must not publish successful files or stale deletion."""
+        old = tmp_path / "old.py"
+        old.write_text("def old():\n    return 1\n")
+        good = tmp_path / "good.py"
+        good.write_text("def good():\n    return 1\n")
+        broken = tmp_path / "broken.py"
+        broken.write_text("def broken():\n    return 1\n")
+        store = GraphStore(tmp_path / "atomic-full.db")
+        try:
+            store.upsert_node(NodeInfo(
+                kind="Function", name="old", file_path=str(old),
+                line_start=1, line_end=2, language="python",
+            ))
+            store.commit()
+            old.unlink()
+
+            original = CodeParser.parse_bytes
+
+            def fail_broken(parser, path, source):
+                if path.name == "broken.py":
+                    raise RuntimeError("forced parse failure")
+                return original(parser, path, source)
+
+            with patch(
+                "code_review_graph.incremental.get_all_tracked_files",
+                return_value=["good.py", "broken.py"],
+            ), patch.object(CodeParser, "parse_bytes", fail_broken), patch.dict(
+                "os.environ", {"CRG_SERIAL_PARSE": "1"}
+            ):
+                with pytest.raises(RuntimeError, match="forced parse failure"):
+                    full_build(tmp_path, store)
+
+            assert store.get_node(f"{old}::old") is not None
+            assert store.get_node(f"{good}::good") is None
+        finally:
+            store.close()
+
 
 class TestMultiHopDependents:
     """Tests for N-hop dependent discovery."""
@@ -1422,7 +1461,10 @@ class TestWatchReconciliation:
         try:
             with (
                 patch("watchdog.observers.Observer") as observer,
-                patch("time.sleep", side_effect=KeyboardInterrupt),
+                patch(
+                    "code_review_graph.incremental._sleep_watch_tick",
+                    side_effect=KeyboardInterrupt,
+                ),
             ):
                 watch(tmp_path, store, on_files_updated=on_files_updated)
             assert callback_count == 1
@@ -1444,7 +1486,10 @@ class TestWatchReconciliation:
         try:
             with (
                 patch("watchdog.observers.Observer") as observer,
-                patch("time.sleep", side_effect=KeyboardInterrupt),
+                patch(
+                    "code_review_graph.incremental._sleep_watch_tick",
+                    side_effect=KeyboardInterrupt,
+                ),
                 patch(
                     "code_review_graph.search.rebuild_fts_index",
                     side_effect=sqlite3.OperationalError("forced FTS failure"),

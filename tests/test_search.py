@@ -157,10 +157,10 @@ class TestHybridSearch:
         merged = rrf_merge([], [])
         assert merged == []
 
-    # --- Fallback to keyword search ---
+    # --- Explicit keyword search ---
 
-    def test_fallback_to_keyword(self):
-        """Works without FTS index by falling back to keyword LIKE matching."""
+    def test_keyword_mode(self):
+        """Keyword LIKE matching is available only when explicitly selected."""
         # Do NOT rebuild FTS index — drop it if it exists
         try:
             self.store._conn.execute("DROP TABLE IF EXISTS nodes_fts")
@@ -168,7 +168,7 @@ class TestHybridSearch:
         except Exception:
             pass
 
-        results = hybrid_search(self.store, "authenticate")
+        results = hybrid_search(self.store, "authenticate", mode="keyword")
         assert len(results) > 0
         names = [r["name"] for r in results]
         assert "authenticate" in names
@@ -261,22 +261,37 @@ class TestHybridSearch:
         assert len(results) > 0
 
     def test_out_mode_keyword(self):
-        """_out_mode is 'keyword' when FTS table is absent and no embeddings."""
+        """_out_mode records explicitly selected keyword retrieval."""
         self.store._conn.execute("DROP TABLE IF EXISTS nodes_fts")
         self.store._conn.commit()
         out: list[str] = []
-        results = hybrid_search(self.store, "authenticate", _out_mode=out)
+        results = hybrid_search(
+            self.store, "authenticate", mode="keyword", _out_mode=out
+        )
         assert out == ["keyword"]
         assert len(results) > 0
 
     def test_out_mode_keyword_no_results(self):
-        """_out_mode is 'none' when keyword fallback also returns 0 results."""
+        """_out_mode records keyword even when it returns no results."""
         self.store._conn.execute("DROP TABLE IF EXISTS nodes_fts")
         self.store._conn.commit()
         out: list[str] = []
-        results = hybrid_search(self.store, "xyzzy_nonexistent_abc123", _out_mode=out)
+        results = hybrid_search(
+            self.store,
+            "xyzzy_nonexistent_abc123",
+            mode="keyword",
+            _out_mode=out,
+        )
         assert results == []
-        assert out == ["none"]
+        assert out == ["keyword"]
+
+    def test_missing_fts_table_fails_loud(self):
+        self.store._conn.execute("DROP TABLE IF EXISTS nodes_fts")
+        self.store._conn.commit()
+        import pytest
+
+        with pytest.raises(Exception, match="nodes_fts"):
+            hybrid_search(self.store, "authenticate", mode="fts")
 
     def test_out_mode_semantic(self, monkeypatch):
         """_out_mode is 'semantic' when only embeddings contribute."""
@@ -293,7 +308,9 @@ class TestHybridSearch:
 
         monkeypatch.setattr(search_mod, "_embedding_search", fake_emb)
         out: list[str] = []
-        results = hybrid_search(self.store, "authenticate", _out_mode=out)
+        results = hybrid_search(
+            self.store, "authenticate", mode="semantic", _out_mode=out
+        )
         assert out == ["semantic"]
         assert len(results) > 0
 

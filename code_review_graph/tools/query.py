@@ -6,7 +6,7 @@ import logging
 import re
 import sqlite3
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from ..config_keys import normalize_spring_config_key
 from ..context_savings import attach_context_savings, estimate_file_tokens
@@ -38,7 +38,6 @@ def _count_embeddings(conn) -> int:
         if "no such table: embeddings" in str(exc).lower():
             return 0
         raise
-        return 0
 
 
 # ---------------------------------------------------------------------------
@@ -777,13 +776,13 @@ def semantic_search_nodes(
     context_files: list[str] | None = None,
     model: str | None = None,
     provider: str | None = None,
+    search_mode: Literal["hybrid", "fts", "semantic", "keyword"] = "hybrid",
     detail_level: str = "standard",
 ) -> dict[str, Any]:
     """Search for nodes by name, keyword, or semantic similarity.
 
-    Uses hybrid search (FTS5 BM25 + vector embeddings merged via Reciprocal
-    Rank Fusion) as the primary search path, with graceful fallback to
-    keyword matching.
+    Uses the explicitly selected search engine. Hybrid combines FTS5 BM25 and
+    available vector embeddings via Reciprocal Rank Fusion.
 
     Args:
         query: Search string to match against node names and qualified names.
@@ -792,6 +791,7 @@ def semantic_search_nodes(
         repo_root: Repository root path. Auto-detected if omitted.
         context_files: Optional list of file paths. Nodes in these files
             receive a relevance boost.
+        search_mode: One of ``hybrid``, ``fts``, ``semantic``, or ``keyword``.
         detail_level: "standard" (full output) or "minimal" (summary only).
 
     Returns:
@@ -804,10 +804,10 @@ def semantic_search_nodes(
         mode_out: list[str] = []
         results = hybrid_search(
             store, query, kind=kind, limit=limit, context_files=context_files,
-            model=model, provider=provider, _out_mode=mode_out,
+            model=model, provider=provider, mode=search_mode, _out_mode=mode_out,
         )
 
-        search_mode = mode_out[0] if mode_out else "keyword"
+        selected_mode = mode_out[0] if mode_out else search_mode
 
         summary = f"Found {len(results)} node(s) matching '{query}'" + (
             f" (kind={kind})" if kind else ""
@@ -827,7 +827,7 @@ def semantic_search_nodes(
             response: dict[str, Any] = {
                 "status": "ok",
                 "query": query,
-                "search_mode": search_mode,
+                "search_mode": selected_mode,
                 "summary": summary,
                 "results": minimal_results,
                 "result_count": len(results),
@@ -841,7 +841,7 @@ def semantic_search_nodes(
         result: dict[str, object] = {
             "status": "ok",
             "query": query,
-            "search_mode": search_mode,
+            "search_mode": selected_mode,
             "summary": summary,
             "results": results,
         }

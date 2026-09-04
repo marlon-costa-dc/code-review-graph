@@ -741,7 +741,10 @@ class TestWatchLoop:
     def _watch_with(self, tmp_path, store, observer, sleeper, health_interval=0.0, **kwargs):
         with (
             patch("watchdog.observers.Observer", return_value=observer),
-            patch("time.sleep", side_effect=sleeper),
+            patch(
+                "code_review_graph.incremental._sleep_watch_tick",
+                side_effect=sleeper,
+            ),
             patch(
                 "code_review_graph.incremental._WATCH_HEALTH_INTERVAL",
                 health_interval,
@@ -1013,7 +1016,10 @@ class TestWatchLoop:
         try:
             with (
                 patch("watchdog.observers.Observer", return_value=FakeObserver()),
-                patch("time.sleep", side_effect=KeyboardInterrupt),
+                patch(
+                    "code_review_graph.incremental._sleep_watch_tick",
+                    side_effect=KeyboardInterrupt,
+                ),
                 patch(
                     "code_review_graph.incremental.incremental_update",
                     side_effect=record_initial_health,

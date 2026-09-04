@@ -238,6 +238,38 @@ def _migrate_v9(conn: sqlite3.Connection) -> None:
     logger.info("Migration v9: added edge confidence columns")
 
 
+def _migrate_v10(conn: sqlite3.Connection) -> None:
+    """v10: Keep the external-content FTS index synchronized with nodes."""
+    conn.execute("""
+        CREATE TRIGGER IF NOT EXISTS nodes_fts_insert AFTER INSERT ON nodes BEGIN
+            INSERT INTO nodes_fts(rowid, name, qualified_name, file_path, signature)
+            VALUES (new.rowid, new.name, new.qualified_name, new.file_path, new.signature);
+        END
+    """)
+    conn.execute("""
+        CREATE TRIGGER IF NOT EXISTS nodes_fts_delete AFTER DELETE ON nodes BEGIN
+            INSERT INTO nodes_fts(nodes_fts, rowid, name, qualified_name, file_path, signature)
+            VALUES (
+                'delete', old.rowid, old.name, old.qualified_name,
+                old.file_path, old.signature
+            );
+        END
+    """)
+    conn.execute("""
+        CREATE TRIGGER IF NOT EXISTS nodes_fts_update AFTER UPDATE ON nodes BEGIN
+            INSERT INTO nodes_fts(nodes_fts, rowid, name, qualified_name, file_path, signature)
+            VALUES (
+                'delete', old.rowid, old.name, old.qualified_name,
+                old.file_path, old.signature
+            );
+            INSERT INTO nodes_fts(rowid, name, qualified_name, file_path, signature)
+            VALUES (new.rowid, new.name, new.qualified_name, new.file_path, new.signature);
+        END
+    """)
+    conn.execute("INSERT INTO nodes_fts(nodes_fts) VALUES('rebuild')")
+    logger.info("Migration v10: synchronized and rebuilt nodes_fts")
+
+
 # ---------------------------------------------------------------------------
 # Migration registry
 # ---------------------------------------------------------------------------
@@ -251,6 +283,7 @@ MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     7: _migrate_v7,
     8: _migrate_v8,
     9: _migrate_v9,
+    10: _migrate_v10,
 }
 
 LATEST_VERSION = max(MIGRATIONS.keys())
@@ -273,6 +306,7 @@ def run_migrations(conn: sqlite3.Connection) -> None:
             continue
         logger.info("Running migration v%d", version)
         try:
+            conn.execute("BEGIN IMMEDIATE")
             MIGRATIONS[version](conn)
             _set_schema_version(conn, version)
             conn.commit()

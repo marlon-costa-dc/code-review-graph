@@ -485,7 +485,10 @@ class TestWatchCallbackIntegration:
         try:
             with (
                 patch("watchdog.observers.Observer") as observer,
-                patch("time.sleep", side_effect=KeyboardInterrupt),
+                patch(
+                    "code_review_graph.incremental._sleep_watch_tick",
+                    side_effect=KeyboardInterrupt,
+                ),
             ):
                 watch(tmp_path, store, on_files_updated=callback)
 
@@ -534,7 +537,10 @@ class TestWatchCallbackIntegration:
 
             with (
                 patch("watchdog.observers.Observer", return_value=observer),
-                patch("time.sleep", side_effect=KeyboardInterrupt),
+                patch(
+                    "code_review_graph.incremental._sleep_watch_tick",
+                    side_effect=KeyboardInterrupt,
+                ),
             ):
                 watch(tmp_path, store, on_files_updated=run_post_processing)
 
