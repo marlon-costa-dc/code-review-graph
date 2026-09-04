@@ -1438,6 +1438,13 @@ def full_build(
             if batch:
                 store.store_file_batch(batch)
 
+    if errors:
+        first = errors[0]
+        raise RuntimeError(
+            f"parsing failed for {len(errors)} file(s); first: "
+            f"{first['file']}: {first['error']}"
+        )
+
     store.set_metadata("last_updated", time.strftime("%Y-%m-%dT%H:%M:%S"))
     store.set_metadata("last_build_type", "full")
     if not cpp_errors:
@@ -1615,6 +1622,13 @@ def incremental_update(
                 total_edges += len(edges)
             if batch:
                 store.store_file_batch(batch)
+
+    if errors:
+        first = errors[0]
+        raise RuntimeError(
+            f"parsing failed for {len(errors)} file(s); first: "
+            f"{first['file']}: {first['error']}"
+        )
 
     removed_files = store.remove_files_permanently(sorted(missing_paths)) if missing_paths else 0
     files_updated = parsed_files + len(stale_files) + removed_files
