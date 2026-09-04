@@ -3,6 +3,8 @@
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from code_review_graph.graph import GraphStore
 from code_review_graph.incremental import CPP_IDENTITY_VERSION, incremental_update
 from code_review_graph.parser import CodeParser, EdgeInfo, NodeInfo
@@ -508,7 +510,7 @@ namespace Beta { void process(int value) {} }
         store.close()
 
 
-def test_cpp_nested_class_keys_stay_legacy_while_function_scope_is_complete(
+def test_cpp_nested_class_and_function_keys_use_complete_scope(
     tmp_path: Path,
 ):
     source_path, store = _index_source(
@@ -523,7 +525,7 @@ def test_cpp_nested_class_keys_stay_legacy_while_function_scope_is_complete(
     prefix = source_path.as_posix()
     outer = f"{prefix}::Outer"
     inner = f"{prefix}::Outer.Inner"
-    deep = f"{prefix}::Inner.Deep"
+    deep = f"{prefix}::Outer.Inner.Deep"
     run = f"{prefix}::Outer.Inner.Deep.run()"
 
     try:
@@ -674,7 +676,7 @@ def test_cross_file_bare_call_is_not_claimed_by_each_exact_overload(
         assert callers["results"] == []
 
 
-def test_failed_cpp_identity_upgrade_remains_pending_and_retries(tmp_path: Path):
+def test_failed_cpp_identity_upgrade_propagates_without_marking_complete(tmp_path: Path):
     source_path = tmp_path / "run.cpp"
     source_path.write_text("void run(int value) {}\n", encoding="utf-8")
     legacy_qn = f"{source_path.as_posix()}::run"
@@ -701,24 +703,11 @@ def test_failed_cpp_identity_upgrade_remains_pending_and_retries(tmp_path: Path)
                 side_effect=RuntimeError("simulated parse failure"),
             ),
         ):
-            failed = incremental_update(tmp_path, store, changed_files=[])
+            with pytest.raises(RuntimeError, match="simulated parse failure"):
+                incremental_update(tmp_path, store, changed_files=[])
 
-        assert failed["identity_rebuild"] is True
-        assert failed["errors"]
         assert store.get_metadata("cpp_identity_version") is None
         assert store.get_node(legacy_qn) is not None
-
-        with patch(
-            "code_review_graph.incremental.get_all_tracked_files",
-            return_value=["run.cpp"],
-        ):
-            retried = incremental_update(tmp_path, store, changed_files=[])
-
-        assert retried["identity_rebuild"] is True
-        assert retried["errors"] == []
-        assert store.get_metadata("cpp_identity_version") == CPP_IDENTITY_VERSION
-        assert store.get_node(legacy_qn) is None
-        assert store.get_node(f"{source_path.as_posix()}::run(int)") is not None
     finally:
         store.close()
 
@@ -1140,7 +1129,7 @@ def test_cross_file_scoped_resolution_rechecks_candidate_changes(tmp_path: Path)
         store.close()
 
 
-def test_non_cpp_failure_does_not_repeat_cpp_identity_migration(tmp_path: Path):
+def test_non_cpp_failure_propagates_during_cpp_identity_migration(tmp_path: Path):
     cpp_path = tmp_path / "run.cpp"
     python_path = tmp_path / "broken.py"
     cpp_path.write_text("void run(int value) {}\n", encoding="utf-8")
@@ -1171,17 +1160,10 @@ def test_non_cpp_failure_does_not_repeat_cpp_identity_migration(tmp_path: Path):
             ),
             patch.object(CodeParser, "parse_bytes", new=parse_with_python_failure),
         ):
-            migrated = incremental_update(tmp_path, store, changed_files=[])
+            with pytest.raises(RuntimeError, match=r"simulated non-C\+\+ parse failure"):
+                incremental_update(tmp_path, store, changed_files=[])
 
-        assert migrated["identity_rebuild"] is True
-        assert migrated["errors"] == [
-            {"file": "broken.py", "error": "simulated non-C++ parse failure"},
-        ]
-        assert store.get_metadata("cpp_identity_version") == CPP_IDENTITY_VERSION
-        assert store.get_node(f"{cpp_path.as_posix()}::run(int)") is not None
-
-        no_retry = incremental_update(tmp_path, store, changed_files=[])
-        assert no_retry.get("identity_rebuild") is None
+        assert store.get_metadata("cpp_identity_version") is None
     finally:
         store.close()
 

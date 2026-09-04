@@ -386,7 +386,10 @@ class TestShippedHooksFiles:
 
 class TestInstallGitHook:
     def _make_git_repo(self, tmp_path: Path) -> Path:
-        (tmp_path / ".git" / "hooks").mkdir(parents=True)
+        self._git("init", cwd=tmp_path)
+        self._git(
+            "config", "core.hooksPath", str(tmp_path / ".git" / "hooks"), cwd=tmp_path
+        )
         return tmp_path
 
     def _git(self, *args: str, cwd: Path) -> str:
@@ -432,12 +435,14 @@ class TestInstallGitHook:
         content = (repo / ".git" / "hooks" / "pre-commit").read_text()
         assert content.count("code-review-graph detect-changes") == 1
 
-    def test_no_git_dir_returns_none(self, tmp_path):
-        assert install_git_hook(tmp_path) is None
+    def test_no_git_dir_fails_loud(self, tmp_path):
+        with pytest.raises(subprocess.CalledProcessError):
+            install_git_hook(tmp_path)
 
     def test_real_repo_installs_into_git_hooks(self, tmp_path):
         """Standard repo: unchanged behavior — hook lands in .git/hooks."""
         repo = self._init_real_repo(tmp_path / "std")
+        self._git("config", "core.hooksPath", ".git/hooks", cwd=repo)
         hook_path = install_git_hook(repo)
         assert hook_path is not None
         expected = repo / ".git" / "hooks" / "pre-commit"
@@ -462,6 +467,9 @@ class TestInstallGitHook:
         """Linked worktree: .git is a file; the hook must still be installed
         into the hooks path git actually consults (issue #313)."""
         main = self._init_real_repo(tmp_path / "main")
+        self._git(
+            "config", "core.hooksPath", str(main / ".git" / "hooks"), cwd=main
+        )
         self._git(
             "-c", "user.email=test@example.com", "-c", "user.name=Test",
             "commit", "--allow-empty", "-m", "init", cwd=main,

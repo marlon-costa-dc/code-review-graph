@@ -6,6 +6,7 @@ MATCH ?=
 APPLY ?= N
 REPO ?= .
 TEST_TMPDIR ?= $(if $(XDG_CACHE_HOME),$(XDG_CACHE_HOME),$(HOME)/.cache)/code-review-graph/pytest
+PROFILE_LIMIT ?= 30
 
 .PHONY: help setup deps check fix test profile
 
@@ -49,3 +50,4 @@ test:
 profile:
 	@test -n "$(FILE)" || { echo 'ERROR: FILE must name the cProfile output' >&2; exit 2; }
 	uv run python -m cProfile -o "$(FILE)" scripts/profile_inventory.py "$(REPO)"
+	uv run python -c 'import pstats; pstats.Stats("$(FILE)").strip_dirs().sort_stats("cumulative").print_stats($(PROFILE_LIMIT))'

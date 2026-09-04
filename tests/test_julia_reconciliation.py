@@ -1,5 +1,6 @@
 """Regression coverage for the safe Julia behavior ported from PR #560."""
 
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -451,7 +452,6 @@ def test_function_local_testset_and_macros_keep_canonical_scope():
 
 
 def test_full_build_persists_distinct_qualified_nodes_and_callers(tmp_path):
-    (tmp_path / ".git").mkdir()
     source_path = tmp_path / "analysis.jl"
     source_path.write_text(
         "module Demo\n"
@@ -464,6 +464,8 @@ def test_full_build_persists_distinct_qualified_nodes_and_callers(tmp_path):
         "end\n",
         encoding="utf-8",
     )
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "add", "analysis.jl"], cwd=tmp_path, check=True)
 
     store = GraphStore(tmp_path / "graph.db")
     try:

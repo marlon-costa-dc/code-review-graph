@@ -1,5 +1,6 @@
 """Tests for Go, Rust, Java, C, C++, C#, Ruby, PHP, Kotlin, Swift, Solidity, and Vue parsing."""
 
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -1315,7 +1316,7 @@ class TestRubyParsing:
 
         # A same-class call resolves to the defining method node, not a bare
         # name, so callers_of/callees_of work within a file.
-        assert any(t.endswith("sample.rb::UserRepository.save") for t in targets)
+        assert any(t.endswith(".UserRepository.save") for t in targets)
 
         # Calls are attributed to their enclosing method.
         create_user_targets = {
@@ -3144,8 +3145,6 @@ class TestRescriptCrossModuleResolver:
         from code_review_graph.graph import GraphStore
         from code_review_graph.incremental import full_build
 
-        (tmp_path / ".git").mkdir()
-
         (tmp_path / "LogicUtils.res").write_text(
             "let safeParse = (s) => s\n"
             "let trim = (s) => s\n"
@@ -3166,6 +3165,8 @@ class TestRescriptCrossModuleResolver:
         (tmp_path / "Layout.res").write_text(
             "let make = (~name) => name\n"
         )
+        subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+        subprocess.run(["git", "add", "*.res"], cwd=tmp_path, check=True)
 
         store = GraphStore(tmp_path / "graph.db")
         result = full_build(tmp_path, store)

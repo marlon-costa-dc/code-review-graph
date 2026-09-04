@@ -1144,47 +1144,35 @@ def install_git_hook(repo_root: Path) -> Path | None:
     ``code-review-graph`` commands into that manager manually instead.
 
     Creates ``pre-commit`` if it doesn't exist, or appends to an existing
-    one — the hook is appended, not overwritten, preserving any hooks
-    already there. Falls back to the legacy ``.git/hooks`` resolution when
-    git itself is unavailable. Returns None when no hooks directory can be
-    determined.
+    one — the hook is appended, not overwritten, preserving any hooks already
+    there. Git resolution failures propagate to the caller.
     """
     script = """\
 #!/bin/sh
 # Installed by code-review-graph. Remove this file to disable pre-commit graph checks.
 if command -v code-review-graph >/dev/null 2>&1; then
-    code-review-graph update || true
-    code-review-graph detect-changes --brief || true
+    code-review-graph update
+    code-review-graph detect-changes --brief
 fi
 """
     marker = "code-review-graph detect-changes"
 
-    hooks_dir: Path | None = None
-    try:
-        result = subprocess.run(
-            ["git", "rev-parse", "--git-path", "hooks"],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            cwd=str(repo_root),
-            timeout=10,
-            stdin=subprocess.DEVNULL,
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            # Output is relative to repo_root (".git/hooks", a core.hooksPath
-            # value such as ".husky") or absolute (linked worktrees).
-            hooks_dir = repo_root / result.stdout.strip()
-    except (subprocess.TimeoutExpired, OSError) as exc:
-        logger.warning("git unavailable (%s); falling back to .git/hooks resolution.", exc)
-
-    if hooks_dir is None:
-        git_dir = repo_root / ".git"
-        if not git_dir.is_dir():
-            logger.warning(
-                "No git hooks directory found at %s — skipping git hook install.", repo_root
-            )
-            return None
-        hooks_dir = git_dir / "hooks"
+    result = subprocess.run(
+        ["git", "rev-parse", "--git-path", "hooks"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        cwd=str(repo_root),
+        timeout=10,
+        stdin=subprocess.DEVNULL,
+        check=True,
+    )
+    raw_hooks_dir = result.stdout.strip()
+    if not raw_hooks_dir:
+        raise RuntimeError("git returned an empty hooks path")
+    hooks_dir = repo_root / raw_hooks_dir
+    if hooks_dir.resolve() == Path("/dev/null"):
+        raise RuntimeError("git hooks are disabled by core.hooksPath=/dev/null")
 
     hook_path = hooks_dir / "pre-commit"
     hook_path.parent.mkdir(parents=True, exist_ok=True)

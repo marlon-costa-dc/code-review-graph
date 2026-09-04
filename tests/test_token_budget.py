@@ -714,6 +714,7 @@ def test_hard_ceilings_bind(repo):
 
     changes = asyncio.run(crg_main.detect_changes_tool(
         repo_root=root, changed_files=all_files, max_results=HUGE,
+        detail_level="standard", max_tokens=0,
     ))
     assert changes["changed_functions_total"] > review._MAX_CHANGED_FUNCTIONS
     assert len(changes["changed_functions"]) == review._MAX_CHANGED_FUNCTIONS
@@ -767,6 +768,7 @@ class TestTruncationContract:
         """#849's payload must not leak back in through detect_changes."""
         result = asyncio.run(crg_main.detect_changes_tool(
             repo_root=repo["root"], changed_files=repo["files"],
+            detail_level="standard",
         ))
         for flow in result["affected_flows"]:
             assert "steps" not in flow, (

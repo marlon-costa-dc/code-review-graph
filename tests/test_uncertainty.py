@@ -365,8 +365,8 @@ def test_search_on_an_empty_graph_says_so(tmp_path):
 
     result = semantic_search_nodes(query="anything", repo_root=str(root))
 
-    assert result["results"] == []
-    assert "graph is empty" in result["confidence"]
+    assert result["status"] == "not_built"
+    assert "Graph not built" in result["message"]
 
 
 # ---------------------------------------------------------------------------
@@ -434,17 +434,14 @@ def test_failure_to_compute_degrades_to_no_marker(repo, monkeypatch):
     assert "confidence" not in result
 
 
-def test_search_failure_degrades_to_no_marker(repo, monkeypatch):
+def test_search_failure_propagates(repo, monkeypatch):
     def boom(*args, **kwargs):
         raise RuntimeError("stats unavailable")
 
     monkeypatch.setattr(GraphStore, "get_stats", boom)
 
-    result = semantic_search_nodes(query="zzz_no_such_symbol", repo_root=str(repo))
-
-    assert result["status"] == "ok"
-    assert result["results"] == []
-    assert "confidence" not in result
+    with pytest.raises(RuntimeError, match="stats unavailable"):
+        semantic_search_nodes(query="zzz_no_such_symbol", repo_root=str(repo))
 
 
 def test_impact_failure_degrades_to_no_marker(repo, monkeypatch):
@@ -539,8 +536,8 @@ def test_unresolved_target_on_an_empty_graph_says_build(tmp_path):
         pattern="callers_of", target="Anything", repo_root=str(root),
     )
 
-    assert "graph is empty" in result["confidence"]
-    assert "build" in result["confidence"]
+    assert result["status"] == "not_built"
+    assert "Graph not built" in result["message"]
 
 
 def test_resolved_target_with_results_still_has_no_marker(repo):

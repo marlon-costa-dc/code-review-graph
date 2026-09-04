@@ -1227,7 +1227,7 @@ _TEST_FILE_PATTERNS = [
     re.compile(r".*\.test\.[jt]sx?$"),
     re.compile(r".*\.spec\.[jt]sx?$"),
     re.compile(r".*_test\.go$"),
-    re.compile(r"tests?/"),
+    re.compile(r"[\\/]tests?[\\/]"),
     re.compile(r"[\\/]__tests__[\\/]"),
     re.compile(r".*_test\.dart$"),
     re.compile(r"test[_-].*\.[rR]$"),
@@ -10424,7 +10424,7 @@ class CodeParser:
                 explicit_scope or lexical_class_scope or enclosing_class,
             )
             if lexical_classes:
-                container_scope = ".".join(lexical_classes[-2:])
+                container_scope = lexical_class_scope
             elif enclosing_class:
                 container_scope = enclosing_class
             if cpp_params is not None:

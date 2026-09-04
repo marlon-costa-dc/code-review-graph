@@ -541,7 +541,7 @@ def test_update_auto_base_across_divergent_branch_switch(tmp_path: Path) -> None
     assert {"sibling_only.py", "main_one.py", "main_two.py"} <= changed
 
 
-def test_update_without_usable_anchor_falls_back_to_full_rebuild(
+def test_update_without_usable_anchor_requires_explicit_rebuild(
     tmp_path: Path,
 ) -> None:
     repo = _init_repo(tmp_path)
@@ -557,35 +557,28 @@ def test_update_without_usable_anchor_falls_back_to_full_rebuild(
         store.close()
 
     _commit_file(repo, "epsilon")
-    res = build_or_update_graph(
-        full_rebuild=False, repo_root=str(repo), base=None, postprocess="none"
-    )
-    assert res["build_type"] == "full"
-    assert res["base_resolved"] is None
+    with pytest.raises(RuntimeError, match="no usable Git base"):
+        build_or_update_graph(
+            full_rebuild=False, repo_root=str(repo), base=None, postprocess="none"
+        )
 
 
-def test_update_missing_graph_ignores_explicit_incremental_base(
+def test_update_missing_graph_requires_explicit_build(
     tmp_path: Path,
 ) -> None:
     repo = _init_repo(tmp_path)
     _commit_file(repo, "beta")
 
-    res = build_or_update_graph(
-        full_rebuild=False,
-        repo_root=str(repo),
-        base="HEAD~1",
-        postprocess="none",
-    )
-
-    assert res["build_type"] == "full"
-    assert res["base_resolved"] is None
-    assert res["files_parsed"] == 2
-    with GraphStore(repo / ".code-review-graph" / "graph.db") as store:
-        assert store.get_nodes_by_file(str(repo / "a.py"))
-        assert store.get_nodes_by_file(str(repo / "beta.py"))
+    with pytest.raises(RuntimeError, match="requires an existing graph"):
+        build_or_update_graph(
+            full_rebuild=False,
+            repo_root=str(repo),
+            base="HEAD~1",
+            postprocess="none",
+        )
 
 
-def test_update_repairs_existing_empty_graph(
+def test_update_rejects_existing_empty_graph(
     tmp_path: Path,
 ) -> None:
     repo = _init_repo(tmp_path)
@@ -594,28 +587,21 @@ def test_update_repairs_existing_empty_graph(
         pass
     _commit_file(repo, "beta")
 
-    res = build_or_update_graph(
-        full_rebuild=False,
-        repo_root=str(repo),
-        base="HEAD~1",
-        postprocess="none",
-    )
-
-    assert res["build_type"] == "full"
-    assert res["base_resolved"] is None
-    assert res["files_parsed"] == 2
-    with GraphStore(graph_path) as store:
-        assert store.get_nodes_by_file(str(repo / "a.py"))
-        assert store.get_nodes_by_file(str(repo / "beta.py"))
+    with pytest.raises(RuntimeError, match="requires an existing graph"):
+        build_or_update_graph(
+            full_rebuild=False,
+            repo_root=str(repo),
+            base="HEAD~1",
+            postprocess="none",
+        )
 
 
-def test_status_then_update_builds_complete_queryable_graph(
+def test_status_then_update_requires_explicit_build(
     tmp_path: Path,
     monkeypatch,
     capsys,
 ) -> None:
     from code_review_graph import cli
-    from code_review_graph.tools.query import query_graph
 
     repo = tmp_path / "queryable-repo"
     repo.mkdir()
@@ -671,12 +657,10 @@ def test_status_then_update_builds_complete_queryable_graph(
             "--skip-postprocess",
         ],
     )
-    cli.main()
-
-    assert "Full rebuild" in capsys.readouterr().out
-    result = query_graph("callers_of", "target", repo_root=str(repo))
-    assert result["status"] == "ok"
-    assert {item["name"] for item in result["results"]} == {"recent", "stable"}
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main()
+    assert exc_info.value.code == 1
+    assert "requires an existing graph" in capsys.readouterr().err
 
 
 def test_update_explicit_base_bypasses_auto_resolution(tmp_path: Path) -> None:

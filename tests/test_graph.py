@@ -1312,7 +1312,7 @@ class TestResolveBareTargets:
             line_start=1, line_end=5, language="python", parent_name=parent,
         ))
 
-    def test_resolves_bare_inherits_target_cross_file(self):
+    def test_call_resolver_does_not_rewrite_inheritance_edges(self):
         self._node("Class", "BaseHandler", "/r/base.py")
         self._node("Class", "JsonHandler", "/r/impl.py")
         # Cross-file INHERITS stored with a bare base name (parser behavior).
@@ -1331,10 +1331,9 @@ class TestResolveBareTargets:
             for e in self.store.get_edges_by_source("/r/impl.py::JsonHandler")
             if e.kind == "INHERITS"
         ]
-        assert "/r/base.py::BaseHandler" in targets
-        assert "BaseHandler" not in targets
+        assert targets == ["BaseHandler"]
 
-    def test_resolves_bare_calls_target_cross_file(self):
+    def test_does_not_resolve_cross_file_call_without_import_evidence(self):
         self._node("Function", "handle", "/r/base.py", parent="BaseHandler")
         self._node("Function", "run", "/r/app.py")
         self.store.upsert_edge(EdgeInfo(
@@ -1348,7 +1347,7 @@ class TestResolveBareTargets:
             for e in self.store.get_edges_by_source("/r/app.py::run")
             if e.kind == "CALLS"
         ]
-        assert any(t.endswith("::handle") or t.endswith(".handle") for t in targets)
+        assert targets == ["handle"]
 
     def test_ambiguous_bare_inherits_left_unresolved(self):
         # Two classes named Base in different files, no import disambiguation.

@@ -145,14 +145,9 @@ def _graph_is_built(store: GraphStore) -> bool:
     metadata row is present. The marker check ensures a legitimately empty repo
     that was actually built is not mistaken for a never-built repo.
     """
-    try:
-        if store.get_stats().total_nodes > 0:
-            return True
-        return any(store.get_metadata(key) for key in _BUILD_MARKER_KEYS)
-    except sqlite3.Error:
-        logger.warning("Failed to read graph build state", exc_info=True)
-        # Be conservative: if we cannot tell, do not block the read tool.
+    if store.get_stats().total_nodes > 0:
         return True
+    return any(store.get_metadata(key) for key in _BUILD_MARKER_KEYS)
 
 
 def _not_built_response() -> dict[str, Any]:

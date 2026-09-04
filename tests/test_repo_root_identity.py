@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import ANY, MagicMock, patch
@@ -16,8 +17,9 @@ from code_review_graph.incremental import full_build, incremental_update
 def test_incremental_update_survives_mixed_repo_root_spellings(tmp_path: Path, monkeypatch) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
-    (repo / ".git").mkdir()
     (repo / "app.py").write_text("def main() -> None:\n    pass\n", encoding="utf-8")
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "add", "app.py"], cwd=repo, check=True)
     monkeypatch.chdir(repo)
 
     store = GraphStore(repo / ".code-review-graph" / "graph.db")
@@ -38,8 +40,9 @@ def test_incremental_update_refuses_total_root_mismatch_without_purging(
 ) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
-    (repo / ".git").mkdir()
     (repo / "app.py").write_text("def main() -> None:\n    pass\n", encoding="utf-8")
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "add", "app.py"], cwd=repo, check=True)
     wrong_root = tmp_path / "wrong-root"
     wrong_root.mkdir()
     store = GraphStore(repo / ".code-review-graph" / "graph.db")

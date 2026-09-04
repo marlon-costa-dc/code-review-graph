@@ -11,6 +11,7 @@ import fnmatch
 import hashlib
 import json
 import logging
+import multiprocessing
 import os
 import re
 import signal
@@ -75,7 +76,10 @@ def _make_executor(max_workers: int):
     """Construct the parallel-parse executor selected by [_select_executor_kind]."""
     if _select_executor_kind() == "thread":
         return concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
-    return concurrent.futures.ProcessPoolExecutor(max_workers=max_workers)
+    return concurrent.futures.ProcessPoolExecutor(
+        max_workers=max_workers,
+        mp_context=multiprocessing.get_context("spawn"),
+    )
 
 logger = logging.getLogger(__name__)
 

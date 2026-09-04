@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import logging
 import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -899,6 +900,8 @@ class TestWatchLoop:
         repo = tmp_path / "repo"
         (repo / "src").mkdir(parents=True)
         (repo / "src" / "app.py").write_text("def handler():\n    return 1\n", encoding="utf-8")
+        subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+        subprocess.run(["git", "add", "src/app.py"], cwd=repo, check=True)
         store = GraphStore(tmp_path / "graph.db")
         incremental_update(tmp_path / "elsewhere", store, changed_files=[])
         store.store_file_nodes_edges(
@@ -1092,6 +1095,8 @@ class TestRealObserver:
         for index in range(6):
             (repo / "node_modules" / f"pkg{index}").mkdir(parents=True)
         (repo / "src" / "app.py").write_text("def handler():\n    return 1\n", encoding="utf-8")
+        subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+        subprocess.run(["git", "add", "src/app.py"], cwd=repo, check=True)
 
         store = GraphStore(repo / "graph.db")
         reader = GraphStore(repo / "graph.db")
@@ -1117,6 +1122,7 @@ class TestRealObserver:
                 created = repo / "services"
                 created.mkdir()
                 (created / "svc.py").write_text("def service():\n    return 3\n", encoding="utf-8")
+                subprocess.run(["git", "add", "services/svc.py"], cwd=repo, check=True)
 
                 indexed = self._wait_for(
                     lambda: any(

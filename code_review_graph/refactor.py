@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any, Optional, Union
 
 from .flows import _has_framework_decorator, _matches_entry_name
-from .graph import GraphStore, _sanitize_name
+from .graph import GraphStore, _compatible_edge_languages, _sanitize_name
 
 logger = logging.getLogger(__name__)
 
@@ -320,6 +320,9 @@ class _DeadCodeContext:
         self.conn = store._conn
         # Load all Function/Class/Test nodes once and derive name stats.
         all_nodes = self.store.get_nodes_by_kind(kinds=["Function", "Class", "Test"])
+        self.source_languages = {
+            node.qualified_name: node.language for node in all_nodes
+        }
         self.type_ref_names = self._collect_type_referenced_names(all_nodes)
         self.name_counts = self._build_name_counts(all_nodes)
         # Class hierarchy and MRO.
@@ -682,6 +685,8 @@ class _NodeFilter:
         # Skip test nodes and anything defined in test files.
         if node.is_test or _is_test_file(node.file_path):
             return True
+        if node.extra.get("verilog_kind"):
+            return True
 
         # Skip example/demo files -- they are standalone entry points.
         if _is_example_file(node.file_path):
@@ -837,10 +842,11 @@ class _NodeFilter:
             return False
         class_qn = self._class_qn_for(node)
         children = self.context.class_children.get(class_qn, [])
-        # No parsed children at all often means the class only holds constant
-        # assignments (e.g. ``class Constants: ...``).
+        # With no parsed children there is no structural evidence of a
+        # namespace. Only the explicit conventional Constants container is
+        # exempt; treating every empty class as a namespace hides dead types.
         if not children:
-            return True
+            return node.name == "Constants"
         # Allow nested classes/types; reject callable members.
         for child in children:
             if child.kind in ("Class", "Type"):
@@ -1106,7 +1112,11 @@ class _DeadCodeDetector:
             return False
         if self.context.incoming["INHERITS"].get(node.qualified_name):
             return True
-        return bool(self.context.bare_inherits.get(node.name))
+        compatible = _compatible_edge_languages(node.language)
+        return any(
+            self.context.source_languages.get(edge.source_qualified) in compatible
+            for edge in self.context.bare_inherits.get(node.name, [])
+        )
 
     def _collect_call_edges(self, node: Any) -> list[Any]:
         """Collect all CALLS edges targeting *node* (qualified, class-qualified,
@@ -1121,8 +1131,10 @@ class _DeadCodeDetector:
             bare = self.context.bare_calls.get(node.name, [])
             partial = self.context.partial_calls.get(node.name, [])
             all_bare = bare + partial
+            compatible = _compatible_edge_languages(node.language)
             all_bare = [
                 e for e in all_bare
+                if self.context.source_languages.get(e.source_qualified) in compatible
                 if self.context.plausibility.is_plausible(
                     e.file_path, node.file_path, node.name
                 )
@@ -1269,396 +1281,7 @@ def find_dead_code(
         kinds=[kind] if kind else ["Function", "Class"],
         file_pattern=file_pattern,
     )
-
-    # Build set of class names referenced in function type annotations.
-    type_ref_names: set[str] = set()
-    for node in store.get_all_nodes():
-        if node.kind in ("Function", "Test"):
-            for text in (node.params, node.return_type):
-                if text:
-                    type_ref_names.update(_TYPE_IDENT_RE.findall(text))
-
-    # Build class hierarchy: class_qualified_name -> [bare_base_names]
-    class_bases: dict[str, list[str]] = {}
-    conn = store._conn
-    for row in conn.execute(
-        "SELECT source_qualified, target_qualified FROM edges WHERE kind = 'INHERITS'"
-    ).fetchall():
-        base = row[1].rsplit("::", 1)[-1] if "::" in row[1] else row[1]
-        class_bases.setdefault(row[0], []).append(base)
-
-    # Build MRO connectivity among classes so a method reachable through the
-    # inheritance chain is not flagged dead. Bare base names are resolved to
-    # class nodes so cross-file inheritance links up. The graph is undirected
-    # (child <-> base) so dispatch works both ways: a call to a base method
-    # keeps every override alive, and a call to an override keeps the
-    # inherited base method reachable. See OO/MRO false positives.
-    class_name_to_qns: dict[str, set[str]] = {}
-    for row in conn.execute(
-        "SELECT name, qualified_name FROM nodes WHERE kind = 'Class'"
-    ).fetchall():
-        class_name_to_qns.setdefault(row[0], set()).add(row[1])
-
-    mro_adj: dict[str, set[str]] = {}
-
-    def _link_classes(a: str, b: str) -> None:
-        mro_adj.setdefault(a, set()).add(b)
-        mro_adj.setdefault(b, set()).add(a)
-
-    for child_qn, base_list in class_bases.items():
-        for base in base_list:
-            for base_qn in class_name_to_qns.get(base, ()):
-                if base_qn != child_qn:
-                    _link_classes(child_qn, base_qn)
-
-    _mro_component_cache: dict[str, frozenset[str]] = {}
-
-    def _mro_component(class_qn: str) -> frozenset[str]:
-        """Return every class qn reachable from *class_qn* via inheritance."""
-        cached = _mro_component_cache.get(class_qn)
-        if cached is not None:
-            return cached
-        seen: set[str] = set()
-        stack = [class_qn]
-        while stack:
-            cur = stack.pop()
-            if cur in seen:
-                continue
-            seen.add(cur)
-            stack.extend(mro_adj.get(cur, ()))
-        frozen = frozenset(seen)
-        for member in seen:
-            _mro_component_cache[member] = frozen
-        return frozen
-
-    # Build import graph: file_path -> set of file_paths it imports from.
-    # Used to filter bare-name caller matches to plausible callers.
-    importer_files: dict[str, set[str]] = {}
-    for row in conn.execute(
-        "SELECT file_path, target_qualified FROM edges WHERE kind = 'IMPORTS_FROM'"
-    ).fetchall():
-        importer_files.setdefault(row[0], set()).add(row[1])
-
-    # Build set of globally unique names (only one non-test node with that name).
-    # For unique names, any bare-name CALLS edge is reliable — no ambiguity.
-    name_counts: dict[str, int] = {}
-    for row in conn.execute(
-        "SELECT name, COUNT(*) FROM nodes "
-        "WHERE kind IN ('Function', 'Class') AND is_test = 0 "
-        "GROUP BY name"
-    ).fetchall():
-        name_counts[row[0]] = row[1]
-
-    def _is_plausible_caller(
-        edge_file: str, node_file: str, node_name: str = "",
-    ) -> bool:
-        """A bare-name edge is plausible if it comes from the same file,
-        from a file that has an IMPORTS_FROM edge whose target matches
-        the node's file path, or the name is globally unique (no ambiguity)."""
-        if edge_file == node_file:
-            return True
-        # Unique names (only one definition) have no ambiguity -- accept all callers.
-        if node_name and name_counts.get(node_name, 0) == 1:
-            return True
-        for imp_target in importer_files.get(edge_file, ()):
-            # Strip "::name" suffix — workspace-resolved imports may include it
-            imp_path = imp_target.split("::")[0] if "::" in imp_target else imp_target
-            # __init__.py represents its parent package directory
-            if imp_path.endswith("/__init__.py"):
-                imp_dir = imp_path[:-12]  # strip "/__init__.py"
-                if node_file.startswith(imp_dir + "/"):
-                    return True
-            if imp_path.startswith(node_file) or node_file.startswith(imp_path + "/"):
-                return True
-            # 2-hop: edge_file imports X, X re-exports from node_file (barrel files)
-            for imp2 in importer_files.get(imp_target, ()):
-                imp2_path = imp2.split("::")[0] if "::" in imp2 else imp2
-                if imp2_path.endswith("/__init__.py"):
-                    imp2_dir = imp2_path[:-12]
-                    if node_file.startswith(imp2_dir + "/"):
-                        return True
-                if imp2_path.startswith(node_file) or node_file.startswith(imp2_path + "/"):
-                    return True
-            # Package-alias heuristic: monorepo imports like "@scope/pkg-name"
-            # contain the directory name of the target package.  Check if the
-            # import target string contains a significant directory segment from
-            # the node's file path (e.g. "lambda-common" in both the import
-            # "@cova-utils/lambda-common" and the path "libraries/lambda-common/...").
-            if not imp_target.startswith("/"):
-                # imp_target is a package specifier, not a file path
-                for seg in _path_segments(node_file):
-                    if seg in imp_target:
-                        return True
-        return False
-
-    dead: list[dict[str, Any]] = []
-
-    for node in candidates:
-
-        # Skip test nodes and anything defined in test files.
-        if node.is_test or _is_test_file(node.file_path):
-            continue
-        if node.extra.get("verilog_kind"):
-            continue
-
-        # Skip ambient type declarations (.d.ts) — they describe external APIs.
-        if node.file_path.endswith(".d.ts"):
-            continue
-
-        # Skip dunder methods -- invoked by runtime, never have explicit callers.
-        if node.name.startswith("__") and node.name.endswith("__"):
-            continue
-
-        # Skip JS/TS/Java constructors -- invoked via `new ClassName()`, which
-        # creates a CALLS edge to the class, not to `constructor`.
-        if node.name == "constructor" and node.parent_name:
-            continue
-
-        # Skip mock/stub variables in test files -- these are test helpers
-        # referenced via variable assignment, not function calls.
-        if node.is_test or _is_test_file(node.file_path):
-            if _MOCK_NAME_RE.search(node.name):
-                continue
-
-        # Skip entry points (by name pattern or decorator, not just "uncalled").
-        if _is_entry_point(node):
-            continue
-
-        # Check for callers (CALLS), test refs (TESTED_BY), importers (IMPORTS_FROM),
-        # and value references (REFERENCES -- function-as-value in maps, arrays, etc.).
-
-        # Skip classes referenced in type annotations (Pydantic schemas, etc.).
-        if node.kind == "Class" and node.name in type_ref_names:
-            continue
-
-        # Skip Angular/NestJS decorated classes -- they are framework-managed
-        # and instantiated by the DI container, not direct CALLS edges.
-        if node.kind == "Class" and _has_framework_decorator(node):
-            continue
-
-        # Skip classes (and their methods) inheriting from known framework bases.
-        _is_framework_class = False
-        _check_qn = node.qualified_name if node.kind == "Class" else (
-            node.qualified_name.rsplit(".", 1)[0] if node.parent_name else None
-        )
-        if _check_qn:
-            outgoing = store.get_edges_by_source(_check_qn)
-            base_names = {
-                e.target_qualified.rsplit("::", 1)[-1]
-                for e in outgoing if e.kind == "INHERITS"
-            }
-            if base_names & _FRAMEWORK_BASE_CLASSES:
-                _is_framework_class = True
-        if node.kind == "Class":
-            if _is_framework_class:
-                continue
-            # Fallback: CDK class name suffixes (no INHERITS edge for external bases)
-            if any(node.name.endswith(s) for s in _CDK_CLASS_SUFFIXES):
-                continue
-        if node.kind == "Function" and _is_framework_class:
-            continue
-        # Also skip methods whose parent class name matches CDK suffixes
-        # (fallback for external base classes without INHERITS edges).
-        if (
-            node.kind == "Function"
-            and node.parent_name
-            and any(node.parent_name.endswith(s) for s in _CDK_CLASS_SUFFIXES)
-        ):
-            continue
-
-        # Skip decorated functions/classes that are invoked implicitly rather
-        # than via explicit CALLS edges.
-        decorators = node.extra.get("decorators", ())
-        if isinstance(decorators, (list, tuple)) and decorators:
-            if node.kind in ("Function", "Test"):
-                # @property -- invoked via attribute access
-                # @abstractmethod -- polymorphic dispatch, never called directly
-                # @classmethod/@staticmethod -- called via Class.method()
-                if any(
-                    d in ("property", "abstractmethod", "classmethod", "staticmethod")
-                    or d.endswith(".abstractmethod")
-                    # Angular @HostListener -- method called by framework event system
-                    or d.startswith("HostListener")
-                    for d in decorators
-                ):
-                    continue
-            if node.kind == "Class":
-                # @dataclass classes are instantiated as types, not via CALLS
-                if any("dataclass" in d for d in decorators):
-                    continue
-
-        # Skip methods that override an @abstractmethod in a base class --
-        # they are called polymorphically via the base class reference.
-        if node.kind == "Function" and node.parent_name:
-            parent_qn = node.qualified_name.rsplit(".", 1)[0]
-            parent_edges = store.get_edges_by_source(parent_qn)
-            base_class_names = [
-                e.target_qualified for e in parent_edges if e.kind == "INHERITS"
-            ]
-            for base_name in base_class_names:
-                # Try fully-qualified base first, then bare name match
-                base_method_qn = f"{base_name}.{node.name}"
-                base_nodes = store.get_node(base_method_qn)
-                if base_nodes is None:
-                    # Base class may be bare name -- search in same file
-                    base_method_qn2 = (
-                        node.file_path + "::" + base_name + "." + node.name
-                    )
-                    base_nodes = store.get_node(base_method_qn2)
-                if base_nodes is not None:
-                    base_decos = base_nodes.extra.get("decorators", ())
-                    if isinstance(base_decos, (list, tuple)) and any(
-                        "abstractmethod" in d for d in base_decos
-                    ):
-                        break
-            else:
-                base_name = None  # no abstract override found
-            if base_name is not None:
-                continue
-
-        incoming = store.get_edges_by_target(node.qualified_name)
-        # Also check class-qualified edges (e.g. "ClassName::method") which
-        # lack the file-path prefix used in node.qualified_name.
-        if not any(e.kind == "CALLS" for e in incoming) and node.parent_name:
-            class_qn = f"{node.parent_name}::{node.name}"
-            incoming = incoming + store.get_edges_by_target(class_qn)
-        # Also check bare-name and partially-qualified edges.
-        # CALLS targets may be bare ("funcName"), class-qualified
-        # ("Class::method"), or workspace-qualified ("pkg/dir::funcName").
-        if not any(e.kind == "CALLS" for e in incoming):
-            bare = store.search_edges_by_target_name(
-                node.name,
-                kind="CALLS",
-                language=node.language or None,
-            )
-            # Also search for partially-qualified targets ending with ::name
-            suffix_rows = conn.execute(
-                "SELECT * FROM edges WHERE kind = 'CALLS'"
-                " AND target_qualified LIKE ?",
-                (f"%::{node.name}",),
-            ).fetchall()
-            suffix_edges = [store._row_to_edge(r) for r in suffix_rows]
-            all_bare = bare + suffix_edges
-            all_bare = [
-                e for e in all_bare
-                if _is_plausible_caller(e.file_path, node.file_path, node.name)
-            ]
-            incoming = incoming + all_bare
-        # TESTED_BY edges are stored as source=production, target=test by the
-        # parser, so a tested production node is the *source* of its TESTED_BY
-        # edge -- look outgoing, not incoming. See: #515
-        outgoing_tb = [
-            e for e in store.get_edges_by_source(node.qualified_name)
-            if e.kind == "TESTED_BY"
-        ]
-        if not outgoing_tb and node.parent_name:
-            # Class-qualified source (e.g. "ClassName::method") which lacks the
-            # file-path prefix used in node.qualified_name.
-            class_qn = f"{node.parent_name}::{node.name}"
-            outgoing_tb += [
-                e for e in store.get_edges_by_source(class_qn)
-                if e.kind == "TESTED_BY"
-            ]
-        if not outgoing_tb:
-            # Bare-name source fallback: unresolved TESTED_BY edges may store the
-            # production function by its plain name (e.g. "authenticate").
-            bare_rows = conn.execute(
-                "SELECT * FROM edges WHERE kind = 'TESTED_BY' AND source_qualified = ?",
-                (node.name,),
-            ).fetchall()
-            outgoing_tb += [
-                e for e in (store._row_to_edge(r) for r in bare_rows)
-                if _is_plausible_caller(e.file_path, node.file_path, node.name)
-            ]
-        # Check INHERITS -- classes with subclasses are not dead.
-        if node.kind == "Class" and not any(e.kind == "INHERITS" for e in incoming):
-            bare_inh = store.search_edges_by_target_name(
-                node.name,
-                kind="INHERITS",
-                language=node.language or None,
-            )
-            incoming = incoming + bare_inh
-        # Count only reachable CALLS: edges tagged reachable=False sit inside
-        # statically-dead guards (if False: / if 0: / if TYPE_CHECKING:) and
-        # must not keep their target alive. Absent key = live (see PR #580).
-        has_callers = any(
-            e.kind == "CALLS" and e.extra.get("reachable", True)
-            for e in incoming
-        )
-        has_test_refs = bool(outgoing_tb)
-        has_importers = any(e.kind == "IMPORTS_FROM" for e in incoming)
-        has_references = any(e.kind == "REFERENCES" for e in incoming)
-        has_subclasses = any(e.kind == "INHERITS" for e in incoming)
-
-        # For classes with no direct references, check if any member has callers.
-        no_refs = not (
-            has_callers or has_test_refs or has_importers
-            or has_references or has_subclasses
-        )
-        if node.kind == "Class" and no_refs:
-            member_prefix = node.qualified_name + "."
-            # Also check bare class-name pattern (unresolved CALLS targets)
-            bare_prefix = node.name + "."
-            member_calls = conn.execute(
-                "SELECT COUNT(*) FROM edges WHERE kind = 'CALLS'"
-                " AND (target_qualified LIKE ? OR target_qualified LIKE ?)",
-                (f"%{member_prefix}%", f"%{bare_prefix}%"),
-            ).fetchone()[0]
-            if member_calls > 0:
-                has_callers = True
-
-        if not (
-            has_callers or has_test_refs or has_importers
-            or has_references or has_subclasses
-        ):
-            # Check if this is a method override where the base class method
-            # has callers (polymorphic dispatch: callers of Base.method()
-            # implicitly call SubClass.method() at runtime).
-            if node.kind == "Function" and node.parent_name and not has_callers:
-                method_suffix = "." + node.name
-                if node.qualified_name.endswith(method_suffix):
-                    class_qn = node.qualified_name[: -len(method_suffix)]
-                    # A method is alive if ANY class in the same MRO-connected
-                    # component defines a same-named method that has a caller.
-                    # A call to any relative dispatches to this method at
-                    # runtime, so overrides and inherited bases stay reachable.
-                    for rel_qn in _mro_component(class_qn):
-                        if rel_qn == class_qn:
-                            continue
-                        sibling_qn = rel_qn + method_suffix
-                        rel_name = (
-                            rel_qn.rsplit("::", 1)[-1]
-                            if "::" in rel_qn else rel_qn
-                        )
-                        if conn.execute(
-                            "SELECT 1 FROM edges WHERE kind = 'CALLS' "
-                            "AND target_qualified IN (?, ?) LIMIT 1",
-                            (sibling_qn, f"{rel_name}::{node.name}"),
-                        ).fetchone():
-                            has_callers = True
-                            break
-
-            if not has_callers:
-                if root:
-                    try:
-                        rel = str(Path(node.file_path).relative_to(root))
-                    except ValueError:
-                        rel = node.file_path
-                else:
-                    rel = node.file_path
-                dead.append({
-                    "name": _sanitize_name(node.name),
-                    "qualified_name": _sanitize_name(node.qualified_name),
-                    "kind": node.kind,
-                    "file": node.file_path,
-                    "file_path": node.file_path,
-                    "relative_path": rel,
-                    "line": node.line_start,
-                    "language": node.language,
-                })
-
-    logger.info("find_dead_code: found %d dead symbols", len(dead))
-    return dead
+    return _DeadCodeDetector(_DeadCodeContext(store, root)).find(candidates)
 
 
 # ---------------------------------------------------------------------------

@@ -41,8 +41,9 @@ class TestRegistry:
 
     def test_default_registry_uses_environment_path(self, tmp_path, monkeypatch):
         """The default registry honors the process isolation boundary."""
-        registry_path = tmp_path / "isolated" / "registry.json"
-        monkeypatch.setenv("CRG_REGISTRY_PATH", str(registry_path))
+        registry_home = tmp_path / "isolated"
+        registry_path = registry_home / "registry.json"
+        monkeypatch.setenv("CRG_HOME", str(registry_home))
 
         registry = Registry()
         registry.register(str(self.repo1), alias="isolated")

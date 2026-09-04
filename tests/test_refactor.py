@@ -575,6 +575,7 @@ class TestFindDeadCodeNewHeuristics:
 
     def setup_method(self):
         self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.tmp.close()
         self.store = GraphStore(self.tmp.name)
 
     def teardown_method(self):
@@ -1571,6 +1572,7 @@ class TestFindDeadCodeMRO:
 
     def setup_method(self):
         self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.tmp.close()
         self.store = GraphStore(self.tmp.name)
 
     def teardown_method(self):
@@ -1749,6 +1751,7 @@ class TestFindDeadCodePerformance:
     def _build_synthetic_store(self, n_functions: int = 500) -> tuple[GraphStore, str]:
         """Create a store with *n_functions* functions and a sparse call graph."""
         tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        tmp.close()
         store = GraphStore(tmp.name)
         # Seed file node
         store.upsert_node(NodeInfo(

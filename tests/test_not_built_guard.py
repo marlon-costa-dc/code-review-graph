@@ -217,7 +217,7 @@ def test_semantic_search_without_embeddings_reports_lexical_mode(tmp_path):
     _make_built_repo(tmp_path)
     result = semantic_search_nodes("hello", repo_root=str(tmp_path))
     assert result["status"] == "ok"
-    assert result["search_mode"] == "lexical"
+    assert result["search_mode"] == "keyword"
 
 
 def test_semantic_search_without_embeddings_does_not_import_provider(

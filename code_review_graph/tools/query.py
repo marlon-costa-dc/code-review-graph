@@ -722,8 +722,9 @@ def query_graph(
                     for k in ("name", "kind", "file_path", "indirect")
                     if k in r
                 }
-                for r in results
+                for r in results[:5]
             ]
+            minimal_omitted = max(0, total_results - len(minimal_results))
             minimal_response: dict[str, Any] = {
                 "status": "ok",
                 "pattern": pattern,
@@ -731,11 +732,14 @@ def query_graph(
                 "description": _QUERY_PATTERNS[pattern],
                 "summary": summary,
                 "result_count": total_results,
-                "results_omitted": results_omitted,
+                "results_omitted": minimal_omitted,
                 "results": minimal_results,
             }
             if confidence:
                 minimal_response["confidence"] = confidence
+            if minimal_omitted:
+                minimal_response["truncated"] = True
+                minimal_response["total_results"] = total_results
             return minimal_response
 
         response = {

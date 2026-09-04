@@ -561,9 +561,12 @@ class TestGraphToolExplicitRepoResolution:
         repo_root = mock_run.call_args.args[1]
         assert repo_root == module.resolve()
 
-    def test_explicit_repo_without_markers_errors_cleanly(self, tmp_path, capsys):
+    def test_explicit_repo_without_markers_errors_cleanly(
+        self, tmp_path, capsys, monkeypatch
+    ):
         bare = tmp_path / "not-a-project"
         bare.mkdir()
+        monkeypatch.setattr(cli, "_find_explicit_repo_root", lambda _path: None)
         argv = ["code-review-graph", "search", "x", "--repo", str(bare)]
         with patch.object(sys, "argv", argv):
             with patch.object(cli, "_run_graph_tool_command") as mock_run:

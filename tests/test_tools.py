@@ -1,6 +1,7 @@
 """Tests for MCP tool functions."""
 
 import os
+import subprocess
 import tempfile
 import time
 from pathlib import Path
@@ -169,7 +170,11 @@ class TestTools:
         store.commit()
         rebuild_fts_index(store)
 
-        monkeypatch.setattr(query_mod, "_get_store", lambda repo_root=None: (store, tmp_path))
+        monkeypatch.setattr(
+            query_mod,
+            "_get_store_for_read",
+            lambda repo_root=None: (store, tmp_path, tmp_db),
+        )
         result = semantic_search_nodes("login")
         assert result["status"] == "ok"
         assert result["search_mode"] == "fts"
@@ -244,7 +249,10 @@ class TestQueryGraphCallTargetFallbacks:
     def setup_method(self):
         self.tmp_dir = tempfile.mkdtemp()
         self.root = Path(self.tmp_dir).resolve()
-        (self.root / ".git").mkdir()
+        subprocess.run(
+            ["git", "init", "-q", str(self.root)],
+            check=True,
+        )
         (self.root / ".code-review-graph").mkdir()
 
         self.target_file = (self.root / "target.m").as_posix()
@@ -349,6 +357,11 @@ class TestQueryGraphCallTargetFallbacks:
             "  return item.id;\n"
             "}\n",
             encoding="utf-8",
+        )
+        subprocess.run(
+            ["git", "add", "types.ts", "use.ts", "alias.ts"],
+            cwd=self.root,
+            check=True,
         )
         with GraphStore(self.db_path) as store:
             build = full_build(self.root, store)
@@ -2493,7 +2506,9 @@ def test_impact_radius_tool_exposes_best_first_scores(monkeypatch, tmp_path):
     store.commit()
 
     monkeypatch.setattr(
-        query_module, "_get_store", lambda _repo_root: (store, tmp_path),
+        query_module,
+        "_get_store_for_read",
+        lambda _repo_root: (store, tmp_path, None),
     )
     monkeypatch.setattr(
         query_module,
@@ -2596,6 +2611,8 @@ class TestReviewTokenBudget:
             changed_files=rel_paths,
             repo_root=str(repo),
             include_source=True,
+            max_files=len(rel_paths),
+            max_lines_per_file=100,
             max_tokens=0,  # disabled
         )
         assert "omitted" not in result
@@ -2686,6 +2703,7 @@ class TestDetectChangesTokenBudget:
             changed_files=[abs_file],
             repo_root=str(repo),
             detail_level="standard",
+            max_results=100,
             max_tokens=0,
         )
         assert "omitted" not in result
@@ -2738,13 +2756,12 @@ class TestQueryGraphMaxResults:
         # Edges are also bounded.
         assert len(result["edges"]) <= 10
 
-    def test_no_cap_returns_all(self):
-        result = query_graph(
-            pattern="callers_of", target=self.hot_qn,
-            repo_root=str(self.root), max_results=0,
-        )
-        assert len(result["results"]) == 50
-        assert "truncated" not in result
+    def test_zero_cap_is_rejected(self):
+        with pytest.raises(ValueError, match="greater than or equal to 1"):
+            query_graph(
+                pattern="callers_of", target=self.hot_qn,
+                repo_root=str(self.root), max_results=0,
+            )
 
     def test_cap_above_total_is_noop(self):
         result = query_graph(

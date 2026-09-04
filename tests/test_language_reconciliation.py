@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -488,7 +489,6 @@ impl MemoryRepository {
         from code_review_graph.incremental import full_build, incremental_update
 
         monkeypatch.setenv("CRG_SERIAL_PARSE", "1")
-        (tmp_path / ".git").mkdir()
         (tmp_path / "Cargo.toml").write_text(
             '[package]\nname = "demo"\nversion = "0.1.0"\n',
             encoding="utf-8",
@@ -508,6 +508,8 @@ impl MemoryRepository {
             "pub fn build() { Repository::new(); }\n",
             encoding="utf-8",
         )
+        subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+        subprocess.run(["git", "add", "."], cwd=tmp_path, check=True)
         target = f"{db.resolve().as_posix()}::Repository.new"
         caller = f"{lib.resolve().as_posix()}::build"
 
@@ -636,7 +638,6 @@ class SecondService {
         from code_review_graph.incremental import full_build, incremental_update
 
         monkeypatch.setenv("CRG_SERIAL_PARSE", "1")
-        (tmp_path / ".git").mkdir()
         (tmp_path / "composer.json").write_text(
             '{"autoload":{"psr-4":{"App\\\\":"app/"}}}',
             encoding="utf-8",
@@ -654,6 +655,8 @@ class SecondService {
             "function register(): void { Mailer::send(); }\n"
         )
         caller.write_text(source, encoding="utf-8")
+        subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+        subprocess.run(["git", "add", "."], cwd=tmp_path, check=True)
         target = f"{mailer.resolve().as_posix()}::Mailer.send"
 
         store = GraphStore(":memory:")

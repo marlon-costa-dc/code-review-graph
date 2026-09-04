@@ -1254,7 +1254,12 @@ def cross_repo_search_tool(
         max_results: Maximum merged results across all repos; total reports
             the untruncated merged count. Default: 50.
     """
-    return _tool_impl("cross_repo_search_func")(query=query, kind=kind, limit=limit)
+    return _tool_impl("cross_repo_search_func")(
+        query=query,
+        kind=kind,
+        limit=limit,
+        max_results=max_results,
+    )
 
 
 @mcp.prompt()
