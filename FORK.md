@@ -5,7 +5,11 @@ This repository is the `dc-use` fork of
 kept current with upstream `main` and carrying deployment-driven deltas. The
 fork is distributed through the ai-hub host-tools pin (branch `dc-use`, exact
 SHA recorded in the host-tools manifest). Fork releases use PEP 440 local
-versions (`2.3.8+dc.2`, `2.4.0+dc1`).
+versions derived from the current upstream release: upstream is at `2.3.8`
+and the fork is at `2.3.8+dc.3`. The next fork release is `2.3.8+dc.4` while
+upstream stays at `2.3.8`; when upstream releases a new version, the fork
+rebases onto it and restarts the local suffix at `+dc.1`. Fork version
+numbers are never invented ahead of an upstream release.
 
 ## Why the fork exists
 
