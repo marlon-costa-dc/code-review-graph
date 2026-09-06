@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+## dc-use fork releases
+
+Fork deltas and release history are documented in [FORK.md](FORK.md). Fork
+releases carry PEP 440 local versions on top of the upstream entries below:
+
+- `2.4.0+dc1` — roll-up of the fork surface (lean MCP tools, doctor,
+  Beads integration, token-budgeted review output)
+- `2.3.8+dc.2` — deployment hardening batch (serve startup fix, atomic
+  indexing, VCS inventory, fallback removal, batched writes)
+
 ## [2.3.8] - 2026-08-21
 
 ### Added
