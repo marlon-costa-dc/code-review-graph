@@ -2555,6 +2555,14 @@ def watch(
     supervisor.schedule_initial(handler)
     handler.start()
     observer.start()
+    # Capture the observer threads before publishing readiness.  Otherwise a
+    # watched directory can disappear after the health file is visible but
+    # before the first tick records its emitter as live; that dead emitter is
+    # then indistinguishable from one still being constructed and is ignored.
+    initial_dead, _ = supervisor.check_liveness()
+    if initial_dead:
+        names = ", ".join(initial_dead)
+        raise RuntimeError(f"watch observer stopped during startup: {names}")
     supervisor.report_health(observer_alive=True, force=True)
 
     logger.info("Watching %s for changes... (Ctrl+C to stop)", repo_root)
