@@ -33,11 +33,11 @@ def test_main_handles_legacy_stdio_encoding(monkeypatch):
 
 
 def test_get_version_returns_distribution_metadata(monkeypatch):
-    monkeypatch.setattr(cli, "pkg_version", lambda _dist_name: "2.4.0+dc1")
+    monkeypatch.setattr(cli, "pkg_version", lambda _dist_name: "2.3.8+dc.4")
 
     version = cli._get_version()
 
-    assert version == "2.4.0+dc1"
+    assert version == "2.3.8+dc.4"
 
 
 def test_get_version_raises_when_metadata_missing(monkeypatch):
