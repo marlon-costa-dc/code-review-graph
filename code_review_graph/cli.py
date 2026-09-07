@@ -1752,13 +1752,13 @@ def main() -> None:
                     print(f"would prune {digest}")
                 print(f"dry-run: {len(removed)} bundle(s) eligible (use --apply to remove)")
         else:
-            entries = list_entries(store_root)
-            if not entries:
+            bundles = list_entries(store_root)
+            if not bundles:
                 print("vstore is empty.")
-            for entry in entries:
-                model = f"  model={entry.embedding_model}" if entry.embedding_model else ""
+            for bundle in bundles:
+                model = f"  model={bundle.embedding_model}" if bundle.embedding_model else ""
                 print(
-                    f"  {entry.tree_hash}  head={entry.head[:12]}  files={len(entry.files)}{model}"
+                    f"  {bundle.tree_hash}  head={bundle.head[:12]}  files={len(bundle.files)}{model}"
                 )
         return
 
@@ -1766,14 +1766,14 @@ def main() -> None:
         from .prune import prune
 
         config_path = Path(args.config).expanduser() if args.config else None
-        report = prune(config_path=config_path, apply=args.apply, data_dirs=args.data_dirs)
-        for path in report.removed_registry:
+        prune_report = prune(config_path=config_path, apply=args.apply, data_dirs=args.data_dirs)
+        for path in prune_report.removed_registry:
             print(f"registry: {path}")
-        for path in report.removed_watch:
+        for path in prune_report.removed_watch:
             print(f"watch:    {path}")
-        for path in report.orphan_data_dirs:
+        for path in prune_report.orphan_data_dirs:
             print(f"data dir: {path}")
-        print(report.summary())
+        print(prune_report.summary())
         return
 
     if args.command == "doctor":
