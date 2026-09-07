@@ -14,7 +14,7 @@ import os
 import shutil
 import subprocess
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 _SCHEMA_VERSION = 1
@@ -37,19 +37,24 @@ class VstoreReceipt:
     @classmethod
     def from_dict(cls, payload: dict[str, object]) -> VstoreReceipt:
         try:
-            files = payload["files"]
-            if not isinstance(files, dict) or not all(
-                isinstance(k, str) and isinstance(v, str) for k, v in files.items()
+            raw_files = payload["files"]
+            if not isinstance(raw_files, dict) or not all(
+                isinstance(k, str) and isinstance(v, str)
+                for k, v in raw_files.items()
             ):
                 raise TypeError("files must map str -> str")
+            schema_version = payload["schema_version"]
+            if not isinstance(schema_version, int):
+                raise TypeError("schema_version must be int")
+            embedding_model = payload.get("embedding_model")
             return cls(
-                schema_version=int(payload["schema_version"]),  # type: ignore[arg-type]
+                schema_version=schema_version,
                 tree_hash=str(payload["tree_hash"]),
                 head=str(payload["head"]),
                 repo_path=str(payload["repo_path"]),
-                embedding_model=payload.get("embedding_model") or None,  # type: ignore[arg-type]
+                embedding_model=str(embedding_model) if embedding_model else None,
                 created_at=str(payload["created_at"]),
-                files=files,
+                files=dict(raw_files),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise ValueError(f"invalid vstore receipt: {exc}") from exc
@@ -176,7 +181,7 @@ def put(
         head=_head(repo_root),
         repo_path=str(repo_root),
         embedding_model=embedding_model,
-        created_at=datetime.now(UTC).isoformat(),
+        created_at=datetime.now(timezone.utc).isoformat(),
         files=file_hashes,
     )
     entry = Path(store_root).resolve() / digest
@@ -269,7 +274,7 @@ def retain(
     root = Path(store_root).resolve()
     victims: list[str] = []
     if ttl_days is not None:
-        cutoff = datetime.now(UTC).timestamp() - ttl_days * 86400
+        cutoff = datetime.now(timezone.utc).timestamp() - ttl_days * 86400
         for receipt in entries:
             entry = root / receipt.tree_hash
             if entry.is_dir() and entry.stat().st_mtime < cutoff:
