@@ -2406,9 +2406,17 @@ def _create_watch_handler(
             directory = repo_root / relative_directory
             if not directory.is_dir() or directory.is_symlink():
                 return set()
+            try:
+                found = list(directory.rglob("*"))
+            except OSError:
+                # The directory vanished between is_dir() and the walk — a
+                # normal filesystem race.  Its deletion event reconciles the
+                # stored rows through _stored_descendants, so there is
+                # nothing new to index here.
+                return set()
             return {
                 str(path.relative_to(repo_root))
-                for path in directory.rglob("*")
+                for path in found
                 if self._parseable_file(str(path.relative_to(repo_root)))
                 and not _should_ignore(str(path.relative_to(repo_root)), ignore_patterns)
             }
