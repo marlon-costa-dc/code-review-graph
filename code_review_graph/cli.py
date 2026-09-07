@@ -1756,11 +1756,10 @@ def main() -> None:
             if not bundles:
                 print("vstore is empty.")
             for bundle in bundles:
-                model = (
-                    f"  model={bundle.embedding_model}" if bundle.embedding_model else ""
-                )
+                model = f"  model={bundle.embedding_model}" if bundle.embedding_model else ""
                 print(
-                    f"  {bundle.tree_hash}  head={bundle.head[:12]}  files={len(bundle.files)}{model}"
+                    f"  {bundle.tree_hash}  head={bundle.head[:12]}  "
+                    f"files={len(bundle.files)}{model}"
                 )
         return
 
