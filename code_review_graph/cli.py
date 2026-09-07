@@ -1366,6 +1366,43 @@ def main() -> None:
         help="Repository path or alias to remove",
     )
 
+    vstore_cmd = sub.add_parser(
+        "vstore",
+        help="Content-addressed index bundle store (keyed by repo tree hash)",
+    )
+    vstore_sub = vstore_cmd.add_subparsers(dest="vstore_command", required=True)
+    vstore_put = vstore_sub.add_parser(
+        "put", help="Store the current index data dir under the repo tree hash"
+    )
+    vstore_put.add_argument("--repo", default=None, help="Repository root (cwd default)")
+    vstore_put.add_argument(
+        "--data-dir",
+        default=None,
+        help="Index data dir (registry data_dir or .code-review-graph default)",
+    )
+    vstore_put.add_argument(
+        "--embedding-model",
+        default=None,
+        help="Embedding model recorded in the receipt",
+    )
+    vstore_put.add_argument(
+        "--store", default=None, help="Store root (default: $CRG_VSTORE/$CRG_HOME/home)"
+    )
+    vstore_get = vstore_sub.add_parser(
+        "get", help="Materialize a stored bundle into a data dir"
+    )
+    vstore_get.add_argument("tree_hash", help="Tree hash of the bundle")
+    vstore_get.add_argument("--dest", required=True, help="Destination data dir")
+    vstore_get.add_argument(
+        "--store", default=None, help="Store root (default: $CRG_VSTORE/$CRG_HOME/home)"
+    )
+    vstore_list = vstore_sub.add_parser(
+        "list", help="List stored bundles (tree hash, commit, model)"
+    )
+    vstore_list.add_argument(
+        "--store", default=None, help="Store root (default: $CRG_VSTORE/$CRG_HOME/home)"
+    )
+
     args = ap.parse_args()
 
     if args.version:
@@ -1590,12 +1627,63 @@ def main() -> None:
         _handle_init(args)
         return
 
+    if args.command == "vstore":
+        from .vstore import default_store_root, get, list_entries, put
+
+        store_root = (
+            Path(args.store).expanduser().resolve()
+            if args.store
+            else default_store_root()
+        )
+        if args.vstore_command == "put":
+            from .registry import Registry
+
+            repo_root = Path(args.repo).resolve() if args.repo else Path.cwd()
+            if args.data_dir:
+                data_dir = Path(args.data_dir).expanduser().resolve()
+            else:
+                registered = Registry().get_data_dir_for_repo(str(repo_root))
+                data_dir = (
+                    Path(registered).expanduser().resolve()
+                    if registered
+                    else repo_root / ".code-review-graph"
+                )
+            receipt = put(
+                store_root,
+                repo_root,
+                data_dir,
+                embedding_model=args.embedding_model,
+            )
+            print(
+                f"stored {receipt.tree_hash} ({len(receipt.files)} files) from {data_dir}"
+            )
+        elif args.vstore_command == "get":
+            receipt = get(store_root, args.tree_hash, Path(args.dest).expanduser())
+            print(
+                f"restored {receipt.tree_hash} -> "
+                f"{Path(args.dest).expanduser()} ({len(receipt.files)} files)"
+            )
+        else:
+            entries = list_entries(store_root)
+            if not entries:
+                print("vstore is empty.")
+            for entry in entries:
+                model = (
+                    f"  model={entry.embedding_model}" if entry.embedding_model else ""
+                )
+                print(
+                    f"  {entry.tree_hash}  head={entry.head[:12]}"
+                    f"  files={len(entry.files)}{model}"
+                )
+        return
+
     if args.command == "doctor":
         _handle_doctor(args)
         return
 
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+
     if args.command in ("register", "unregister", "repos"):
-        logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
         from .registry import Registry
 
         registry = Registry()
