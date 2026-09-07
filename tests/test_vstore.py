@@ -119,3 +119,35 @@ def test_receipt_carries_commit_and_model_metadata(repo: Path, tmp_path: Path) -
     assert raw["schema_version"] == 1
     assert raw["head"] == _git(repo, "rev-parse", "HEAD")
     assert raw["files"]["graph.db"]
+
+
+def test_seed_helper_restores_bundle_and_reports_miss(
+    repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from code_review_graph.cli import _seed_build_from_vstore
+
+    store = tmp_path / "store"
+    put(store, repo, _make_data_dir(tmp_path), embedding_model="local/minilm")
+
+    target = tmp_path / "crg-data"
+    monkeypatch.setenv("CRG_DATA_DIR", str(target))
+
+    assert _seed_build_from_vstore(store, repo, quiet=False) is True
+    assert (target / "graph.db").read_bytes() == b"graph-bytes"
+    assert (target / "embeddings" / "vectors.npz").read_bytes() == b"embedding-bytes"
+
+    assert _seed_build_from_vstore(tmp_path / "empty-store", repo, quiet=True) is False
+
+
+def test_seed_helper_fails_loud_on_tampered_bundle(
+    repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from code_review_graph.cli import _seed_build_from_vstore
+
+    store = tmp_path / "store"
+    put(store, repo, _make_data_dir(tmp_path))
+    digest = tree_hash(repo)
+    (store / digest / "bundle" / "graph.db").write_bytes(b"tampered")
+    monkeypatch.setenv("CRG_DATA_DIR", str(tmp_path / "target"))
+    with pytest.raises(ValueError, match="tampered"):
+        _seed_build_from_vstore(store, repo, quiet=True)

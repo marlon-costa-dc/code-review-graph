@@ -91,9 +91,8 @@ def tree_hash(repo_root: Path) -> str:
         check=False,
     )
     if toplevel.returncode != 0 or not toplevel.stdout.strip():
-        raise RuntimeError(
-            f"tree hash unavailable for {repo_root}: {toplevel.stderr.strip() or 'not a git repository'}"
-        )
+        reason = toplevel.stderr.strip() or "not a git repository"
+        raise RuntimeError(f"tree hash unavailable for {repo_root}: {reason}")
     actual_root = Path(toplevel.stdout.strip()).resolve()
     if actual_root != repo_root:
         raise RuntimeError(
