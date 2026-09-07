@@ -10,7 +10,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
-import tomllib
+try:
+    import tomllib
+except ImportError:  # Python < 3.11
+    import tomli as tomllib
 
 from .daemon import (
     DaemonConfig,
