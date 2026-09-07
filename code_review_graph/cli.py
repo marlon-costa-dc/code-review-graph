@@ -1465,6 +1465,22 @@ def main() -> None:
     )
     prune_cmd.add_argument("--config", default=None, help="Alternate watch.toml path")
 
+    vstore_prune = vstore_sub.add_parser(
+        "prune", help="Apply LRU/TTL retention to the store (report unless --apply)"
+    )
+    vstore_prune.add_argument(
+        "--store", default=None, help="Store root (default: $CRG_VSTORE/$CRG_HOME/home)"
+    )
+    vstore_prune.add_argument(
+        "--max-entries", type=int, default=None, help="Keep the newest N bundles"
+    )
+    vstore_prune.add_argument(
+        "--ttl-days", type=float, default=None, help="Drop bundles older than N days"
+    )
+    vstore_prune.add_argument(
+        "--apply", action="store_true", help="Perform the removals (default: report)"
+    )
+
     args = ap.parse_args()
 
     if args.version:
@@ -1692,7 +1708,7 @@ def main() -> None:
         return
 
     if args.command == "vstore":
-        from .vstore import default_store_root, get, list_entries, put
+        from .vstore import default_store_root, get, list_entries, put, retain
 
         store_root = Path(args.store).expanduser().resolve() if args.store else default_store_root()
         if args.vstore_command == "put":
@@ -1721,6 +1737,20 @@ def main() -> None:
                 f"restored {receipt.tree_hash} -> "
                 f"{Path(args.dest).expanduser()} ({len(receipt.files)} files)"
             )
+        elif args.vstore_command == "prune":
+            removed = retain(
+                store_root,
+                max_entries=args.max_entries,
+                ttl_days=args.ttl_days,
+            )
+            if args.apply:
+                for digest in removed:
+                    print(f"pruned {digest}")
+                print(f"pruned {len(removed)} bundle(s)")
+            else:
+                for digest in removed:
+                    print(f"would prune {digest}")
+                print(f"dry-run: {len(removed)} bundle(s) eligible (use --apply to remove)")
         else:
             entries = list_entries(store_root)
             if not entries:

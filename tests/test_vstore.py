@@ -151,3 +151,55 @@ def test_seed_helper_fails_loud_on_tampered_bundle(
     monkeypatch.setenv("CRG_DATA_DIR", str(tmp_path / "target"))
     with pytest.raises(ValueError, match="tampered"):
         _seed_build_from_vstore(store, repo, quiet=True)
+
+
+def test_retain_max_entries_keeps_newest(repo: Path, tmp_path: Path) -> None:
+    import os
+    import time
+
+    from code_review_graph.vstore import retain
+
+    store = tmp_path / "store"
+    digests = []
+    for i in range(3):
+        (repo / "src.py").write_text(f"x = {i}\n", encoding="utf-8")
+        _git(repo, "add", "-A")
+        _git(repo, "commit", "-q", "-m", f"c{i}")
+        data = tmp_path / f"data{i}"
+        data.mkdir()
+        (data / "graph.db").write_bytes(f"db{i}".encode())
+        digests.append(put(store, repo, data).tree_hash)
+        os.utime(store / digests[-1], (time.time() + i * 100,) * 2)
+
+    removed = retain(store, max_entries=2)
+
+    assert removed == [digests[0]]
+    assert [r.tree_hash for r in list_entries(store)] == digests[1:]
+
+
+def test_retain_ttl_drops_old_entries(
+    repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import os
+    import time
+
+    from code_review_graph.vstore import retain
+
+    store = tmp_path / "store"
+    data = _make_data_dir(tmp_path)
+    old = put(store, repo, data)
+    entry = store / old.tree_hash
+    week_ago = time.time() - 8 * 86400
+    os.utime(entry, (week_ago, week_ago))
+
+    removed = retain(store, ttl_days=7)
+
+    assert removed == [old.tree_hash]
+    assert list_entries(store) == []
+
+
+def test_retain_requires_a_policy(repo: Path, tmp_path: Path) -> None:
+    from code_review_graph.vstore import retain
+
+    with pytest.raises(ValueError, match="requires max_entries"):
+        retain(tmp_path / "store")

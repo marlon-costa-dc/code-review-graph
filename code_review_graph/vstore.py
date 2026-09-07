@@ -247,3 +247,37 @@ def list_entries(store_root: Path) -> list[VstoreReceipt]:
                 VstoreReceipt.from_dict(json.loads(receipt_path.read_text(encoding="utf-8")))
             )
     return receipts
+
+
+def retain(
+    store_root: Path,
+    *,
+    max_entries: int | None = None,
+    ttl_days: float | None = None,
+) -> list[str]:
+    """Apply LRU/TTL retention; return removed tree hashes (oldest first).
+
+    Entries are ordered oldest-first by bundle mtime. ``max_entries`` keeps
+    the newest N; ``ttl_days`` drops entries older than the window. Both may
+    combine; at least one must be set.
+    """
+    if max_entries is None and ttl_days is None:
+        raise ValueError("retention requires max_entries and/or ttl_days")
+    entries = list_entries(store_root)
+    if not entries:
+        return []
+    root = Path(store_root).resolve()
+    victims: list[str] = []
+    if ttl_days is not None:
+        cutoff = datetime.now(UTC).timestamp() - ttl_days * 86400
+        for receipt in entries:
+            entry = root / receipt.tree_hash
+            if entry.is_dir() and entry.stat().st_mtime < cutoff:
+                victims.append(receipt.tree_hash)
+    if max_entries is not None:
+        survivors = [r.tree_hash for r in entries if r.tree_hash not in victims]
+        excess = survivors[:-max_entries] if max_entries > 0 else survivors
+        victims.extend(t for t in excess if t not in victims)
+    for digest in victims:
+        shutil.rmtree(root / digest)
+    return victims
