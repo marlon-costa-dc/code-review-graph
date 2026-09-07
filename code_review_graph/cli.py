@@ -1449,6 +1449,22 @@ def main() -> None:
         "--store", default=None, help="Store root (default: $CRG_VSTORE/$CRG_HOME/home)"
     )
 
+    prune_cmd = sub.add_parser(
+        "prune",
+        help="Remove dead registry/watch entries and report orphaned data dirs",
+    )
+    prune_cmd.add_argument(
+        "--apply",
+        action="store_true",
+        help="Perform the removals (default: report only)",
+    )
+    prune_cmd.add_argument(
+        "--data-dirs",
+        action="store_true",
+        help="With --apply, also delete orphaned external data dirs",
+    )
+    prune_cmd.add_argument("--config", default=None, help="Alternate watch.toml path")
+
     args = ap.parse_args()
 
     if args.version:
@@ -1714,6 +1730,20 @@ def main() -> None:
                 print(
                     f"  {entry.tree_hash}  head={entry.head[:12]}  files={len(entry.files)}{model}"
                 )
+        return
+
+    if args.command == "prune":
+        from .prune import prune
+
+        config_path = Path(args.config).expanduser() if args.config else None
+        report = prune(config_path=config_path, apply=args.apply, data_dirs=args.data_dirs)
+        for path in report.removed_registry:
+            print(f"registry: {path}")
+        for path in report.removed_watch:
+            print(f"watch:    {path}")
+        for path in report.orphan_data_dirs:
+            print(f"data dir: {path}")
+        print(report.summary())
         return
 
     if args.command == "doctor":
