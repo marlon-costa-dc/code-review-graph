@@ -77,8 +77,29 @@ def default_store_root() -> Path:
 
 
 def tree_hash(repo_root: Path) -> str:
-    """Return the committed tree hash of ``repo_root``; fail loud when absent."""
+    """Return the committed tree hash of ``repo_root``; fail loud when absent.
+
+    Verifies that ``repo_root`` is itself a git repository root (not merely a
+    subdirectory of one) to prevent ``git rev-parse`` from traversing upward
+    and silently returning a parent repository's tree hash.
+    """
     repo_root = Path(repo_root).resolve()
+    toplevel = subprocess.run(
+        ["git", "-C", str(repo_root), "rev-parse", "--show-toplevel"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if toplevel.returncode != 0 or not toplevel.stdout.strip():
+        raise RuntimeError(
+            f"tree hash unavailable for {repo_root}: {toplevel.stderr.strip() or 'not a git repository'}"
+        )
+    actual_root = Path(toplevel.stdout.strip()).resolve()
+    if actual_root != repo_root:
+        raise RuntimeError(
+            f"tree hash unavailable for {repo_root}: "
+            f"not a repository root (git toplevel is {actual_root})"
+        )
     result = subprocess.run(
         ["git", "-C", str(repo_root), "rev-parse", "HEAD^{tree}"],
         capture_output=True,
