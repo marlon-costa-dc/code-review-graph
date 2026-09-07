@@ -129,3 +129,47 @@ def test_prune_apply_with_data_dirs_removes_orphans(
 
     assert not orphan_dir.exists()
     assert report.removed_registry == [str(dead)]
+
+
+def test_watch_config_round_trips_per_repo_options(home: Path, tmp_path: Path) -> None:
+    from code_review_graph.daemon import (
+        DaemonConfig,
+        WatchRepo,
+        default_config_path,
+        save_config,
+        watcher_env,
+    )
+
+    live = tmp_path / "repo"
+    live.mkdir()
+    (live / ".git").mkdir()
+
+    config = DaemonConfig(
+        repos=[
+            WatchRepo(path=str(live), alias="plain"),
+            WatchRepo(
+                path=str(live),
+                alias="tuned",
+                data_dir="/tmp/ext-data",
+                recurse_submodules=True,
+                embedding="local/minilm",
+            ),
+        ]
+    )
+    save_config(config, default_config_path())
+    loaded = load_config(default_config_path())
+
+    assert [r.alias for r in loaded.repos] == ["plain", "tuned"]
+    tuned = loaded.repos[1]
+    assert tuned.data_dir == "/tmp/ext-data"
+    assert tuned.recurse_submodules is True
+    assert tuned.embedding == "local/minilm"
+    assert loaded.repos[0].data_dir == ""
+
+    env = watcher_env(tuned)
+    assert env["CRG_DATA_DIR"] == "/tmp/ext-data"
+    assert env["CRG_RECURSE_SUBMODULES"] == "1"
+    assert env["CRG_EMBEDDING_MODEL"] == "local/minilm"
+    plain_env = watcher_env(loaded.repos[0])
+    assert "CRG_DATA_DIR" not in plain_env
+    assert "CRG_RECURSE_SUBMODULES" not in plain_env
