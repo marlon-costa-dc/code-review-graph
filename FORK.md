@@ -54,6 +54,7 @@ this list at the next sync.
 | Embeddings | `CRG_EMBEDDING_MODEL` selects the local model; cloud providers require explicit acceptance env |
 | Serving | `CRG_TOOLS=lean`, `CRG_DETAIL_LEVEL`, `CRG_TOOL_TIMEOUT` bound the MCP surface |
 | Watch daemon | `crg-daemon` start/stop/status with health records, restart backoff, hot config reload |
+| Index reuse store | `vstore put/get/list`: index bundles content-addressed by the repo tree hash (`git rev-parse HEAD^{tree}`, gitlinks included) with sha256 receipts and reflink copies (`cp --reflink=auto`, byte-copy fallback); store root is `$CRG_VSTORE`, `$CRG_HOME/vstore`, or `~/.code-review-graph/vstore` |
 
 Known gaps scheduled under the autopilot epic (ai-hub beads `aihub-3t7yh.3`):
 per-repo daemon options in `watch.toml` (only `path`/`alias` today), no

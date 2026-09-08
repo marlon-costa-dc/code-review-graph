@@ -81,6 +81,7 @@ def _make_executor(max_workers: int):
         mp_context=multiprocessing.get_context("spawn"),
     )
 
+
 logger = logging.getLogger(__name__)
 
 CPP_IDENTITY_VERSION = "1"
@@ -91,6 +92,7 @@ def _run_python_resolver(store: GraphStore) -> Optional[dict]:
     """Run repository-wide Python import resolution without failing a build."""
     try:
         from .python_resolver import resolve_python_imports
+
         return resolve_python_imports(store)
     except Exception as exc:  # noqa: BLE001 - best-effort post-pass
         logger.warning("Python import resolver failed: %s", exc)
@@ -107,6 +109,7 @@ def _run_rescript_resolver(store: GraphStore) -> Optional[dict]:
     """
     try:
         from .rescript_resolver import resolve_rescript_cross_module
+
         return resolve_rescript_cross_module(store)
     except sqlite3.Error as exc:
         logger.warning("ReScript cross-module resolver failed: %s", exc)
@@ -123,6 +126,7 @@ def _run_spring_resolver(store: GraphStore) -> Optional[dict]:
     """
     try:
         from .spring_resolver import resolve_spring_di_calls
+
         return resolve_spring_di_calls(store)
     except sqlite3.Error as exc:
         logger.warning("Spring DI resolver failed: %s", exc)
@@ -133,6 +137,7 @@ def _run_spring_event_resolver(store: GraphStore) -> Optional[dict]:
     """Run the Spring application-event resolver without failing a build."""
     try:
         from .event_resolver import resolve_spring_events
+
         return resolve_spring_events(store)
     except Exception as exc:  # noqa: BLE001
         logger.warning("Spring event resolver failed: %s", exc)
@@ -149,6 +154,7 @@ def _run_temporal_resolver(store: GraphStore) -> Optional[dict]:
     """
     try:
         from .temporal_resolver import resolve_temporal_calls
+
         return resolve_temporal_calls(store)
     except sqlite3.Error as exc:
         logger.warning("Temporal resolver failed: %s", exc)
@@ -159,6 +165,7 @@ def _run_hcl_resolver(store: GraphStore) -> Optional[dict]:
     """Run Terraform module-scope resolution without failing a build."""
     try:
         from .hcl_resolver import resolve_hcl_module_references
+
         return resolve_hcl_module_references(store)
     except Exception as exc:  # noqa: BLE001 - best-effort post-pass
         logger.warning("Terraform/HCL resolver failed: %s", exc)
@@ -169,6 +176,7 @@ def _run_scoped_resolver(store: GraphStore) -> Optional[dict]:
     """Resolve static/scoped ``Class::method`` calls without failing a build."""
     try:
         from .scoped_resolver import resolve_scoped_calls
+
         return resolve_scoped_calls(store)
     except Exception as exc:  # noqa: BLE001 - best-effort post-pass
         logger.warning("Scoped call resolver failed: %s", exc)
@@ -188,6 +196,7 @@ def _run_jedi_resolver(store: GraphStore, repo_root: Path) -> Optional[dict]:
     """
     try:
         from .jedi_resolver import enrich_jedi_calls
+
         return enrich_jedi_calls(store, repo_root)
     except sqlite3.Error as exc:
         logger.warning("Jedi Python resolver failed: %s", exc)
@@ -211,6 +220,7 @@ def _run_bare_target_resolver(store: GraphStore) -> Optional[int]:
     except sqlite3.Error as exc:
         logger.warning("Bare-target resolver failed: %s", exc)
         return None
+
 
 # Default ignore patterns (in addition to .gitignore).
 #
@@ -298,18 +308,22 @@ DEFAULT_IGNORE_PATTERNS = [
 # everyone whose nested ``build/`` or ``dist/`` holds real sources.  See: #811.
 NESTED_OUTPUT_DIR_MARKERS: dict[str, frozenset[str]] = {
     "target": frozenset({"pom.xml", "Cargo.toml", "build.sbt"}),
-    "build": frozenset({
-        "build.gradle",
-        "build.gradle.kts",
-        "settings.gradle",
-        "settings.gradle.kts",
-    }),
-    ".next": frozenset({
-        "next.config.js",
-        "next.config.mjs",
-        "next.config.cjs",
-        "next.config.ts",
-    }),
+    "build": frozenset(
+        {
+            "build.gradle",
+            "build.gradle.kts",
+            "settings.gradle",
+            "settings.gradle.kts",
+        }
+    ),
+    ".next": frozenset(
+        {
+            "next.config.js",
+            "next.config.mjs",
+            "next.config.cjs",
+            "next.config.ts",
+        }
+    ),
     ".nuxt": frozenset({"nuxt.config.js", "nuxt.config.mjs", "nuxt.config.ts"}),
 }
 
@@ -717,9 +731,7 @@ def _nested_output_ignore_patterns(
     patterns = _scan_nested_output_dirs(repo_root, base_patterns)
     if keep:
         spared = {entry.replace("\\", "/").strip("/") for entry in keep}
-        patterns = [
-            pattern for pattern in patterns if pattern[1:-3] not in spared
-        ]
+        patterns = [pattern for pattern in patterns if pattern[1:-3] not in spared]
     if patterns:
         logger.info(
             "Excluding %d nested build-output director%s (a sibling manifest marks "
@@ -766,7 +778,9 @@ def _git_branch_info(repo_root: Path) -> tuple[str, str]:
         result = subprocess.run(
             ["git", "rev-parse", "--abbrev-ref", "HEAD"],
             capture_output=True,
-            text=True, encoding='utf-8', errors='replace',
+            text=True,
+            encoding="utf-8",
+            errors="replace",
             cwd=str(repo_root),
             timeout=_GIT_TIMEOUT,
             stdin=subprocess.DEVNULL,
@@ -779,7 +793,9 @@ def _git_branch_info(repo_root: Path) -> tuple[str, str]:
         result = subprocess.run(
             ["git", "rev-parse", "HEAD"],
             capture_output=True,
-            text=True, encoding='utf-8', errors='replace',
+            text=True,
+            encoding="utf-8",
+            errors="replace",
             cwd=str(repo_root),
             timeout=_GIT_TIMEOUT,
             stdin=subprocess.DEVNULL,
@@ -798,8 +814,12 @@ def _svn_revision_info(repo_root: Path) -> tuple[str, str]:
     try:
         result = subprocess.run(
             ["svn", "info", "--non-interactive"],
-            capture_output=True, text=True, encoding="utf-8", errors="replace",
-            cwd=str(repo_root), timeout=_GIT_TIMEOUT,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            cwd=str(repo_root),
+            timeout=_GIT_TIMEOUT,
             stdin=subprocess.DEVNULL,
         )
         if result.returncode == 0:
@@ -956,6 +976,7 @@ def get_changed_files(repo_root: Path, base: str = "HEAD~1") -> list[str]:
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return []
 
+
 def _get_svn_changed_files(repo_root: Path, rev_range: str | None = None) -> list[str]:
     """Return changed files in an SVN working copy.
 
@@ -967,13 +988,20 @@ def _get_svn_changed_files(repo_root: Path, rev_range: str | None = None) -> lis
         if rev_range:
             result = subprocess.run(
                 ["svn", "diff", "--summarize", "--non-interactive", "-r", rev_range],
-                capture_output=True, text=True, encoding="utf-8", errors="replace",
-                cwd=str(repo_root), timeout=_GIT_TIMEOUT,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                cwd=str(repo_root),
+                timeout=_GIT_TIMEOUT,
                 stdin=subprocess.DEVNULL,
             )
             if result.returncode != 0:
-                logger.warning("svn diff --summarize failed (rc=%d): %s",
-                               result.returncode, result.stderr[:200])
+                logger.warning(
+                    "svn diff --summarize failed (rc=%d): %s",
+                    result.returncode,
+                    result.stderr[:200],
+                )
                 return []
             files = []
             for line in result.stdout.splitlines():
@@ -984,8 +1012,12 @@ def _get_svn_changed_files(repo_root: Path, rev_range: str | None = None) -> lis
         else:
             result = subprocess.run(
                 ["svn", "status", "--non-interactive"],
-                capture_output=True, text=True, encoding="utf-8", errors="replace",
-                cwd=str(repo_root), timeout=_GIT_TIMEOUT,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                cwd=str(repo_root),
+                timeout=_GIT_TIMEOUT,
                 stdin=subprocess.DEVNULL,
             )
             files = []
@@ -1001,6 +1033,7 @@ def _get_svn_changed_files(repo_root: Path, rev_range: str | None = None) -> lis
             return files
     except (FileNotFoundError, subprocess.TimeoutExpired, UnicodeDecodeError):
         return []
+
 
 def get_staged_and_unstaged(repo_root: Path) -> list[str]:
     """Get all modified files (staged + unstaged + untracked)."""
@@ -1040,6 +1073,7 @@ def get_staged_and_unstaged(repo_root: Path) -> list[str]:
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return []
 
+
 def get_all_tracked_files(
     repo_root: Path,
     recurse_submodules: bool | None = None,
@@ -1067,7 +1101,9 @@ def get_all_tracked_files(
     result = subprocess.run(
         cmd,
         capture_output=True,
-        text=True, encoding='utf-8', errors='replace',
+        text=True,
+        encoding="utf-8",
+        errors="replace",
         cwd=str(repo_root),
         timeout=_GIT_TIMEOUT,
         stdin=subprocess.DEVNULL,
@@ -1078,6 +1114,7 @@ def get_all_tracked_files(
         )
     return [f.strip() for f in result.stdout.splitlines() if f.strip()]
 
+
 def _get_svn_all_tracked_files(repo_root: Path) -> list[str]:
     """Return SVN-versioned files by walking the working copy.
 
@@ -1086,8 +1123,12 @@ def _get_svn_all_tracked_files(repo_root: Path) -> list[str]:
     cmd = ["svn", "list", "--recursive", "--non-interactive"]
     result = subprocess.run(
         cmd,
-        capture_output=True, text=True, encoding="utf-8", errors="replace",
-        cwd=str(repo_root), timeout=60,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        cwd=str(repo_root),
+        timeout=60,
         stdin=subprocess.DEVNULL,
     )
     if result.returncode != 0:
@@ -1095,9 +1136,7 @@ def _get_svn_all_tracked_files(repo_root: Path) -> list[str]:
             result.returncode, cmd, output=result.stdout, stderr=result.stderr
         )
     return [
-        f.strip()
-        for f in result.stdout.splitlines()
-        if f.strip() and not f.strip().endswith("/")
+        f.strip() for f in result.stdout.splitlines() if f.strip() and not f.strip().endswith("/")
     ]
 
 
@@ -1182,9 +1221,7 @@ def _reconcile_stale_files(
     """Remove graph files absent from the current parseable repository inventory."""
     stored_files = set(store.get_all_files())
     if current_files is not None:
-        current_paths = {
-            normalize_file_path(repo_root / file_path) for file_path in current_files
-        }
+        current_paths = {normalize_file_path(repo_root / file_path) for file_path in current_files}
     else:
         ignore_patterns = _load_ignore_patterns(repo_root)
         parser = CodeParser(repo_root)
@@ -1318,17 +1355,25 @@ def find_dependents(
 
 def _parse_single_file(
     args: tuple[str, str],
-) -> tuple[str, list, list, str | None, str]:
+) -> tuple[str, list, list, str | None, str, bool]:
     """Parse one file in a process- or thread-pool worker.
 
-    Returns ``(rel_path, nodes, edges, error_or_none, file_hash)``.
-    Must be a module-level function so ``ProcessPoolExecutor`` can
-    serialise it across processes.
+    Returns ``(rel_path, nodes, edges, error_or_none, file_hash, missing)``.
+    ``missing`` marks a path that vanished before it could be read — the
+    caller reconciles it as a deletion.  Must be a module-level function so
+    ``ProcessPoolExecutor`` can serialise it across processes.
     """
     rel_path, repo_root_str = args
     abs_path = Path(repo_root_str) / rel_path
     try:
         raw = abs_path.read_bytes()
+    except FileNotFoundError:
+        # The path vanished between the listing and the worker: an
+        # event-sourced index reconciles that as a deletion, not a failure.
+        return (rel_path, [], [], None, "", True)
+    except Exception as e:
+        return (rel_path, [], [], str(e), "", False)
+    try:
         fhash = hashlib.sha256(raw).hexdigest()
         parser = getattr(_PARSE_WORKER_STATE, "parser", None)
         parser_repo_root = getattr(_PARSE_WORKER_STATE, "repo_root", None)
@@ -1337,9 +1382,9 @@ def _parse_single_file(
             _PARSE_WORKER_STATE.parser = parser
             _PARSE_WORKER_STATE.repo_root = repo_root_str
         nodes, edges = parser.parse_bytes(abs_path, raw)
-        return (rel_path, nodes, edges, None, fhash)
+        return (rel_path, nodes, edges, None, fhash, False)
     except Exception as e:
-        return (rel_path, [], [], str(e), "")
+        return (rel_path, [], [], str(e), "", False)
 
 
 def _canonical_repo_root(repo_root: Path) -> Path:
@@ -1416,10 +1461,19 @@ def full_build(
         # CRG_PARSE_EXECUTOR env.
         args_list = [(rel_path, str(repo_root)) for rel_path in files]
         with _make_executor(_MAX_PARSE_WORKERS) as executor:
-            for i, (rel_path, nodes, edges, error, fhash) in enumerate(
+            for i, (
+                rel_path,
+                nodes,
+                edges,
+                error,
+                fhash,
+                missing,
+            ) in enumerate(
                 executor.map(_parse_single_file, args_list, chunksize=20),
                 1,
             ):
+                if missing:
+                    continue
                 if error:
                     logger.warning("Error parsing %s: %s", rel_path, error)
                     errors.append({"file": rel_path, "error": error})
@@ -1435,8 +1489,7 @@ def full_build(
     if errors:
         first = errors[0]
         raise RuntimeError(
-            f"parsing failed for {len(errors)} file(s); first: "
-            f"{first['file']}: {first['error']}"
+            f"parsing failed for {len(errors)} file(s); first: {first['file']}: {first['error']}"
         )
 
     store.apply_file_changes_atomic(parsed_batch, sorted(stale_files))
@@ -1491,10 +1544,9 @@ def incremental_update(
     parser = CodeParser(repo_root)
     ignore_patterns = _load_ignore_patterns(repo_root)
 
-    if (
-        store.get_metadata(_CPP_IDENTITY_METADATA_KEY) != CPP_IDENTITY_VERSION
-        and store.has_nodes_for_language("cpp")
-    ):
+    if store.get_metadata(
+        _CPP_IDENTITY_METADATA_KEY
+    ) != CPP_IDENTITY_VERSION and store.has_nodes_for_language("cpp"):
         logger.info(
             "C++ identity format changed; rebuilding the graph before incremental update",
         )
@@ -1518,11 +1570,7 @@ def incremental_update(
     # Determine changed files
     if changed_files is None:
         changed_files = get_changed_files(repo_root, base)
-    stale_files = (
-        _reconcile_stale_files(repo_root, store, remove=False)
-        if reconcile_stale
-        else []
-    )
+    stale_files = _reconcile_stale_files(repo_root, store, remove=False) if reconcile_stale else []
 
     if not changed_files and not stale_files:
         return {
@@ -1589,6 +1637,14 @@ def incremental_update(
             abs_path = repo_root / rel_path
             try:
                 source = abs_path.read_bytes()
+            except FileNotFoundError:
+                # Vanished between listing and parse: reconcile as deletion.
+                missing_paths.add(normalize_file_path(abs_path))
+                continue
+            except (OSError, PermissionError) as e:
+                errors.append({"file": rel_path, "error": str(e)})
+                continue
+            try:
                 fhash = hashlib.sha256(source).hexdigest()
                 nodes, edges = parser.parse_bytes(abs_path, source)
                 parsed_batch.append((str(abs_path), nodes, edges, fhash))
@@ -1604,11 +1660,14 @@ def incremental_update(
         # See full-build comment above for executor kind rationale.
         args_list = [(rel_path, str(repo_root)) for rel_path in to_parse]
         with _make_executor(_MAX_PARSE_WORKERS) as executor:
-            for rel_path, nodes, edges, error, fhash in executor.map(
+            for rel_path, nodes, edges, error, fhash, missing in executor.map(
                 _parse_single_file,
                 args_list,
                 chunksize=20,
             ):
+                if missing:
+                    missing_paths.add(normalize_file_path(repo_root / rel_path))
+                    continue
                 if error:
                     logger.warning("Error parsing %s: %s", rel_path, error)
                     errors.append({"file": rel_path, "error": error})
@@ -1620,8 +1679,7 @@ def incremental_update(
     if errors:
         first = errors[0]
         raise RuntimeError(
-            f"parsing failed for {len(errors)} file(s); first: "
-            f"{first['file']}: {first['error']}"
+            f"parsing failed for {len(errors)} file(s); first: {first['file']}: {first['error']}"
         )
 
     removed_files = store.apply_file_changes_atomic(
@@ -1638,29 +1696,21 @@ def incremental_update(
 
     # Only re-run language-specific resolvers when the relevant files changed.
     python_changed = any(
-        path.endswith(".py")
-        for path in set(all_files) | set(stale_files) | missing_paths
+        path.endswith(".py") for path in set(all_files) | set(stale_files) | missing_paths
     )
     python_stats = _run_python_resolver(store) if python_changed else None
 
-    rescript_changed = any(
-        rp.endswith((".res", ".resi")) for rp in all_files
-    )
-    rescript_stats = (
-        _run_rescript_resolver(store) if rescript_changed else None
-    )
+    rescript_changed = any(rp.endswith((".res", ".resi")) for rp in all_files)
+    rescript_stats = _run_rescript_resolver(store) if rescript_changed else None
 
     # Like python_changed above, include stale/missing paths so a deletion
     # that only surfaces through reconciliation still clears derived state
     # (e.g. virtual Spring Event nodes — issue #474).
     spring_changed = any(
-        path.endswith(".java")
-        for path in set(all_files) | set(stale_files) | missing_paths
+        path.endswith(".java") for path in set(all_files) | set(stale_files) | missing_paths
     )
     spring_stats = _run_spring_resolver(store) if spring_changed else None
-    spring_event_stats = (
-        _run_spring_event_resolver(store) if spring_changed else None
-    )
+    spring_event_stats = _run_spring_event_resolver(store) if spring_changed else None
     temporal_stats = _run_temporal_resolver(store) if spring_changed else None
     hcl_changed = any(rp.endswith((".tf", ".hcl")) for rp in all_files)
     hcl_stats = _run_hcl_resolver(store) if hcl_changed else None
@@ -1705,8 +1755,7 @@ def _raise_watch_update_errors(result: dict, context: str) -> None:
     if not errors:
         return
     details = "; ".join(
-        f"{error.get('file', 'unknown')}: {error.get('error', 'unknown error')}"
-        for error in errors
+        f"{error.get('file', 'unknown')}: {error.get('error', 'unknown error')}" for error in errors
     )
     raise RuntimeError(f"{context} reported errors: {details}")
 
@@ -2012,9 +2061,7 @@ class _WatchSupervisor:
         adopted: list[str] = []
         vanished: list[str] = []
         for parent in sorted(self._shallow):
-            present = {
-                name for name, is_dir in _child_directories(Path(parent)) if is_dir
-            }
+            present = {name for name, is_dir in _child_directories(Path(parent)) if is_dir}
             for child in sorted(self._children_of(parent)):
                 if os.path.basename(child) not in present:
                     self._release_directory(child)
@@ -2359,9 +2406,17 @@ def _create_watch_handler(
             directory = repo_root / relative_directory
             if not directory.is_dir() or directory.is_symlink():
                 return set()
+            try:
+                found = list(directory.rglob("*"))
+            except OSError:
+                # The directory vanished between is_dir() and the walk — a
+                # normal filesystem race.  Its deletion event reconciles the
+                # stored rows through _stored_descendants, so there is
+                # nothing new to index here.
+                return set()
             return {
                 str(path.relative_to(repo_root))
-                for path in directory.rglob("*")
+                for path in found
                 if self._parseable_file(str(path.relative_to(repo_root)))
                 and not _should_ignore(str(path.relative_to(repo_root)), ignore_patterns)
             }
@@ -2371,9 +2426,7 @@ def _create_watch_handler(
             source = self._relative_path(os.fsdecode(event.src_path))
             destination_path = getattr(event, "dest_path", "")
             destination = (
-                self._relative_path(os.fsdecode(destination_path))
-                if destination_path
-                else None
+                self._relative_path(os.fsdecode(destination_path)) if destination_path else None
             )
             if event.is_directory:
                 if source is not None and event.event_type in {"deleted", "moved"}:
@@ -2480,6 +2533,7 @@ def _install_sigterm_interrupt() -> Callable[[], None]:
     dies at 143 and leaves its health file behind, which then reads as a
     stalled watcher forever.  Only the main thread may install handlers.
     """
+
     def _raise_interrupt(_signum: int, _frame: Any) -> None:
         raise KeyboardInterrupt
 

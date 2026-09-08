@@ -53,9 +53,24 @@ logger = logging.getLogger(__name__)
 
 # Shared platform choices for install and init commands
 _PLATFORM_CHOICES = [
-    "codex", "claude", "claude-code", "cursor", "windsurf", "zed",
-    "continue", "opencode", "antigravity", "gemini-cli", "qwen", "kiro", "qoder",
-    "copilot", "copilot-cli", "codebuddy", "hermes", "all",
+    "codex",
+    "claude",
+    "claude-code",
+    "cursor",
+    "windsurf",
+    "zed",
+    "continue",
+    "opencode",
+    "antigravity",
+    "gemini-cli",
+    "qwen",
+    "kiro",
+    "qoder",
+    "copilot",
+    "copilot-cli",
+    "codebuddy",
+    "hermes",
+    "all",
 ]
 
 
@@ -247,9 +262,7 @@ def _match_files_to_forget(
             if normalised == absolute_str:
                 matched.add(stored_path)
                 continue
-            if relative is not None and os.path.normpath(relative) == os.path.normpath(
-                pattern
-            ):
+            if relative is not None and os.path.normpath(relative) == os.path.normpath(pattern):
                 matched.add(stored_path)
                 continue
             # Every file underneath a named directory.
@@ -385,7 +398,6 @@ def _handle_init(args: argparse.Namespace) -> None:
     elif skip_instructions:
         print("Skipped instruction injection (--no-instructions).")
 
-
     # Install Qoder skills (global user-level skills directory)
     if not skip_skills and target in ("qoder", "all"):
         qoder_skills_dir = install_qoder_skills(repo_root)
@@ -442,11 +454,38 @@ def _handle_init(args: argparse.Namespace) -> None:
     print("  3. Restart your AI coding tool to pick up the new config")
 
 
+def _seed_build_from_vstore(store_root: Path, repo_root: Path, *, quiet: bool) -> bool:
+    """Materialize a vstore bundle for this repo's tree hash; False on miss.
+
+    A miss falls through to a normal build (documented optimization contract);
+    a tampered or incomplete bundle raises (fail loud), never silently rebuilds.
+    """
+    from .incremental import get_data_dir
+    from .vstore import get as vstore_get
+    from .vstore import tree_hash
+
+    digest = tree_hash(repo_root)
+    data_dir = get_data_dir(repo_root)
+    try:
+        receipt = vstore_get(store_root, digest, data_dir)
+    except FileNotFoundError:
+        if not quiet:
+            print(f"No vstore entry for tree {digest[:12]}; building from scratch.")
+        return False
+    if not quiet:
+        print(
+            f"Seeded index from vstore: tree {receipt.tree_hash[:12]} "
+            f"({len(receipt.files)} files, delta-zero) -> {data_dir}"
+        )
+    return True
+
+
 def _handle_data_dir_option(args, repo_root: Path) -> None:
     """Handle --data-dir option by updating registry if specified."""
     if hasattr(args, "data_dir") and args.data_dir:
         try:
             from .registry import Registry
+
             data_dir_path = Path(args.data_dir).expanduser().resolve()
             data_dir_path.mkdir(parents=True, exist_ok=True)
             Registry().set_data_dir(str(repo_root), str(data_dir_path))
@@ -528,25 +567,27 @@ _GRAPH_TOOL_COMMANDS = {
 }
 
 
-_PATH_REPO_COMMANDS = frozenset({
-    "install",
-    "init",
-    "uninstall",
-    "build",
-    "update",
-    "postprocess",
-    "embed",
-    "watch",
-    "status",
-    "forget",
-    "visualize",
-    "wiki",
-    "detect-changes",
-    "dead-code",
-    "serve",
-    "mcp",
-    *_GRAPH_TOOL_COMMANDS,
-})
+_PATH_REPO_COMMANDS = frozenset(
+    {
+        "install",
+        "init",
+        "uninstall",
+        "build",
+        "update",
+        "postprocess",
+        "embed",
+        "watch",
+        "status",
+        "forget",
+        "visualize",
+        "wiki",
+        "detect-changes",
+        "dead-code",
+        "serve",
+        "mcp",
+        *_GRAPH_TOOL_COMMANDS,
+    }
+)
 
 
 def _canonicalize_repo_argument(args: argparse.Namespace) -> None:
@@ -576,10 +617,7 @@ def _find_explicit_repo_root(start: Path) -> "Path | None":
     if not current.is_dir():
         return None
     while True:
-        if any(
-            (current / marker).exists()
-            for marker in (".code-review-graph", ".git", ".svn")
-        ):
+        if any((current / marker).exists() for marker in (".code-review-graph", ".git", ".svn")):
             return current
         if current == current.parent:
             return None
@@ -794,7 +832,7 @@ def main() -> None:
         choices=_PLATFORM_CHOICES,
         default="all",
         help="Unbind only this platform's MCP registration and keep the graph "
-             "data and every other integration. Default: all (full uninstall).",
+        "data and every other integration. Default: all (full uninstall).",
     )
     uninstall_cmd.add_argument(
         "--dry-run",
@@ -825,7 +863,16 @@ def main() -> None:
     build_cmd.add_argument(
         "--data-dir",
         default=None,
-        help="External directory to store graph database (useful for network shares)"
+        help="External directory to store graph database (useful for network shares)",
+    )
+    build_cmd.add_argument(
+        "--seed-from",
+        nargs="?",
+        const="auto",
+        default=None,
+        metavar="STORE",
+        help="Seed the index from a vstore bundle matching this tree hash "
+        "instead of rebuilding (bare flag: default store root)",
     )
     _add_embedding_refresh_args(build_cmd)
 
@@ -852,24 +899,24 @@ def main() -> None:
         "--brief",
         action="store_true",
         help="After re-parsing changed files into the graph, also print the "
-             "risk summary + Token Savings panel that 'detect-changes --brief' "
-             "prints. Use this after a rebase or large change set when you "
-             "want to refresh the graph AND see the impact in one command; "
-             "use 'detect-changes --brief' alone when the graph is already "
-             "up to date (analysis only, no re-parse).",
+        "risk summary + Token Savings panel that 'detect-changes --brief' "
+        "prints. Use this after a rebase or large change set when you "
+        "want to refresh the graph AND see the impact in one command; "
+        "use 'detect-changes --brief' alone when the graph is already "
+        "up to date (analysis only, no re-parse).",
     )
     update_cmd.add_argument(
         "--verify",
         action="store_true",
         help="Calibrate the estimated savings against tiktoken's "
-             "cl100k_base tokenizer (the GPT-4 family tokenizer). Adds a "
-             "second row to the panel with the real token counts. Requires "
-             "`pip install tiktoken`.",
+        "cl100k_base tokenizer (the GPT-4 family tokenizer). Adds a "
+        "second row to the panel with the real token counts. Requires "
+        "`pip install tiktoken`.",
     )
     update_cmd.add_argument(
         "--data-dir",
         default=None,
-        help="External directory to store graph database (useful for network shares)"
+        help="External directory to store graph database (useful for network shares)",
     )
     _add_embedding_refresh_args(update_cmd)
 
@@ -885,7 +932,7 @@ def main() -> None:
     pp_cmd.add_argument(
         "--data-dir",
         default=None,
-        help="External directory to store graph database (useful for network shares)"
+        help="External directory to store graph database (useful for network shares)",
     )
     _add_embedding_refresh_args(pp_cmd)
 
@@ -905,12 +952,12 @@ def main() -> None:
         "--model",
         default=None,
         help="Embedding model. For local: HuggingFace ID (default all-MiniLM-L6-v2); "
-             "for openai/google/minimax/voyage: provider-specific model ID.",
+        "for openai/google/minimax/voyage: provider-specific model ID.",
     )
     embed_cmd.add_argument(
         "--data-dir",
         default=None,
-        help="External directory to store graph database (useful for network shares)"
+        help="External directory to store graph database (useful for network shares)",
     )
 
     # watch
@@ -919,7 +966,7 @@ def main() -> None:
     watch_cmd.add_argument(
         "--data-dir",
         default=None,
-        help="External directory to store graph database (useful for network shares)"
+        help="External directory to store graph database (useful for network shares)",
     )
     _add_embedding_refresh_args(watch_cmd)
 
@@ -936,7 +983,7 @@ def main() -> None:
     status_cmd.add_argument(
         "--data-dir",
         default=None,
-        help="External directory to store graph database (useful for network shares)"
+        help="External directory to store graph database (useful for network shares)",
     )
 
     # forget
@@ -949,7 +996,7 @@ def main() -> None:
         nargs="+",
         metavar="PATH",
         help="Files, directories, or glob patterns to drop from the graph. "
-             "Paths may be absolute or relative to the repository root.",
+        "Paths may be absolute or relative to the repository root.",
     )
     forget_cmd.add_argument("--repo", default=None, help="Repository root (auto-detected)")
     forget_cmd.add_argument(
@@ -960,7 +1007,7 @@ def main() -> None:
     forget_cmd.add_argument(
         "--data-dir",
         default=None,
-        help="External directory to store graph database (useful for network shares)"
+        help="External directory to store graph database (useful for network shares)",
     )
 
     # visualize
@@ -986,7 +1033,7 @@ def main() -> None:
     vis_cmd.add_argument(
         "--data-dir",
         default=None,
-        help="External directory to store graph database (useful for network shares)"
+        help="External directory to store graph database (useful for network shares)",
     )
 
     # wiki
@@ -1000,7 +1047,7 @@ def main() -> None:
     wiki_cmd.add_argument(
         "--data-dir",
         default=None,
-        help="External directory to store graph database (useful for network shares)"
+        help="External directory to store graph database (useful for network shares)",
     )
 
     # register
@@ -1053,8 +1100,7 @@ def main() -> None:
         "--embed-provider",
         choices=["local", "openai", "google", "minimax", "voyage"],
         default=None,
-        help="Provider for --embed (default: local, needs "
-             "code-review-graph[embeddings])",
+        help="Provider for --embed (default: local, needs code-review-graph[embeddings])",
     )
     eval_cmd.add_argument(
         "--embed-model",
@@ -1066,30 +1112,30 @@ def main() -> None:
     detect_cmd = sub.add_parser(
         "detect-changes",
         help="Analyze change impact against the existing graph (read-only). "
-             "Does NOT re-parse files — for that, use 'update --brief'.",
+        "Does NOT re-parse files — for that, use 'update --brief'.",
     )
     detect_cmd.add_argument("--base", default="HEAD~1", help="Git diff base (default: HEAD~1)")
     detect_cmd.add_argument(
         "--brief",
         action="store_true",
         help="Show the risk summary + Token Savings panel instead of the "
-             "full JSON. Read-only against the existing graph.",
+        "full JSON. Read-only against the existing graph.",
     )
     detect_cmd.add_argument("--repo", default=None, help="Repository root (auto-detected)")
     detect_cmd.add_argument(
         "--churn",
         action="store_true",
         help="Add an opt-in change-frequency term to risk scores. Counts "
-             "commits per file over 90 days by default; set "
-             "CRG_CHURN_WINDOW_DAYS to adjust.",
+        "commits per file over 90 days by default; set "
+        "CRG_CHURN_WINDOW_DAYS to adjust.",
     )
     detect_cmd.add_argument(
         "--verify",
         action="store_true",
         help="Calibrate the estimated savings against tiktoken's "
-             "cl100k_base tokenizer (the GPT-4 family tokenizer). Adds a "
-             "second row to the panel with the real token counts. Requires "
-             "`pip install tiktoken`.",
+        "cl100k_base tokenizer (the GPT-4 family tokenizer). Adds a "
+        "second row to the panel with the real token counts. Requires "
+        "`pip install tiktoken`.",
     )
 
     # enrich (Claude Code PreToolUse hook; reads one JSON object from stdin)
@@ -1246,7 +1292,8 @@ def main() -> None:
         help="Start filesystem watch in a daemon thread while MCP server runs",
     )
     serve_cmd.add_argument(
-        "--tools", default=None,
+        "--tools",
+        default=None,
         metavar="all|lean|<csv>",
         help=(
             "Which MCP tools to expose. 'all' = every tool (~30, default), "
@@ -1256,7 +1303,8 @@ def main() -> None:
         ),
     )
     serve_cmd.add_argument(
-        "--detail", default=None,
+        "--detail",
+        default=None,
         choices=["minimal", "standard", "verbose"],
         help=(
             "Server-wide detail_level override for all tools. Forces every "
@@ -1366,6 +1414,73 @@ def main() -> None:
         help="Repository path or alias to remove",
     )
 
+    vstore_cmd = sub.add_parser(
+        "vstore",
+        help="Content-addressed index bundle store (keyed by repo tree hash)",
+    )
+    vstore_sub = vstore_cmd.add_subparsers(dest="vstore_command", required=True)
+    vstore_put = vstore_sub.add_parser(
+        "put", help="Store the current index data dir under the repo tree hash"
+    )
+    vstore_put.add_argument("--repo", default=None, help="Repository root (cwd default)")
+    vstore_put.add_argument(
+        "--data-dir",
+        default=None,
+        help="Index data dir (registry data_dir or .code-review-graph default)",
+    )
+    vstore_put.add_argument(
+        "--embedding-model",
+        default=None,
+        help="Embedding model recorded in the receipt",
+    )
+    vstore_put.add_argument(
+        "--store", default=None, help="Store root (default: $CRG_VSTORE/$CRG_HOME/home)"
+    )
+    vstore_get = vstore_sub.add_parser("get", help="Materialize a stored bundle into a data dir")
+    vstore_get.add_argument("tree_hash", help="Tree hash of the bundle")
+    vstore_get.add_argument("--dest", required=True, help="Destination data dir")
+    vstore_get.add_argument(
+        "--store", default=None, help="Store root (default: $CRG_VSTORE/$CRG_HOME/home)"
+    )
+    vstore_list = vstore_sub.add_parser(
+        "list", help="List stored bundles (tree hash, commit, model)"
+    )
+    vstore_list.add_argument(
+        "--store", default=None, help="Store root (default: $CRG_VSTORE/$CRG_HOME/home)"
+    )
+
+    prune_cmd = sub.add_parser(
+        "prune",
+        help="Remove dead registry/watch entries and report orphaned data dirs",
+    )
+    prune_cmd.add_argument(
+        "--apply",
+        action="store_true",
+        help="Perform the removals (default: report only)",
+    )
+    prune_cmd.add_argument(
+        "--data-dirs",
+        action="store_true",
+        help="With --apply, also delete orphaned external data dirs",
+    )
+    prune_cmd.add_argument("--config", default=None, help="Alternate watch.toml path")
+
+    vstore_prune = vstore_sub.add_parser(
+        "prune", help="Apply LRU/TTL retention to the store (report unless --apply)"
+    )
+    vstore_prune.add_argument(
+        "--store", default=None, help="Store root (default: $CRG_VSTORE/$CRG_HOME/home)"
+    )
+    vstore_prune.add_argument(
+        "--max-entries", type=int, default=None, help="Keep the newest N bundles"
+    )
+    vstore_prune.add_argument(
+        "--ttl-days", type=float, default=None, help="Drop bundles older than N days"
+    )
+    vstore_prune.add_argument(
+        "--apply", action="store_true", help="Perform the removals (default: report)"
+    )
+
     args = ap.parse_args()
 
     if args.version:
@@ -1445,8 +1560,10 @@ def main() -> None:
                 )
             else:
                 serve_main(
-                    repo_root=args.repo, auto_watch=auto_watch,
-                    tools=args.tools, detail_level=args.detail,
+                    repo_root=args.repo,
+                    auto_watch=auto_watch,
+                    tools=args.tools,
+                    detail_level=args.detail,
                 )
         else:
             serve_main(repo_root=args.repo, auto_watch=auto_watch)
@@ -1590,12 +1707,83 @@ def main() -> None:
         _handle_init(args)
         return
 
+    if args.command == "vstore":
+        from .vstore import default_store_root, get, list_entries, put, retain
+
+        store_root = Path(args.store).expanduser().resolve() if args.store else default_store_root()
+        if args.vstore_command == "put":
+            from .registry import Registry
+
+            repo_root = Path(args.repo).resolve() if args.repo else Path.cwd()
+            if args.data_dir:
+                data_dir = Path(args.data_dir).expanduser().resolve()
+            else:
+                registered = Registry().get_data_dir_for_repo(str(repo_root))
+                data_dir = (
+                    Path(registered).expanduser().resolve()
+                    if registered
+                    else repo_root / ".code-review-graph"
+                )
+            receipt = put(
+                store_root,
+                repo_root,
+                data_dir,
+                embedding_model=args.embedding_model,
+            )
+            print(f"stored {receipt.tree_hash} ({len(receipt.files)} files) from {data_dir}")
+        elif args.vstore_command == "get":
+            receipt = get(store_root, args.tree_hash, Path(args.dest).expanduser())
+            print(
+                f"restored {receipt.tree_hash} -> "
+                f"{Path(args.dest).expanduser()} ({len(receipt.files)} files)"
+            )
+        elif args.vstore_command == "prune":
+            removed = retain(
+                store_root,
+                max_entries=args.max_entries,
+                ttl_days=args.ttl_days,
+            )
+            if args.apply:
+                for digest in removed:
+                    print(f"pruned {digest}")
+                print(f"pruned {len(removed)} bundle(s)")
+            else:
+                for digest in removed:
+                    print(f"would prune {digest}")
+                print(f"dry-run: {len(removed)} bundle(s) eligible (use --apply to remove)")
+        else:
+            bundles = list_entries(store_root)
+            if not bundles:
+                print("vstore is empty.")
+            for bundle in bundles:
+                model = f"  model={bundle.embedding_model}" if bundle.embedding_model else ""
+                print(
+                    f"  {bundle.tree_hash}  head={bundle.head[:12]}  "
+                    f"files={len(bundle.files)}{model}"
+                )
+        return
+
+    if args.command == "prune":
+        from .prune import prune
+
+        config_path = Path(args.config).expanduser() if args.config else None
+        prune_report = prune(config_path=config_path, apply=args.apply, data_dirs=args.data_dirs)
+        for path in prune_report.removed_registry:
+            print(f"registry: {path}")
+        for path in prune_report.removed_watch:
+            print(f"watch:    {path}")
+        for path in prune_report.orphan_data_dirs:
+            print(f"data dir: {path}")
+        print(prune_report.summary())
+        return
+
     if args.command == "doctor":
         _handle_doctor(args)
         return
 
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+
     if args.command in ("register", "unregister", "repos"):
-        logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
         from .registry import Registry
 
         registry = Registry()
@@ -1708,17 +1896,17 @@ def main() -> None:
     )
     # Read-only consumers must not create graph.db / data dirs / registry
     # entries when the graph is missing (follow-up to #777 / #782; see #803).
-    _read_only_db_cmds = frozenset({
-        "status",
-        "detect-changes",
-        "visualize",
-        "wiki",
-        "watch",
-    })
-    explicit_data_dir = bool(getattr(args, "data_dir", None))
-    read_only_explicit_data_dir = (
-        args.command in _read_only_db_cmds and explicit_data_dir
+    _read_only_db_cmds = frozenset(
+        {
+            "status",
+            "detect-changes",
+            "visualize",
+            "wiki",
+            "watch",
+        }
     )
+    explicit_data_dir = bool(getattr(args, "data_dir", None))
+    read_only_explicit_data_dir = args.command in _read_only_db_cmds and explicit_data_dir
     if args.command in _data_dir_cmds and not read_only_explicit_data_dir:
         _handle_data_dir_option(args, repo_root)
 
@@ -1740,10 +1928,7 @@ def main() -> None:
             db_path = get_db_path(repo_root)
     else:
         db_path = get_db_path(repo_root)
-    if (
-        args.command in ("dead-code", "forget", *_read_only_db_cmds)
-        and not db_path.exists()
-    ):
+    if args.command in ("dead-code", "forget", *_read_only_db_cmds) and not db_path.exists():
         print(
             f"No graph found at {db_path}. Run `code-review-graph build` first.",
             file=sys.stderr,
@@ -1775,6 +1960,16 @@ def main() -> None:
                     print(f"  [{kind}] {name}  ({file_path}:{line})")
 
         elif args.command == "build":
+            if getattr(args, "seed_from", None) is not None:
+                from .vstore import default_store_root
+
+                store_root = (
+                    Path(args.seed_from).expanduser().resolve()
+                    if args.seed_from != "auto"
+                    else default_store_root()
+                )
+                if _seed_build_from_vstore(store_root, repo_root, quiet=args.quiet):
+                    return
             pp = (
                 "none"
                 if getattr(args, "skip_postprocess", False)
@@ -1799,8 +1994,7 @@ def main() -> None:
             edges = result.get("total_edges", 0)
             if not args.quiet:
                 print(
-                    f"Full build: {parsed} files, {nodes} nodes, {edges} edges "
-                    f"(postprocess={pp})"
+                    f"Full build: {parsed} files, {nodes} nodes, {edges} edges (postprocess={pp})"
                 )
                 if result.get("errors"):
                     print(f"Errors: {len(result['errors'])}")
@@ -1890,8 +2084,11 @@ def main() -> None:
                     verified = None
                     if getattr(args, "verify", False):
                         from .context_savings import verify_with_tiktoken
+
                         verified = verify_with_tiktoken(
-                            repo_root, changed, impact,
+                            repo_root,
+                            changed,
+                            impact,
                         )
                         if verified is None:
                             print(
@@ -1922,20 +2119,24 @@ def main() -> None:
             stored_rev = store.get_metadata("svn_revision")
 
             if args.json_output:
-                print(json.dumps({
-                    "nodes": stats.total_nodes,
-                    "edges": stats.total_edges,
-                    "files": stats.files_count,
-                    "languages": list(stats.languages),
-                    "last_updated": stats.last_updated,
-                    "vcs": vcs,
-                    "built_on_branch": stored_branch,
-                    "built_at_commit": stored_sha,
-                    "current_branch": current_branch,
-                    "current_sha": current_sha,
-                    "svn_branch": stored_svn_branch,
-                    "svn_revision": stored_rev,
-                }))
+                print(
+                    json.dumps(
+                        {
+                            "nodes": stats.total_nodes,
+                            "edges": stats.total_edges,
+                            "files": stats.files_count,
+                            "languages": list(stats.languages),
+                            "last_updated": stats.last_updated,
+                            "vcs": vcs,
+                            "built_on_branch": stored_branch,
+                            "built_at_commit": stored_sha,
+                            "current_branch": current_branch,
+                            "current_sha": current_sha,
+                            "svn_branch": stored_svn_branch,
+                            "svn_revision": stored_rev,
+                        }
+                    )
+                )
             elif not args.quiet:
                 print(f"Nodes: {stats.total_nodes}")
                 print(f"Edges: {stats.total_edges}")
@@ -1988,14 +2189,10 @@ def main() -> None:
                     summary = forget_files(store, repo_root, targets)
                     reparsed = summary.get("reparsed", [])
                     if reparsed:
-                        print(
-                            f"  re-resolved {len(reparsed)} referring file(s) "
-                            "so no edges dangle"
-                        )
+                        print(f"  re-resolved {len(reparsed)} referring file(s) so no edges dangle")
                     remaining = len(stored_files) - len(targets)
                     print(
-                        f"\nForgot {len(targets)} file(s); "
-                        f"{remaining} file(s) remain in the graph."
+                        f"\nForgot {len(targets)} file(s); {remaining} file(s) remain in the graph."
                     )
 
         elif args.command == "watch":
@@ -2134,6 +2331,7 @@ def main() -> None:
                         format_context_savings_panel,
                         verify_with_tiktoken,
                     )
+
                     print(result.get("summary", "No summary available."))
                     verified = None
                     if getattr(args, "verify", False):

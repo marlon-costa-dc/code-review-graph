@@ -41,6 +41,7 @@ logger = logging.getLogger(__name__)
 # Config file location
 # ---------------------------------------------------------------------------
 
+
 def default_config_path() -> Path:
     """Path to ``watch.toml`` under the per-user state directory."""
     return crg_home() / "watch.toml"
@@ -121,6 +122,27 @@ class WatchRepo:
 
     alias: str
     """Short name for this repo (derived from directory name when not specified)."""
+
+    data_dir: str = ""
+    """Per-repo graph data dir (rendered as ``CRG_DATA_DIR`` in the watcher env)."""
+
+    recurse_submodules: bool = False
+    """Watch with ``CRG_RECURSE_SUBMODULES=1``."""
+
+    embedding: str = ""
+    """Per-repo embedding model (rendered as ``CRG_EMBEDDING_MODEL``)."""
+
+
+def watcher_env(repo: WatchRepo) -> dict[str, str]:
+    """Build the child environment honoring per-repo overrides."""
+    env = dict(os.environ)
+    if repo.data_dir:
+        env["CRG_DATA_DIR"] = repo.data_dir
+    if repo.recurse_submodules:
+        env["CRG_RECURSE_SUBMODULES"] = "1"
+    if repo.embedding:
+        env["CRG_EMBEDDING_MODEL"] = repo.embedding
+    return env
 
 
 @dataclass
@@ -213,7 +235,15 @@ def load_config(path: Path | None = None) -> DaemonConfig:
             continue
 
         seen_aliases.add(alias)
-        repos.append(WatchRepo(path=str(repo_path), alias=alias))
+        repos.append(
+            WatchRepo(
+                path=str(repo_path),
+                alias=alias,
+                data_dir=str(entry.get("data_dir", "") or ""),
+                recurse_submodules=bool(entry.get("recurse_submodules", False)),
+                embedding=str(entry.get("embedding", "") or ""),
+            )
+        )
 
     return DaemonConfig(
         session_name=session_name,
@@ -278,6 +308,12 @@ def _serialize_toml(config: DaemonConfig) -> str:
         lines.append("[[repos]]")
         lines.append(f"path = {_toml_str(repo.path)}")
         lines.append(f"alias = {_toml_str(repo.alias)}")
+        if repo.data_dir:
+            lines.append(f"data_dir = {_toml_str(repo.data_dir)}")
+        if repo.recurse_submodules:
+            lines.append("recurse_submodules = true")
+        if repo.embedding:
+            lines.append(f"embedding = {_toml_str(repo.embedding)}")
     lines.append("")  # trailing newline
     return "\n".join(lines)
 
@@ -1232,6 +1268,7 @@ class WatchDaemon:
                 stdout=log_fd,
                 stderr=subprocess.STDOUT,
                 stdin=subprocess.DEVNULL,
+                env=watcher_env(repo),
             )
         except Exception:
             log_fd.close()

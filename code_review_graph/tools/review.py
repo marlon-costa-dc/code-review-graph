@@ -57,7 +57,12 @@ _MAX_DETECT_FLOWS = 200
 # step detail should use get_affected_flows_tool, so the embedded copy keeps
 # per-flow metadata only.
 _DETECT_FLOW_FIELDS = (
-    "id", "name", "criticality", "depth", "node_count", "file_count",
+    "id",
+    "name",
+    "criticality",
+    "depth",
+    "node_count",
+    "file_count",
 )
 
 
@@ -174,22 +179,16 @@ def get_review_context(
             else:
                 risk = "low"
 
-            key_entities = [
-                n.name for n in impact["changed_nodes"][:5]
-            ]
+            key_entities = [n.name for n in impact["changed_nodes"][:5]]
 
             # Count test gaps among changed functions.
             changed_funcs = [
-                n for n in impact["changed_nodes"]
-                if n.kind == "Function" and not n.is_test
+                n for n in impact["changed_nodes"] if n.kind == "Function" and not n.is_test
             ]
-            test_edges = [
-                e for e in impact["edges"] if e.kind == "TESTED_BY"
-            ]
+            test_edges = [e for e in impact["edges"] if e.kind == "TESTED_BY"]
             tested_qualified = {e.source_qualified for e in test_edges}
             test_gap_count = sum(
-                1 for f in changed_funcs
-                if f.qualified_name not in tested_qualified
+                1 for f in changed_funcs if f.qualified_name not in tested_qualified
             )
 
             summary_parts = [
@@ -219,23 +218,31 @@ def get_review_context(
         # Build review context. Every list below scales with the change set,
         # so each is bounded and reports its untruncated total.
         shown_files, files_total, files_cut = _bounded(
-            changed_files, max_files, _MAX_REVIEW_FILES,
+            changed_files,
+            max_files,
+            _MAX_REVIEW_FILES,
         )
         impacted_files, impacted_total, impacted_cut = _bounded(
-            impact["impacted_files"], max_files, _MAX_REVIEW_FILES,
+            impact["impacted_files"],
+            max_files,
+            _MAX_REVIEW_FILES,
         )
         changed_nodes, changed_nodes_total, cn_cut = _bounded(
-            impact["changed_nodes"], max_results, _MAX_REVIEW_NODES,
+            impact["changed_nodes"],
+            max_results,
+            _MAX_REVIEW_NODES,
         )
         impacted_nodes, impacted_nodes_total, in_cut = _bounded(
-            impact["impacted_nodes"], max_results, _MAX_REVIEW_NODES,
+            impact["impacted_nodes"],
+            max_results,
+            _MAX_REVIEW_NODES,
         )
         edges, edges_total, edges_cut = _bounded(
-            impact["edges"], max_results, _MAX_REVIEW_EDGES,
+            impact["edges"],
+            max_results,
+            _MAX_REVIEW_EDGES,
         )
-        truncated = (
-            files_cut or impacted_cut or cn_cut or in_cut or edges_cut
-        )
+        truncated = files_cut or impacted_cut or cn_cut or in_cut or edges_cut
 
         context: dict[str, Any] = {
             "changed_files": shown_files,
@@ -269,9 +276,7 @@ def get_review_context(
                 full_path = root / rel_path
                 if full_path.is_file():
                     try:
-                        lines = full_path.read_text(
-                            errors="replace"
-                        ).splitlines()
+                        lines = full_path.read_text(encoding="utf-8", errors="replace").splitlines()
                         allowed = min(per_file, budget)
                         if len(lines) > allowed:
                             # Include only the relevant functions/classes
@@ -285,8 +290,7 @@ def get_review_context(
                             budget -= allowed
                         else:
                             snippets[rel_path] = "\n".join(
-                                f"{i+1}: {line}"
-                                for i, line in enumerate(lines)
+                                f"{i + 1}: {line}" for i, line in enumerate(lines)
                             )
                             budget -= len(lines)
                     except (OSError, UnicodeDecodeError):
@@ -303,18 +307,16 @@ def get_review_context(
         # we budget them; the structural subgraph + guidance stay intact.
         budget_note = None
         if max_tokens and include_source and context.get("source_snippets"):
-            budget_note = _budget_source_snippets(
-                context, impact["changed_nodes"], max_tokens
-            )
+            budget_note = _budget_source_snippets(context, impact["changed_nodes"], max_tokens)
 
         summary_parts = [
             f"Review context for {files_total} changed file(s)"
-            + _shown_of(len(shown_files), files_total) + ":",
+            + _shown_of(len(shown_files), files_total)
+            + ":",
             f"  - {changed_nodes_total} directly changed nodes"
             + _shown_of(len(changed_nodes), changed_nodes_total),
             f"  - {impacted_nodes_total} impacted nodes"
-            f" in {impacted_total} files"
-            + _shown_of(len(impacted_nodes), impacted_nodes_total),
+            f" in {impacted_total} files" + _shown_of(len(impacted_nodes), impacted_nodes_total),
             "",
             "Review guidance:",
             guidance,
@@ -409,7 +411,10 @@ def _budget_source_snippets(
 
 
 def _extract_relevant_lines(
-    lines: list[str], nodes: list, file_path: str, max_lines: int = 200,
+    lines: list[str],
+    nodes: list,
+    file_path: str,
+    max_lines: int = 200,
 ) -> str:
     """Extract only the lines relevant to changed nodes.
 
@@ -426,9 +431,7 @@ def _extract_relevant_lines(
 
     if not ranges:
         # Show first N lines as fallback
-        return "\n".join(
-            f"{i+1}: {line}" for i, line in enumerate(lines[:min(50, max_lines)])
-        )
+        return "\n".join(f"{i + 1}: {line}" for i, line in enumerate(lines[: min(50, max_lines)]))
 
     # Merge overlapping ranges
     ranges.sort()
@@ -448,29 +451,22 @@ def _extract_relevant_lines(
         if parts:
             parts.append("...")
         for i in range(start, min(end, start + max_lines - emitted)):
-            parts.append(f"{i+1}: {lines[i]}")
+            parts.append(f"{i + 1}: {lines[i]}")
             emitted += 1
 
     return "\n".join(parts)
 
 
-def _generate_review_guidance(
-    impact: dict, changed_files: list[str]
-) -> str:
+def _generate_review_guidance(impact: dict, changed_files: list[str]) -> str:
     """Generate review guidance based on the impact analysis."""
     guidance_parts = []
 
     # Check for test coverage
-    changed_funcs = [
-        n for n in impact["changed_nodes"] if n.kind == "Function"
-    ]
+    changed_funcs = [n for n in impact["changed_nodes"] if n.kind == "Function"]
     test_edges = [e for e in impact["edges"] if e.kind == "TESTED_BY"]
     tested_funcs = {e.source_qualified for e in test_edges}
 
-    untested = [
-        f for f in changed_funcs
-        if f.qualified_name not in tested_funcs and not f.is_test
-    ]
+    untested = [f for f in changed_funcs if f.qualified_name not in tested_funcs and not f.is_test]
     if untested:
         guidance_parts.append(
             f"- {len(untested)} changed function(s) lack test coverage: "
@@ -486,10 +482,7 @@ def _generate_review_guidance(
         )
 
     # Check for inheritance changes
-    inheritance_edges = [
-        e for e in impact["edges"]
-        if e.kind in ("INHERITS", "IMPLEMENTS")
-    ]
+    inheritance_edges = [e for e in impact["edges"] if e.kind in ("INHERITS", "IMPLEMENTS")]
     if inheritance_edges:
         guidance_parts.append(
             f"- {len(inheritance_edges)} inheritance/implementation "
@@ -506,9 +499,7 @@ def _generate_review_guidance(
         )
 
     if not guidance_parts:
-        guidance_parts.append(
-            "- Changes appear well-contained with minimal blast radius."
-        )
+        guidance_parts.append("- Changes appear well-contained with minimal blast radius.")
 
     return "\n".join(guidance_parts)
 
@@ -580,7 +571,8 @@ def get_affected_flows_func(
         total = result["total"]
         flows = result["affected_flows"]
         ceiling = (
-            _MAX_AFFECTED_FLOWS_MINIMAL if detail_level == "minimal"
+            _MAX_AFFECTED_FLOWS_MINIMAL
+            if detail_level == "minimal"
             else _MAX_AFFECTED_FLOWS_STANDARD
         )
         # ``max_flows=0`` keeps its documented "no caller limit" meaning, but
@@ -598,17 +590,14 @@ def get_affected_flows_func(
             "status": "ok",
             "summary": (
                 f"{total} flow(s) affected by changes "
-                f"in {len(changed_files)} file(s)"
-                + _shown_of(len(flows), total)
+                f"in {len(changed_files)} file(s)" + _shown_of(len(flows), total)
             ),
             "changed_files": changed_files,
             "affected_flows": flows,
             "total": total,
             "truncated": truncated,
         }
-        out["_hints"] = generate_hints(
-            "get_affected_flows", out, get_session()
-        )
+        out["_hints"] = generate_hints("get_affected_flows", out, get_session())
         return out
     except Exception as exc:
         return {"status": "error", "error": str(exc)}
@@ -727,13 +716,12 @@ def detect_changes_func(
                     if file_path.is_file():
                         try:
                             lines = file_path.read_text(
-                                errors="replace"
+                                encoding="utf-8", errors="replace"
                             ).splitlines()
                             start = max(0, ls - 1)
                             end = min(len(lines), le, start + budget)
                             func["source"] = "\n".join(
-                                f"{i + 1}: {lines[i]}"
-                                for i in range(start, end)
+                                f"{i + 1}: {lines[i]}" for i in range(start, end)
                             )
                             budget -= max(0, end - start)
                         except (OSError, UnicodeDecodeError):
@@ -741,10 +729,7 @@ def detect_changes_func(
 
         if detail_level == "minimal":
             priorities = analysis.get("review_priorities", [])
-            top_priorities = [
-                p.get("name", p.get("qualified_name", ""))
-                for p in priorities[:3]
-            ]
+            top_priorities = [p.get("name", p.get("qualified_name", "")) for p in priorities[:3]]
             result: dict[str, Any] = {
                 "status": "ok",
                 "summary": analysis.get("summary", ""),
@@ -756,18 +741,23 @@ def detect_changes_func(
         else:
             funcs, funcs_total, funcs_cut = _bounded(
                 analysis.get("changed_functions", []),
-                max_results, _MAX_CHANGED_FUNCTIONS,
+                max_results,
+                _MAX_CHANGED_FUNCTIONS,
             )
             gaps, gaps_total, gaps_cut = _bounded(
                 analysis.get("test_gaps", []),
-                max_results, _MAX_CHANGED_FUNCTIONS,
+                max_results,
+                _MAX_CHANGED_FUNCTIONS,
             )
             flows, flows_total, flows_cut = _bounded(
                 analysis.get("affected_flows", []),
-                max_flows, _MAX_DETECT_FLOWS,
+                max_flows,
+                _MAX_DETECT_FLOWS,
             )
             files, files_total, files_cut = _bounded(
-                changed_files, max_results, _MAX_REVIEW_FILES,
+                changed_files,
+                max_results,
+                _MAX_REVIEW_FILES,
             )
             any_cut = funcs_cut or gaps_cut or flows_cut or files_cut
             summary = analysis.get("summary", "")
@@ -798,12 +788,9 @@ def detect_changes_func(
                     result["omitted"] = budget_note
                     summary = result.get("summary", "")
                     result["summary"] = (
-                        f"{summary}\n{budget_note['note']}" if summary
-                        else budget_note["note"]
+                        f"{summary}\n{budget_note['note']}" if summary else budget_note["note"]
                     )
-        result["_hints"] = generate_hints(
-            "detect_changes", result, get_session()
-        )
+        result["_hints"] = generate_hints("detect_changes", result, get_session())
         attach_context_savings(result, original_tokens=original_tokens)
         return result
     except Exception as exc:
@@ -812,9 +799,7 @@ def detect_changes_func(
         store.close()
 
 
-def _budget_detect_changes(
-    result: dict[str, Any], max_tokens: int
-) -> dict[str, Any] | None:
+def _budget_detect_changes(result: dict[str, Any], max_tokens: int) -> dict[str, Any] | None:
     """Trim a standard detect_changes result to fit ``max_tokens``.
 
     The big-list fields are trimmed lowest-signal first, in this order:
@@ -843,9 +828,7 @@ def _budget_detect_changes(
     }
 
     # Highest-risk functions first; the other lists keep their upstream order.
-    ranked_funcs = sorted(
-        funcs, key=lambda f: f.get("risk_score", 0.0), reverse=True
-    )
+    ranked_funcs = sorted(funcs, key=lambda f: f.get("risk_score", 0.0), reverse=True)
 
     # Counts kept per field; start with everything, shrink as needed.
     keep = dict(orig)
@@ -867,8 +850,7 @@ def _budget_detect_changes(
     # Trim each field down to zero in priority order until the payload fits.
     # Binary-search the largest count that still fits to keep this O(log N)
     # per field rather than O(N) decrements on large PRs.
-    for field in ("affected_flows", "changed_functions", "test_gaps",
-                  "review_priorities"):
+    for field in ("affected_flows", "changed_functions", "test_gaps", "review_priorities"):
         if _fits():
             break
         lo, hi = 0, keep[field]  # hi currently overflows
