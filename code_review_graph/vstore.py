@@ -39,8 +39,7 @@ class VstoreReceipt:
         try:
             raw_files = payload["files"]
             if not isinstance(raw_files, dict) or not all(
-                isinstance(k, str) and isinstance(v, str)
-                for k, v in raw_files.items()
+                isinstance(k, str) and isinstance(v, str) for k, v in raw_files.items()
             ):
                 raise TypeError("files must map str -> str")
             schema_version = payload["schema_version"]

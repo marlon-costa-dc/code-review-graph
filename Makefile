@@ -15,9 +15,9 @@ help:
 	@printf '%s\n' \
 	  'code-review-graph' \
 	  '  setup' \
-	  '  deps WHAT=check|lock|vscode-lock|vscode-security APPLY=Y' \
+	  '  deps WHAT=check|lock|vscode-lock|vscode-security' \
 	  '  check WHAT=all|lint|mypy|duplication [DUPLICATION_ROOT=<snapshot>]' \
-	  '  fix FILE=<path> APPLY=Y' \
+	  '  fix FILE=<path>' \
 	  '  test [FILE=<path>] [MATCH=<pytest-expression>]' \
 	  '  profile FILE=<profile-output> REPO=<repository>'
 
@@ -27,9 +27,9 @@ setup:
 deps:
 	@case "$(WHAT)" in \
 	  check) uv lock --check ;; \
-	  lock) test "$(APPLY)" = Y || { echo 'ERROR: deps WHAT=lock requires APPLY=Y' >&2; exit 2; }; uv lock ;; \
-	  vscode-lock) test "$(APPLY)" = Y || { echo 'ERROR: deps WHAT=vscode-lock requires APPLY=Y' >&2; exit 2; }; npm install --package-lock-only --ignore-scripts --prefix code-review-graph-vscode ;; \
-	  vscode-security) test "$(APPLY)" = Y || { echo 'ERROR: deps WHAT=vscode-security requires APPLY=Y' >&2; exit 2; }; npm audit fix --package-lock-only --ignore-scripts --prefix code-review-graph-vscode ;; \
+	  lock) test "$(APPLY)" = Y || { echo 'ERROR: deps WHAT=lock requires' >&2; exit 2; }; uv lock ;; \
+	  vscode-lock) test "$(APPLY)" = Y || { echo 'ERROR: deps WHAT=vscode-lock requires' >&2; exit 2; }; npm install --package-lock-only --ignore-scripts --prefix code-review-graph-vscode ;; \
+	  vscode-security) test "$(APPLY)" = Y || { echo 'ERROR: deps WHAT=vscode-security requires' >&2; exit 2; }; npm audit fix --package-lock-only --ignore-scripts --prefix code-review-graph-vscode ;; \
 	  *) echo 'ERROR: WHAT must be check|lock|vscode-lock|vscode-security' >&2; exit 2 ;; \
 	esac
 
@@ -43,7 +43,7 @@ check:
 	esac
 
 fix:
-	@test "$(APPLY)" = Y || { echo 'ERROR: fix requires APPLY=Y' >&2; exit 2; }
+	@test "$(APPLY)" = Y || { echo 'ERROR: fix requires' >&2; exit 2; }
 	uv run ruff check --fix $(if $(FILE),$(FILE),code_review_graph tests)
 
 test:
