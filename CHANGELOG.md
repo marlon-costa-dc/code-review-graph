@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+### Added
+
+- Generated `build-graph` skill: freshness checks (`status`, `doctor`),
+  `update` versus `build`, `CRG_RECURSE_SUBMODULES=1` for submodule
+  workspaces (and the superproject-only diff of `update`), `postprocess`,
+  one watcher per graph, the multi-repo registry, MCP registration and hooks.
+  The other generated skills gain a graph-freshness preflight, and
+  `refactor-safely` maps the rename cascade with `callers_of`,
+  `importers_of` and `tests_for`.
+
+### Fixed
+
+- `prune` imports `tomllib` behind a Python version check, clearing the
+  mypy `no-redef` error from 98065a3.
+
 ## dc-use fork releases
 
 Fork deltas and release history are documented in [FORK.md](FORK.md). Fork

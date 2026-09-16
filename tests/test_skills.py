@@ -118,10 +118,11 @@ class TestGenerateSkills:
         assert result.is_dir()
         assert result == tmp_path / ".claude" / "skills"
 
-    def test_creates_four_skill_subdirs(self, tmp_path):
+    def test_creates_five_skill_subdirs(self, tmp_path):
         skills_dir = generate_skills(tmp_path)
         subdirs = sorted(f.name for f in skills_dir.iterdir() if f.is_dir())
         assert subdirs == [
+            "build-graph",
             "debug-issue",
             "explore-codebase",
             "refactor-safely",
@@ -150,6 +151,7 @@ class TestGenerateSkills:
         bundled = Path(__file__).parents[1] / "skills"
 
         for skill_name in (
+            "build-graph",
             "debug-issue",
             "explore-codebase",
             "refactor-safely",
@@ -167,7 +169,7 @@ class TestGenerateSkills:
         result = generate_skills(tmp_path, skills_dir=custom)
         assert result == custom
         assert result.is_dir()
-        assert len(list(result.iterdir())) == 4
+        assert len(list(result.iterdir())) == 5
 
     def test_skill_content_includes_get_minimal_context(self, tmp_path):
         """Every skill template must reference get_minimal_context_tool."""
@@ -183,6 +185,13 @@ class TestGenerateSkills:
         bundled = Path(__file__).parents[1] / "skills"
 
         expected_tools = {
+            "build-graph": [
+                "get_minimal_context_tool",
+                "build_or_update_graph_tool",
+                "run_postprocess_tool",
+                "list_repos_tool",
+                "cross_repo_search_tool",
+            ],
             "explore-codebase": [
                 "get_minimal_context_tool",
                 "list_graph_stats_tool",
@@ -229,7 +238,7 @@ class TestGenerateSkills:
         generate_skills(tmp_path)
         generate_skills(tmp_path)
         skills_dir = tmp_path / ".claude" / "skills"
-        assert len(list(skills_dir.iterdir())) == 4
+        assert len(list(skills_dir.iterdir())) == 5
 
 
 class TestGenerateHooksConfig:
@@ -1110,6 +1119,7 @@ class TestCodeBuddyPlatform:
 
         assert skills_root == tmp_path / ".codebuddy" / "skills"
         assert {path.name for path in skills_root.iterdir()} == {
+            "build-graph",
             "debug-issue",
             "explore-codebase",
             "refactor-safely",
