@@ -21,6 +21,10 @@ Use the knowledge graph to systematically trace and debug issues.
 - Look at affected flows to find the entry point that triggers the bug.
 - Recent changes are the most common source of new issues.
 
+## Graph Freshness
+
+- If `get_minimal_context_tool` returns `status: not_ready`, or `code-review-graph status` reports a commit other than `HEAD`, refresh the graph with the build-graph skill before trusting any result.
+
 ## Token Efficiency Rules
 - Start with `get_minimal_context_tool(task="<your task>")` before other graph tools.
 - Use `detail_level="minimal"` on all calls. Only escalate to "standard" when minimal is insufficient.

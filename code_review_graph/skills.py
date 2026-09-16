@@ -872,7 +872,112 @@ def install_platform_configs(
 
 # --- Skill file contents ---
 
+_GRAPH_FRESHNESS = (
+    "## Graph Freshness\n\n"
+    "- If `get_minimal_context_tool` returns `status: not_ready`, or "
+    "`code-review-graph status` reports a commit other than `HEAD`, refresh the "
+    "graph with the build-graph skill before trusting any result.\n\n"
+)
+
+_TOKEN_EFFICIENCY_RULES = (
+    "## Token Efficiency Rules\n"
+    '- Start with `get_minimal_context_tool(task="<your task>")` '
+    "before other graph tools.\n"
+    '- Use `detail_level="minimal"` on all calls. Only escalate to '
+    '"standard" when minimal is insufficient.\n'
+    "- Target: complete any review/debug/refactor task in ≤5 tool calls "
+    "and ≤800 total output tokens.\n"
+    "- Read the implementation and its tests before changing code. The graph "
+    "narrows scope; it does not replace the source."
+)
+
 _SKILLS: dict[str, dict[str, str]] = {
+    "build-graph.md": {
+        "name": "build-graph",
+        "description": (
+            "Build, update, post-process, watch, register and health-check "
+            "the code knowledge graph"
+        ),
+        "body": (
+            "## Build Graph\n\n"
+            "Keep the graph current before any graph-backed answer. A stale graph "
+            "reports facts about code that no longer exists.\n\n"
+            "### Check freshness\n\n"
+            "1. `code-review-graph status` prints `Built on branch` and `Built at commit`; "
+            "compare them with `git rev-parse HEAD`.\n"
+            "2. `code-review-graph doctor` checks graph presence, freshness, MCP config, "
+            "serve command, server import, hooks and embeddings. It exits non-zero only "
+            "when the graph is missing or empty or the MCP server does not import; "
+            "freshness, MCP config and "
+            "hooks are warnings, so read every line, not only the exit code.\n\n"
+            "### Build or update\n\n"
+            "- `code-review-graph update` (MCP: `build_or_update_graph_tool()`) re-parses "
+            "files changed since the commit the graph was built at, plus their "
+            "dependents. Use it after ordinary edits, commits and branch switches.\n"
+            "- `code-review-graph build` (MCP: "
+            "`build_or_update_graph_tool(full_rebuild=True)`) re-parses every tracked "
+            "file. Use it for a missing graph and after history rewrites or mass moves.\n"
+            "- Submodule workspaces: `CRG_RECURSE_SUBMODULES=1 code-review-graph build` "
+            "feeds `git ls-files --recurse-submodules`, so submodule files enter the "
+            "graph; without the variable only the superproject is indexed. Set it for "
+            "every command that builds that graph. `update` diffs the superproject "
+            "only: an edit or commit inside a submodule is not re-parsed, yet `status` "
+            "reports the new commit. After submodule changes, run the recursive "
+            "`build` again.\n"
+            "- `--skip-flows` (signatures and search index only) and "
+            "`--skip-postprocess` (raw parse only) write faster but leave flows and "
+            "communities stale.\n\n"
+            "### Post-process\n\n"
+            "`code-review-graph postprocess` (MCP: `run_postprocess_tool`) recomputes "
+            "derived data on the existing graph: signatures, the full-text search "
+            "index, execution flows and communities (`--no-flows`, `--no-communities`, "
+            "`--no-fts` skip one step). Run it before flow, community or architecture "
+            "queries whenever the last write skipped post-processing, including the "
+            "editor hook, which runs `update --skip-flows`. Embeddings are separate: "
+            "`code-review-graph embed` (MCP: `embed_graph_tool`) uses the local "
+            "provider by default; a cloud provider transmits source-derived text.\n\n"
+            "### Watch\n\n"
+            "- `code-review-graph watch` keeps one repository current in the foreground; "
+            "`serve --auto-watch` does the same inside the MCP server; "
+            "`code-review-graph daemon start|status|add|remove` supervises watchers "
+            "for the repositories in its watch config.\n"
+            "- Run one watcher per graph. Before starting one, check "
+            "`code-review-graph daemon status` and any host supervisor that owns the "
+            "graph (under ai-hub: `systemctl --user status ai-hub-watch.service`, whose "
+            "orphan sweep reconciles loose watcher processes). When one is active, use "
+            "`update` for an immediate refresh; never start a second watcher.\n\n"
+            "### Multi-repo registry\n\n"
+            "- `code-review-graph register <path> --alias <name>`, `repos` and "
+            "`unregister <path-or-alias>` manage `registry.json` under "
+            "`~/.code-review-graph` (relocated by `CRG_HOME`).\n"
+            "- `list_repos_tool` lists registered repositories; "
+            "`cross_repo_search_tool(query=...)` searches every registered graph. "
+            "Registration does not build: each repository still needs its own graph.\n"
+            "- `code-review-graph prune` reports dead registry and watch entries; "
+            "`--apply` removes them.\n\n"
+            "### MCP server and hooks\n\n"
+            "- `code-review-graph install` registers the `code-review-graph` MCP server "
+            "for detected platforms, writes skills and instructions, and installs "
+            "hooks (`--no-hooks`, `--no-skills`, `--no-instructions`, `--dry-run`, "
+            "`--platform`). A client may expose a tool subset (`serve --tools "
+            "lean|<csv>`, `CRG_TOOLS`) or load MCP tool schemas on demand; load a "
+            "schema before its first call.\n"
+            "- Claude Code hooks: `PostToolUse` on Edit/Write runs "
+            "`update --skip-flows`; `SessionStart` runs `status`. The git "
+            "`pre-commit` hook runs `update` and `detect-changes --brief` from the "
+            "directory git uses for hooks (`core.hooksPath` is respected).\n"
+            "- `doctor` looks for hooks only in `.claude/settings.json`, "
+            "`.qoder/settings.json` and `.git/hooks/pre-commit`; with `core.hooksPath` "
+            "set, a working git hook is reported as missing.\n\n"
+            "### Failures\n\n"
+            "- Refresh a stale or missing graph with the commands above, then repeat "
+            "the query; never answer from a stale graph or guess missing "
+            "relationships.\n"
+            "- A failed build, update or post-process is a failure: report the "
+            "command, exit code and error.\n\n"
+            + _TOKEN_EFFICIENCY_RULES
+        ),
+    },
     "explore-codebase.md": {
         "name": "explore-codebase",
         "description": "Navigate and understand codebase structure using the knowledge graph",
@@ -892,15 +997,8 @@ _SKILLS: dict[str, dict[str, str]] = {
             "- Start broad (stats, architecture) then narrow down to specific areas.\n"
             "- Use `children_of` on a file to see all its functions and classes.\n"
             "- Use `find_large_functions_tool` to identify complex code.\n\n"
-            "## Token Efficiency Rules\n"
-            '- Start with `get_minimal_context_tool(task="<your task>")` '
-            "before other graph tools.\n"
-            '- Use `detail_level="minimal"` on all calls. Only escalate to '
-            '"standard" when minimal is insufficient.\n'
-            "- Target: complete any review/debug/refactor task in ≤5 tool calls "
-            "and ≤800 total output tokens.\n"
-            "- Read the implementation and its tests before changing code. The graph "
-            "narrows scope; it does not replace the source."
+            + _GRAPH_FRESHNESS
+            + _TOKEN_EFFICIENCY_RULES
         ),
     },
     "review-changes.md": {
@@ -922,15 +1020,8 @@ _SKILLS: dict[str, dict[str, str]] = {
             "- Test coverage status\n"
             "- Suggested improvements\n"
             "- Overall merge recommendation\n\n"
-            "## Token Efficiency Rules\n"
-            '- Start with `get_minimal_context_tool(task="<your task>")` '
-            "before other graph tools.\n"
-            '- Use `detail_level="minimal"` on all calls. Only escalate to '
-            '"standard" when minimal is insufficient.\n'
-            "- Target: complete any review/debug/refactor task in ≤5 tool calls "
-            "and ≤800 total output tokens.\n"
-            "- Read the implementation and its tests before changing code. The graph "
-            "narrows scope; it does not replace the source."
+            + _GRAPH_FRESHNESS
+            + _TOKEN_EFFICIENCY_RULES
         ),
     },
     "debug-issue.md": {
@@ -950,15 +1041,8 @@ _SKILLS: dict[str, dict[str, str]] = {
             "- Check both callers and callees to understand the full context.\n"
             "- Look at affected flows to find the entry point that triggers the bug.\n"
             "- Recent changes are the most common source of new issues.\n\n"
-            "## Token Efficiency Rules\n"
-            '- Start with `get_minimal_context_tool(task="<your task>")` '
-            "before other graph tools.\n"
-            '- Use `detail_level="minimal"` on all calls. Only escalate to '
-            '"standard" when minimal is insufficient.\n'
-            "- Target: complete any review/debug/refactor task in ≤5 tool calls "
-            "and ≤800 total output tokens.\n"
-            "- Read the implementation and its tests before changing code. The graph "
-            "narrows scope; it does not replace the source."
+            + _GRAPH_FRESHNESS
+            + _TOKEN_EFFICIENCY_RULES
         ),
     },
     "refactor-safely.md": {
@@ -977,18 +1061,13 @@ _SKILLS: dict[str, dict[str, str]] = {
             "5. After changes, run `detect_changes_tool` to verify the refactoring impact.\n\n"
             "### Safety Checks\n\n"
             "- Always preview before applying (rename mode gives you an edit list).\n"
+            "- Map the cascade before a rename or move: `query_graph_tool` with "
+            "`callers_of`, `importers_of` and `tests_for` on the target.\n"
             "- Check `get_impact_radius_tool` before major refactors.\n"
             "- Use `get_affected_flows_tool` to ensure no critical paths are broken.\n"
             "- Run `find_large_functions_tool` to identify decomposition targets.\n\n"
-            "## Token Efficiency Rules\n"
-            '- Start with `get_minimal_context_tool(task="<your task>")` '
-            "before other graph tools.\n"
-            '- Use `detail_level="minimal"` on all calls. Only escalate to '
-            '"standard" when minimal is insufficient.\n'
-            "- Target: complete any review/debug/refactor task in ≤5 tool calls "
-            "and ≤800 total output tokens.\n"
-            "- Read the implementation and its tests before changing code. The graph "
-            "narrows scope; it does not replace the source."
+            + _GRAPH_FRESHNESS
+            + _TOKEN_EFFICIENCY_RULES
         ),
     },
 }
@@ -997,7 +1076,7 @@ _SKILLS: dict[str, dict[str, str]] = {
 def generate_skills(repo_root: Path, skills_dir: Path | None = None) -> Path:
     """Generate Claude Code skill files.
 
-    Creates `.claude/skills/` directory with 4 skill markdown files,
+    Creates `.claude/skills/` directory with one SKILL.md per `_SKILLS` entry,
     each containing frontmatter and instructions.
 
     Args:
