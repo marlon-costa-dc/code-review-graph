@@ -40,7 +40,9 @@ this list at the next sync.
   improvements; graph-backed refactor previews.
 - **MCP surface**: lean curated tool set (`--tools lean` / `CRG_TOOLS=lean`);
   token-budgeted review output; bounded query results; graph-not-built guard
-  for read tools.
+  for read tools; complete change analysis by default (`detect_changes`,
+  `get_review_context`) with caller limits applied exactly and every cut
+  reported (ai-hub ADR-0026 D6).
 - **Runtime**: `doctor` health checklist; FastMCP 4 / MCP 2 migration;
   one-line uv installer; Beads integration for this repository's own
   development; VSCode reader schema alignment.

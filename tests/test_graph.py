@@ -1069,8 +1069,8 @@ class TestWeightedImpactScoring:
         assert elapsed < 5.0
 
 
-class TestGetTransitiveTestsFrontierCap:
-    """Regression tests for O(N*M) query explosion in get_transitive_tests."""
+class TestGetTransitiveTestsFrontier:
+    """get_transitive_tests follows the whole frontier with batched queries."""
 
     def setup_method(self):
         self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
@@ -1095,10 +1095,12 @@ class TestGetTransitiveTestsFrontierCap:
             file_path=source_qn.split("::")[0], line=1,
         ))
 
-    def test_frontier_capped_limits_sql_queries(self):
-        """Hub function with 200 callees must not issue 200 TESTED_BY queries."""
+    def test_hub_fan_out_uses_constant_queries(self, monkeypatch):
+        """Hub function with 1000 callees must not issue one query per callee."""
+        # The former env default (50) must not bring the cap back.
+        monkeypatch.setenv("CRG_MAX_TRANSITIVE_FRONTIER", "50")
         hub_qn = self._add_func("hub", "/t/hub.py")
-        for i in range(200):
+        for i in range(1000):
             callee_qn = self._add_func(f"callee_{i}", "/t/callee.py")
             self._add_calls_edge(hub_qn, callee_qn)
         self.store.commit()
@@ -1110,38 +1112,35 @@ class TestGetTransitiveTestsFrontierCap:
             query_count += 1
 
         self.store._conn.set_trace_callback(_trace)
-        self.store.get_transitive_tests(hub_qn, max_frontier=50)
+        self.store.get_transitive_tests(hub_qn)
         self.store._conn.set_trace_callback(None)
 
-        # Without cap: 200 callee TESTED_BY queries + overhead = ~204
-        # With cap of 50: ~54 queries max
-        assert query_count <= 60, (
-            f"Expected <=60 queries with frontier cap, got {query_count}"
+        # One CALLS batch plus three TESTED_BY batches of at most 450 callees,
+        # on top of the fixed direct-coverage lookups.
+        assert query_count <= 12, (
+            f"Expected batched frontier queries, got {query_count}"
         )
 
-    def test_uncapped_small_frontier_unchanged(self):
-        """Small fan-out (< cap) returns same results regardless of cap."""
+    def test_every_callee_on_a_wide_frontier_is_followed(self, monkeypatch):
+        """Coverage of all 120 callees survives; nothing past 50 is dropped."""
+        monkeypatch.setenv("CRG_MAX_TRANSITIVE_FRONTIER", "50")
         hub_qn = self._add_func("hub", "/t/hub.py")
-        test_qn = self._add_func("test_hub", "/t/test_hub.py")
-        for i in range(5):
+        for i in range(120):
             callee_qn = self._add_func(f"callee_{i}", "/t/callee.py")
+            test_qn = self._add_func(f"test_callee_{i}", "/t/test_callee.py")
             self._add_calls_edge(hub_qn, callee_qn)
-            # Only callee_2 has a test
-            if i == 2:
-                self.store.upsert_edge(EdgeInfo(
-                    kind="TESTED_BY", source=callee_qn, target=test_qn,
-                    file_path="/t/test_hub.py", line=1,
-                ))
+            self.store.upsert_edge(EdgeInfo(
+                kind="TESTED_BY", source=callee_qn, target=test_qn,
+                file_path="/t/test_callee.py", line=1,
+            ))
         self.store.commit()
 
-        results_default = self.store.get_transitive_tests(hub_qn)
-        results_capped = self.store.get_transitive_tests(hub_qn, max_frontier=50)
+        results = self.store.get_transitive_tests(hub_qn)
 
-        indirect_default = [r for r in results_default if r["indirect"]]
-        indirect_capped = [r for r in results_capped if r["indirect"]]
-        assert len(indirect_default) == 1
-        assert len(indirect_capped) == 1
-        assert indirect_default[0]["name"] == indirect_capped[0]["name"]
+        indirect = sorted(r["name"] for r in results if r["indirect"])
+        assert indirect == sorted(f"test_callee_{i}" for i in range(120))
+        # Stable order: the same graph always yields the same sequence.
+        assert results == self.store.get_transitive_tests(hub_qn)
 
 
 class TestResolveBareEndpoints:

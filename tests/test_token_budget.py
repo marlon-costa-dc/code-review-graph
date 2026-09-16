@@ -258,15 +258,17 @@ BUDGETS: dict[str, dict[str, Any]] = {
     },
     "get_review_context_tool": {
         "default": {"changed_files": "LEAF"},
+        # Change analysis has no hard ceiling: it is complete unless the
+        # caller limits it (see test_complete_change_analysis.py). Its worst
+        # case is therefore a caller who sets every limit generously; the
+        # limits it sets are what bound the response.
         "worst": {
             "changed_files": "ALL", "include_source": True,
-            "max_lines_per_file": HUGE, "max_results": HUGE,
-            "max_files": HUGE,
+            "max_lines_per_file": HUGE, "max_results": 100,
+            "max_files": 25, "max_tokens": 20_000,
         },
         # Larger budgets by design: this is the "give me everything needed to
-        # review" tool, and it inlines source. Bounded by max_results
-        # (100 nodes / 150 edges), an 800-line shared source budget, and
-        # max_lines_per_file capped at 500.
+        # review" tool, and it inlines source.
         "default_max": 20_000,
         "worst_max": 50_000,
     },
@@ -355,9 +357,11 @@ BUDGETS: dict[str, dict[str, Any]] = {
     },
     "detect_changes_tool": {
         "default": {"changed_files": "LEAF"},
+        # No hard ceiling (complete change analysis); HUGE limits are honoured
+        # and the caller's own max_tokens is what bounds the response.
         "worst": {
             "changed_files": "ALL", "include_source": True, "max_depth": 5,
-            "max_results": HUGE, "max_flows": HUGE,
+            "max_results": HUGE, "max_flows": HUGE, "max_tokens": 40_000,
         },
         "default_max": 12_000,
         "worst_max": 50_000,
@@ -642,11 +646,6 @@ MAX_CEILINGS = {
     "analysis_tools._MAX_GAPS_PER_CATEGORY": (
         analysis_tools._MAX_GAPS_PER_CATEGORY, 50,
     ),
-    "review._MAX_REVIEW_NODES": (review._MAX_REVIEW_NODES, 100),
-    "review._MAX_REVIEW_EDGES": (review._MAX_REVIEW_EDGES, 150),
-    "review._MAX_REVIEW_SOURCE_LINES": (review._MAX_REVIEW_SOURCE_LINES, 800),
-    "review._MAX_LINES_PER_FILE": (review._MAX_LINES_PER_FILE, 500),
-    "review._MAX_CHANGED_FUNCTIONS": (review._MAX_CHANGED_FUNCTIONS, 100),
     "review._MAX_AFFECTED_FLOWS_STANDARD": (
         review._MAX_AFFECTED_FLOWS_STANDARD, 25,
     ),
@@ -712,26 +711,9 @@ def test_hard_ceilings_bind(repo):
     emitted = sum(len(f.get("steps") or []) for f in flows["affected_flows"])
     assert emitted <= review._MAX_AFFECTED_FLOW_STEPS
 
-    changes = asyncio.run(crg_main.detect_changes_tool(
-        repo_root=root, changed_files=all_files, max_results=HUGE,
-        detail_level="standard", max_tokens=0,
-    ))
-    assert changes["changed_functions_total"] > review._MAX_CHANGED_FUNCTIONS
-    assert len(changes["changed_functions"]) == review._MAX_CHANGED_FUNCTIONS
-
-    context = crg_main.get_review_context_tool(
-        repo_root=root, changed_files=all_files, max_results=HUGE,
-        max_files=HUGE, include_source=True, max_lines_per_file=HUGE,
-    )["context"]
-    assert len(context["graph"]["impacted_nodes"]) <= review._MAX_REVIEW_NODES
-    assert len(context["graph"]["edges"]) <= review._MAX_REVIEW_EDGES
-    emitted_lines = sum(
-        len(snippet.splitlines())
-        for snippet in context["source_snippets"].values()
-    )
-    # Each snippet can overshoot by the "..." separators it inserts, so allow
-    # a small margin over the raw line budget.
-    assert emitted_lines <= review._MAX_REVIEW_SOURCE_LINES * 1.5
+    # detect_changes and get_review_context are change analysis and take no
+    # hard ceiling; test_complete_change_analysis.py proves they return
+    # everything and apply caller limits exactly.
 
     dead = crg_main.refactor_tool(
         repo_root=root, mode="dead_code", max_results=HUGE,
