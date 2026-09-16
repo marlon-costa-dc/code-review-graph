@@ -24,10 +24,10 @@ from functools import lru_cache
 from pathlib import Path, PurePath
 from typing import Any, NamedTuple, Optional
 
-try:
+if sys.version_info >= (3, 11):
     import tomllib
-except ModuleNotFoundError:  # pragma: no cover - Python 3.10
-    import tomli as tomllib  # type: ignore[import-not-found,no-redef]
+else:
+    import tomli as tomllib
 
 from .config_keys import is_spring_config_path, normalize_spring_config_key
 from .custom_languages import CustomLanguage, load_custom_languages
