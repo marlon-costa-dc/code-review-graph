@@ -2508,7 +2508,13 @@ def _create_watch_handler(
     return GraphUpdateHandler()
 
 
-def _sync_watch_tree(supervisor: _WatchSupervisor, handler: Any) -> None:
+def _sync_watch_tree(
+    supervisor: _WatchSupervisor,
+    handler: Any,
+    repo_root: Path,
+    store: GraphStore,
+    on_files_updated: Optional[Callable] = None,
+) -> None:
     """Reconcile watches, then bring the graph in line with what changed.
 
     A directory adopted this tick may already hold files, and one that
@@ -2524,6 +2530,29 @@ def _sync_watch_tree(supervisor: _WatchSupervisor, handler: Any) -> None:
         handler.dispatch(DirCreatedEvent(path))
     for path in vanished:
         handler.dispatch(DirDeletedEvent(path))
+    # Poll-based indexing of an adopted directory's current contents: the
+    # synthesized DirCreatedEvent only covers what existed at adoption time,
+    # and filesystem event delivery is not guaranteed on every platform (the
+    # deterministic watch-robustness CI failure).  incremental_update filters
+    # ignore patterns and unparseable files internally.
+    poll_targets: list[str] = []
+    for directory in adopted:
+        directory_path = Path(directory)
+        if directory_path.is_dir():
+            poll_targets.extend(
+                str(path) for path in directory_path.rglob("*") if path.is_file()
+            )
+    if poll_targets:
+        republished = incremental_update(
+            repo_root,
+            store,
+            changed_files=poll_targets,
+            reconcile_stale=False,
+        )
+        _raise_watch_update_errors(republished, "adopted-directory poll indexing")
+        if republished.get("files_updated", 0) > 0 and on_files_updated is not None:
+            postprocess_result = on_files_updated(store)
+            _raise_watch_postprocess_warnings(postprocess_result)
 
 
 def _install_sigterm_interrupt() -> Callable[[], None]:
@@ -2629,7 +2658,7 @@ def watch(
             else:
                 _sleep_watch_tick(_WATCH_TICK_SECONDS)
             handler.raise_if_failed()
-            _sync_watch_tree(supervisor, handler)
+            _sync_watch_tree(supervisor, handler, repo_root, store, on_files_updated)
             dead, repaired = supervisor.check_liveness()
             for path in repaired:
                 # A rescheduled watch missed whatever happened while it was
