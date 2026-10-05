@@ -395,7 +395,12 @@ def find_repo_root(
 
 def detect_vcs(root: Path) -> str:
     """Return ``'git'``, ``'svn'``, or ``'none'`` based on VCS markers at *root*."""
-    if (root / ".git").exists():
+    git_marker = root / ".git"
+    # A repository is ``.git/HEAD`` (or a ``.git`` file pointing at the real
+    # gitdir, as worktrees and submodules have).  A bare ``.git`` directory
+    # is not a repository: claiming git here would make ``git ls-files``
+    # fail later instead of walking the directory unversioned.
+    if git_marker.is_file() or (git_marker.is_dir() and (git_marker / "HEAD").exists()):
         return "git"
     if (root / ".svn").exists():
         return "svn"
@@ -2616,6 +2621,11 @@ def watch(
     # comparison below — stored file paths, watch keys, event paths — assumes
     # they are all spelled the same way.
     repo_root = _canonical_repo_root(repo_root)
+    # Before anything is built or watched: a store from another root is a
+    # misconfiguration, and the startup build below would rewrite every row
+    # onto it.  Refusing here also keeps the Observer unconstructed, so the
+    # caller sees the refusal before any watcher exists.
+    _assert_graph_matches_root(repo_root, store)
     supervisor = _WatchSupervisor(
         None,
         repo_root,
@@ -2626,30 +2636,53 @@ def watch(
     # heartbeat up front, ``crg-daemon status`` calls that healthy watcher
     # stalled for the whole build.
     supervisor.report_health(observer_alive=True, phase="initial-build", force=True)
-
-    initial = incremental_update(repo_root, store, changed_files=[])
-    _raise_watch_update_errors(initial, "initial watch reconciliation")
-    if initial["files_updated"] > 0 and on_files_updated is not None:
-        postprocess_result = on_files_updated(store)
-        _raise_watch_postprocess_warnings(postprocess_result)
     observer = Observer()
     supervisor.attach(observer)
     handler = _create_watch_handler(repo_root, store, on_files_updated)
     supervisor.schedule_initial(handler)
     handler.start()
-    observer.start()
-    # Capture the observer threads before publishing readiness.  Otherwise a
-    # watched directory can disappear after the health file is visible but
-    # before the first tick records its emitter as live; that dead emitter is
-    # then indistinguishable from one still being constructed and is ignored.
-    initial_dead, _ = supervisor.check_liveness()
-    if initial_dead:
-        names = ", ".join(initial_dead)
-        raise RuntimeError(f"watch observer stopped during startup: {names}")
-    supervisor.report_health(observer_alive=True, force=True)
+    restore_sigterm = _install_sigterm_interrupt()
+    try:
+        observer.start()
+        # Capture the observer threads before publishing readiness.  Otherwise a
+        # watched directory can disappear after the health file is visible but
+        # before the first tick records its emitter as live; that dead emitter is
+        # then indistinguishable from one still being constructed and is ignored.
+        initial_dead, _ = supervisor.check_liveness()
+        if initial_dead:
+            names = ", ".join(initial_dead)
+            raise RuntimeError(f"watch observer stopped during startup: {names}")
+
+        # The watches are live, but everything that raced them — content created
+        # between process start and the schedules above — pre-dates every event
+        # stream and would stay unindexed forever.  The deterministic CI failure
+        # was exactly this: the readiness heartbeat publishes before the
+        # schedules exist, so a ready client's writes land in that window, and
+        # the old pre-watch reconciliation (``changed_files=[]``) indexed nothing
+        # by contract.  The startup build is the authoritative convergence with
+        # the repository as it exists now; the pre-watch heartbeat published
+        # above exists to cover this build's duration, and the "watching"
+        # readiness below is only published once the graph has converged.
+        initial = full_build(repo_root, store)
+        _raise_watch_update_errors(initial, "initial watch build")
+        # A full build rewrites the graph wholesale, so post-processing runs for
+        # any non-empty convergence — parsed files, or a now-empty repo whose
+        # stale rows were just removed.
+        if initial["files_parsed"] > 0 or initial["stale_files_removed"] > 0:
+            if on_files_updated is not None:
+                postprocess_result = on_files_updated(store)
+                _raise_watch_postprocess_warnings(postprocess_result)
+
+        supervisor.report_health(observer_alive=True, force=True)
+    except BaseException:
+        # Startup failed after the observer went live: stop its threads and
+        # the debouncer before propagating, or they outlive this watcher.
+        _run_time_boxed(observer.stop, "observer stop")
+        observer.join(timeout=_WATCH_STOP_TIMEOUT)
+        handler.stop()
+        raise
 
     logger.info("Watching %s for changes... (Ctrl+C to stop)", repo_root)
-    restore_sigterm = _install_sigterm_interrupt()
     try:
         while True:
             if stop_event is not None:

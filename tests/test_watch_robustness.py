@@ -1011,7 +1011,7 @@ class TestWatchLoop:
 
         def record_initial_health(*args, **kwargs):
             seen.append(read_watch_health(tmp_path) or {})
-            return {"files_updated": 0}
+            return {"files_parsed": 0, "stale_files_removed": 0}
 
         try:
             with (
@@ -1021,7 +1021,7 @@ class TestWatchLoop:
                     side_effect=KeyboardInterrupt,
                 ),
                 patch(
-                    "code_review_graph.incremental.incremental_update",
+                    "code_review_graph.incremental.full_build",
                     side_effect=record_initial_health,
                 ),
             ):
@@ -1029,7 +1029,7 @@ class TestWatchLoop:
         finally:
             store.close()
 
-        assert seen, "incremental_update was never reached"
+        assert seen, "full_build was never reached"
         assert seen[0].get("phase") == "initial-build"
         assert seen[0].get("stalled") is False
 
@@ -1109,28 +1109,6 @@ class TestRealObserver:
         stop = threading.Event()
         failure: list[BaseException] = []
 
-        # TEMPORARY CI FORENSICS (round gc-qp4n7n): record every sync_watches
-        # adoption so the deterministic runner-only failure can be fixed from
-        # evidence. Removed once the cure lands.
-        import code_review_graph.incremental as _incremental
-
-        sync_log: list[dict[str, object]] = []
-        real_sync = _incremental._WatchSupervisor.sync_watches
-
-        def _recording_sync(supervisor_self):
-            adopted, vanished = real_sync(supervisor_self)
-            sync_log.append(
-                {
-                    "adopted": sorted(adopted),
-                    "vanished": sorted(vanished),
-                    "watches": sorted(supervisor_self._watches),
-                    "shallow": sorted(supervisor_self._shallow),
-                }
-            )
-            return adopted, vanished
-
-        _incremental._WatchSupervisor.sync_watches = _recording_sync
-
         def run_watch():
             try:
                 watch(repo, store, stop_event=stop)
@@ -1157,23 +1135,7 @@ class TestRealObserver:
                         path.endswith("svc.py") for path in reader.get_all_files()
                     )
                 )
-                store_rows_snapshot = sorted(reader.get_all_files())
-                # TEMPORARY CI FORENSICS payload (round gc-qp4n7n): the quiet
-                # pytest mode drops captured stdout, so the failure evidence
-                # rides in the assertion message itself. Removed post-cure.
-                import json as _json
-
-                forensics = _json.dumps(
-                    {
-                        "sync_log": sync_log,
-                        "store_rows": store_rows_snapshot,
-                        "svc_exists": (repo / "services" / "svc.py").exists(),
-                        "repo_children": sorted(p.name for p in repo.iterdir()),
-                    },
-                    default=str,
-                )
             finally:
-                _incremental._WatchSupervisor.sync_watches = real_sync
                 stop.set()
                 thread.join(timeout=20)
                 store.close()
@@ -1181,8 +1143,7 @@ class TestRealObserver:
 
         assert not failure, f"watch() raised: {failure[0]!r}"
         assert indexed, (
-            "a top-level directory created after startup was never watched or"
-            " indexed — CI-FORENSICS " + forensics
+            "a top-level directory created after startup was never watched or indexed"
         )
 
     def test_recreated_directory_survives_and_is_reindexed(self, tmp_path):
