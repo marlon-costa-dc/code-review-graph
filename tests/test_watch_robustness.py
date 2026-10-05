@@ -1158,6 +1158,20 @@ class TestRealObserver:
                     )
                 )
                 store_rows_snapshot = sorted(reader.get_all_files())
+                # TEMPORARY CI FORENSICS payload (round gc-qp4n7n): the quiet
+                # pytest mode drops captured stdout, so the failure evidence
+                # rides in the assertion message itself. Removed post-cure.
+                import json as _json
+
+                forensics = _json.dumps(
+                    {
+                        "sync_log": sync_log,
+                        "store_rows": store_rows_snapshot,
+                        "svc_exists": (repo / "services" / "svc.py").exists(),
+                        "repo_children": sorted(p.name for p in repo.iterdir()),
+                    },
+                    default=str,
+                )
             finally:
                 _incremental._WatchSupervisor.sync_watches = real_sync
                 stop.set()
@@ -1166,30 +1180,9 @@ class TestRealObserver:
                 reader.close()
 
         assert not failure, f"watch() raised: {failure[0]!r}"
-        if not indexed:
-            # TEMPORARY CI FORENSICS dump (round gc-qp4n7n) — removed post-cure.
-            import json as _json
-
-            print(
-                "CI-FORENSICS "
-                + _json.dumps(
-                    {
-                        "resolved_repo": str(repo.resolve()),
-                        "repo_children": sorted(p.name for p in repo.iterdir()),
-                        "svc_exists": (repo / "services" / "svc.py").exists(),
-                        "disk_files": sorted(
-                            str(path.relative_to(repo))
-                            for path in repo.rglob("*")
-                            if path.is_file() and "node_modules" not in path.parts
-                        ),
-                        "store_rows": sorted(store_rows_snapshot),
-                        "sync_log": sync_log,
-                    },
-                    default=str,
-                )
-            )
         assert indexed, (
-            "a top-level directory created after startup was never watched or indexed"
+            "a top-level directory created after startup was never watched or"
+            " indexed — CI-FORENSICS " + forensics
         )
 
     def test_recreated_directory_survives_and_is_reindexed(self, tmp_path):
