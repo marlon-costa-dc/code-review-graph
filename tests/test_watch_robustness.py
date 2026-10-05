@@ -1109,6 +1109,28 @@ class TestRealObserver:
         stop = threading.Event()
         failure: list[BaseException] = []
 
+        # TEMPORARY CI FORENSICS (round gc-qp4n7n): record every sync_watches
+        # adoption so the deterministic runner-only failure can be fixed from
+        # evidence. Removed once the cure lands.
+        import code_review_graph.incremental as _incremental
+
+        sync_log: list[dict[str, object]] = []
+        real_sync = _incremental._WatchSupervisor.sync_watches
+
+        def _recording_sync(supervisor_self):
+            adopted, vanished = real_sync(supervisor_self)
+            sync_log.append(
+                {
+                    "adopted": sorted(adopted),
+                    "vanished": sorted(vanished),
+                    "watches": sorted(supervisor_self._watches),
+                    "shallow": sorted(supervisor_self._shallow),
+                }
+            )
+            return adopted, vanished
+
+        _incremental._WatchSupervisor.sync_watches = _recording_sync
+
         def run_watch():
             try:
                 watch(repo, store, stop_event=stop)
@@ -1135,13 +1157,37 @@ class TestRealObserver:
                         path.endswith("svc.py") for path in reader.get_all_files()
                     )
                 )
+                store_rows_snapshot = sorted(reader.get_all_files())
             finally:
+                _incremental._WatchSupervisor.sync_watches = real_sync
                 stop.set()
                 thread.join(timeout=20)
                 store.close()
                 reader.close()
 
         assert not failure, f"watch() raised: {failure[0]!r}"
+        if not indexed:
+            # TEMPORARY CI FORENSICS dump (round gc-qp4n7n) — removed post-cure.
+            import json as _json
+
+            print(
+                "CI-FORENSICS "
+                + _json.dumps(
+                    {
+                        "resolved_repo": str(repo.resolve()),
+                        "repo_children": sorted(p.name for p in repo.iterdir()),
+                        "svc_exists": (repo / "services" / "svc.py").exists(),
+                        "disk_files": sorted(
+                            str(path.relative_to(repo))
+                            for path in repo.rglob("*")
+                            if path.is_file() and "node_modules" not in path.parts
+                        ),
+                        "store_rows": sorted(store_rows_snapshot),
+                        "sync_log": sync_log,
+                    },
+                    default=str,
+                )
+            )
         assert indexed, (
             "a top-level directory created after startup was never watched or indexed"
         )
