@@ -569,8 +569,7 @@ pip install "code-review-graph[all]"                 # All optional dependencies
 | `CRG_MAX_IMPACT_NODES` | Maximum nodes to include in impact analysis | `500` |
 | `CRG_MAX_IMPACT_DEPTH` | Search depth for blast-radius analysis | `2` |
 | `CRG_MAX_BFS_DEPTH` | Maximum depth for graph traversal | `15` |
-| `CRG_MAX_CHANGED_FUNCS` | Maximum changed functions analysed in one change report | `500` |
-| `CRG_MAX_TRANSITIVE_FRONTIER` | Maximum frontier size for transitive caller/callee expansion | `50` |
+| `CRG_MAX_CHANGED_FUNCS` | Opt-in bound on changed functions analysed in one change report; when it cuts, the report sets `functions_truncated` and states the total | - (complete analysis) |
 | `CRG_TOOL_TIMEOUT` | Optional timeout in seconds for bounded MCP tools (`0` disables timeout) | `0` |
 | `CRG_RECURSE_SUBMODULES` | Include git submodules in file collection when set to `1`, `true`, or `yes` | - |
 | `CRG_TOOLS` | Comma-separated allowlist of MCP tools to expose when serving | - |

@@ -253,10 +253,13 @@ def render_markdown(
         )
 
     if report.get("functions_truncated"):
+        analysed = len(report.get("changed_functions") or [])
+        total = report.get("changed_functions_total", analysed)
         lines.append("")
         lines.append(
-            "> Note: analysis was capped at the configured maximum number of "
-            "changed functions (set `CRG_MAX_CHANGED_FUNCS` to adjust)."
+            f"> Note: analysis covered {analysed} of {total} changed functions "
+            "because the opt-in `CRG_MAX_CHANGED_FUNCS` bound is set; unset it "
+            "for the complete analysis."
         )
 
     lines.extend(["", "---", "", FOOTER])

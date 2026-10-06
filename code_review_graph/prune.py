@@ -7,12 +7,13 @@ on top of ``--apply`` (epic aihub-3t7yh.3.3).
 
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
-try:
+if sys.version_info >= (3, 11):
     import tomllib
-except ImportError:  # Python < 3.11
+else:
     import tomli as tomllib
 
 from .daemon import (

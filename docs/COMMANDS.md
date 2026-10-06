@@ -75,15 +75,18 @@ max_results: int = 100           # Minimal mode additionally caps visible result
 changed_files: list[str] | None
 max_depth: int = 2
 include_source: bool = True
-max_lines_per_file: int = 200    # Capped at 500
+max_lines_per_file: int = 200    # Per-file excerpt size, applied exactly
 repo_root: str | None
 base: str = "HEAD~1"
 detail_level: str = "standard"   # "standard" or "minimal"
-max_results: int = 50            # Graph nodes per list (max 100) and edges (max 150)
-max_files: int = 25              # Files listed and given snippets (max 200)
+max_results: int | None = None   # Graph nodes per list and edges; None = all
+max_files: int | None = None     # Files listed and given snippets; None = all
+max_tokens: int = 0              # Snippet token budget; 0 = none; reports omissions
 ```
-Snippets share an 800-line budget across the whole response. Each list reports
-its untruncated `*_total`, and `context.truncated` marks any cut.
+The context is complete unless the caller passes a limit, and every limit is
+applied exactly (no hidden ceiling). Each list reports its untruncated
+`*_total`, and `context.truncated` marks any cut. `context.impact_truncated`
+reports when the impact radius stopped at `CRG_MAX_IMPACT_NODES`.
 Relevant responses may include compact estimated `context_savings` metadata.
 
 #### `traverse_graph_tool`
@@ -245,14 +248,17 @@ include_source: bool = False
 max_depth: int = 2
 repo_root: str | None
 detail_level: str = "standard"
-max_results: int = 25        # Changed functions, test gaps, changed files (max 100)
-max_flows: int = 20          # Affected flows embedded (max 200)
-max_tokens: int = 6000           # Token budget; drops lowest-risk items, reports omissions
+max_results: int | None = None  # Changed functions, test gaps, changed files; None = all
+max_flows: int | None = None    # Affected flows embedded; None = all
+max_tokens: int = 0             # Token budget; 0 = none; drops lowest-risk items, reports omissions
 ```
 Primary tool for code review. Maps changed files to affected functions, flows, communities, and test coverage gaps. Returns risk scores and prioritized review items.
-Embedded flows carry per-flow metadata only — use `get_affected_flows_tool` for
-step detail. `changed_functions_total`, `test_gaps_total`, and
-`affected_flows_total` report the untruncated counts.
+The analysis is complete unless the caller passes a limit, and every limit is
+applied exactly (no hidden ceiling). Embedded flows carry per-flow metadata
+only — use `get_affected_flows_tool` for step detail.
+`changed_functions_total`, `test_gaps_total`, `affected_flows_total`, and
+`changed_file_count` report the untruncated counts; `truncated` and the
+summary state every cut.
 Relevant responses may include compact estimated `context_savings` metadata.
 
 #### `refactor_tool`
