@@ -1135,6 +1135,7 @@ class TestRealObserver:
                         path.endswith("svc.py") for path in reader.get_all_files()
                     )
                 )
+                rows_snapshot = sorted(reader.get_all_files())
             finally:
                 stop.set()
                 thread.join(timeout=20)
@@ -1142,9 +1143,19 @@ class TestRealObserver:
                 reader.close()
 
         assert not failure, f"watch() raised: {failure[0]!r}"
-        assert indexed, (
-            "a top-level directory created after startup was never watched or indexed"
-        )
+        if not indexed:
+            # TEMPORARY CI FORENSICS (round gc-41qasf): quiet mode drops
+            # captured logs, so the failure evidence rides in the assertion
+            # message. Removed once the startup race is cured.
+            import traceback
+
+            raise AssertionError(
+                "a top-level directory created after startup was never watched or indexed:"
+                f" rows={rows_snapshot}"
+                f" svc_exists={(repo / 'services' / 'svc.py').exists()}"
+                f" watch_thread_alive={thread.is_alive()}"
+                + "".join(traceback.format_exception(failure[-1]) if failure else "")
+            )
 
     def test_recreated_directory_survives_and_is_reindexed(self, tmp_path):
         """`rm -rf src && mkdir src` inside one tick, on a real Observer.

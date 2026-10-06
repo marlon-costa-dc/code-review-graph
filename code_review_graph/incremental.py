@@ -7,6 +7,7 @@ and updates the graph accordingly. Also supports CLI invocation for hooks.
 from __future__ import annotations
 
 import concurrent.futures
+import errno
 import fnmatch
 import hashlib
 import json
@@ -2652,7 +2653,23 @@ def watch(
     handler.start()
     restore_sigterm = _install_sigterm_interrupt()
     try:
-        observer.start()
+        while True:
+            try:
+                observer.start()
+                break
+            except OSError as exc:
+                if exc.errno != errno.ENOENT:
+                    raise
+                # A planned watch vanished between the schedule and the
+                # inotify arm — a deletion racing startup, which the runner
+                # traceback proved.  watchdog removed the dead emitter and
+                # left the surviving emitters and the consumer thread
+                # unstarted; start the survivors.  The first sync tick
+                # releases the stale entry and re-adopts the directory if it
+                # returns, and the build below converges the store either
+                # way.  Each ENOENT retires one emitter, so the loop is
+                # bounded by the plan size.
+                logger.warning("Watch root vanished while arming the observer: %s", exc)
         # Capture the observer threads before publishing readiness.  Otherwise a
         # watched directory can disappear after the health file is visible but
         # before the first tick records its emitter as live; that dead emitter is
