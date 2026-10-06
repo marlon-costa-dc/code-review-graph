@@ -2494,7 +2494,11 @@ def _create_watch_handler(
 
         def stop(self) -> None:
             debouncer.stop()
-            debouncer.join()
+            # A startup failure can reach this before the debouncer thread
+            # ever started (a watch deleted while startup is still
+            # scheduling); Thread.join() raises on an unstarted thread.
+            if debouncer.is_alive():
+                debouncer.join()
 
         def process(self, events: list[FileSystemEvent]) -> None:
             processor.process(events)
