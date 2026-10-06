@@ -1447,6 +1447,11 @@ def full_build(
                 parsed_batch.append((str(full_path), nodes, edges, fhash))
                 total_nodes += len(nodes)
                 total_edges += len(edges)
+            except FileNotFoundError:
+                # The path vanished between the listing and the read: the
+                # parallel path's ``missing`` semantics — an event-sourced
+                # index reconciles that as a deletion, not a failure.
+                logger.debug("File vanished during build: %s", rel_path)
             except (OSError, PermissionError) as e:
                 errors.append({"file": rel_path, "error": str(e)})
                 if parser.detect_language(full_path) == "cpp":
