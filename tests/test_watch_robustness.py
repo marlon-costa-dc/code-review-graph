@@ -1231,7 +1231,16 @@ class TestRealObserver:
                 thread.join(timeout=20)
                 store.close()
 
-        assert not failure, f"deleting a watched directory killed the watcher: {failure[0]!r}"
+        if failure:
+            # TEMPORARY CI FORENSICS (round gc-41qasf): the quiet mode drops
+            # captured logs, so the full traceback rides in the assertion
+            # message. Removed once the startup-deletion race is cured.
+            import traceback
+
+            raise AssertionError(
+                "deleting a watched directory killed the watcher: "
+                + "".join(traceback.format_exception(failure[-1]))
+            )
         assert still_running
 
 
