@@ -2679,10 +2679,13 @@ def watch(
 
         supervisor.report_health(observer_alive=True, force=True)
     except BaseException:
-        # Startup failed after the observer went live: stop its threads and
-        # the debouncer before propagating, or they outlive this watcher.
+        # Startup failed after (or while) the observer went live: stop its
+        # threads and the debouncer before propagating, or they outlive this
+        # watcher.  If start() itself raised, the thread never began — join
+        # would raise on it and mask the real failure.
         _run_time_boxed(observer.stop, "observer stop")
-        observer.join(timeout=_WATCH_STOP_TIMEOUT)
+        if observer.is_alive():
+            observer.join(timeout=_WATCH_STOP_TIMEOUT)
         handler.stop()
         raise
 
