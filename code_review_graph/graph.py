@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import sqlite3
 import threading
 import time
@@ -588,7 +587,7 @@ class GraphStore:
             yield self._row_to_edge(row)
 
     def get_transitive_tests(
-        self, qualified_name: str, max_depth: int = 1, max_frontier: int | None = None,
+        self, qualified_name: str, max_depth: int = 1,
     ) -> list[dict]:
         """Find tests covering a node, including indirect (transitive) coverage.
 
@@ -600,13 +599,9 @@ class GraphStore:
            then collect TESTED_BY edges on each callee.
 
         Returns a list of dicts with node fields plus ``indirect: bool``.
-
-        ``max_frontier`` caps the CALLS fan-out per BFS hop to prevent O(N*M)
-        query explosion on hub functions in large graphs. Defaults to
-        ``CRG_MAX_TRANSITIVE_FRONTIER`` env var (50 if unset).
+        Every callee on every hop is followed; nothing is dropped from the
+        frontier.
         """
-        if max_frontier is None:
-            max_frontier = int(os.environ.get("CRG_MAX_TRANSITIVE_FRONTIER", "50"))
         conn = self._conn
         seen: set[str] = set()
         results: list[dict] = []
@@ -727,43 +722,55 @@ class GraphStore:
                 if d:
                     results.append(d)
 
-        # Transitive: follow CALLS edges, then collect TESTED_BY on callees
-        frontier = set(input_qns)
+        # Transitive: follow CALLS edges, then collect TESTED_BY on callees.
+        # The whole frontier is followed on every hop. Each hop resolves its
+        # edges with batched ``IN (...)`` lookups, so a hub function's fan-out
+        # costs a constant number of statements instead of one per callee,
+        # and no callee's coverage is dropped to keep the query count down.
+        frontier = sorted(set(input_qns))
         for _ in range(max_depth):
             next_frontier: set[str] = set()
-            for qn in frontier:
-                for row in conn.execute(
-                    "SELECT target_qualified, extra FROM edges "
-                    "WHERE source_qualified = ? AND kind = 'CALLS'",
-                    (qn,),
-                ).fetchall():
-                    if _has_unresolved_metadata(row["extra"]):
-                        continue
-                    next_frontier.add(row["target_qualified"])
-            if len(next_frontier) > max_frontier:
-                next_frontier = set(list(next_frontier)[:max_frontier])
-            for callee in next_frontier:
-                # A bare callee has no stable identity. Endpoint resolution
-                # qualifies it when graph evidence exists; otherwise following
-                # TESTED_BY here would attribute every same-named test.
-                if "::" not in callee:
+            for row in self._edges_by_sources(frontier, "CALLS"):
+                if _has_unresolved_metadata(row["extra"]):
                     continue
-                for row in conn.execute(
-                    "SELECT target_qualified, extra FROM edges "
-                    "WHERE source_qualified = ? AND kind = 'TESTED_BY'",
-                    (callee,),
-                ).fetchall():
-                    if _has_unresolved_metadata(row["extra"]):
-                        continue
-                    tgt = row["target_qualified"]
-                    if tgt not in seen:
-                        seen.add(tgt)
-                        d = _node_dict(tgt, indirect=True)
-                        if d:
-                            results.append(d)
-            frontier = next_frontier
+                next_frontier.add(row["target_qualified"])
+            frontier = sorted(next_frontier)
+            # A bare callee has no stable identity. Endpoint resolution
+            # qualifies it when graph evidence exists; otherwise following
+            # TESTED_BY here would attribute every same-named test.
+            qualified_callees = [callee for callee in frontier if "::" in callee]
+            for row in self._edges_by_sources(qualified_callees, "TESTED_BY"):
+                if _has_unresolved_metadata(row["extra"]):
+                    continue
+                tgt = row["target_qualified"]
+                if tgt not in seen:
+                    seen.add(tgt)
+                    d = _node_dict(tgt, indirect=True)
+                    if d:
+                        results.append(d)
 
         return results
+
+    def _edges_by_sources(
+        self, source_qns: list[str], kind: str,
+    ) -> list[sqlite3.Row]:
+        """Return every *kind* edge sourced from *source_qns*, in stable order.
+
+        Batched to stay under SQLite's variable limit; rows are ordered by
+        source then insertion so callers see a deterministic sequence.
+        """
+        rows: list[sqlite3.Row] = []
+        batch_size = 450
+        for i in range(0, len(source_qns), batch_size):
+            batch = source_qns[i:i + batch_size]
+            placeholders = ",".join("?" for _ in batch)
+            rows.extend(self._conn.execute(  # nosec B608
+                "SELECT source_qualified, target_qualified, extra FROM edges "
+                f"WHERE kind = ? AND source_qualified IN ({placeholders}) "
+                "ORDER BY source_qualified, id",
+                (kind, *batch),
+            ).fetchall())
+        return rows
 
     @staticmethod
     def _select_evidence_backed_candidate(

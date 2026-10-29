@@ -24,19 +24,13 @@ from ._common import (
 
 logger = logging.getLogger(__name__)
 
-# Hard ceilings shared by the review tools. All three walk the full impact
-# radius of a change set, so on a whole-repo diff every list below is
-# proportional to the repository, not to the change. The numbers are set
-# from measured cost per row against a 5.6k-node graph:
+# ``detect_changes`` and ``get_review_context`` are change analysis: they
+# return the complete analysis unless the caller passes a limit, apply every
+# caller limit exactly (no smaller hard ceiling), and report each cut with its
+# untruncated ``*_total``. Measured cost per row against a 5.6k-node graph,
+# for callers choosing their own limits:
 #   node dict ~60 tok, node+risk_score ~118 tok, test gap ~85 tok,
 #   source line ~10 tok, flow with full steps ~980 tok, flow metadata ~18 tok.
-_MAX_REVIEW_NODES = 100
-_MAX_REVIEW_EDGES = 150
-_MAX_REVIEW_FILES = 200
-_MAX_REVIEW_SOURCE_LINES = 800
-_MAX_LINES_PER_FILE = 500
-_MAX_CHANGED_FUNCTIONS = 100
-_MAX_DETECT_SOURCE_LINES = 600
 
 # ``get_affected_flows`` in standard mode carries a full ``steps`` list per
 # flow (~980 tokens each), so 50 flows is still ~49k tokens — #849 was only
@@ -49,7 +43,6 @@ _MAX_AFFECTED_FLOWS_MINIMAL = 500
 # down until this shared budget runs out; the rest keep their metadata and
 # are marked ``steps_omitted``.
 _MAX_AFFECTED_FLOW_STEPS = 400
-_MAX_DETECT_FLOWS = 200
 
 # ``detect_changes`` embeds affected flows for context, not for flow
 # spelunking: every flow carries a full ``steps`` list, which is exactly
@@ -97,6 +90,15 @@ def _bound_flow_steps(
     return bounded, truncated
 
 
+def _impact_truncation_note(impact: dict[str, Any]) -> str:
+    """Summary line stating that the impact radius stopped at its node bound."""
+    return (
+        f"  - Impact radius limited to {len(impact['impacted_nodes'])} of "
+        f"{impact['total_impacted']} reachable node(s) by CRG_MAX_IMPACT_NODES; "
+        "impacted files and edges cover the kept nodes only"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Tool 4: get_review_context
 # ---------------------------------------------------------------------------
@@ -110,13 +112,15 @@ def get_review_context(
     repo_root: str | None = None,
     base: str = "HEAD~1",
     detail_level: str = "standard",
-    max_results: int = 50,
-    max_files: int = 25,
+    max_results: int | None = None,
+    max_files: int | None = None,
     max_tokens: int = 0,
 ) -> dict[str, Any]:
     """Generate a focused review context from changed files.
 
-    Builds a token-optimized subgraph + source snippets for code review.
+    Builds a subgraph + source snippets for code review. The context is
+    complete unless the caller passes a limit; every limit is applied exactly
+    and every cut is reported.
 
     Args:
         changed_files: Files to review (auto-detected from git diff if omitted).
@@ -129,13 +133,11 @@ def get_review_context(
             "minimal" returns summary, risk level, changed/impacted file counts,
             top 5 key entity names, test gap count, and next tool suggestions.
             Default: "standard".
-        max_results: Maximum graph nodes per list and edges to return
-            (default 50; nodes capped at 200, edges at 300). Each list
-            carries its untruncated ``*_total`` count.
-        max_files: Maximum files to list and to emit source snippets for
-            (default 25, capped at 200). A whole-repo diff otherwise inlined
-            every tracked file's source. Snippets additionally share an
-            800-line budget and ``max_lines_per_file`` is capped at 500.
+        max_results: Maximum graph nodes per list and edges to return.
+            ``None`` (default) returns every node and edge. Each list carries
+            its untruncated ``*_total`` count.
+        max_files: Maximum files to list and to emit source snippets for.
+            ``None`` (default) lists every file.
         max_tokens: Token budget for the standard response (estimated via the
             chars/4 heuristic).  When the source snippets would exceed it, the
             lowest-risk files are dropped first and an honest ``omitted`` note
@@ -143,10 +145,15 @@ def get_review_context(
 
     Returns:
         Structured review context with subgraph, source snippets, and
-        review guidance, plus a ``truncated`` flag.
+        review guidance, plus a ``truncated`` flag. ``impact_truncated``
+        reports when the impact radius itself stopped at its configured node
+        bound (``CRG_MAX_IMPACT_NODES``), with ``impacted_nodes_total`` holding
+        the real reachable count.
     """
-    _validate_positive_int(max_results, "max_results")
-    _validate_positive_int(max_files, "max_files")
+    if max_results is not None:
+        _validate_positive_int(max_results, "max_results")
+    if max_files is not None:
+        _validate_positive_int(max_files, "max_files")
     _validate_positive_int(max_lines_per_file, "max_lines_per_file")
 
     store, root, not_built = _get_store_for_read(repo_root)
@@ -170,8 +177,11 @@ def get_review_context(
         original_tokens = estimate_file_tokens(root, changed_files)
         impact = store.get_impact_radius(graph_files, max_depth=max_depth)
 
+        impact_truncated = bool(impact["truncated"])
+        impact_total = int(impact["total_impacted"])
+
         if detail_level == "minimal":
-            impacted_count = len(impact["impacted_nodes"])
+            impacted_count = impact_total
             if impacted_count > 20:
                 risk = "high"
             elif impacted_count > 5:
@@ -194,9 +204,11 @@ def get_review_context(
             summary_parts = [
                 f"Review context for {len(changed_files)} changed file(s):",
                 f"  - Risk: {risk}",
-                f"  - {len(impact['impacted_nodes'])} impacted nodes"
+                f"  - {impact_total} impacted nodes"
                 f" in {len(impact['impacted_files'])} files",
             ]
+            if impact_truncated:
+                summary_parts.append(_impact_truncation_note(impact))
 
             result = {
                 "status": "ok",
@@ -204,6 +216,8 @@ def get_review_context(
                 "risk": risk,
                 "changed_file_count": len(changed_files),
                 "impacted_file_count": len(impact["impacted_files"]),
+                "impacted_node_count": impact_total,
+                "impact_truncated": impact_truncated,
                 "key_entities": key_entities,
                 "test_gaps": test_gap_count,
                 "next_tool_suggestions": [
@@ -215,34 +229,23 @@ def get_review_context(
             attach_context_savings(result, original_tokens=original_tokens)
             return result
 
-        # Build review context. Every list below scales with the change set,
-        # so each is bounded and reports its untruncated total.
-        shown_files, files_total, files_cut = _bounded(
-            changed_files,
-            max_files,
-            _MAX_REVIEW_FILES,
-        )
+        # Build review context. Every list below scales with the change set;
+        # each honours the caller's limit exactly (all items when it is None)
+        # and reports its untruncated total.
+        shown_files, files_total, files_cut = _bounded(changed_files, max_files, None)
         impacted_files, impacted_total, impacted_cut = _bounded(
-            impact["impacted_files"],
-            max_files,
-            _MAX_REVIEW_FILES,
+            impact["impacted_files"], max_files, None,
         )
         changed_nodes, changed_nodes_total, cn_cut = _bounded(
-            impact["changed_nodes"],
-            max_results,
-            _MAX_REVIEW_NODES,
+            impact["changed_nodes"], max_results, None,
         )
-        impacted_nodes, impacted_nodes_total, in_cut = _bounded(
-            impact["impacted_nodes"],
-            max_results,
-            _MAX_REVIEW_NODES,
+        impacted_nodes, _impacted_shown_total, in_cut = _bounded(
+            impact["impacted_nodes"], max_results, None,
         )
-        edges, edges_total, edges_cut = _bounded(
-            impact["edges"],
-            max_results,
-            _MAX_REVIEW_EDGES,
+        edges, edges_total, edges_cut = _bounded(impact["edges"], max_results, None)
+        truncated = (
+            files_cut or impacted_cut or cn_cut or in_cut or edges_cut or impact_truncated
         )
-        truncated = files_cut or impacted_cut or cn_cut or in_cut or edges_cut
 
         context: dict[str, Any] = {
             "changed_files": shown_files,
@@ -253,46 +256,37 @@ def get_review_context(
                 "changed_nodes": [node_to_dict(n) for n in changed_nodes],
                 "changed_nodes_total": changed_nodes_total,
                 "impacted_nodes": [node_to_dict(n) for n in impacted_nodes],
-                "impacted_nodes_total": impacted_nodes_total,
+                "impacted_nodes_total": impact_total,
                 "edges": [edge_to_dict(e) for e in edges],
                 "edges_total": edges_total,
             },
+            "impact_truncated": impact_truncated,
             "truncated": truncated,
         }
 
-        # Add source snippets for the bounded file list, spending a shared
-        # line budget. Snippets were 109k of a 134k-token worst case: without
-        # a total budget, ``max_lines_per_file`` alone lets N files each
-        # contribute a whole file.
+        # Add source snippets for every listed file. ``max_lines_per_file`` is
+        # the caller's per-file excerpt size and is applied exactly; a caller
+        # who needs a response-wide bound passes ``max_tokens``, which reports
+        # the files it omits.
         if include_source:
             snippets = {}
-            per_file = min(max_lines_per_file, _MAX_LINES_PER_FILE)
-            budget = _MAX_REVIEW_SOURCE_LINES
             for rel_path in shown_files:
-                if budget <= 0:
-                    context["source_truncated"] = True
-                    context["truncated"] = True
-                    break
                 full_path = root / rel_path
                 if full_path.is_file():
                     try:
                         lines = full_path.read_text(encoding="utf-8", errors="replace").splitlines()
-                        allowed = min(per_file, budget)
-                        if len(lines) > allowed:
+                        if len(lines) > max_lines_per_file:
                             # Include only the relevant functions/classes
-                            relevant_lines = _extract_relevant_lines(
+                            snippets[rel_path] = _extract_relevant_lines(
                                 lines,
                                 impact["changed_nodes"],
                                 str(full_path),
-                                allowed,
+                                max_lines_per_file,
                             )
-                            snippets[rel_path] = relevant_lines
-                            budget -= allowed
                         else:
                             snippets[rel_path] = "\n".join(
                                 f"{i + 1}: {line}" for i, line in enumerate(lines)
                             )
-                            budget -= len(lines)
                     except (OSError, UnicodeDecodeError):
                         snippets[rel_path] = "(could not read file)"
             context["source_snippets"] = snippets
@@ -315,13 +309,18 @@ def get_review_context(
             + ":",
             f"  - {changed_nodes_total} directly changed nodes"
             + _shown_of(len(changed_nodes), changed_nodes_total),
-            f"  - {impacted_nodes_total} impacted nodes"
-            f" in {impacted_total} files" + _shown_of(len(impacted_nodes), impacted_nodes_total),
+            f"  - {impact_total} impacted nodes"
+            f" in {impacted_total} files" + _shown_of(len(impacted_nodes), impact_total),
+        ]
+        if impact_truncated:
+            summary_parts.append(_impact_truncation_note(impact))
+        summary_parts += [
             "",
             "Review guidance:",
             guidance,
         ]
         if budget_note:
+            context["truncated"] = True
             summary_parts.append("")
             summary_parts.append(budget_note["note"])
 
@@ -617,8 +616,8 @@ def detect_changes_func(
     max_depth: int = 2,
     repo_root: str | None = None,
     detail_level: str = "standard",
-    max_results: int = 25,
-    max_flows: int = 20,
+    max_results: int | None = None,
+    max_flows: int | None = None,
     max_tokens: int = 0,
 ) -> dict[str, Any]:
     """Detect changes and produce risk-scored review guidance.
@@ -639,12 +638,14 @@ def detect_changes_func(
             "minimal" returns only summary, risk_score, changed_file_count,
             test_gap_count, and top 3 review priorities (text only).
             Default: "standard".
-        max_results: Maximum changed functions and test gaps to return
-            (default 25, capped at 200). ``changed_functions_total`` and
-            ``test_gaps_total`` report the untruncated counts.
-        max_flows: Maximum affected flows to embed (default 20, capped at
-            200). The embedded flows carry per-flow metadata only; use
-            get_affected_flows_tool for step detail. See #849.
+        max_results: Maximum changed functions, test gaps, and changed files
+            to return, applied exactly. ``None`` (default) returns all of
+            them. ``changed_functions_total``, ``test_gaps_total``, and
+            ``changed_file_count`` report the untruncated counts.
+        max_flows: Maximum affected flows to embed, applied exactly. ``None``
+            (default) embeds every affected flow. The embedded flows carry
+            per-flow metadata only; use get_affected_flows_tool for step
+            detail. See #849.
         max_tokens: Token budget for the standard response (estimated via the
             chars/4 heuristic).  When the analysis would exceed it, the
             lowest-risk changed functions and flows are dropped first and an
@@ -652,10 +653,15 @@ def detect_changes_func(
 
     Returns:
         Risk-scored analysis with changed functions, affected flows,
-        test gaps, and review priorities, plus ``truncated``.
+        test gaps, and review priorities, plus ``truncated``. The analysis is
+        complete unless the caller passes a limit (or opts into
+        ``CRG_MAX_CHANGED_FUNCS``); every cut sets ``truncated``, keeps the
+        ``*_total`` counts, and is stated in the summary.
     """
-    _validate_positive_int(max_results, "max_results")
-    _validate_positive_int(max_flows, "max_flows")
+    if max_results is not None:
+        _validate_positive_int(max_results, "max_results")
+    if max_flows is not None:
+        _validate_positive_int(max_flows, "max_flows")
 
     store, root, not_built = _get_store_for_read(repo_root)
     if store is None or root is None:
@@ -700,14 +706,11 @@ def detect_changes_func(
             base=base,
         )
 
-        # Optionally include source snippets for changed functions, spending a
-        # shared line budget. Inlining every changed function body turned a
-        # whole-repo diff into a 30k-token ``changed_functions`` list.
+        # Optionally include the source of every changed function. A caller
+        # who needs a response-wide bound passes ``max_tokens``, which drops
+        # the lowest-risk functions first and reports what it omitted.
         if include_source:
-            budget = _MAX_DETECT_SOURCE_LINES
             for func in analysis.get("changed_functions", []):
-                if budget <= 0:
-                    break
                 fp = func.get("file_path")
                 ls = func.get("line_start")
                 le = func.get("line_end")
@@ -719,11 +722,10 @@ def detect_changes_func(
                                 encoding="utf-8", errors="replace"
                             ).splitlines()
                             start = max(0, ls - 1)
-                            end = min(len(lines), le, start + budget)
+                            end = min(len(lines), le)
                             func["source"] = "\n".join(
                                 f"{i + 1}: {lines[i]}" for i in range(start, end)
                             )
-                            budget -= max(0, end - start)
                         except (OSError, UnicodeDecodeError):
                             func["source"] = "(could not read file)"
 
@@ -739,26 +741,20 @@ def detect_changes_func(
                 "review_priorities": top_priorities,
             }
         else:
-            funcs, funcs_total, funcs_cut = _bounded(
-                analysis.get("changed_functions", []),
-                max_results,
-                _MAX_CHANGED_FUNCTIONS,
+            funcs, _funcs_listed, funcs_cut = _bounded(
+                analysis.get("changed_functions", []), max_results, None,
             )
+            # The analysis reports its own untruncated total: an opt-in
+            # CRG_MAX_CHANGED_FUNCS bound may already have cut the list.
+            funcs_total = analysis["changed_functions_total"]
+            funcs_cut = funcs_cut or analysis["functions_truncated"]
             gaps, gaps_total, gaps_cut = _bounded(
-                analysis.get("test_gaps", []),
-                max_results,
-                _MAX_CHANGED_FUNCTIONS,
+                analysis.get("test_gaps", []), max_results, None,
             )
             flows, flows_total, flows_cut = _bounded(
-                analysis.get("affected_flows", []),
-                max_flows,
-                _MAX_DETECT_FLOWS,
+                analysis.get("affected_flows", []), max_flows, None,
             )
-            files, files_total, files_cut = _bounded(
-                changed_files,
-                max_results,
-                _MAX_REVIEW_FILES,
-            )
+            files, files_total, files_cut = _bounded(changed_files, max_results, None)
             any_cut = funcs_cut or gaps_cut or flows_cut or files_cut
             summary = analysis.get("summary", "")
             if any_cut:
@@ -766,7 +762,8 @@ def detect_changes_func(
                     "\n  - Response bounded: "
                     f"{len(funcs)} of {funcs_total} changed function(s), "
                     f"{len(gaps)} of {gaps_total} test gap(s), "
-                    f"{len(flows)} of {flows_total} flow(s) shown"
+                    f"{len(flows)} of {flows_total} flow(s), "
+                    f"{len(files)} of {files_total} changed file(s) shown"
                 )
             result = {
                 "status": "ok",
@@ -786,6 +783,7 @@ def detect_changes_func(
                 budget_note = _budget_detect_changes(result, max_tokens)
                 if budget_note:
                     result["omitted"] = budget_note
+                    result["truncated"] = True
                     summary = result.get("summary", "")
                     result["summary"] = (
                         f"{summary}\n{budget_note['note']}" if summary else budget_note["note"]

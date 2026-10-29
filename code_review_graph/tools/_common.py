@@ -326,9 +326,12 @@ def _resolve_graph_file_paths(
 #   * ``truncated`` marks that the list was cut,
 #   * the summary line says how many of how many are shown.
 #
-# Each tool pairs a caller-facing default with a hard ceiling. The ceiling
+# Browsing tools pair a caller-facing default with a hard ceiling. The ceiling
 # exists so a caller passing ``max_results=1_000_000`` still gets a response
 # that fits the ~25k-token budget most MCP clients allow for one tool result.
+# Change-analysis tools (detect_changes, get_review_context) take no ceiling:
+# they return everything unless the caller limits them, and apply that limit
+# exactly.
 
 
 def _validate_positive_int(value: int, name: str) -> int:
@@ -343,15 +346,21 @@ def _validate_positive_int(value: int, name: str) -> int:
 
 
 def _bounded(
-    items: "list[Any]", max_results: int, hard_cap: int,
+    items: "list[Any]", max_results: int | None, hard_cap: int | None,
 ) -> tuple[list[Any], int, bool]:
-    """Cap *items* at ``min(max_results, hard_cap)``.
+    """Cap *items* at the smaller of ``max_results`` and ``hard_cap``.
+
+    ``None`` means that bound does not apply: a ``None`` caller limit asks for
+    every item, and a ``None`` hard cap applies the caller limit exactly.
 
     Returns ``(visible, total, truncated)`` where ``total`` is the
     untruncated length, so callers can always report the real count.
     """
     total = len(items)
-    limit = min(max_results, hard_cap)
+    bounds = [bound for bound in (max_results, hard_cap) if bound is not None]
+    if not bounds:
+        return list(items), total, False
+    limit = min(bounds)
     return list(items[:limit]), total, total > limit
 
 

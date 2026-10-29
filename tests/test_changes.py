@@ -539,8 +539,8 @@ class TestChanges:
         assert getattr(self.store.close, "__func__", None) is GraphStore.close
 
 
-class TestAnalyzeChangesFunctionCap:
-    """Regression tests for O(N) slowdown when PR touches many functions."""
+class TestAnalyzeChangesFunctionBound:
+    """The change analysis is complete unless CRG_MAX_CHANGED_FUNCS opts in."""
 
     def setup_method(self):
         self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
@@ -560,26 +560,50 @@ class TestAnalyzeChangesFunctionCap:
             self.store.upsert_node(node, file_hash="abc")
         self.store.commit()
 
-    def test_changed_funcs_capped(self, monkeypatch):
-        """analyze_changes processes at most CRG_MAX_CHANGED_FUNCS functions."""
+    def test_every_changed_function_is_analysed_by_default(self, monkeypatch):
+        """More changed functions than the former 500 default are all kept."""
+        monkeypatch.delenv("CRG_MAX_CHANGED_FUNCS", raising=False)
+        self._add_funcs(620)
+
+        result = analyze_changes(self.store, changed_files=["app.py"])
+
+        assert len(result["changed_functions"]) == 620
+        assert result["changed_functions_total"] == 620
+        assert len(result["test_gaps"]) == 620
+        assert result["functions_truncated"] is False
+        assert "CRG_MAX_CHANGED_FUNCS" not in result["summary"]
+
+    def test_opt_in_bound_is_reported_with_total(self, monkeypatch):
+        """An explicit CRG_MAX_CHANGED_FUNCS cut states what it omitted."""
         monkeypatch.setenv("CRG_MAX_CHANGED_FUNCS", "10")
         self._add_funcs(20)
 
         result = analyze_changes(self.store, changed_files=["app.py"])
 
         assert len(result["changed_functions"]) == 10
+        assert result["changed_functions_total"] == 20
         assert result["functions_truncated"] is True
+        assert "limited to 10 of 20 changed functions" in result["summary"]
         assert "CRG_MAX_CHANGED_FUNCS" in result["summary"]
 
-    def test_no_truncation_below_cap(self, monkeypatch):
-        """analyze_changes processes all functions when count is below cap."""
+    def test_opt_in_bound_above_count_cuts_nothing(self, monkeypatch):
         monkeypatch.setenv("CRG_MAX_CHANGED_FUNCS", "50")
         self._add_funcs(5)
 
         result = analyze_changes(self.store, changed_files=["app.py"])
 
         assert len(result["changed_functions"]) == 5
+        assert result["changed_functions_total"] == 5
         assert result["functions_truncated"] is False
+
+    @pytest.mark.parametrize("raw", ["0", "-3", "many"])
+    def test_invalid_opt_in_bound_raises(self, monkeypatch, raw):
+        """A malformed bound fails loudly instead of selecting another bound."""
+        monkeypatch.setenv("CRG_MAX_CHANGED_FUNCS", raw)
+        self._add_funcs(3)
+
+        with pytest.raises(ValueError):
+            analyze_changes(self.store, changed_files=["app.py"])
 
 
 class TestAnalyzeChangesInternalParseRemap:

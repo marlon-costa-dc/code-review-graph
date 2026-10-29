@@ -487,14 +487,15 @@ def get_review_context_tool(
     repo_root: Optional[str] = None,
     base: str = "HEAD~1",
     detail_level: str = "standard",
-    max_results: int = 100,
-    max_files: int = 25,
-    max_tokens: int = 6000,
+    max_results: Optional[int] = None,
+    max_files: Optional[int] = None,
+    max_tokens: int = 0,
 ) -> dict:
-    """Generate a focused, token-efficient review context for code changes.
+    """Generate a complete review context for code changes.
 
     Combines impact analysis with source snippets and review guidance.
-    Use this for comprehensive code reviews.
+    Use this for comprehensive code reviews. Nothing is omitted unless the
+    caller passes a limit; every limit is applied exactly and reported.
 
     Args:
         changed_files: Files to review. Auto-detected from git diff if omitted.
@@ -506,12 +507,12 @@ def get_review_context_tool(
         detail_level: "standard" for full output, "minimal" for
             token-efficient summary. Default: standard.
         max_results: Maximum graph nodes per list and edges to return.
-            Default: 50. Each list reports its untruncated ``*_total``.
+            Default: all. Each list reports its untruncated ``*_total``.
         max_files: Maximum files listed and given source snippets.
-            Default: 25. Snippets share an 800-line budget.
-        max_tokens: Token budget for the response. When the full context would
+            Default: all.
+        max_tokens: Token budget for the source snippets. When they would
             exceed this, the lowest-risk source snippets are dropped first and
-            an honest ``omitted`` note is added. Default: 6000. Set 0 to disable.
+            an honest ``omitted`` note is added. Default: 0 (no budget).
     """
     root = _resolve_repo_root(repo_root)
     return with_provenance(get_review_context(
@@ -879,9 +880,9 @@ async def detect_changes_tool(
     max_depth: int = 2,
     repo_root: Optional[str] = None,
     detail_level: str = "minimal",
-    max_results: int = 25,
-    max_flows: int = 20,
-    max_tokens: int = 6000,
+    max_results: Optional[int] = None,
+    max_flows: Optional[int] = None,
+    max_tokens: int = 0,
 ) -> dict:
     """Detect changes and produce risk-scored, priority-ordered review guidance.
 
@@ -903,14 +904,14 @@ async def detect_changes_tool(
             token-efficient summary. Default: standard.
         max_results: Maximum changed functions, test gaps, and changed files
             to return; the matching *_total fields report the full counts.
-            Default: 25.
+            Default: all (the complete analysis).
         max_flows: Maximum affected flows to embed. Embedded flows carry
             per-flow metadata only — use get_affected_flows_tool for step
-            detail. Default: 20.
+            detail. Default: all.
         max_tokens: Token budget for the standard response. When the full
             analysis would exceed this, the lowest-risk changed functions and
             flows are dropped first and an honest ``omitted`` note is added.
-            Default: 6000. Set 0 to disable.
+            Default: 0 (no budget).
     """
     root = _resolve_repo_root(repo_root)
 
@@ -931,8 +932,9 @@ async def detect_changes_tool(
         except asyncio.TimeoutError:
             message = (
                 f"detect_changes_tool timed out after {tool_timeout}s. "
-                "Reduce scope with CRG_MAX_CHANGED_FUNCS / CRG_MAX_TRANSITIVE_FRONTIER, "
-                "or increase CRG_TOOL_TIMEOUT."
+                "Increase CRG_TOOL_TIMEOUT, narrow the change set with "
+                "changed_files or a closer base, or opt into a reported bound "
+                "with CRG_MAX_CHANGED_FUNCS."
             )
             error_response = {
                 "status": "error",

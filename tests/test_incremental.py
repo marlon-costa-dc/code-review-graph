@@ -1504,7 +1504,11 @@ class TestWatchReconciliation:
             ):
                 watch(tmp_path, store, on_files_updated=run_post_processing)
 
-            observer.assert_not_called()
+            # The startup build converges after the observer is live, so the
+            # contract is "the failed post-process aborts the watcher", not
+            # "the observer is never constructed": the watch loop raised out
+            # of startup and its finally-block stopped the observer.
+            observer.return_value.stop.assert_called()
         finally:
             store.close()
 

@@ -647,11 +647,17 @@ class TestMcpWrapperDefaults:
         assert "max_results" in sig.parameters
         assert sig.parameters["max_results"].default == 100
 
-    def test_review_tools_have_max_tokens(self):
-        for name in ("get_review_context_tool", "detect_changes_tool"):
+    def test_review_tools_are_complete_by_default(self):
+        """Change analysis applies no limit unless the caller passes one."""
+        limits = {
+            "get_review_context_tool": ("max_results", "max_files"),
+            "detect_changes_tool": ("max_results", "max_flows"),
+        }
+        for name, limit_names in limits.items():
             sig = inspect.signature(self._wrapper(name))
-            assert "max_tokens" in sig.parameters
-            assert sig.parameters["max_tokens"].default == 6000
+            assert sig.parameters["max_tokens"].default == 0
+            for limit_name in limit_names:
+                assert sig.parameters[limit_name].default is None
 
 
 class TestServeDetailFlag:

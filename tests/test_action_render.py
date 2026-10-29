@@ -245,8 +245,19 @@ def test_max_flows_cap(report):
 
 def test_truncated_analysis_note(report):
     report["functions_truncated"] = True
+    report["changed_functions_total"] = len(report["changed_functions"]) + 7
     body = render.render_markdown(report)
     assert "CRG_MAX_CHANGED_FUNCS" in body
+    assert (
+        f"covered {len(report['changed_functions'])} of "
+        f"{report['changed_functions_total']} changed functions"
+    ) in body
+
+
+def test_complete_analysis_has_no_truncation_note(report):
+    assert report["functions_truncated"] is False
+    body = render.render_markdown(report)
+    assert "CRG_MAX_CHANGED_FUNCS" not in body
 
 
 def test_markdown_injection_in_names_is_escaped(report):

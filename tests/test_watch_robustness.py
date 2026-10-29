@@ -1011,7 +1011,7 @@ class TestWatchLoop:
 
         def record_initial_health(*args, **kwargs):
             seen.append(read_watch_health(tmp_path) or {})
-            return {"files_updated": 0}
+            return {"files_parsed": 0, "stale_files_removed": 0}
 
         try:
             with (
@@ -1021,7 +1021,7 @@ class TestWatchLoop:
                     side_effect=KeyboardInterrupt,
                 ),
                 patch(
-                    "code_review_graph.incremental.incremental_update",
+                    "code_review_graph.incremental.full_build",
                     side_effect=record_initial_health,
                 ),
             ):
@@ -1029,7 +1029,7 @@ class TestWatchLoop:
         finally:
             store.close()
 
-        assert seen, "incremental_update was never reached"
+        assert seen, "full_build was never reached"
         assert seen[0].get("phase") == "initial-build"
         assert seen[0].get("stalled") is False
 
