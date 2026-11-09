@@ -3742,7 +3742,7 @@ class CodeParser:
                     )
                 )
                 code_chunks.append(cell.source)
-                current_line += cell_line_count + 1
+                current_line += cell.source.count("\n") + 1
 
             concatenated = "\n".join(code_chunks)
             concat_bytes = concatenated.encode("utf-8")
