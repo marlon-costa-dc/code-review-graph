@@ -744,11 +744,11 @@ class TestWatchLoop:
             ), "the last scheduled module stopped receiving events"
             ignored = repo / "module31" / "target" / "ignored.py"
             ignored.write_text("def excluded():\n    return 3\n", encoding="utf-8")
-            assert str(ignored) not in reader.get_all_files()
+            assert ignored.as_posix() not in reader.get_all_files()
             assert thread.is_alive()
         assert not (set(threading.enumerate()) - original_threads), "observer threads leaked"
         with GraphStore(repo / "graph.db") as stopped:
-            assert str(ignored) not in stopped.get_all_files()
+            assert ignored.as_posix() not in stopped.get_all_files()
 
     def _watch_with(self, tmp_path, store, observer, sleeper, health_interval=0.0, **kwargs):
         with (
@@ -880,7 +880,7 @@ class TestWatchLoop:
             assert health is not None and health["observer_alive"] is True
             assert isinstance(health["last_event_at"], float)
             assert thread.is_alive()
-            assert str(ignored) not in reader.get_all_files()
+            assert ignored.as_posix() not in reader.get_all_files()
 
     def test_relative_repo_keeps_a_graph_built_with_an_absolute_root(self, tmp_path):
         """A real watcher using ``.`` preserves the absolute-root graph."""
@@ -892,7 +892,7 @@ class TestWatchLoop:
         with GraphStore(database) as store:
             incremental_update(repo, store, changed_files=["src/app.py"])
             before = store.get_all_files()
-        assert before == [str(source)]
+        assert before == [source.as_posix()]
         command = (
             "from pathlib import Path\n"
             "from threading import Event\n"
@@ -924,7 +924,7 @@ class TestWatchLoop:
         with GraphStore(tmp_path / "graph.db") as store:
             incremental_update(other, store, changed_files=[str(source.relative_to(other))])
             original_files = store.get_all_files()
-            assert original_files == [str(source)]
+            assert original_files == [source.as_posix()]
             with pytest.raises(RuntimeError, match="different repository root"):
                 watch(repo, store)
             assert store.get_all_files() == original_files
@@ -950,7 +950,7 @@ class TestWatchLoop:
             assert harness._wait_for(
                 lambda: (read_watch_health(repo) or {}).get("phase") == "watching"
             ), "the watcher did not finish its initial build"
-            assert str(doomed) in reader.get_all_files()
+            assert doomed.as_posix() in reader.get_all_files()
             emitter = next(
                 emitter for emitter in observer.emitters if emitter.watch.path == str(source_dir)
             )
@@ -959,11 +959,11 @@ class TestWatchLoop:
             arrived.write_text("def arrived():\n    return 3\n", encoding="utf-8")
             assert harness._wait_for(
                 lambda: (
-                    str(arrived) in reader.get_all_files()
-                    and str(doomed) not in reader.get_all_files()
+                    arrived.as_posix() in reader.get_all_files()
+                    and doomed.as_posix() not in reader.get_all_files()
                 )
             ), "the repaired watch did not reconcile the outage"
-            assert str(keeper) in reader.get_all_files()
+            assert keeper.as_posix() in reader.get_all_files()
             assert thread.is_alive()
 
     def test_health_is_published_before_the_first_build(self, tmp_path):
@@ -1076,7 +1076,7 @@ class TestWatchLoop:
             source.write_text("def handler():\n    return 1\n", encoding="utf-8")
             with GraphStore(repo / "graph.db") as reader:
                 assert TestRealObserver()._wait_for(
-                    lambda: str(source) in reader.get_all_files()
+                    lambda: source.as_posix() in reader.get_all_files()
                 ), "the watcher did not complete an adoption tick"
             assert health_path.read_bytes() == before
             assert process.stdin is not None
@@ -1297,11 +1297,11 @@ class TestRealObserver:
                     for emitter in observer.emitters
                 )
             ), "the new directory did not receive a recursive watch"
-            assert self._wait_for(lambda: str(created / "svc.py") in reader.get_all_files()), (
-                "the new directory was not indexed"
-            )
+            assert self._wait_for(
+                lambda: (created / "svc.py").as_posix() in reader.get_all_files()
+            ), "the new directory was not indexed"
             assert all(emitter.watch.path != str(ignored) for emitter in observer.emitters)
-            assert str(ignored_file) not in reader.get_all_files()
+            assert ignored_file.as_posix() not in reader.get_all_files()
             nested = repo / "src" / "nested"
             assert any(
                 emitter.watch.path == str(repo / "src") and emitter.watch.is_recursive
@@ -1311,7 +1311,7 @@ class TestRealObserver:
             nested_file = nested / "child.py"
             nested_file.write_text("def child():\n    return 4\n", encoding="utf-8")
             subprocess.run(["git", "add", "src/nested/child.py"], cwd=repo, check=True)
-            assert self._wait_for(lambda: str(nested_file) in reader.get_all_files())
+            assert self._wait_for(lambda: nested_file.as_posix() in reader.get_all_files())
             assert all(emitter.watch.path != str(nested) for emitter in observer.emitters)
             assert thread.is_alive()
 
@@ -1334,12 +1334,12 @@ class TestRealObserver:
             first = next(
                 emitter for emitter in observer.emitters if emitter.watch.path == str(source)
             )
-            assert str(original) in reader.get_all_files()
+            assert original.as_posix() in reader.get_all_files()
             shutil.rmtree(source)
             assert self._wait_for(
                 lambda: (
                     all(emitter.watch.path != str(source) for emitter in observer.emitters)
-                    and str(original) not in reader.get_all_files()
+                    and original.as_posix() not in reader.get_all_files()
                 )
             ), "the removed directory was not released"
             assert thread.is_alive()
@@ -1352,7 +1352,7 @@ class TestRealObserver:
                         emitter is not first and emitter.watch.path == str(source)
                         for emitter in observer.emitters
                     )
-                    and str(restored) in reader.get_all_files()
+                    and restored.as_posix() in reader.get_all_files()
                 )
             ), "the restored directory was not re-adopted"
             shutil.rmtree(source)
@@ -1361,8 +1361,8 @@ class TestRealObserver:
             reborn.write_text("def reborn():\n    return 5\n", encoding="utf-8")
             assert self._wait_for(
                 lambda: (
-                    str(reborn) in reader.get_all_files()
-                    and str(restored) not in reader.get_all_files()
+                    reborn.as_posix() in reader.get_all_files()
+                    and restored.as_posix() not in reader.get_all_files()
                 )
             ), "the same-tick replacement was not reindexed"
             assert thread.is_alive()

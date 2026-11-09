@@ -7,7 +7,7 @@ import subprocess
 import threading
 import time
 from pathlib import Path
-from unittest.mock import MagicMock, call, patch  # noqa: F401 – used in tests
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 
@@ -1270,13 +1270,15 @@ class TestMultiHopDependents:
 
     def test_one_hop_finds_b_not_a(self, chain):
         repo, store = chain
-        assert store.get_dependent_files([str(repo / "c.ts")], max_hops=1) == [str(repo / "b.ts")]
+        assert store.get_dependent_files([str(repo / "c.ts")], max_hops=1) == [
+            (repo / "b.ts").as_posix()
+        ]
 
     def test_two_hops_finds_b_and_a(self, chain):
         repo, store = chain
         assert store.get_dependent_files([str(repo / "c.ts")], max_hops=2) == [
-            str(repo / "a.ts"),
-            str(repo / "b.ts"),
+            (repo / "a.ts").as_posix(),
+            (repo / "b.ts").as_posix(),
         ]
 
     @pytest.mark.parametrize("change", ["rename", "delete"])
@@ -1291,7 +1293,7 @@ class TestMultiHopDependents:
                 'import { hub } from "./hub"; export function use() { return hub(); }',
                 encoding="utf-8",
             )
-            expected.append(str(path))
+            expected.append(path.as_posix())
         with GraphStore(tmp_path / "fanout.db") as store:
             full_build(repo, store)
             # Read-only dry run: complete affected set before any update.
@@ -1340,11 +1342,11 @@ class TestMultiHopDependents:
         )
         full_build(repo, store)
         assert store.get_dependent_files([str(repo / "c.ts")]) == [
-            str(repo / "a.ts"),
-            str(repo / "b.ts"),
+            (repo / "a.ts").as_posix(),
+            (repo / "b.ts").as_posix(),
         ]
         assert store.get_dependent_files([str(repo / "a.ts"), str(repo / "c.ts")]) == [
-            str(repo / "b.ts"),
+            (repo / "b.ts").as_posix(),
         ]
         assert store.get_dependent_files([str(repo / "c.ts")], max_hops=0) == []
         with pytest.raises(ValueError, match="max_hops"):
@@ -1439,7 +1441,7 @@ class TestMultiHopDependents:
         assert (member.parent / ".git").is_file()
         with GraphStore(tmp_path / "submodule.db") as store:
             full_build(repo, store, recurse_submodules=True)
-            assert store.get_dependent_files([str(repo / "c.ts")]) == [str(member)]
+            assert store.get_dependent_files([str(repo / "c.ts")]) == [member.as_posix()]
             original = member.read_bytes()
             (repo / "c.ts").write_text("export function c() { return 2; }", encoding="utf-8")
             result = incremental_update(repo, store, changed_files=["c.ts"])
@@ -1464,7 +1466,7 @@ class TestMultiHopDependents:
             unchanged = {path: path.read_bytes() for path in repo.glob("m[0-3].ts")}
             # Plan and compare the existing cohort read-only before either DB write.
             affected = store.get_dependent_files([str(repo / "m4.ts")])
-            assert affected == sorted(str(path) for path in unchanged)
+            assert affected == sorted(path.as_posix() for path in unchanged)
             before = {
                 (edge.kind, edge.source_qualified, edge.target_qualified, edge.file_path)
                 for edge in store.get_all_edges()
@@ -1497,8 +1499,8 @@ class TestMultiHopDependents:
                 assert incremental_edges == rebuilt_edges
                 assert incremental_edges != before
                 unchanged_edges_changed = {
-                    edge for edge in incremental_edges if edge[3] != str(repo / "m4.ts")
-                } != {edge for edge in before if edge[3] != str(repo / "m4.ts")}
+                    edge for edge in incremental_edges if edge[3] != (repo / "m4.ts").as_posix()
+                } != {edge for edge in before if edge[3] != (repo / "m4.ts").as_posix()}
                 assert unchanged_edges_changed == (change == "delete")
                 assert {
                     (node.kind, node.qualified_name, node.file_path, node.file_hash)
