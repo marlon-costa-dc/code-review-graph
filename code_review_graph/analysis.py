@@ -5,13 +5,66 @@ from __future__ import annotations
 
 import logging
 from collections import Counter, defaultdict
+from typing import TypedDict
 
 from .graph import GraphStore, _sanitize_name
 
 logger = logging.getLogger(__name__)
 
 
-def find_hub_nodes(store: GraphStore, top_n: int = 10) -> list[dict]:
+class _GraphNodeReport(TypedDict):
+    name: str
+    qualified_name: str
+    kind: str
+    file: str
+
+
+class _HubNodeReport(_GraphNodeReport):
+    in_degree: int
+    out_degree: int
+    total_degree: int
+    community_id: int | None
+
+
+class _BridgeNodeReport(_GraphNodeReport):
+    betweenness: float
+    community_id: int | None
+
+
+class _DegreeNodeReport(_GraphNodeReport):
+    degree: int
+
+
+class _CommunityReport(TypedDict):
+    community_id: int
+    name: str
+    size: int
+
+
+class _SingleFileCommunityReport(_CommunityReport):
+    file: str
+
+
+class _KnowledgeGapsReport(TypedDict):
+    isolated_nodes: list[_DegreeNodeReport]
+    thin_communities: list[_CommunityReport]
+    untested_hotspots: list[_DegreeNodeReport]
+    single_file_communities: list[_SingleFileCommunityReport]
+
+
+class _SurprisingConnectionReport(TypedDict):
+    source: str
+    source_qualified: str
+    target: str
+    target_qualified: str
+    edge_kind: str
+    surprise_score: float
+    reasons: list[str]
+    source_community: int | None
+    target_community: int | None
+
+
+def find_hub_nodes(store: GraphStore, top_n: int = 10) -> list[_HubNodeReport]:
     """Find the most connected nodes (highest in+out degree), excluding File nodes.
 
     Returns list of dicts with: name, qualified_name, kind, file,
@@ -29,7 +82,7 @@ def find_hub_nodes(store: GraphStore, top_n: int = 10) -> list[dict]:
     nodes = store.get_all_nodes(exclude_files=True)
     community_map = store.get_all_community_ids()
 
-    scored = []
+    scored: list[_HubNodeReport] = []
     for n in nodes:
         qn = n.qualified_name
         ind = in_degree.get(qn, 0)
@@ -51,13 +104,13 @@ def find_hub_nodes(store: GraphStore, top_n: int = 10) -> list[dict]:
         )
 
     scored.sort(
-        key=lambda x: x.get("total_degree", 0),  # type: ignore[arg-type,return-value]
+        key=lambda x: x["total_degree"],
         reverse=True,
     )
     return scored[:top_n]
 
 
-def find_bridge_nodes(store: GraphStore, top_n: int = 10) -> list[dict]:
+def find_bridge_nodes(store: GraphStore, top_n: int = 10) -> list[_BridgeNodeReport]:
     """Find nodes with highest betweenness centrality.
 
     These are architectural chokepoints that sit on shortest paths
@@ -86,7 +139,7 @@ def find_bridge_nodes(store: GraphStore, top_n: int = 10) -> list[dict]:
     community_map = store.get_all_community_ids()
     node_map = {n.qualified_name: n for n in store.get_all_nodes(exclude_files=True)}
 
-    results = []
+    results: list[_BridgeNodeReport] = []
     for qn, score in bc.items():
         if score <= 0 or qn not in node_map:
             continue
@@ -105,13 +158,13 @@ def find_bridge_nodes(store: GraphStore, top_n: int = 10) -> list[dict]:
         )
 
     results.sort(
-        key=lambda x: float(x.get("betweenness", 0)),  # type: ignore[arg-type,return-value]
+        key=lambda x: x["betweenness"],
         reverse=True,
     )
     return results[:top_n]
 
 
-def find_knowledge_gaps(store: GraphStore) -> dict[str, list[dict]]:
+def find_knowledge_gaps(store: GraphStore) -> _KnowledgeGapsReport:
     """Identify structural weaknesses in the codebase graph.
 
     Returns dict with categories:
@@ -134,7 +187,7 @@ def find_knowledge_gaps(store: GraphStore) -> dict[str, list[dict]]:
             tested_nodes.add(e.source_qualified)
 
     # 1. Isolated nodes (degree <= 1, not File)
-    isolated = []
+    isolated: list[_DegreeNodeReport] = []
     for n in nodes:
         d = degree.get(n.qualified_name, 0)
         if d <= 1:
@@ -159,7 +212,7 @@ def find_knowledge_gaps(store: GraphStore) -> dict[str, list[dict]]:
 
     # Thin communities (< 3 members)
     communities = store.get_communities_list()
-    thin = []
+    thin: list[_CommunityReport] = []
     for c in communities:
         cid = int(c["id"])
         size = comm_sizes.get(cid, 0)
@@ -173,7 +226,7 @@ def find_knowledge_gaps(store: GraphStore) -> dict[str, list[dict]]:
             )
 
     # 3. Untested hotspots (degree >= 5, no TESTED_BY)
-    untested_hotspots = []
+    untested_hotspots: list[_DegreeNodeReport] = []
     for n in nodes:
         d = degree.get(n.qualified_name, 0)
         if d >= 5 and n.qualified_name not in tested_nodes and not n.is_test:
@@ -187,12 +240,12 @@ def find_knowledge_gaps(store: GraphStore) -> dict[str, list[dict]]:
                 }
             )
     untested_hotspots.sort(
-        key=lambda x: x.get("degree", 0),  # type: ignore[arg-type,return-value]
+        key=lambda x: x["degree"],
         reverse=True,
     )
 
     # 4. Single-file communities
-    single_file = []
+    single_file: list[_SingleFileCommunityReport] = []
     for c in communities:
         cid = int(c["id"])
         files = comm_files.get(cid, set())
@@ -215,7 +268,9 @@ def find_knowledge_gaps(store: GraphStore) -> dict[str, list[dict]]:
     }
 
 
-def find_surprising_connections(store: GraphStore, top_n: int = 15) -> list[dict]:
+def find_surprising_connections(
+    store: GraphStore, top_n: int = 15
+) -> list[_SurprisingConnectionReport]:
     """Find edges with high surprise scores.
 
     Detects unexpected architectural coupling based on:
@@ -244,7 +299,7 @@ def find_surprising_connections(store: GraphStore, top_n: int = 15) -> list[dict
     median_deg = sorted(degrees)[len(degrees) // 2]
     high_deg_threshold = max(median_deg * 3, 10)
 
-    scored_edges = []
+    scored_edges: list[_SurprisingConnectionReport] = []
     for e in edges:
         src = node_map.get(e.source_qualified)
         tgt = node_map.get(e.target_qualified)
@@ -305,7 +360,7 @@ def find_surprising_connections(store: GraphStore, top_n: int = 15) -> list[dict
             )
 
     scored_edges.sort(
-        key=lambda x: float(x.get("surprise_score", 0)),  # type: ignore[arg-type,return-value]
+        key=lambda x: x["surprise_score"],
         reverse=True,
     )
     return scored_edges[:top_n]
@@ -397,16 +452,16 @@ def generate_suggested_questions(
             }
         )
 
-    for h in gaps["untested_hotspots"][:2]:
+    for hotspot in gaps["untested_hotspots"][:2]:
         questions.append(
             {
                 "category": "untested_hotspot",
                 "question": (
-                    f"'{h['name']}' has {h['degree']} "
+                    f"'{hotspot['name']}' has {hotspot['degree']} "
                     f"connections but no test coverage. "
                     f"Is this a risk?"
                 ),
-                "target": h["qualified_name"],
+                "target": hotspot["qualified_name"],
                 "priority": "medium",
             }
         )

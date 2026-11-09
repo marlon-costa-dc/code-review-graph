@@ -30,7 +30,7 @@ import threading
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Optional, TypeGuard, get_args
 
 import tree_sitter_language_pack as tslp
 
@@ -74,7 +74,7 @@ class CustomLanguage:
     """One validated ``[languages.<name>]`` entry from languages.toml."""
 
     name: str
-    grammar: str
+    grammar: tslp.SupportedLanguage
     extensions: tuple[str, ...]
     function_node_types: tuple[str, ...] = ()
     class_node_types: tuple[str, ...] = ()
@@ -102,6 +102,11 @@ def clear_cache() -> None:
     """Drop the loader cache (used by tests)."""
     with _cache_lock:
         _cache.clear()
+
+
+def _is_supported_grammar(grammar: str) -> TypeGuard[tslp.SupportedLanguage]:
+    """Use the installed language pack's own accepted grammar domain."""
+    return grammar in get_args(tslp.SupportedLanguage)
 
 
 def load_custom_languages(
@@ -340,8 +345,17 @@ def _validate_entry(
 
     # Probe the grammar last (it is the expensive check).  Parser objects
     # themselves are created lazily by CodeParser._get_parser.
+    if not _is_supported_grammar(grammar):
+        logger.warning(
+            "%s: custom language %r: grammar %r is not available in "
+            "tree_sitter_language_pack — skipping",
+            config_path,
+            name,
+            grammar,
+        )
+        return None
     try:
-        tslp.get_language(grammar)  # type: ignore[arg-type]
+        tslp.get_language(grammar)
     except (LookupError, ValueError, ImportError, OSError) as exc:
         logger.warning(
             "%s: custom language %r: grammar %r is not available in "

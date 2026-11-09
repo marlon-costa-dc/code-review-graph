@@ -19,6 +19,7 @@ import signal
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 
 logger = logging.getLogger(__name__)
 
@@ -361,7 +362,7 @@ def main() -> None:
         ap.print_help()
         sys.exit(0)
 
-    handlers: dict[str, object] = {
+    handlers: dict[str, Callable[[argparse.Namespace], None]] = {
         "start": _handle_start,
         "stop": _handle_stop,
         "restart": _handle_restart,
@@ -376,7 +377,7 @@ def main() -> None:
         ap.print_help()
         sys.exit(1)
 
-    handler(args)  # type: ignore[operator]
+    handler(args)
 
 
 if __name__ == "__main__":

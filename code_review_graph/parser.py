@@ -33,13 +33,14 @@ from .config_keys import is_spring_config_path, normalize_spring_config_key
 from .custom_languages import CustomLanguage, load_custom_languages
 
 try:
-    import yaml as _yaml  # type: ignore[import-untyped]
+    import yaml as _yaml
     from yaml import MappingNode as _YamlMapping
+    from yaml import Node as _YamlNode
     from yaml import ScalarNode as _YamlScalar
     from yaml import SequenceNode as _YamlSequence
 except ImportError:
-    _yaml = None  # type: ignore[assignment]
-    _YamlMapping = _YamlSequence = _YamlScalar = None  # type: ignore[assignment,misc]
+    _yaml = None
+    _YamlMapping = _YamlNode = _YamlSequence = _YamlScalar = None
 
 from .tsconfig_resolver import TsconfigResolver
 
@@ -105,30 +106,30 @@ class _PythonScopeBindingVisitor(ast.NodeVisitor):
     def __init__(self) -> None:
         self.names: set[str] = set()
 
-    def visit_Name(self, node: ast.Name) -> None:  # noqa: N802
+    def visit_Name(self, node: ast.Name) -> None:
         if isinstance(node.ctx, (ast.Store, ast.Del)):
             self.names.add(node.id)
 
-    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:  # noqa: N802
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
         self.names.add(node.name)
 
-    def visit_AsyncFunctionDef(  # noqa: N802
+    def visit_AsyncFunctionDef(
         self,
         node: ast.AsyncFunctionDef,
     ) -> None:
         self.names.add(node.name)
 
-    def visit_ClassDef(self, node: ast.ClassDef) -> None:  # noqa: N802
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
         self.names.add(node.name)
 
-    def visit_Lambda(self, node: ast.Lambda) -> None:  # noqa: N802
+    def visit_Lambda(self, node: ast.Lambda) -> None:
         return
 
-    def visit_Import(self, node: ast.Import) -> None:  # noqa: N802
+    def visit_Import(self, node: ast.Import) -> None:
         for alias in node.names:
             self.names.add(alias.asname or alias.name.split(".", 1)[0])
 
-    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:  # noqa: N802
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
         for alias in node.names:
             if alias.name != "*":
                 self.names.add(alias.asname or alias.name)
@@ -220,12 +221,12 @@ class _PythonUnreachableCallVisitor(ast.NodeVisitor):
         self._type_checking_names = type_checking_names
         self._typing_modules = typing_modules
 
-    def visit_Call(self, node: ast.Call) -> None:  # noqa: N802
+    def visit_Call(self, node: ast.Call) -> None:
         if self._dead:
             self.positions.add((node.lineno, node.col_offset))
         self.generic_visit(node)
 
-    def visit_If(self, node: ast.If) -> None:  # noqa: N802
+    def visit_If(self, node: ast.If) -> None:
         self.visit(node.test)
         truth = _python_static_truth(
             node.test,
@@ -235,16 +236,16 @@ class _PythonUnreachableCallVisitor(ast.NodeVisitor):
         self._visit_statements(node.body, dead=truth is False)
         self._visit_statements(node.orelse, dead=truth is True)
 
-    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:  # noqa: N802
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
         self._visit_function(node)
 
-    def visit_AsyncFunctionDef(  # noqa: N802
+    def visit_AsyncFunctionDef(
         self,
         node: ast.AsyncFunctionDef,
     ) -> None:
         self._visit_function(node)
 
-    def visit_ClassDef(self, node: ast.ClassDef) -> None:  # noqa: N802
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
         for decorator in node.decorator_list:
             self.visit(decorator)
         for base in node.bases:
@@ -582,7 +583,7 @@ def _load_tree_sitter_parser(grammar: str):
         return None
     try:
         language_pack = importlib.import_module("tree_sitter_language_pack")
-        return language_pack.get_parser(grammar)  # type: ignore[attr-defined]
+        return language_pack.get_parser(grammar)
     except _EXPECTED_PARSER_LOAD_ERRORS as exc:
         _mark_parser_unavailable(grammar)
         logger.debug("tree-sitter parser unavailable for %s: %s", grammar, exc)
@@ -2678,16 +2679,16 @@ def _ansible_fqcn_short(key: str) -> str:
     return key.rsplit(".", 1)[-1]
 
 
-def _yaml_line(node: object) -> int:
-    return node.start_mark.line + 1  # type: ignore[attr-defined]
+def _yaml_line(node: _YamlNode) -> int:
+    return node.start_mark.line + 1
 
 
-def _yaml_end_line(node: object) -> int:
-    return node.end_mark.line + 1  # type: ignore[attr-defined]
+def _yaml_end_line(node: _YamlNode) -> int:
+    return node.end_mark.line + 1
 
 
-def _yaml_get_key(mapping_node: object, key: str) -> Optional[object]:
-    for k_node, v_node in mapping_node.value:  # type: ignore[attr-defined]
+def _yaml_get_key(mapping_node: _YamlMapping, key: str) -> Optional[_YamlNode]:
+    for k_node, v_node in mapping_node.value:
         if isinstance(k_node, _YamlScalar) and k_node.value == key:
             return v_node
     return None
@@ -2695,7 +2696,7 @@ def _yaml_get_key(mapping_node: object, key: str) -> Optional[object]:
 
 def _yaml_scalar(node: object) -> Optional[str]:
     if isinstance(node, _YamlScalar):
-        return node.value  # type: ignore[attr-defined]
+        return node.value
     return None
 
 
@@ -2712,7 +2713,7 @@ def _ansible_is_play_item(item: object) -> bool:
         return False
     keys: set[Optional[str]] = {
         _yaml_scalar(k)
-        for k, _ in item.value  # type: ignore[attr-defined]
+        for k, _ in item.value
         if isinstance(k, _YamlScalar)
     }
     if "import_playbook" in keys:
@@ -2812,7 +2813,7 @@ class CodeParser:
                 self._import_types[custom.name] = list(custom.import_node_types)
                 self._call_types[custom.name] = list(custom.call_node_types)
 
-    def _get_parser(self, language: str):  # type: ignore[arg-type]
+    def _get_parser(self, language: str):
         if language not in self._parsers:
             # Custom languages map their name onto a packaged grammar.
             custom = self._custom_languages.get(language)
@@ -6747,7 +6748,7 @@ class CodeParser:
         Handles: plain string, ``{role: name}`` dict, ``{name: ns.role}`` dict.
         """
         if isinstance(item, _YamlScalar):
-            return item.value or None  # type: ignore[attr-defined]
+            return item.value or None
         if isinstance(item, _YamlMapping):
             for key in ("role", "name"):
                 v = _yaml_get_key(item, key)
@@ -6759,12 +6760,12 @@ class CodeParser:
     def _ansible_extract_notify_targets(self, notify_node: object) -> list[str]:
         """Extract handler names from a notify: value (scalar or sequence)."""
         if isinstance(notify_node, _YamlScalar):
-            return [notify_node.value] if notify_node.value else []  # type: ignore[attr-defined]
+            return [notify_node.value] if notify_node.value else []
         if isinstance(notify_node, _YamlSequence):
             return [
-                item.value  # type: ignore[attr-defined]
-                for item in notify_node.value  # type: ignore[attr-defined]
-                if isinstance(item, _YamlScalar) and item.value  # type: ignore[attr-defined]
+                item.value
+                for item in notify_node.value
+                if isinstance(item, _YamlScalar) and item.value
             ]
         return []
 
@@ -6777,7 +6778,7 @@ class CodeParser:
         if args_node is None:
             return None
         if isinstance(args_node, _YamlScalar):
-            return args_node.value or None  # type: ignore[attr-defined]
+            return args_node.value or None
         if isinstance(args_node, _YamlMapping):
             for key in ("file", "_raw_params"):
                 v = _yaml_get_key(args_node, key)
@@ -6791,7 +6792,7 @@ class CodeParser:
         if args_node is None:
             return None
         if isinstance(args_node, _YamlScalar):
-            return args_node.value or None  # type: ignore[attr-defined]
+            return args_node.value or None
         if isinstance(args_node, _YamlMapping):
             v = _yaml_get_key(args_node, "name")
             return _yaml_scalar(v)
@@ -14368,7 +14369,7 @@ class CodeParser:
             parser = self._get_parser("python")
             if not parser:
                 return {}
-            tree = parser.parse(source)  # type: ignore[union-attr]
+            tree = parser.parse(source)
             import_map, defined_names = self._collect_file_scope(
                 tree.root_node,
                 "python",
