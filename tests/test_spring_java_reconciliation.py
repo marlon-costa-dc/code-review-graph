@@ -12,9 +12,7 @@ def _injected_fields(source: str, class_name: str) -> dict[str, str]:
     return {
         edge.extra["field_name"]: edge.extra["injection_type"]
         for edge in edges
-        if edge.kind == "INJECTS"
-        and class_name in edge.source
-        and "field_name" in edge.extra
+        if edge.kind == "INJECTS" and class_name in edge.source and "field_name" in edge.extra
     }
 
 

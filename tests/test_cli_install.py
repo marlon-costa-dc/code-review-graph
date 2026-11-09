@@ -22,9 +22,7 @@ def _args(tmp_path: Path, platform: str) -> argparse.Namespace:
     )
 
 
-def test_copilot_cli_install_reinstall_uninstall_lifecycle(
-    monkeypatch, tmp_path
-):
+def test_copilot_cli_install_reinstall_uninstall_lifecycle(monkeypatch, tmp_path):
     """The public lifecycle migrates safely and is repeatable without a client."""
     repo = tmp_path / "repo"
     (repo / ".git" / "hooks").mkdir(parents=True)
@@ -60,12 +58,7 @@ def test_copilot_cli_install_reinstall_uninstall_lifecycle(
 
     _handle_init(args)
     first_config = config.read_bytes()
-    current_instruction = (
-        repo
-        / ".github"
-        / "instructions"
-        / "code-review-graph.instructions.md"
-    )
+    current_instruction = repo / ".github" / "instructions" / "code-review-graph.instructions.md"
     first_instruction = current_instruction.read_bytes()
     _handle_init(args)
 
@@ -176,14 +169,13 @@ def test_handle_init_cursor_installs_cursor_hooks(monkeypatch, tmp_path, capsys)
     assert "Installed Cursor hooks" in out
 
 
-def test_handle_init_codebuddy_installs_only_codebuddy_native_files(
-    monkeypatch, tmp_path, capsys
-):
+def test_handle_init_codebuddy_installs_only_codebuddy_native_files(monkeypatch, tmp_path, capsys):
     import code_review_graph.skills as skills_module
 
-    assert "codebuddy" in __import__(
-        "code_review_graph.cli", fromlist=["_PLATFORM_CHOICES"]
-    )._PLATFORM_CHOICES
+    assert (
+        "codebuddy"
+        in __import__("code_review_graph.cli", fromlist=["_PLATFORM_CHOICES"])._PLATFORM_CHOICES
+    )
 
     monkeypatch.setattr(
         "code_review_graph.incremental.find_repo_root",

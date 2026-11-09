@@ -13,40 +13,32 @@ from code_review_graph.parser import _SQL_KEYWORDS, _SQL_TABLE_RE, CodeParser
 
 class TestIfNotExistsRegex:
     def test_lowercase_clause(self):
-        assert _SQL_TABLE_RE.findall(
-            "create table if not exists foo (id INT);"
-        ) == ["foo"]
+        assert _SQL_TABLE_RE.findall("create table if not exists foo (id INT);") == ["foo"]
 
     def test_mixed_case_clause(self):
-        assert _SQL_TABLE_RE.findall(
-            "Create Table If Not Exists Foo (id INT);"
-        ) == ["Foo"]
+        assert _SQL_TABLE_RE.findall("Create Table If Not Exists Foo (id INT);") == ["Foo"]
 
     def test_newlines_and_tabs_inside_clause(self):
-        assert _SQL_TABLE_RE.findall(
-            "CREATE TABLE\n  IF\tNOT\nEXISTS bar (id INT);"
-        ) == ["bar"]
+        assert _SQL_TABLE_RE.findall("CREATE TABLE\n  IF\tNOT\nEXISTS bar (id INT);") == ["bar"]
 
     def test_backtick_quoted_name_after_clause(self):
-        assert _SQL_TABLE_RE.findall(
-            "CREATE TABLE IF NOT EXISTS `my table` (id INT);"
-        ) == ["`my table`"]
+        assert _SQL_TABLE_RE.findall("CREATE TABLE IF NOT EXISTS `my table` (id INT);") == [
+            "`my table`"
+        ]
 
     def test_schema_qualified_name_after_clause(self):
-        assert _SQL_TABLE_RE.findall(
-            "CREATE TABLE IF NOT EXISTS db.schema.tbl (id INT);"
-        ) == ["db.schema.tbl"]
+        assert _SQL_TABLE_RE.findall("CREATE TABLE IF NOT EXISTS db.schema.tbl (id INT);") == [
+            "db.schema.tbl"
+        ]
 
     def test_or_replace_combined_with_if_not_exists(self):
         # BigQuery-style CREATE OR REPLACE TABLE IF NOT EXISTS.
-        assert _SQL_TABLE_RE.findall(
-            "CREATE OR REPLACE TABLE IF NOT EXISTS bq_tbl (id INT);"
-        ) == ["bq_tbl"]
+        assert _SQL_TABLE_RE.findall("CREATE OR REPLACE TABLE IF NOT EXISTS bq_tbl (id INT);") == [
+            "bq_tbl"
+        ]
 
     def test_view_lowercase_clause(self):
-        assert _SQL_TABLE_RE.findall(
-            "create view if not exists v1 as select 1;"
-        ) == ["v1"]
+        assert _SQL_TABLE_RE.findall("create view if not exists v1 as select 1;") == ["v1"]
 
     def test_names_starting_with_clause_keywords_are_not_swallowed(self):
         # The optional clause must not eat identifiers that merely start
@@ -56,15 +48,16 @@ class TestIfNotExistsRegex:
             assert _SQL_TABLE_RE.findall(sql) == [name], sql
 
     def test_unicode_table_name(self):
-        assert _SQL_TABLE_RE.findall(
-            "CREATE TABLE IF NOT EXISTS façade_übersicht (id INT);"
-        ) == ["façade_übersicht"]
+        assert _SQL_TABLE_RE.findall("CREATE TABLE IF NOT EXISTS façade_übersicht (id INT);") == [
+            "façade_übersicht"
+        ]
 
     def test_plain_statements_unchanged(self):
         assert _SQL_TABLE_RE.findall("CREATE TABLE t (id INT);") == ["t"]
-        assert _SQL_TABLE_RE.findall(
-            "INSERT OVERWRITE cat.sch.tbl SELECT * FROM src"
-        ) == ["cat.sch.tbl", "src"]
+        assert _SQL_TABLE_RE.findall("INSERT OVERWRITE cat.sch.tbl SELECT * FROM src") == [
+            "cat.sch.tbl",
+            "src",
+        ]
 
     def test_new_keywords_registered(self):
         assert {"IF", "NOT", "EXISTS"} <= _SQL_KEYWORDS
@@ -80,9 +73,7 @@ class TestIfNotExistsEndToEnd:
 
     def test_many_idempotent_creates_all_recorded_with_lines(self):
         n = 200
-        sql = b"".join(
-            b"CREATE TABLE IF NOT EXISTS tbl_%d (id INT);\n" % i for i in range(n)
-        )
+        sql = b"".join(b"CREATE TABLE IF NOT EXISTS tbl_%d (id INT);\n" % i for i in range(n))
         imports = self._imports(sql)
         assert [e.target for e in imports] == [f"tbl_{i}" for i in range(n)]
         assert [e.line for e in imports] == list(range(1, n + 1))
@@ -98,12 +89,12 @@ class TestIfNotExistsEndToEnd:
     def test_keyword_filter_is_exact_match_not_prefix(self):
         # Names that contain filter keywords as a prefix must survive.
         imports = self._imports(
-            b"SELECT * FROM notifications;\n"
-            b"SELECT * FROM if_config;\n"
-            b"SELECT * FROM exists_flags;\n"
+            b"SELECT * FROM notifications;\nSELECT * FROM if_config;\nSELECT * FROM exists_flags;\n"
         )
         assert [e.target for e in imports] == [
-            "notifications", "if_config", "exists_flags",
+            "notifications",
+            "if_config",
+            "exists_flags",
         ]
 
     def test_where_not_exists_subquery_adds_no_keyword_edges(self):
@@ -121,7 +112,5 @@ class TestIfNotExistsEndToEnd:
         assert all(e.target.upper() != "IF" for e in imports)
 
     def test_qualified_create_strips_schema_prefix(self):
-        imports = self._imports(
-            b"CREATE TABLE IF NOT EXISTS warehouse.public.facts (id INT);\n"
-        )
+        imports = self._imports(b"CREATE TABLE IF NOT EXISTS warehouse.public.facts (id INT);\n")
         assert [e.target for e in imports] == ["facts"]

@@ -99,6 +99,7 @@ SCALING_AND_TOKEN_EFFICIENCY_PLAN.md
 OC3_TECHNICAL_CONTRIBUTION.md
 OC3_TECHNICAL_CONTRIBUTION.pdf
 PRESENTATION_BRIEF.md
+.reports/
 
 # Beads / Dolt files (added by bd init)
 .beads/proxieddb/
@@ -110,12 +111,3 @@ PRESENTATION_BRIEF.md
 .cursor/
 .envrc
 .mise.toml
-
-# BEGIN ai-hub projection destinations (generated from config/workspaces.yaml; do not edit; regenerate: make workspace-config in ai-hub)
-/.cursorrules
-/.windsurfrules
-/CODEBUDDY.md
-/GEMINI.md
-/QODER.md
-/opencode.jsonc
-# END ai-hub projection destinations

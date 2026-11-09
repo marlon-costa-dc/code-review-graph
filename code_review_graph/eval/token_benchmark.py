@@ -91,7 +91,9 @@ def benchmark_debug_workflow(repo_root: str) -> dict:
     calls.append({"tool": "get_minimal_context", "tokens": tokens})
 
     result = semantic_search_nodes(
-        query="login", repo_root=repo_root, detail_level="minimal",
+        query="login",
+        repo_root=repo_root,
+        detail_level="minimal",
     )
     tokens = estimate_tokens(result)
     total_tokens += tokens

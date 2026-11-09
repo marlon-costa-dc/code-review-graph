@@ -193,12 +193,16 @@ def resolve_temporal_calls(store: GraphStore) -> dict:
         resolved += 1
         logger.debug(
             "Temporal resolved: %s → %s (receiver=%s, interface=%s)",
-            source_qual, new_target, receiver, interface_bare,
+            source_qual,
+            new_target,
+            receiver,
+            interface_bare,
         )
 
     if resolved:
         conn.commit()
 
-    logger.info("Temporal resolver: resolved %d CALLS edges in %d Java files",
-                resolved, len(java_files))
+    logger.info(
+        "Temporal resolver: resolved %d CALLS edges in %d Java files", resolved, len(java_files)
+    )
     return {"files_indexed": len(java_files), "calls_resolved": resolved}

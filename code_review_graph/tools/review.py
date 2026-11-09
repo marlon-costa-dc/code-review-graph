@@ -204,8 +204,7 @@ def get_review_context(
             summary_parts = [
                 f"Review context for {len(changed_files)} changed file(s):",
                 f"  - Risk: {risk}",
-                f"  - {impact_total} impacted nodes"
-                f" in {len(impact['impacted_files'])} files",
+                f"  - {impact_total} impacted nodes in {len(impact['impacted_files'])} files",
             ]
             if impact_truncated:
                 summary_parts.append(_impact_truncation_note(impact))
@@ -234,18 +233,22 @@ def get_review_context(
         # and reports its untruncated total.
         shown_files, files_total, files_cut = _bounded(changed_files, max_files, None)
         impacted_files, impacted_total, impacted_cut = _bounded(
-            impact["impacted_files"], max_files, None,
+            impact["impacted_files"],
+            max_files,
+            None,
         )
         changed_nodes, changed_nodes_total, cn_cut = _bounded(
-            impact["changed_nodes"], max_results, None,
+            impact["changed_nodes"],
+            max_results,
+            None,
         )
         impacted_nodes, _impacted_shown_total, in_cut = _bounded(
-            impact["impacted_nodes"], max_results, None,
+            impact["impacted_nodes"],
+            max_results,
+            None,
         )
         edges, edges_total, edges_cut = _bounded(impact["edges"], max_results, None)
-        truncated = (
-            files_cut or impacted_cut or cn_cut or in_cut or edges_cut or impact_truncated
-        )
+        truncated = files_cut or impacted_cut or cn_cut or in_cut or edges_cut or impact_truncated
 
         context: dict[str, Any] = {
             "changed_files": shown_files,
@@ -742,17 +745,23 @@ def detect_changes_func(
             }
         else:
             funcs, _funcs_listed, funcs_cut = _bounded(
-                analysis.get("changed_functions", []), max_results, None,
+                analysis.get("changed_functions", []),
+                max_results,
+                None,
             )
             # The analysis reports its own untruncated total: an opt-in
             # CRG_MAX_CHANGED_FUNCS bound may already have cut the list.
             funcs_total = analysis["changed_functions_total"]
             funcs_cut = funcs_cut or analysis["functions_truncated"]
             gaps, gaps_total, gaps_cut = _bounded(
-                analysis.get("test_gaps", []), max_results, None,
+                analysis.get("test_gaps", []),
+                max_results,
+                None,
             )
             flows, flows_total, flows_cut = _bounded(
-                analysis.get("affected_flows", []), max_flows, None,
+                analysis.get("affected_flows", []),
+                max_flows,
+                None,
             )
             files, files_total, files_cut = _bounded(changed_files, max_results, None)
             any_cut = funcs_cut or gaps_cut or flows_cut or files_cut

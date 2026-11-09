@@ -20,39 +20,24 @@ def _parse_source(tmp_path: Path, source: str, name: str = "mod.py"):
 
 
 def _ref_targets(edges) -> set:
-    return {
-        e.target.rsplit("::", 1)[-1] for e in edges if e.kind == "REFERENCES"
-    }
+    return {e.target.rsplit("::", 1)[-1] for e in edges if e.kind == "REFERENCES"}
 
 
 class TestKeywordCallbackEdges:
     def test_keyword_name_never_treated_as_reference(self, tmp_path):
         """f(handler=42): the keyword NAME collides with a defined function
         but the VALUE is a literal — no REFERENCES edge may be emitted."""
-        src = (
-            "def handler(x):\n"
-            "    return x\n"
-            "\n"
-            "def wire(reg):\n"
-            "    reg.configure(handler=42)\n"
-        )
+        src = "def handler(x):\n    return x\n\ndef wire(reg):\n    reg.configure(handler=42)\n"
         _, edges = _parse_source(tmp_path, src)
         assert "handler" not in _ref_targets(edges)
 
     def test_keyword_value_matching_keyword_name_emits_single_edge(self, tmp_path):
         """f(handler=handler): exactly one REFERENCES edge, from the value."""
         src = (
-            "def handler(x):\n"
-            "    return x\n"
-            "\n"
-            "def wire(reg):\n"
-            "    reg.configure(handler=handler)\n"
+            "def handler(x):\n    return x\n\ndef wire(reg):\n    reg.configure(handler=handler)\n"
         )
         _, edges = _parse_source(tmp_path, src)
-        refs = [
-            e for e in edges
-            if e.kind == "REFERENCES" and e.target.endswith("handler")
-        ]
+        refs = [e for e in edges if e.kind == "REFERENCES" and e.target.endswith("handler")]
         assert len(refs) == 1, [(e.source, e.target, e.line) for e in refs]
         assert refs[0].line == 5
 
@@ -91,9 +76,7 @@ class TestKeywordCallbackEdges:
         assert "inner_cb" in targets, targets
         # `make_handler()` is a call, not a bare identifier: no REFERENCES
         # from the keyword path (it gets a CALLS edge instead).
-        call_targets = {
-            e.target.rsplit("::", 1)[-1] for e in edges if e.kind == "CALLS"
-        }
+        call_targets = {e.target.rsplit("::", 1)[-1] for e in edges if e.kind == "CALLS"}
         assert "make_handler" in call_targets
 
     def test_method_reference_value_is_skipped_without_crash(self, tmp_path):
@@ -165,12 +148,8 @@ class TestKeywordCallbackEdges:
     def test_many_keyword_callbacks_scale(self, tmp_path):
         """300 keyword-referenced handlers: every one gets an edge."""
         n = 300
-        defs = "\n".join(
-            f"def handler_{i:03d}(args):\n    return args\n" for i in range(n)
-        )
-        wires = "\n".join(
-            f"    sp.set_defaults(func_{i:03d}=handler_{i:03d})" for i in range(n)
-        )
+        defs = "\n".join(f"def handler_{i:03d}(args):\n    return args\n" for i in range(n))
+        wires = "\n".join(f"    sp.set_defaults(func_{i:03d}=handler_{i:03d})" for i in range(n))
         src = f"{defs}\n\ndef wire(sp):\n{wires}\n"
         _, edges = _parse_source(tmp_path, src)
         targets = _ref_targets(edges)

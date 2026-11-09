@@ -114,15 +114,19 @@ class TestFlows:
     def test_detect_entry_points_pytest_hooks(self):
         """pytest plugin hooks are entry points (wired by pytest)."""
         for name in (
-            "pytest_configure", "pytest_collection_modifyitems",
-            "pytest_sessionstart", "pytest_terminal_summary",
+            "pytest_configure",
+            "pytest_collection_modifyitems",
+            "pytest_sessionstart",
+            "pytest_terminal_summary",
         ):
             self._add_func(name)
         eps = detect_entry_points(self.store)
         ep_names = {ep.name for ep in eps}
         for name in (
-            "pytest_configure", "pytest_collection_modifyitems",
-            "pytest_sessionstart", "pytest_terminal_summary",
+            "pytest_configure",
+            "pytest_collection_modifyitems",
+            "pytest_sessionstart",
+            "pytest_terminal_summary",
         ):
             assert name in ep_names
 
@@ -231,10 +235,16 @@ class TestFlows:
         self._add_func("run_job", path="script.py")
         # Ensure the File node exists so its qualified_name resolves cleanly
         # (production code creates this automatically during parsing).
-        self.store.upsert_node(NodeInfo(
-            kind="File", name="script.py", file_path="script.py",
-            line_start=1, line_end=10, language="python",
-        ))
+        self.store.upsert_node(
+            NodeInfo(
+                kind="File",
+                name="script.py",
+                file_path="script.py",
+                line_start=1,
+                line_end=10,
+                language="python",
+            )
+        )
         self.store.commit()
         # Module-scope call: source is the File node's qualified_name.
         self._add_call("script.py", "script.py::run_job", path="script.py")
@@ -283,7 +293,7 @@ class TestFlows:
         for i in range(20):
             self._add_func(f"func_{i}")
         for i in range(19):
-            self._add_call(f"app.py::func_{i}", f"app.py::func_{i+1}")
+            self._add_call(f"app.py::func_{i}", f"app.py::func_{i + 1}")
 
         flows_shallow = trace_flows(self.store, max_depth=3)
         entry_flow = [f for f in flows_shallow if f["entry_point"] == "app.py::func_0"]
@@ -457,9 +467,7 @@ class TestFlows:
         # Changing services.py should affect the handler flow.
         result = get_affected_flows(self.store, ["services.py"])
         assert result["total"] >= 1
-        affected_entries = {
-            f["entry_point_id"] for f in result["affected_flows"]
-        }
+        affected_entries = {f["entry_point_id"] for f in result["affected_flows"]}
         handler_node = self.store.get_node("routes.py::handler")
         assert handler_node is not None
         assert handler_node.id in affected_entries

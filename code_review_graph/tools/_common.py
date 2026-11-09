@@ -6,13 +6,18 @@ import logging
 import sqlite3
 import subprocess
 from datetime import datetime
+from hashlib import sha256
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict
+
+from pydantic_core import to_json
 
 from ..graph import GraphStore
 from ..incremental import find_project_root, get_db_path
 from ..parser import normalize_file_path
 
+_MAX_PAGE_BYTES = 40_000
+_MCP_FRAME_RESERVE_BYTES = 1_024
 _PROVENANCE_READ_TIMEOUT_SECONDS = 0.05
 _PROVENANCE_GIT_TIMEOUT_SECONDS = 1.0
 
@@ -20,7 +25,9 @@ logger = logging.getLogger(__name__)
 
 
 def _error_response(
-    message: str, status: str = "error", **extra: Any,
+    message: str,
+    status: str = "error",
+    **extra: Any,
 ) -> dict[str, Any]:
     """Build a standardised error response dict."""
     return {"status": status, "error": message, "summary": message, **extra}
@@ -81,10 +88,12 @@ def graph_provenance(repo_root: str | None = None) -> dict[str, Any] | None:
             timeout=_PROVENANCE_READ_TIMEOUT_SECONDS,
         )
         try:
-            rows = dict(connection.execute(
-                "SELECT key, value FROM metadata WHERE key IN "
-                "('last_updated', 'git_branch', 'git_head_sha')"
-            ).fetchall())
+            rows = dict(
+                connection.execute(
+                    "SELECT key, value FROM metadata WHERE key IN "
+                    "('last_updated', 'git_branch', 'git_head_sha')"
+                ).fetchall()
+            )
         finally:
             connection.close()
 
@@ -98,7 +107,8 @@ def graph_provenance(repo_root: str | None = None) -> dict[str, Any] | None:
                 # timezone; None preserves the stored naive/local format.
                 now = datetime.now(tz=built_at.tzinfo)
                 provenance["age_seconds"] = max(
-                    0, int((now - built_at).total_seconds()),
+                    0,
+                    int((now - built_at).total_seconds()),
                 )
             except (OverflowError, TypeError, ValueError):
                 # A malformed timestamp only removes the derived age. The raw
@@ -182,46 +192,179 @@ def _get_store_for_read(
         return None, None, _not_built_response()
     return store, root, None
 
+
 # Common JS/TS builtin method names filtered from callers_of results.
 # "Who calls .map()?" returns hundreds of hits and is never useful.
 # These are kept in the graph (callees_of still shows them) but excluded
 # when doing reverse call tracing to reduce noise.
 _BUILTIN_CALL_NAMES: set[str] = {
-    "map", "filter", "reduce", "reduceRight", "forEach", "find", "findIndex",
-    "some", "every", "includes", "indexOf", "lastIndexOf",
-    "push", "pop", "shift", "unshift", "splice", "slice",
-    "concat", "join", "flat", "flatMap", "sort", "reverse", "fill",
-    "keys", "values", "entries", "from", "isArray", "of", "at",
-    "trim", "trimStart", "trimEnd", "split", "replace", "replaceAll",
-    "match", "matchAll", "search", "substring", "substr",
-    "toLowerCase", "toUpperCase", "startsWith", "endsWith",
-    "padStart", "padEnd", "repeat", "charAt", "charCodeAt",
-    "assign", "freeze", "defineProperty", "getOwnPropertyNames",
-    "hasOwnProperty", "create", "is", "fromEntries",
-    "log", "warn", "error", "info", "debug", "trace", "dir", "table",
-    "time", "timeEnd", "assert", "clear", "count",
-    "then", "catch", "finally", "resolve", "reject", "all", "allSettled", "race", "any",
-    "parse", "stringify",
-    "floor", "ceil", "round", "random", "max", "min", "abs", "pow", "sqrt",
-    "addEventListener", "removeEventListener", "querySelector", "querySelectorAll",
-    "getElementById", "createElement", "appendChild", "removeChild",
-    "setAttribute", "getAttribute", "preventDefault", "stopPropagation",
-    "setTimeout", "clearTimeout", "setInterval", "clearInterval",
-    "toString", "valueOf", "toJSON", "toISOString",
-    "getTime", "getFullYear", "now",
-    "isNaN", "parseInt", "parseFloat", "toFixed",
-    "encodeURIComponent", "decodeURIComponent",
-    "call", "apply", "bind", "next",
-    "emit", "on", "off", "once",
-    "pipe", "write", "read", "end", "close", "destroy",
-    "send", "status", "json", "redirect",
-    "set", "get", "delete", "has",
-    "findUnique", "findFirst", "findMany", "createMany",
-    "update", "updateMany", "deleteMany", "upsert",
-    "aggregate", "groupBy", "transaction",
-    "describe", "it", "test", "expect", "beforeEach", "afterEach",
-    "beforeAll", "afterAll", "mock", "spyOn",
-    "require", "fetch",
+    "map",
+    "filter",
+    "reduce",
+    "reduceRight",
+    "forEach",
+    "find",
+    "findIndex",
+    "some",
+    "every",
+    "includes",
+    "indexOf",
+    "lastIndexOf",
+    "push",
+    "pop",
+    "shift",
+    "unshift",
+    "splice",
+    "slice",
+    "concat",
+    "join",
+    "flat",
+    "flatMap",
+    "sort",
+    "reverse",
+    "fill",
+    "keys",
+    "values",
+    "entries",
+    "from",
+    "isArray",
+    "of",
+    "at",
+    "trim",
+    "trimStart",
+    "trimEnd",
+    "split",
+    "replace",
+    "replaceAll",
+    "match",
+    "matchAll",
+    "search",
+    "substring",
+    "substr",
+    "toLowerCase",
+    "toUpperCase",
+    "startsWith",
+    "endsWith",
+    "padStart",
+    "padEnd",
+    "repeat",
+    "charAt",
+    "charCodeAt",
+    "assign",
+    "freeze",
+    "defineProperty",
+    "getOwnPropertyNames",
+    "hasOwnProperty",
+    "create",
+    "is",
+    "fromEntries",
+    "log",
+    "warn",
+    "error",
+    "info",
+    "debug",
+    "trace",
+    "dir",
+    "table",
+    "time",
+    "timeEnd",
+    "assert",
+    "clear",
+    "count",
+    "then",
+    "catch",
+    "finally",
+    "resolve",
+    "reject",
+    "all",
+    "allSettled",
+    "race",
+    "any",
+    "parse",
+    "stringify",
+    "floor",
+    "ceil",
+    "round",
+    "random",
+    "max",
+    "min",
+    "abs",
+    "pow",
+    "sqrt",
+    "addEventListener",
+    "removeEventListener",
+    "querySelector",
+    "querySelectorAll",
+    "getElementById",
+    "createElement",
+    "appendChild",
+    "removeChild",
+    "setAttribute",
+    "getAttribute",
+    "preventDefault",
+    "stopPropagation",
+    "setTimeout",
+    "clearTimeout",
+    "setInterval",
+    "clearInterval",
+    "toString",
+    "valueOf",
+    "toJSON",
+    "toISOString",
+    "getTime",
+    "getFullYear",
+    "now",
+    "isNaN",
+    "parseInt",
+    "parseFloat",
+    "toFixed",
+    "encodeURIComponent",
+    "decodeURIComponent",
+    "call",
+    "apply",
+    "bind",
+    "next",
+    "emit",
+    "on",
+    "off",
+    "once",
+    "pipe",
+    "write",
+    "read",
+    "end",
+    "close",
+    "destroy",
+    "send",
+    "status",
+    "json",
+    "redirect",
+    "set",
+    "get",
+    "delete",
+    "has",
+    "findUnique",
+    "findFirst",
+    "findMany",
+    "createMany",
+    "update",
+    "updateMany",
+    "deleteMany",
+    "upsert",
+    "aggregate",
+    "groupBy",
+    "transaction",
+    "describe",
+    "it",
+    "test",
+    "expect",
+    "beforeEach",
+    "afterEach",
+    "beforeAll",
+    "afterAll",
+    "mock",
+    "spyOn",
+    "require",
+    "fetch",
 }
 
 
@@ -234,9 +377,7 @@ def _validate_repo_root(path: "Path | str") -> Path:
     """
     resolved = Path(path).resolve()
     if not resolved.is_dir():
-        raise ValueError(
-            f"repo_root is not an existing directory: {resolved}"
-        )
+        raise ValueError(f"repo_root is not an existing directory: {resolved}")
     has_vcs = (
         (resolved / ".git").exists()
         or (resolved / ".svn").exists()
@@ -268,7 +409,9 @@ def _get_store(repo_root: str | None = None) -> tuple[GraphStore, Path]:
 
 
 def _resolve_graph_file_paths(
-    store: GraphStore, root: Path, file_paths: list[str],
+    store: GraphStore,
+    root: Path,
+    file_paths: list[str],
 ) -> list[str]:
     """Resolve user-facing file paths to the paths stored in the graph.
 
@@ -340,13 +483,15 @@ def _validate_positive_int(value: int, name: str) -> int:
     Mirrors the check ``query.py`` applies to ``max_results``: ``bool`` is
     rejected explicitly because ``True`` would otherwise silently mean 1.
     """
-    if isinstance(value, bool) or value < 1:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
         raise ValueError(f"{name} must be an integer greater than or equal to 1")
     return value
 
 
 def _bounded(
-    items: "list[Any]", max_results: int | None, hard_cap: int | None,
+    items: "list[Any]",
+    max_results: int | None,
+    hard_cap: int | None,
 ) -> tuple[list[Any], int, bool]:
     """Cap *items* at the smaller of ``max_results`` and ``hard_cap``.
 
@@ -397,3 +542,111 @@ def compact_response(
     if detail_level != "minimal" and data:
         resp["data"] = data
     return resp
+
+
+class ResponsePage(TypedDict):
+    """Stable delivery window over the unchanged public result arrays."""
+
+    offset: int
+    next_offset: int | None
+    page_size: int
+    totals: dict[str, int]
+    snapshot: str
+    byte_limit: int
+
+
+def _paginate_response(
+    response: dict[str, Any],
+    *,
+    offset: int = 0,
+    page_size: int = 100,
+    snapshot: str | None = None,
+) -> dict[str, Any]:
+    """Deliver complete ordered arrays through measured, snapshot-bound pages."""
+    if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+        raise ValueError("offset must be a non-negative integer")
+    _validate_positive_int(page_size, "page_size")
+    arrays = {
+        key: value
+        for key, value in response.items()
+        if key
+        in {
+            "changed_files",
+            "changed_nodes",
+            "impacted_nodes",
+            "impacted_files",
+            "edges",
+            "results",
+            "traversal",
+        }
+        and isinstance(value, list)
+    }
+    stable = {key: value for key, value in response.items() if key != "_hints"}
+    if isinstance(stable.get("_graph"), dict):
+        stable["_graph"] = {
+            key: value for key, value in stable["_graph"].items() if key != "age_seconds"
+        }
+    digest = sha256(to_json(stable)).hexdigest()
+    if snapshot is not None and snapshot != digest:
+        return _error_response(
+            "Query results changed; restart at offset 0 without the old snapshot.",
+            status="stale_page",
+        )
+    totals = {key: len(value) for key, value in arrays.items()}
+    size = min(page_size, max(1, max(totals.values(), default=0) - offset))
+    lower, upper = 1, size
+    best: dict[str, Any] | None = None
+    while lower <= upper:
+        page = {**response, **{key: value[offset : offset + size] for key, value in arrays.items()}}
+        more = any(offset + size < total for total in totals.values())
+        metadata: ResponsePage = {
+            "offset": offset,
+            "next_offset": offset + size if more else None,
+            "page_size": size,
+            "totals": totals,
+            "snapshot": digest,
+            "byte_limit": _MAX_PAGE_BYTES,
+        }
+        page["pagination"] = metadata
+        page["analysis_truncated"] = bool(response.get("truncated", False))
+        page["truncated"] = page["analysis_truncated"] or offset > 0 or more
+        if _serialized_mcp_size(page) <= _MAX_PAGE_BYTES:
+            best = page
+            if size == upper:
+                return page
+            lower = size + 1
+        else:
+            upper = size - 1
+        size = (lower + upper) // 2
+    if best is not None:
+        return best
+    references = [
+        {
+            "collection": key,
+            "index": offset,
+            **{
+                name: values[offset][name]
+                for name in ("file_path", "file", "line_start", "line_end")
+                if name in values[offset]
+            },
+        }
+        for key, values in arrays.items()
+        if offset < len(values) and isinstance(values[offset], dict)
+    ]
+    refusal = _error_response(
+        "Entity or metadata exceeds the page budget; recover the exact "
+        "source through these references or the direct API/CLI.",
+        status="page_too_large",
+        references=references,
+    )
+    if _serialized_mcp_size(refusal) > _MAX_PAGE_BYTES:
+        raise ValueError("Query source references exceed the delivery budget")
+    return refusal
+
+
+def _serialized_mcp_size(response: dict[str, Any]) -> int:
+    """Use the serving SDK serializer without loading it on direct CLI reads."""
+    from fastmcp.tools.base import ToolResult
+
+    payload = ToolResult(structured_content=response).to_mcp_result()
+    return len(to_json(payload)) + _MCP_FRAME_RESERVE_BYTES

@@ -91,11 +91,7 @@ def test_lock_requires_dist_matches_pyproject():
     """The lock's recorded requires-dist must agree with pyproject on both
     the SDK swap and the [all] extra addition."""
     lock = _lock()
-    crg = next(
-        pkg
-        for pkg in lock["package"]
-        if pkg["name"] == "code-review-graph"
-    )
+    crg = next(pkg for pkg in lock["package"] if pkg["name"] == "code-review-graph")
     requires = crg["metadata"]["requires-dist"]
     google = [r for r in requires if r["name"] == "google-genai"]
     assert len(google) == 1

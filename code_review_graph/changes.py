@@ -25,11 +25,21 @@ logger = logging.getLogger(__name__)
 # that touches their class, so listing them as test gaps is noise that
 # inflates the gap count and the Untested summary (#850). Names cover
 # PHPUnit/xUnit and Python unittest conventions.
-_TEST_GAP_EXEMPT_NAMES = frozenset({
-    "setUp", "tearDown", "setUpBeforeClass", "tearDownAfterClass",
-    "setup_method", "teardown_method", "setUpClass", "tearDownClass",
-    "__construct", "__init__", "__destruct",
-})
+_TEST_GAP_EXEMPT_NAMES = frozenset(
+    {
+        "setUp",
+        "tearDown",
+        "setUpBeforeClass",
+        "tearDownAfterClass",
+        "setup_method",
+        "teardown_method",
+        "setUpClass",
+        "tearDownClass",
+        "__construct",
+        "__init__",
+        "__destruct",
+    }
+)
 
 _GIT_TIMEOUT = int(os.environ.get("CRG_GIT_TIMEOUT", "30"))  # seconds, configurable
 
@@ -444,9 +454,7 @@ def analyze_changes(
     # already-absolute inputs (MCP) pass through pathlib joining unchanged.
     if repo_root is not None:
         _root = Path(repo_root)
-        changed_files = [
-            normalize_file_path(_root / fp) for fp in changed_files
-        ]
+        changed_files = [normalize_file_path(_root / fp) for fp in changed_files]
 
     # Map changes to nodes.
     if changed_ranges:
@@ -460,9 +468,9 @@ def analyze_changes(
     # RTL declarations are stored as Function nodes for compatibility but
     # are not callable/testable functions.
     changed_funcs = [
-        n for n in changed_nodes
-        if n.kind in ("Function", "Test", "Class")
-        and not n.extra.get("verilog_kind")
+        n
+        for n in changed_nodes
+        if n.kind in ("Function", "Test", "Class") and not n.extra.get("verilog_kind")
     ]
 
     # The analysis is complete by default. ``CRG_MAX_CHANGED_FUNCS`` is an
@@ -486,10 +494,12 @@ def analyze_changes(
     node_risks: list[dict[str, Any]] = []
     for node in changed_funcs:
         risk = compute_risk_score(store, node, churn_counts)
-        node_risks.append({
-            **node_to_dict(node),
-            "risk_score": risk,
-        })
+        node_risks.append(
+            {
+                **node_to_dict(node),
+                "risk_score": risk,
+            }
+        )
 
     # Overall risk score: max of individual risks, or 0.
     overall_risk = max((nr["risk_score"] for nr in node_risks), default=0.0)
@@ -509,13 +519,15 @@ def analyze_changes(
         # See: #515
         tested = store.get_edges_by_source(node.qualified_name)
         if not any(e.kind == "TESTED_BY" for e in tested):
-            test_gaps.append({
-                "name": _sanitize_name(node.name),
-                "qualified_name": _sanitize_name(node.qualified_name),
-                "file": node.file_path,
-                "line_start": node.line_start,
-                "line_end": node.line_end,
-            })
+            test_gaps.append(
+                {
+                    "name": _sanitize_name(node.name),
+                    "qualified_name": _sanitize_name(node.qualified_name),
+                    "file": node.file_path,
+                    "line_start": node.line_start,
+                    "line_end": node.line_end,
+                }
+            )
 
     # Review priorities: top 10 by risk score.
     review_priorities = sorted(node_risks, key=lambda x: x["risk_score"], reverse=True)[:10]
@@ -578,7 +590,5 @@ def _changed_funcs_bound() -> int | None:
         return None
     bound = int(raw)
     if bound < 1:
-        raise ValueError(
-            f"CRG_MAX_CHANGED_FUNCS must be a positive integer, got {raw!r}"
-        )
+        raise ValueError(f"CRG_MAX_CHANGED_FUNCS must be a positive integer, got {raw!r}")
     return bound

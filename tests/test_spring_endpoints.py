@@ -76,9 +76,7 @@ def test_duplicate_routes_remain_linked_to_distinct_handlers(tmp_path: Path) -> 
     path = tmp_path / "CatalogController.java"
     nodes, edges = _parsed(path)
     duplicate_endpoints = [
-        node
-        for node in nodes
-        if node.kind == "Endpoint" and node.extra["route"].endswith("/same")
+        node for node in nodes if node.kind == "Endpoint" and node.extra["route"].endswith("/same")
     ]
 
     assert len(duplicate_endpoints) == 4

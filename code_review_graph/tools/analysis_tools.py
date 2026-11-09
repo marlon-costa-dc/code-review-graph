@@ -69,16 +69,15 @@ def get_hub_nodes_func(
         return not_built if not_built is not None else _not_built_response()
     try:
         hubs, total, truncated = _bounded(
-            find_hub_nodes(store, top_n=_FETCH_ALL), top_n, _MAX_HUB_NODES,
+            find_hub_nodes(store, top_n=_FETCH_ALL),
+            top_n,
+            _MAX_HUB_NODES,
         )
         if detail_level == "minimal":
             hubs = _project(hubs, _MINIMAL_HUB_FIELDS)
         return {
             "status": "ok",
-            "summary": (
-                f"{total} hub node(s) ranked by degree"
-                + _shown_of(len(hubs), total)
-            ),
+            "summary": (f"{total} hub node(s) ranked by degree" + _shown_of(len(hubs), total)),
             "hub_nodes": hubs,
             "count": len(hubs),
             "total": total,
@@ -121,15 +120,16 @@ def get_bridge_nodes_func(
         return not_built if not_built is not None else _not_built_response()
     try:
         bridges, total, truncated = _bounded(
-            find_bridge_nodes(store, top_n=_FETCH_ALL), top_n, _MAX_BRIDGE_NODES,
+            find_bridge_nodes(store, top_n=_FETCH_ALL),
+            top_n,
+            _MAX_BRIDGE_NODES,
         )
         if detail_level == "minimal":
             bridges = _project(bridges, _MINIMAL_BRIDGE_FIELDS)
         return {
             "status": "ok",
             "summary": (
-                f"{total} bridge node(s) ranked by betweenness"
-                + _shown_of(len(bridges), total)
+                f"{total} bridge node(s) ranked by betweenness" + _shown_of(len(bridges), total)
             ),
             "bridge_nodes": bridges,
             "count": len(bridges),
@@ -183,7 +183,9 @@ def get_knowledge_gaps_func(
         truncated = False
         for category, rows in raw.items():
             visible, _total, cut = _bounded(
-                rows, max_per_category, _MAX_GAPS_PER_CATEGORY,
+                rows,
+                max_per_category,
+                _MAX_GAPS_PER_CATEGORY,
             )
             if detail_level == "minimal":
                 visible = _project(visible, _MINIMAL_GAP_FIELDS)
@@ -282,7 +284,9 @@ def get_suggested_questions_func(
     try:
         questions = generate_suggested_questions(store)
         by_priority: dict[str, list[dict[str, Any]]] = {
-            "high": [], "medium": [], "low": [],
+            "high": [],
+            "medium": [],
+            "low": [],
         }
         for q in questions:
             prio = q.get("priority", "medium")
@@ -291,9 +295,7 @@ def get_suggested_questions_func(
         return {
             "questions": questions,
             "count": len(questions),
-            "by_priority": {
-                k: len(v) for k, v in by_priority.items()
-            },
+            "by_priority": {k: len(v) for k, v in by_priority.items()},
             "next_tool_suggestions": [
                 "get_knowledge_gaps -- structural weaknesses",
                 "detect_changes -- risk-scored review",

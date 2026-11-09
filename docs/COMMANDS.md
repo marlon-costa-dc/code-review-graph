@@ -97,6 +97,9 @@ mode: str = "bfs"               # "bfs" or "dfs"
 token_budget: int = 2000
 repo_root: str | None
 ```
+Traversal budgets must be positive integers. The direct API and CLI honor the
+requested analysis budget; MCP delivery pages the resulting traversal without
+discarding the next unreturned node.
 
 #### `semantic_search_nodes_tool`
 ```
@@ -108,6 +111,30 @@ model: str | None    # Embedding model (falls back to provider-specific env vars
 provider: str | None # local, openai, google, minimax, voyage
 detail_level: str = "minimal"    # "minimal" (default) or "standard"
 ```
+Search and oversized-function browsing validate positive result limits. The
+direct API and CLI retain the complete requested result set and ranking.
+
+#### Query response pages
+
+`get_impact_radius_tool`, `semantic_search_nodes_tool`,
+`find_large_functions_tool`, and `traverse_graph_tool` accept
+`offset: int = 0`, `page_size: int = 100`, and `snapshot: str | None = None`.
+`get_impact_radius_tool` also exposes the existing `max_results: int = 500`
+analysis bound. Paging never changes that bound or the direct API/CLI response.
+All correlated result arrays keep their original order and structure; navigation
+suggestions remain complete metadata on every page. `pagination`
+reports per-array totals, the effective page size, `next_offset`, a content
+snapshot of the result and stable provenance, and the serialized byte budget.
+Volatile graph age and session hints do not change the snapshot. Follow `next_offset` with the same
+arguments and returned snapshot until it is absent; concatenating each array
+recovers the complete direct response. A changed snapshot is explicitly refused.
+Pages fit a measured 40,000-byte MCP envelope: the native FastMCP serializer
+accounts for both text content and structured content, including provenance,
+with 1,024 bytes reserved for server and protocol framing.
+Page sizing searches the largest verified window that fits this envelope, so
+unused delivery capacity does not cause avoidable graph recomputation.
+An individual entity or metadata that cannot fit is refused with real source
+references for direct API/CLI recovery; strings are never silently shortened.
 
 #### `embed_graph_tool`
 ```

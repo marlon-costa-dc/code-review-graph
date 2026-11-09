@@ -92,7 +92,7 @@ def _strip_workspace_prefix(path_part: str) -> str | None:
     if workspace:
         prefix = workspace.rstrip("/") + "/"
         if path_part.startswith(prefix):
-            return path_part[len(prefix):]
+            return path_part[len(prefix) :]
 
     # Fallback: Actions checks repos out at /work/<name>/<name>/<files...>.
     repo = os.environ.get("GITHUB_REPOSITORY", "")
@@ -101,7 +101,7 @@ def _strip_workspace_prefix(path_part: str) -> str | None:
         marker = f"/{name}/{name}/"
         idx = path_part.find(marker)
         if idx != -1:
-            return path_part[idx + len(marker):]
+            return path_part[idx + len(marker) :]
 
     return None
 
@@ -179,9 +179,7 @@ def _flows_section(flows: list[dict[str, Any]], max_flows: int) -> list[str]:
         )
         node_count = flow.get("node_count", "?")
         file_count = flow.get("file_count", "?")
-        lines.append(
-            f"- **{name}** — {crit_txt}, {node_count} node(s) across {file_count} file(s)"
-        )
+        lines.append(f"- **{name}** — {crit_txt}, {node_count} node(s) across {file_count} file(s)")
     if len(flows) > max_flows:
         lines.append(f"- ...and {len(flows) - max_flows} more affected flow(s)")
     return lines
@@ -220,9 +218,7 @@ def render_markdown(
     flows = report.get("affected_flows") or []
     gaps = report.get("test_gaps") or []
     priorities = report.get("review_priorities") or changed
-    gap_names = {
-        str(g.get("qualified_name") or g.get("name") or "") for g in gaps
-    }
+    gap_names = {str(g.get("qualified_name") or g.get("name") or "") for g in gaps}
 
     lines: list[str] = [MARKER, "", "## code-review-graph review", ""]
     lines.append(

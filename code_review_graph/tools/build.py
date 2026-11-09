@@ -86,14 +86,10 @@ def _run_postprocess(
         resolved = store.resolve_bare_call_targets()
         resolved += store.resolve_bare_tested_by_sources()
         build_result["bare_edges_resolved"] = resolved
-        build_result["cpp_scoped_edges_resolved"] = (
-            store.resolve_cpp_scoped_call_targets()
-        )
+        build_result["cpp_scoped_edges_resolved"] = store.resolve_cpp_scoped_call_targets()
     except sqlite3.OperationalError as e:
         logger.warning("Call-target resolution failed: %s", e)
-        warnings.append(
-            f"Call-target resolution failed: {type(e).__name__}: {e}"
-        )
+        warnings.append(f"Call-target resolution failed: {type(e).__name__}: {e}")
 
     # -- Signatures + FTS (fast, always run unless "none") --
     timing: dict[str, float] = {}
@@ -612,14 +608,10 @@ def run_postprocess(
             resolved = store.resolve_bare_call_targets()
             resolved += store.resolve_bare_tested_by_sources()
             result["bare_edges_resolved"] = resolved
-            result["cpp_scoped_edges_resolved"] = (
-                store.resolve_cpp_scoped_call_targets()
-            )
+            result["cpp_scoped_edges_resolved"] = store.resolve_cpp_scoped_call_targets()
         except sqlite3.OperationalError as e:
             logger.warning("Call-target resolution failed: %s", e)
-            warnings.append(
-                f"Call-target resolution failed: {type(e).__name__}: {e}"
-            )
+            warnings.append(f"Call-target resolution failed: {type(e).__name__}: {e}")
 
         try:
             rows = store.get_nodes_without_signature()

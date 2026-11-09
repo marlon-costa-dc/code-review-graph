@@ -55,10 +55,7 @@ class TestGoParsing:
         """
         funcs = [n for n in self.nodes if n.kind == "Function"]
         find_by_id = next(f for f in funcs if f.name == "FindByID")
-        save = next(
-            f for f in funcs
-            if f.name == "Save" and f.parent_name == "InMemoryRepo"
-        )
+        save = next(f for f in funcs if f.name == "Save" and f.parent_name == "InMemoryRepo")
         assert find_by_id.parent_name == "InMemoryRepo"
         assert save.parent_name == "InMemoryRepo"
         # Free functions should still have no parent.
@@ -67,19 +64,11 @@ class TestGoParsing:
 
         contains = [(e.source, e.target) for e in self.edges if e.kind == "CONTAINS"]
         find_by_id_contains = [
-            (s, t) for (s, t) in contains
-            if t.endswith("::InMemoryRepo.FindByID")
+            (s, t) for (s, t) in contains if t.endswith("::InMemoryRepo.FindByID")
         ]
-        save_contains = [
-            (s, t) for (s, t) in contains
-            if t.endswith("::InMemoryRepo.Save")
-        ]
-        assert find_by_id_contains, (
-            f"no CONTAINS edge for InMemoryRepo.FindByID in {contains}"
-        )
-        assert save_contains, (
-            f"no CONTAINS edge for InMemoryRepo.Save in {contains}"
-        )
+        save_contains = [(s, t) for (s, t) in contains if t.endswith("::InMemoryRepo.Save")]
+        assert find_by_id_contains, f"no CONTAINS edge for InMemoryRepo.FindByID in {contains}"
+        assert save_contains, f"no CONTAINS edge for InMemoryRepo.Save in {contains}"
         # Source of each CONTAINS should be the InMemoryRepo type,
         # not the file path.
         assert find_by_id_contains[0][0].endswith("::InMemoryRepo")
@@ -87,9 +76,9 @@ class TestGoParsing:
 
     def test_receiver_call_resolves_to_receiver_method(self):
         calls = [
-            edge for edge in self.edges
-            if edge.kind == "CALLS"
-            and edge.source.endswith("::InMemoryRepo.SaveAndReturn")
+            edge
+            for edge in self.edges
+            if edge.kind == "CALLS" and edge.source.endswith("::InMemoryRepo.SaveAndReturn")
         ]
         assert len(calls) == 1
         assert calls[0].target.endswith("::InMemoryRepo.Save")
@@ -110,10 +99,13 @@ class TestGoParsing:
         ],
     )
     def test_shadowed_receiver_call_stays_unresolved(
-        self, method_name, call_count,
+        self,
+        method_name,
+        call_count,
     ):
         calls = [
-            edge for edge in self.edges
+            edge
+            for edge in self.edges
             if edge.kind == "CALLS"
             and edge.source.endswith(f"::ShadowA.{method_name}")
             and edge.extra.get("receiver") == "a"
@@ -124,29 +116,34 @@ class TestGoParsing:
 
     def test_receiver_call_resolves_after_shadowing_scope(self):
         calls = [
-            edge for edge in self.edges
+            edge
+            for edge in self.edges
             if edge.kind == "CALLS"
             and edge.source.endswith("::ShadowA.CallsAfterShadowScope")
             and edge.extra.get("receiver") == "a"
         ]
         assert [edge.target.endswith("::ShadowA.Save") for edge in calls] == [
-            False, True,
+            False,
+            True,
         ]
 
     def test_initializer_uses_receiver_before_shadowing(self):
         calls = [
-            edge for edge in self.edges
+            edge
+            for edge in self.edges
             if edge.kind == "CALLS"
             and edge.source.endswith("::ShadowA.CallsInitializerScope")
             and edge.extra.get("receiver") == "a"
         ]
         assert [edge.target.endswith("::ShadowA.Save") for edge in calls] == [
-            True, False,
+            True,
+            False,
         ]
 
     def test_same_scope_redeclaration_keeps_receiver_resolution(self):
         calls = [
-            edge for edge in self.edges
+            edge
+            for edge in self.edges
             if edge.kind == "CALLS"
             and edge.source.endswith("::ShadowA.CallsSameScopeRedeclaration")
             and edge.extra.get("receiver") == "a"
@@ -165,28 +162,25 @@ class TestGoParsing:
         ],
     )
     def test_receiver_bindings_follow_lexical_lifetime(
-        self, method_name, receiver_resolution,
+        self,
+        method_name,
+        receiver_resolution,
     ):
         calls = [
-            edge for edge in self.edges
+            edge
+            for edge in self.edges
             if edge.kind == "CALLS"
             and edge.source.endswith(f"::ShadowA.{method_name}")
             and edge.extra.get("receiver") == "a"
         ]
-        assert [
-            edge.target.endswith("::ShadowA.Save") for edge in calls
-        ] == receiver_resolution
+        assert [edge.target.endswith("::ShadowA.Save") for edge in calls] == receiver_resolution
 
     def test_deep_receiver_scope_walk_does_not_overflow(self):
         source = (
             "package auth\n"
             "type ShadowA struct{}\n"
             "func (a *ShadowA) Save() {}\n"
-            "func (a *ShadowA) Deep() {\n"
-            + "(" * 1200
-            + "a.Save()"
-            + ")" * 1200
-            + "\n}\n"
+            "func (a *ShadowA) Deep() {\n" + "(" * 1200 + "a.Save()" + ")" * 1200 + "\n}\n"
         ).encode()
         root = self.parser._get_parser("go").parse(source).root_node
         stack = [root]
@@ -228,7 +222,8 @@ class TestGoParsing:
         ).encode()
         _, edges = CodeParser().parse_bytes(Path("many_calls.go"), source)
         calls = [
-            edge for edge in edges
+            edge
+            for edge in edges
             if edge.kind == "CALLS" and edge.source.endswith("::ShadowA.ManyCalls")
         ]
         assert len(calls) == 200
@@ -244,11 +239,7 @@ func (b *Box[T]) Pointer() {}
 """,
         )
 
-        parents = {
-            node.name: node.parent_name
-            for node in nodes
-            if node.kind == "Function"
-        }
+        parents = {node.name: node.parent_name for node in nodes if node.kind == "Function"}
         assert parents == {"Value": "Box", "Pointer": "Box"}
         assert {
             edge.target.rsplit("::", 1)[-1]
@@ -369,9 +360,7 @@ class TestJavaParsing:
         """
         inherits = [e for e in self.edges if e.kind == "INHERITS"]
         # Must have both extends and implements edges to test both paths
-        assert len(inherits) >= 2, (
-            "Expected at least 2 INHERITS edges (extends + implements)"
-        )
+        assert len(inherits) >= 2, "Expected at least 2 INHERITS edges (extends + implements)"
         for e in inherits:
             assert not e.target.startswith("implements "), (
                 f"INHERITS target should be bare type name, got: {e.target!r}"
@@ -400,7 +389,7 @@ class TestJavaMethodNames:
         nodes, _ = self._parse(
             "public class Suite {\n"
             "    public Suite() { }\n"
-            "    public String getLabel() { return \"\"; }\n"
+            '    public String getLabel() { return ""; }\n'
             "    public User createUser() { return null; }\n"
             "    public void plainVoid() { }\n"
             "    public List<String> genericReturn() { return null; }\n"
@@ -429,15 +418,11 @@ class TestJavaImportResolution:
         # Create a mini Java project with two packages
         auth = tmp_path / "src/main/java/com/example/auth"
         auth.mkdir(parents=True)
-        (auth / "User.java").write_text(
-            "package com.example.auth;\npublic class User {}\n"
-        )
+        (auth / "User.java").write_text("package com.example.auth;\npublic class User {}\n")
         svc = tmp_path / "src/main/java/com/example/service"
         svc.mkdir(parents=True)
         (svc / "App.java").write_text(
-            "package com.example.service;\n"
-            "import com.example.auth.User;\n"
-            "public class App {}\n"
+            "package com.example.service;\nimport com.example.auth.User;\npublic class App {}\n"
         )
 
         parser = CodeParser()
@@ -462,8 +447,7 @@ class TestJavaImportResolution:
         pkg = tmp_path / "src/main/java/com/example/util"
         pkg.mkdir(parents=True)
         (pkg / "Helper.java").write_text(
-            "package com.example.util;\n"
-            "public class Helper { public static int MAX = 1; }\n"
+            "package com.example.util;\npublic class Helper { public static int MAX = 1; }\n"
         )
         app_dir = tmp_path / "src/main/java/com/example/app"
         app_dir.mkdir(parents=True)
@@ -484,9 +468,7 @@ class TestJavaImportResolution:
         app_dir = tmp_path / "src/main/java/com/example"
         app_dir.mkdir(parents=True)
         (app_dir / "App.java").write_text(
-            "package com.example;\n"
-            "import java.util.*;\n"
-            "public class App {}\n"
+            "package com.example;\nimport java.util.*;\npublic class App {}\n"
         )
 
         parser = CodeParser()
@@ -573,6 +555,7 @@ class TestHhParsing:
 def _has_csharp_parser():
     try:
         import tree_sitter_language_pack as tslp
+
         tslp.get_parser("csharp")
         return True
     except (LookupError, ImportError):
@@ -613,16 +596,12 @@ class TestCSharpParsing:
         inherits = [e for e in self.edges if e.kind == "INHERITS"]
         by_source = {}
         for edge in inherits:
-            by_source.setdefault(edge.source.rsplit("::", 1)[-1], set()).add(
-                edge.target
-            )
+            by_source.setdefault(edge.source.rsplit("::", 1)[-1], set()).add(edge.target)
 
         assert by_source.get("AuditedUser") == {"User", "IRepository"}
         assert by_source.get("TaggedUser") == {"User"}
         assert "IRepository" in by_source.get("Token", set())
-        assert "System.Collections.Generic.List<User>" in {
-            edge.target for edge in inherits
-        }
+        assert "System.Collections.Generic.List<User>" in {edge.target for edge in inherits}
         assert "ConstrainedHolder" not in by_source
         assert by_source.get("SeededRepo") == {"InMemoryRepo"}
         assert all(not edge.target.startswith("(") for edge in inherits)
@@ -640,35 +619,29 @@ class TestCSharpParsing:
         ids=("bare", "member", "chained", "null-conditional"),
     )
     def test_finds_calls_and_attributes_them_to_enclosing_method(
-        self, tmp_path, statement, expected_targets,
+        self,
+        tmp_path,
+        statement,
+        expected_targets,
     ):
         source_file = tmp_path / "Calls.cs"
         source_file.write_text(
-            "class Caller\n"
-            "{\n"
-            "    void Run()\n"
-            "    {\n"
-            f"        {statement}\n"
-            "    }\n"
-            "}\n"
+            f"class Caller\n{{\n    void Run()\n    {{\n        {statement}\n    }}\n}}\n"
         )
 
         _, edges = self.parser.parse_file(source_file)
         calls = [edge for edge in edges if edge.kind == "CALLS"]
-        call_targets = {
-            edge.target.split("::")[-1].split(".")[-1]: edge
-            for edge in calls
-        }
+        call_targets = {edge.target.split("::")[-1].split(".")[-1]: edge for edge in calls}
 
         assert expected_targets <= call_targets.keys()
         assert all(
-            call_targets[target].source.endswith("::Caller.Run")
-            for target in expected_targets
+            call_targets[target].source.endswith("::Caller.Run") for target in expected_targets
         )
 
 
 @pytest.mark.skipif(
-    not _has_csharp_parser(), reason="csharp tree-sitter grammar not installed",
+    not _has_csharp_parser(),
+    reason="csharp tree-sitter grammar not installed",
 )
 class TestCSharpMethodNames:
     """Regression tests for #791: a non-generic C# return type is itself an
@@ -704,7 +677,8 @@ class TestCSharpMethodNames:
 
 
 @pytest.mark.skipif(
-    not _has_csharp_parser(), reason="csharp tree-sitter grammar not installed",
+    not _has_csharp_parser(),
+    reason="csharp tree-sitter grammar not installed",
 )
 class TestCSharpAttributes:
     """Regression tests for #295 (C# half): C# attributes use
@@ -720,7 +694,7 @@ class TestCSharpAttributes:
     def test_method_attributes_captured(self, tmp_path):
         nodes, _ = self._parse(
             "namespace Api;\npublic class Ctrl {\n"
-            "    [HttpGet(\"/x\")]\n    [Authorize]\n"
+            '    [HttpGet("/x")]\n    [Authorize]\n'
             "    public void Get() {}\n}\n",
             tmp_path,
         )
@@ -730,8 +704,7 @@ class TestCSharpAttributes:
 
     def test_class_attribute_captured(self, tmp_path):
         nodes, _ = self._parse(
-            "namespace Api;\n[ApiController]\npublic class Ctrl {\n"
-            "    public void Get() {}\n}\n",
+            "namespace Api;\n[ApiController]\npublic class Ctrl {\n    public void Get() {}\n}\n",
             tmp_path,
         )
         ctrl = next(n for n in nodes if n.kind == "Class" and n.name == "Ctrl")
@@ -749,7 +722,8 @@ class TestCSharpAttributes:
 
 
 @pytest.mark.skipif(
-    not _has_csharp_parser(), reason="csharp tree-sitter grammar not installed",
+    not _has_csharp_parser(),
+    reason="csharp tree-sitter grammar not installed",
 )
 class TestCSharpNamespaceResolution:
     """Regression tests for #310: C# ``using X.Y;`` directives carry a
@@ -824,18 +798,12 @@ class TestCSharpNamespaceResolution:
         core = tmp_path / "Core.cs"
         self._write(
             core,
-            "namespace Acme {\n"
-            "    namespace Core {\n"
-            "        public class TaskBoard {}\n"
-            "    }\n"
-            "}\n",
+            "namespace Acme {\n    namespace Core {\n        public class TaskBoard {}\n    }\n}\n",
         )
         app = tmp_path / "App.cs"
         self._write(
             app,
-            "using Acme.Core;\n"
-            "namespace Acme.App;\n"
-            "public class App {}\n",
+            "using Acme.Core;\nnamespace Acme.App;\npublic class App {}\n",
         )
 
         store = GraphStore(tmp_path / ".code-review-graph" / "graph.db")
@@ -884,7 +852,8 @@ class TestCSharpNamespaceResolution:
 
 
 @pytest.mark.skipif(
-    not _has_csharp_parser(), reason="csharp tree-sitter grammar not installed",
+    not _has_csharp_parser(),
+    reason="csharp tree-sitter grammar not installed",
 )
 class TestCSharpReceiverCallResolution:
     """Regression tests for #612: C# receiver calls (``Service.StaticCall()``,
@@ -1015,7 +984,8 @@ class TestCSharpReceiverCallResolution:
             store.close()
 
     def test_full_build_resolves_receiver_calls_to_canonical_methods(
-        self, tmp_path,
+        self,
+        tmp_path,
     ):
         self._build(tmp_path)
         service = str(tmp_path / "Service.cs")
@@ -1044,49 +1014,45 @@ class TestCSharpReceiverCallResolution:
                 repo_root=str(tmp_path),
             )
             assert result.get("status") == "ok"
-            run_callers = [
-                r for r in result.get("results", [])
-                if r.get("name") == "Run"
-            ]
+            run_callers = [r for r in result.get("results", []) if r.get("name") == "Run"]
             assert run_callers, f"callers_of({method}) missed Consumer.Run"
-            assert all(
-                r.get("target_resolution") != "unresolved"
-                for r in run_callers
-            ), f"callers_of({method}) still marks Consumer.Run unresolved"
+            assert all(r.get("target_resolution") != "unresolved" for r in run_callers), (
+                f"callers_of({method}) still marks Consumer.Run unresolved"
+            )
 
     def test_impact_radius_of_service_file_reaches_consumer(self, tmp_path):
         from code_review_graph.tools.query import get_impact_radius
 
         self._build(tmp_path)
         result = get_impact_radius(
-            changed_files=["Service.cs"], repo_root=str(tmp_path),
+            changed_files=["Service.cs"],
+            repo_root=str(tmp_path),
         )
         assert result.get("status") == "ok"
-        impacted_names = {
-            n["name"] for n in result.get("impacted_nodes", [])
-        }
+        impacted_names = {n["name"] for n in result.get("impacted_nodes", [])}
         assert "Run" in impacted_names
         assert str(tmp_path / "Consumer.cs") in set(
             result.get("impacted_files", []),
         )
 
     def test_impact_radius_of_decoy_file_does_not_reach_consumer(
-        self, tmp_path,
+        self,
+        tmp_path,
     ):
         from code_review_graph.tools.query import get_impact_radius
 
         self._build(tmp_path)
         result = get_impact_radius(
-            changed_files=["Decoy.cs"], repo_root=str(tmp_path),
+            changed_files=["Decoy.cs"],
+            repo_root=str(tmp_path),
         )
         assert result.get("status") == "ok"
-        impacted_names = {
-            n["name"] for n in result.get("impacted_nodes", [])
-        }
+        impacted_names = {n["name"] for n in result.get("impacted_nodes", [])}
         assert "Run" not in impacted_names
 
     def test_tests_for_finds_test_through_resolved_receiver_call(
-        self, tmp_path,
+        self,
+        tmp_path,
     ):
         from code_review_graph.tools.query import query_graph
 
@@ -1103,7 +1069,8 @@ class TestCSharpReceiverCallResolution:
 
 
 @pytest.mark.skipif(
-    not _has_csharp_parser(), reason="csharp tree-sitter grammar not installed",
+    not _has_csharp_parser(),
+    reason="csharp tree-sitter grammar not installed",
 )
 class TestCSharpNamespaceImpactAndCoverage:
     """End-to-end regression tests for #310 / #792.
@@ -1164,9 +1131,7 @@ class TestCSharpNamespaceImpactAndCoverage:
         )
         unrelated = tmp_path / "Unrelated.cs"
         unrelated.write_text(
-            "using System.Linq;\n"
-            "namespace ACME.Other;\n"
-            "public class Other {}\n",
+            "using System.Linq;\nnamespace ACME.Other;\npublic class Other {}\n",
             encoding="utf-8",
         )
 
@@ -1218,7 +1183,9 @@ class TestCSharpNamespaceImpactAndCoverage:
         store, core, app, _tests, _unrelated = self._build(tmp_path)
         try:
             result = query_graph(
-                "importers_of", str(core), repo_root=str(tmp_path),
+                "importers_of",
+                str(core),
+                repo_root=str(tmp_path),
             )
             assert result.get("status") == "ok"
             importers = {r["file"] for r in result.get("results", [])}
@@ -1234,10 +1201,7 @@ class TestCSharpNamespaceImpactAndCoverage:
         try:
             method_qn = f"{core}::TaskBoard.CountTasks"
             test_qn = f"{tests}::TaskBoardTests.CountTasks_ReturnsZero"
-            tested_by = [
-                e for e in store.get_edges_by_source(method_qn)
-                if e.kind == "TESTED_BY"
-            ]
+            tested_by = [e for e in store.get_edges_by_source(method_qn) if e.kind == "TESTED_BY"]
             assert [e.target_qualified for e in tested_by] == [test_qn]
         finally:
             store.close()
@@ -1253,9 +1217,7 @@ class TestCSharpNamespaceImpactAndCoverage:
             repo_root=str(tmp_path),
         )
         assert result.get("status") == "ok"
-        found = {
-            r["qualified_name"]: r for r in result.get("results", [])
-        }
+        found = {r["qualified_name"]: r for r in result.get("results", [])}
         test_qn = f"{tests}::TaskBoardTests.CountTasks_ReturnsZero"
         assert test_qn in found
         # Must come from the resolved TESTED_BY edge, not name matching.
@@ -1320,8 +1282,7 @@ class TestRubyParsing:
 
         # Calls are attributed to their enclosing method.
         create_user_targets = {
-            e.target for e in calls
-            if e.source.endswith("UserRepository.create_user")
+            e.target for e in calls if e.source.endswith("UserRepository.create_user")
         }
         assert any(t.endswith("UserRepository.save") for t in create_user_targets)
         assert any(t.endswith("new") for t in create_user_targets)
@@ -1364,14 +1325,8 @@ class TestPHPParsing:
         assert "search" in target_names
 
         # Scoped/static calls
-        assert any(
-            target.endswith("sample.php::QueryUtils.fetchRecords")
-            for target in targets
-        )
-        assert any(
-            target.endswith("sample.php::EncounterService.create")
-            for target in targets
-        )
+        assert any(target.endswith("sample.php::QueryUtils.fetchRecords") for target in targets)
+        assert any(target.endswith("sample.php::EncounterService.create") for target in targets)
         assert any(t.endswith("__construct") for t in run_queries_targets)
         assert any(t.endswith("factory") for t in run_queries_targets)
 
@@ -1533,17 +1488,13 @@ class TestPHPTestAnnotations:
 
     def test_unrelated_qualified_attribute_is_not_detected(self, tmp_path):
         nodes, _ = self._parse(tmp_path)
-        m = next(
-            n for n in nodes if n.name == "unrelated_qualified_attribute"
-        )
+        m = next(n for n in nodes if n.name == "unrelated_qualified_attribute")
         assert m.kind == "Function"
         assert m.is_test is False
 
     def test_unrelated_aliased_attribute_is_not_detected(self, tmp_path):
         nodes, _ = self._parse(tmp_path)
-        m = next(
-            n for n in nodes if n.name == "unrelated_aliased_attribute"
-        )
+        m = next(n for n in nodes if n.name == "unrelated_aliased_attribute")
         assert m.kind == "Function"
         assert m.is_test is False
 
@@ -1567,15 +1518,11 @@ class TestPHPImportResolution:
         """``use`` of a project class resolves to its .php file."""
         entity = tmp_path / "src/App/Domain/Entity"
         entity.mkdir(parents=True)
-        (entity / "Job.php").write_text(
-            "<?php\nnamespace App\\Domain\\Entity;\nclass Job {}\n"
-        )
+        (entity / "Job.php").write_text("<?php\nnamespace App\\Domain\\Entity;\nclass Job {}\n")
         svc = tmp_path / "src/App/Service"
         svc.mkdir(parents=True)
         (svc / "MatchService.php").write_text(
-            "<?php\nnamespace App\\Service;\n"
-            "use App\\Domain\\Entity\\Job;\n"
-            "class MatchService {}\n"
+            "<?php\nnamespace App\\Service;\nuse App\\Domain\\Entity\\Job;\nclass MatchService {}\n"
         )
 
         parser = CodeParser(tmp_path)
@@ -1590,9 +1537,7 @@ class TestPHPImportResolution:
         svc = tmp_path / "src/App/Service"
         svc.mkdir(parents=True)
         (svc / "Logger.php").write_text(
-            "<?php\nnamespace App\\Service;\n"
-            "use Psr\\Log\\LoggerInterface;\n"
-            "class Logger {}\n"
+            "<?php\nnamespace App\\Service;\nuse Psr\\Log\\LoggerInterface;\nclass Logger {}\n"
         )
         parser = CodeParser()
         _, edges = parser.parse_file(svc / "Logger.php")
@@ -1698,8 +1643,7 @@ class TestKotlinAnnotations:
 
     def test_composable_annotation_on_function(self, tmp_path):
         nodes, _ = self._parse(
-            "package com.example\n@Composable\nfun Greeting(n: String) {\n"
-            "    println(n)\n}\n",
+            "package com.example\n@Composable\nfun Greeting(n: String) {\n    println(n)\n}\n",
             tmp_path,
         )
         fn = next(n for n in nodes if n.kind == "Function" and n.name == "Greeting")
@@ -1710,7 +1654,8 @@ class TestKotlinAnnotations:
         """Guard: adding annotation support must not leak an empty string
         or empty list onto unannotated nodes."""
         nodes, _ = self._parse(
-            "package com.example\nfun bare() { println(1) }\n", tmp_path,
+            "package com.example\nfun bare() { println(1) }\n",
+            tmp_path,
         )
         fn = next(n for n in nodes if n.kind == "Function" and n.name == "bare")
         assert fn.modifiers is None
@@ -1797,7 +1742,8 @@ class TestSwiftParsing:
     def test_finds_initializers(self):
         """`init` / `convenience init` are Function nodes on their own type."""
         inits = [
-            n for n in self.nodes
+            n
+            for n in self.nodes
             if n.kind == "Function" and n.name == "init" and n.parent_name == "InMemoryRepo"
         ]
         assert len(inits) == 2
@@ -1816,7 +1762,8 @@ class TestSwiftParsing:
         """Calls inside init/deinit/subscript belong to that declaration, not the file."""
         calls = {
             (e.source.rsplit("::", 1)[-1], e.target.rsplit("::", 1)[-1])
-            for e in self.edges if e.kind == "CALLS"
+            for e in self.edges
+            if e.kind == "CALLS"
         }
         # init(seed:) calls save(user); convenience init() delegates to self.init
         assert ("InMemoryRepo.init", "InMemoryRepo.save") in calls
@@ -1933,10 +1880,7 @@ class TestSolidityParsing:
         assert "BonusClaimed" in names
 
     def test_finds_file_level_events(self):
-        funcs = [
-            n for n in self.nodes
-            if n.kind == "Function" and n.parent_name is None
-        ]
+        funcs = [n for n in self.nodes if n.kind == "Function" and n.parent_name is None]
         names = {f.name for f in funcs}
         # file-level events declared outside any contract
         assert "Staked" in names or "Unstaked" in names
@@ -1948,10 +1892,7 @@ class TestSolidityParsing:
         assert "PositionId" in names
 
     def test_finds_file_level_constants(self):
-        constants = [
-            n for n in self.nodes
-            if n.extra.get("solidity_kind") == "constant"
-        ]
+        constants = [n for n in self.nodes if n.extra.get("solidity_kind") == "constant"]
         names = {c.name for c in constants}
         assert "MAX_SUPPLY" in names
         assert "ZERO_ADDRESS" in names
@@ -1973,10 +1914,7 @@ class TestSolidityParsing:
         assert "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol" in targets
 
     def test_finds_state_variables(self):
-        state_vars = [
-            n for n in self.nodes
-            if n.extra.get("solidity_kind") == "state_variable"
-        ]
+        state_vars = [n for n in self.nodes if n.extra.get("solidity_kind") == "state_variable"]
         names = {v.name for v in state_vars}
         assert "stakes" in names
         assert "totalStaked" in names
@@ -1989,8 +1927,7 @@ class TestSolidityParsing:
 
     def test_state_variable_types(self):
         state_vars = {
-            n.name: n for n in self.nodes
-            if n.extra.get("solidity_kind") == "state_variable"
+            n.name: n for n in self.nodes if n.extra.get("solidity_kind") == "state_variable"
         }
         assert state_vars["totalStaked"].return_type == "uint256"
         assert state_vars["guardian"].return_type == "address"
@@ -2057,15 +1994,13 @@ class TestSolidityParsing:
 
     def test_extracts_params(self):
         funcs = {
-            n.name: n for n in self.nodes
-            if n.kind == "Function" and n.parent_name == "RewardMath"
+            n.name: n for n in self.nodes if n.kind == "Function" and n.parent_name == "RewardMath"
         }
         assert funcs["mulPrecise"].params == "(uint256 a, uint256 b)"
 
     def test_extracts_return_type(self):
         funcs = {
-            n.name: n for n in self.nodes
-            if n.kind == "Function" and n.parent_name == "RewardMath"
+            n.name: n for n in self.nodes if n.kind == "Function" and n.parent_name == "RewardMath"
         }
         assert "uint256" in funcs["mulPrecise"].return_type
 
@@ -2126,10 +2061,7 @@ class TestRParsing:
         assert "MyClass" in names
 
     def test_finds_class_methods(self):
-        methods = [
-            n for n in self.nodes
-            if n.kind == "Function" and n.parent_name == "MyClass"
-        ]
+        methods = [n for n in self.nodes if n.kind == "Function" and n.parent_name == "MyClass"]
         names = {m.name for m in methods}
         assert "greet" in names
         assert "get_age" in names
@@ -2202,7 +2134,9 @@ class TestPerlParsing:
     def test_finds_calls(self):
         calls = [e for e in self.edges if e.kind == "CALLS"]
         targets = {e.target for e in calls}
-        assert any(t == "speak" or t.endswith("::speak") for t in targets)  # $self->speak() — method_call_expression
+        assert any(
+            t == "speak" or t.endswith("::speak") for t in targets
+        )  # $self->speak() — method_call_expression
         assert "bless" in targets  # ambiguous_function_call_expression
 
     def test_finds_contains(self):
@@ -2255,45 +2189,32 @@ class TestLuaParsing:
         assert self.parser.detect_language(Path("config.lua")) == "lua"
 
     def test_finds_top_level_functions(self):
-        funcs = [
-            n for n in self.nodes
-            if n.kind == "Function" and n.parent_name is None
-        ]
+        funcs = [n for n in self.nodes if n.kind == "Function" and n.parent_name is None]
         names = {f.name for f in funcs}
         assert "greet" in names
         assert "helper" in names
         assert "process_animals" in names
 
     def test_finds_variable_assigned_functions(self):
-        funcs = [
-            n for n in self.nodes
-            if n.kind == "Function" and n.parent_name is None
-        ]
+        funcs = [n for n in self.nodes if n.kind == "Function" and n.parent_name is None]
         names = {f.name for f in funcs}
         assert "transform" in names
         assert "validate" in names
 
     def test_finds_dot_syntax_methods(self):
-        funcs = [
-            n for n in self.nodes
-            if n.kind == "Function" and n.parent_name == "Animal"
-        ]
+        funcs = [n for n in self.nodes if n.kind == "Function" and n.parent_name == "Animal"]
         names = {f.name for f in funcs}
         assert "new" in names
 
     def test_finds_colon_syntax_methods(self):
-        funcs = [
-            n for n in self.nodes
-            if n.kind == "Function" and n.parent_name == "Animal"
-        ]
+        funcs = [n for n in self.nodes if n.kind == "Function" and n.parent_name == "Animal"]
         names = {f.name for f in funcs}
         assert "speak" in names
         assert "rename" in names
 
     def test_finds_inherited_table_methods(self):
         dog_funcs = [
-            n for n in self.nodes
-            if n.kind in ("Function", "Test") and n.parent_name == "Dog"
+            n for n in self.nodes if n.kind in ("Function", "Test") and n.parent_name == "Dog"
         ]
         names = {f.name for f in dog_funcs}
         assert "new" in names
@@ -2325,7 +2246,8 @@ class TestLuaParsing:
 
     def test_method_parent_names(self):
         funcs = {
-            (n.name, n.parent_name) for n in self.nodes
+            (n.name, n.parent_name)
+            for n in self.nodes
             if n.kind == "Function" and n.parent_name is not None
         }
         assert ("new", "Animal") in funcs
@@ -2347,10 +2269,7 @@ class TestLuaParsing:
         assert funcs["greet"].params is not None
         assert "name" in funcs["greet"].params
         # Animal.new has (name, sound)
-        animal_new = [
-            n for n in self.nodes
-            if n.name == "new" and n.parent_name == "Animal"
-        ][0]
+        animal_new = [n for n in self.nodes if n.name == "new" and n.parent_name == "Animal"][0]
         assert animal_new.params is not None
         assert "name" in animal_new.params
         assert "sound" in animal_new.params
@@ -2383,44 +2302,31 @@ class TestLuauParsing:
         assert "Callback" in names
 
     def test_finds_top_level_functions(self):
-        funcs = [
-            n for n in self.nodes
-            if n.kind == "Function" and n.parent_name is None
-        ]
+        funcs = [n for n in self.nodes if n.kind == "Function" and n.parent_name is None]
         names = {f.name for f in funcs}
         assert "greet" in names
         assert "add" in names
         assert "process_animals" in names
 
     def test_finds_variable_assigned_functions(self):
-        funcs = [
-            n for n in self.nodes
-            if n.kind == "Function" and n.parent_name is None
-        ]
+        funcs = [n for n in self.nodes if n.kind == "Function" and n.parent_name is None]
         names = {f.name for f in funcs}
         assert "transform" in names
 
     def test_finds_dot_syntax_methods(self):
-        funcs = [
-            n for n in self.nodes
-            if n.kind == "Function" and n.parent_name == "Animal"
-        ]
+        funcs = [n for n in self.nodes if n.kind == "Function" and n.parent_name == "Animal"]
         names = {f.name for f in funcs}
         assert "new" in names
 
     def test_finds_colon_syntax_methods(self):
-        funcs = [
-            n for n in self.nodes
-            if n.kind == "Function" and n.parent_name == "Animal"
-        ]
+        funcs = [n for n in self.nodes if n.kind == "Function" and n.parent_name == "Animal"]
         names = {f.name for f in funcs}
         assert "speak" in names
         assert "rename" in names
 
     def test_finds_inherited_table_methods(self):
         dog_funcs = [
-            n for n in self.nodes
-            if n.kind in ("Function", "Test") and n.parent_name == "Dog"
+            n for n in self.nodes if n.kind in ("Function", "Test") and n.parent_name == "Dog"
         ]
         names = {f.name for f in dog_funcs}
         assert "new" in names
@@ -2451,7 +2357,8 @@ class TestLuauParsing:
 
     def test_method_parent_names(self):
         funcs = {
-            (n.name, n.parent_name) for n in self.nodes
+            (n.name, n.parent_name)
+            for n in self.nodes
             if n.kind == "Function" and n.parent_name is not None
         }
         assert ("new", "Animal") in funcs
@@ -2502,9 +2409,7 @@ class TestObjectiveCParsing:
         assert "Calculator" in names
 
     def test_finds_instance_and_class_methods(self):
-        funcs = {
-            (n.name, n.parent_name) for n in self.nodes if n.kind == "Function"
-        }
+        funcs = {(n.name, n.parent_name) for n in self.nodes if n.kind == "Function"}
         assert ("add", "Calculator") in funcs
         assert ("reset", "Calculator") in funcs
         assert ("logResult", "Calculator") in funcs
@@ -2582,6 +2487,7 @@ class TestBashParsing:
             for e in edges:
                 counts[e.kind] = counts.get(e.kind, 0) + 1
             return counts
+
         assert by_kind(ksh_edges) == by_kind(self.edges)
 
     def test_nodes_have_bash_language(self):
@@ -2628,10 +2534,7 @@ class TestBashParsing:
 
     def test_main_calls_resolve_to_internal_functions(self):
         """main() should have CALLS edges to log_info, ensure_dir, and cleanup."""
-        calls = [
-            e for e in self.edges
-            if e.kind == "CALLS" and e.source.endswith("::main")
-        ]
+        calls = [e for e in self.edges if e.kind == "CALLS" and e.source.endswith("::main")]
         call_targets = {e.target for e in calls}
         assert any(t.endswith("::log_info") for t in call_targets)
         assert any(t.endswith("::ensure_dir") for t in call_targets)
@@ -2659,9 +2562,7 @@ class TestElixirParsing:
         assert "MathHelpers" in classes
 
     def test_def_defp_produce_functions_with_parent_module(self):
-        funcs = {
-            (n.name, n.parent_name) for n in self.nodes if n.kind == "Function"
-        }
+        funcs = {(n.name, n.parent_name) for n in self.nodes if n.kind == "Function"}
         # public defs
         assert ("add", "Calculator") in funcs
         assert ("subtract", "Calculator") in funcs
@@ -2693,8 +2594,7 @@ class TestElixirParsing:
         contains = [e for e in self.edges if e.kind == "CONTAINS"]
         # Each function should be CONTAINS-linked to its parent module
         function_targets = {
-            e.target for e in contains
-            if "::" in e.source and "Calculator" in e.source
+            e.target for e in contains if "::" in e.source and "Calculator" in e.source
         }
         assert any(t.endswith("::Calculator.add") for t in function_targets)
         assert any(t.endswith("::Calculator.compute") for t in function_targets)
@@ -2719,20 +2619,14 @@ class TestGDScriptParsing:
         assert "Item" in classes
 
     def test_finds_top_level_functions(self):
-        funcs = [
-            n for n in self.nodes
-            if n.kind == "Function" and n.parent_name is None
-        ]
+        funcs = [n for n in self.nodes if n.kind == "Function" and n.parent_name is None]
         names = {f.name for f in funcs}
         for expected in ("_ready", "_load_items", "get_item", "helper"):
             assert expected in names, f"missing top-level function {expected}"
 
     def test_finds_inner_class_methods(self):
         """Methods defined inside ``class Inner:`` should attach to the inner class."""
-        inner_funcs = [
-            n for n in self.nodes
-            if n.kind == "Function" and n.parent_name == "Item"
-        ]
+        inner_funcs = [n for n in self.nodes if n.kind == "Function" and n.parent_name == "Item"]
         names = {f.name for f in inner_funcs}
         assert "promote" in names
 
@@ -2769,14 +2663,18 @@ class TestGDScriptParsing:
     def test_contains_edges_wire_classes_and_functions(self):
         contains = [(e.source, e.target) for e in self.edges if e.kind == "CONTAINS"]
         # File CONTAINS the top-level Class and Function nodes.
-        file_contains = {t for s, t in contains if not s.endswith(".gd::Item")
-                         and not s.endswith(".gd::SampleManager")}
+        file_contains = {
+            t
+            for s, t in contains
+            if not s.endswith(".gd::Item") and not s.endswith(".gd::SampleManager")
+        }
         assert any(t.endswith("::SampleManager") for t in file_contains)
         assert any(t.endswith("::Item") for t in file_contains)
         assert any(t.endswith("::_ready") for t in file_contains)
         # Inner class CONTAINS its method.
         item_contains = {t for s, t in contains if s.endswith("::Item")}
         assert any(t.endswith("::Item.promote") for t in item_contains)
+
 
 class TestJuliaParsing:
     def setup_method(self):
@@ -2803,10 +2701,7 @@ class TestJuliaParsing:
         inherits = [e for e in self.edges if e.kind == "INHERITS"]
         # Dog's qualified source is file::SampleModule.Dog; we only care
         # about the trailing struct name and the target.
-        pairs = {
-            (e.source.split("::")[-1].split(".")[-1], e.target)
-            for e in inherits
-        }
+        pairs = {(e.source.split("::")[-1].split(".")[-1], e.target) for e in inherits}
         assert ("Dog", "AbstractAnimal") in pairs
 
     def test_finds_long_form_functions(self):
@@ -2859,10 +2754,9 @@ class TestJuliaParsing:
 
     def test_finds_exports(self):
         refs = [
-            e for e in self.edges
-            if e.kind == "REFERENCES"
-            and e.extra
-            and e.extra.get("julia_export")
+            e
+            for e in self.edges
+            if e.kind == "REFERENCES" and e.extra and e.extra.get("julia_export")
         ]
         # Targets may be resolved to qualified names (file::SampleModule.greet)
         # if the exported symbol is defined locally; otherwise they stay bare.
@@ -2880,9 +2774,7 @@ class TestJuliaParsing:
         # The CONTAINS edge for inner should originate from outer, and
         # its qualified target should carry `outer.inner` in the name.
         assert any(
-            e.source.endswith("outer")
-            and e.target.endswith("outer.inner")
-            for e in contains
+            e.source.endswith("outer") and e.target.endswith("outer.inner") for e in contains
         )
 
     def test_qualified_function_name(self):
@@ -2904,9 +2796,9 @@ class TestJuliaParsing:
 
     def test_finds_enum_variants(self):
         variants = {
-            n.name for n in self.nodes
-            if n.kind == "Function"
-            and (n.extra or {}).get("julia_kind") == "enum_variant"
+            n.name
+            for n in self.nodes
+            if n.kind == "Function" and (n.extra or {}).get("julia_kind") == "enum_variant"
         }
         assert {"RED", "BLUE", "GREEN"} <= variants
 
@@ -2914,18 +2806,15 @@ class TestJuliaParsing:
         contains = [e for e in self.edges if e.kind == "CONTAINS"]
         # Color -> RED, BLUE, GREEN
         variants_under_color = {
-            e.target.split(".")[-1]
-            for e in contains
-            if e.source.endswith("Color")
+            e.target.split(".")[-1] for e in contains if e.source.endswith("Color")
         }
         assert {"RED", "BLUE", "GREEN"} <= variants_under_color
 
     def test_finds_public_symbols(self):
         refs = [
-            e for e in self.edges
-            if e.kind == "REFERENCES"
-            and e.extra
-            and e.extra.get("julia_public")
+            e
+            for e in self.edges
+            if e.kind == "REFERENCES" and e.extra and e.extra.get("julia_public")
         ]
         trailing = {e.target.split(".")[-1] for e in refs}
         assert "square" in trailing
@@ -2934,10 +2823,8 @@ class TestJuliaParsing:
     def test_qualified_function_references_base(self):
         refs = [e for e in self.edges if e.kind == "REFERENCES"]
         # function Base.show(...) should emit a REFERENCES edge to Base
-        assert any(
-            "show" in e.source and e.target == "Base"
-            for e in refs
-        )
+        assert any("show" in e.source and e.target == "Base" for e in refs)
+
 
 class TestRescriptParser:
     def setup_method(self):
@@ -2960,9 +2847,7 @@ class TestRescriptParser:
         assert {"User", "App", "Validator"}.issubset(names)
 
     def test_nested_module_has_parent(self):
-        validator = next(
-            n for n in self.nodes if n.kind == "Class" and n.name == "Validator"
-        )
+        validator = next(n for n in self.nodes if n.kind == "Class" and n.name == "Validator")
         assert validator.parent_name == "User"
 
     def test_finds_top_level_lets(self):
@@ -3015,9 +2900,7 @@ class TestRescriptParser:
         sources = {e.source for e in calls}
         targets = {e.target for e in calls}
         assert any(s.endswith("::App.start") for s in sources)
-        assert "User.make" in targets or any(
-            t.endswith("::User.make") for t in targets
-        )
+        assert "User.make" in targets or any(t.endswith("::User.make") for t in targets)
 
     def test_contains_edges_wire_module_to_members(self):
         contains = [e for e in self.edges if e.kind == "CONTAINS"]
@@ -3077,18 +2960,12 @@ class TestRescriptEdgeCases:
 
     def test_duplicate_open_produces_single_import_edge(self):
         # sample.res has `open Belt` twice — should emit only one edge.
-        belt_edges = [
-            e for e in self.edges
-            if e.kind == "IMPORTS_FROM" and e.target == "Belt"
-        ]
+        belt_edges = [e for e in self.edges if e.kind == "IMPORTS_FROM" and e.target == "Belt"]
         assert len(belt_edges) == 1
 
     def test_module_alias_emits_import_edge(self):
         # `module IntMap = Belt.Map.Int` → IMPORTS_FROM Belt.Map.Int
-        aliases = [
-            e for e in self.edges
-            if e.extra.get("rescript_import_kind") == "module_alias"
-        ]
+        aliases = [e for e in self.edges if e.extra.get("rescript_import_kind") == "module_alias"]
         assert any(e.target == "Belt.Map.Int" for e in aliases)
         assert any(e.extra.get("alias_name") == "IntMap" for e in aliases)
 
@@ -3099,31 +2976,24 @@ class TestRescriptEdgeCases:
         assert "IntMap" not in names
 
     def test_js_binding_module_is_tagged(self):
-        text_encoder = next(
-            n for n in self.nodes if n.kind == "Class" and n.name == "TextEncoder"
-        )
+        text_encoder = next(n for n in self.nodes if n.kind == "Class" and n.name == "TextEncoder")
         assert text_encoder.extra.get("rescript_kind") == "js_binding"
 
     def test_regular_module_keeps_module_tag(self):
-        user = next(
-            n for n in self.nodes if n.kind == "Class" and n.name == "User"
-        )
+        user = next(n for n in self.nodes if n.kind == "Class" and n.name == "User")
         assert user.extra.get("rescript_kind") == "module"
 
     def test_jsx_emits_import_and_call_edges(self):
-        jsx_imports = [
-            e for e in self.edges
-            if e.extra.get("rescript_import_kind") == "jsx"
-        ]
+        jsx_imports = [e for e in self.edges if e.extra.get("rescript_import_kind") == "jsx"]
         jsx_targets = {e.target for e in jsx_imports}
         assert "Layout" in jsx_targets
         assert "User" in jsx_targets
         assert "AnalyticsFilterUi" in jsx_targets
 
         jsx_calls = [
-            e for e in self.edges
-            if e.kind == "CALLS"
-            and e.extra.get("rescript_call_kind") == "jsx"
+            e
+            for e in self.edges
+            if e.kind == "CALLS" and e.extra.get("rescript_call_kind") == "jsx"
         ]
         call_targets = {e.target for e in jsx_calls}
         assert "User.Badge" in call_targets
@@ -3131,9 +3001,9 @@ class TestRescriptEdgeCases:
 
     def test_jsx_call_attributed_to_enclosing_let(self):
         jsx_calls = [
-            e for e in self.edges
-            if e.kind == "CALLS"
-            and e.extra.get("rescript_call_kind") == "jsx"
+            e
+            for e in self.edges
+            if e.kind == "CALLS" and e.extra.get("rescript_call_kind") == "jsx"
         ]
         assert all(e.source.endswith("::render") for e in jsx_calls)
 
@@ -3145,26 +3015,19 @@ class TestRescriptCrossModuleResolver:
         from code_review_graph.graph import GraphStore
         from code_review_graph.incremental import full_build
 
-        (tmp_path / "LogicUtils.res").write_text(
-            "let safeParse = (s) => s\n"
-            "let trim = (s) => s\n"
-        )
-        (tmp_path / "CurrencyFormatUtils.res").write_text(
-            "let format = (n) => n\n"
-        )
+        (tmp_path / "LogicUtils.res").write_text("let safeParse = (s) => s\nlet trim = (s) => s\n")
+        (tmp_path / "CurrencyFormatUtils.res").write_text("let format = (n) => n\n")
         (tmp_path / "Caller.res").write_text(
             "open CurrencyFormatUtils\n"
             "let run = () => {\n"
-            "  let a = LogicUtils.safeParse(\"x\")\n"
-            "  let b = LogicUtils.safeParse(\"y\")\n"
+            '  let a = LogicUtils.safeParse("x")\n'
+            '  let b = LogicUtils.safeParse("y")\n'
             "  let c = format(12.0)\n"
-            "  let d = <Layout name=\"hi\" />\n"
+            '  let d = <Layout name="hi" />\n'
             "  (a, b, c, d)\n"
             "}\n"
         )
-        (tmp_path / "Layout.res").write_text(
-            "let make = (~name) => name\n"
-        )
+        (tmp_path / "Layout.res").write_text("let make = (~name) => name\n")
         subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
         subprocess.run(["git", "add", "*.res"], cwd=tmp_path, check=True)
 
@@ -3182,9 +3045,9 @@ class TestRescriptCrossModuleResolver:
         targets = {r["target_qualified"] for r in rows}
         # Both LogicUtils.safeParse callsites should now point to the canonical
         # node path, not the bare `LogicUtils.safeParse` string.
-        assert any(
-            t.endswith("LogicUtils.res::safeParse") for t in targets
-        ), f"no canonical resolution in {targets}"
+        assert any(t.endswith("LogicUtils.res::safeParse") for t in targets), (
+            f"no canonical resolution in {targets}"
+        )
         assert not any(t == "LogicUtils.safeParse" for t in targets)
 
     def test_callers_of_canonical_node_finds_both_sites(self, tmp_path):
@@ -3232,11 +3095,13 @@ class TestRescriptCrossModuleResolver:
         from code_review_graph.rescript_resolver import (
             resolve_rescript_cross_module,
         )
+
         store, _ = self._build(tmp_path)
         second = resolve_rescript_cross_module(store)
         # Second run should find nothing new — all already resolved.
         assert second["calls_resolved"] == 0
         assert second["imports_resolved"] == 0
+
 
 class TestNixParsing:
     """Flake-aware Nix parser — see the Nix language-support epic."""
@@ -3248,7 +3113,8 @@ class TestNixParsing:
         flake_bytes = (FIXTURES / "sample.nix").read_bytes()
         self.flake_path = FIXTURES / "flake.nix"
         self.flake_nodes, self.flake_edges = self.parser.parse_bytes(
-            self.flake_path, flake_bytes,
+            self.flake_path,
+            flake_bytes,
         )
         # The non-flake fixture retains its actual path; it's used to verify
         # the flake-input branch does *not* fire on non-flake files.
@@ -3276,16 +3142,12 @@ class TestNixParsing:
         assert "devShells.default" in funcs
 
     def test_flake_inputs_produce_import_edges(self):
-        targets = {
-            e.target for e in self.flake_edges if e.kind == "IMPORTS_FROM"
-        }
+        targets = {e.target for e in self.flake_edges if e.kind == "IMPORTS_FROM"}
         assert "github:NixOS/nixpkgs/nixos-unstable" in targets
         assert "github:numtide/flake-utils" in targets
 
     def test_import_and_callpackage_produce_import_edges(self):
-        targets = {
-            e.target for e in self.flake_edges if e.kind == "IMPORTS_FROM"
-        }
+        targets = {e.target for e in self.flake_edges if e.kind == "IMPORTS_FROM"}
         # callPackage ./default.nix and import ./shell.nix. Relative paths
         # are resolved against the caller's directory when possible; since
         # neither file exists alongside the fixture, the raw relative
@@ -3296,9 +3158,7 @@ class TestNixParsing:
     def test_non_flake_file_has_no_input_edges(self):
         # ``sample_module.nix`` is not named ``flake.nix``, so the
         # inputs.*.url branch must not fire — no github:-prefixed targets.
-        targets = [
-            e.target for e in self.module_edges if e.kind == "IMPORTS_FROM"
-        ]
+        targets = [e.target for e in self.module_edges if e.kind == "IMPORTS_FROM"]
         assert not any(t.startswith("github:") for t in targets)
         # The import ./foo.nix inside the `let` body still produces an edge.
         assert any("foo.nix" in t for t in targets)
@@ -3306,15 +3166,12 @@ class TestNixParsing:
     def test_contains_edges_wire_file_to_top_level_bindings(self):
         file_path = self.flake_path.as_posix()
         contains_targets = {
-            e.target for e in self.flake_edges
-            if e.kind == "CONTAINS" and e.source == file_path
+            e.target for e in self.flake_edges if e.kind == "CONTAINS" and e.source == file_path
         }
         # Each top-level binding should be CONTAINS-linked from the file.
         for name in ("description", "inputs", "outputs"):
             qualified = f"{file_path}::{name}"
-            assert qualified in contains_targets, (
-                f"missing CONTAINS edge for {qualified}"
-            )
+            assert qualified in contains_targets, f"missing CONTAINS edge for {qualified}"
 
 
 class TestSpringDIParsing:
@@ -3360,15 +3217,17 @@ class TestSpringDIParsing:
         assert "OrderRepository" in targets
 
     def test_autowired_field_source_is_class(self):
-        injects = [e for e in self.edges if e.kind == "INJECTS"
-                   and e.extra.get("injection_type") == "field"]
+        injects = [
+            e
+            for e in self.edges
+            if e.kind == "INJECTS" and e.extra.get("injection_type") == "field"
+        ]
         sources = {e.source for e in injects}
         assert any("NotificationService" in s for s in sources)
 
     def test_lombok_required_args_constructor_injection(self):
         injects = [e for e in self.edges if e.kind == "INJECTS"]
-        lombok_edges = [e for e in injects
-                        if e.extra.get("injection_type") == "constructor_lombok"]
+        lombok_edges = [e for e in injects if e.extra.get("injection_type") == "constructor_lombok"]
         targets = {e.target for e in lombok_edges}
         # OrderService has two final injected fields
         assert "OrderRepository" in targets
@@ -3382,15 +3241,17 @@ class TestSpringDIParsing:
 
     def test_explicit_autowired_constructor_injection(self):
         injects = [e for e in self.edges if e.kind == "INJECTS"]
-        ctor_edges = [e for e in injects
-                      if e.extra.get("injection_type") == "constructor"]
+        ctor_edges = [e for e in injects if e.extra.get("injection_type") == "constructor"]
         targets = {e.target for e in ctor_edges}
         # AuditLogger has @Autowired constructor with OrderRepository param
         assert "OrderRepository" in targets
 
     def test_autowired_constructor_source_is_class(self):
-        injects = [e for e in self.edges if e.kind == "INJECTS"
-                   and e.extra.get("injection_type") == "constructor"]
+        injects = [
+            e
+            for e in self.edges
+            if e.kind == "INJECTS" and e.extra.get("injection_type") == "constructor"
+        ]
         sources = {e.source for e in injects}
         assert any("AuditLogger" in s for s in sources)
 
@@ -3441,10 +3302,7 @@ class TestSpringDIResolver:
         pkg.mkdir(parents=True)
 
         (pkg / "OrderRepository.java").write_text(
-            "package com.example;\n"
-            "public interface OrderRepository {\n"
-            "    void save(Order o);\n"
-            "}\n"
+            "package com.example;\npublic interface OrderRepository {\n    void save(Order o);\n}\n"
         )
         (pkg / "JpaOrderRepository.java").write_text(
             "package com.example;\n"
@@ -3601,7 +3459,7 @@ class TestTemporalResolver:
             "public class OrderWorkflowImpl {\n"
             "    private PaymentActivity paymentActivity;\n"
             "    public String process(String id) {\n"
-            "        return paymentActivity.charge(id) ? \"OK\" : \"FAIL\";\n"
+            '        return paymentActivity.charge(id) ? "OK" : "FAIL";\n'
             "    }\n"
             "}\n"
         )
@@ -3677,8 +3535,9 @@ class TestKafkaParsing:
         assert "kafka:order-retry" in targets
 
     def test_kafka_listener_topic_in_extra(self):
-        consumes = [e for e in self.edges if e.kind == "CONSUMES"
-                    and e.target == "kafka:order-events"]
+        consumes = [
+            e for e in self.edges if e.kind == "CONSUMES" and e.target == "kafka:order-events"
+        ]
         assert consumes
         assert consumes[0].extra.get("topic") == "order-events"
 
@@ -3693,8 +3552,9 @@ class TestKafkaParsing:
         assert any("ReactiveOrderConsumer" in s for s in sources)
 
     def test_kafka_receiver_message_type_stored(self):
-        consumes = [e for e in self.edges if e.kind == "CONSUMES"
-                    and "ReactiveOrderConsumer" in e.source]
+        consumes = [
+            e for e in self.edges if e.kind == "CONSUMES" and "ReactiveOrderConsumer" in e.source
+        ]
         assert consumes
         assert consumes[0].extra.get("message_type") == "OrderEvent"
 
@@ -3723,6 +3583,7 @@ class TestKafkaParsing:
 def _has_verilog_parser():
     try:
         import tree_sitter_language_pack as tslp
+
         tslp.get_parser("verilog")
         return True
     except (LookupError, ImportError):
@@ -3791,6 +3652,7 @@ class TestVerilogParsing:
         assert len(file_nodes) == 1
         assert file_nodes[0].language == "verilog"
 
+
 class TestSQLParsing:
     def setup_method(self):
         self.parser = CodeParser()
@@ -3817,16 +3679,14 @@ class TestSQLParsing:
 
     def test_finds_function(self):
         funcs = [
-            n for n in self.nodes
-            if n.kind == "Function" and n.extra.get("sql_kind") == "function"
+            n for n in self.nodes if n.kind == "Function" and n.extra.get("sql_kind") == "function"
         ]
         names = {f.name for f in funcs}
         assert "get_user_total" in names
 
     def test_finds_procedure(self):
         procs = [
-            n for n in self.nodes
-            if n.kind == "Function" and n.extra.get("sql_kind") == "procedure"
+            n for n in self.nodes if n.kind == "Function" and n.extra.get("sql_kind") == "procedure"
         ]
         names = {p.name for p in procs}
         assert "archive_old_orders" in names
@@ -3866,24 +3726,15 @@ class TestZigParsing:
         assert self.parser.detect_language(Path("main.zig")) == "zig"
 
     def test_finds_top_level_functions(self):
-        funcs = {
-            n.name for n in self.nodes
-            if n.kind == "Function" and n.parent_name is None
-        }
+        funcs = {n.name for n in self.nodes if n.kind == "Function" and n.parent_name is None}
         assert {"main", "helper"} <= funcs
 
     def test_finds_struct_methods(self):
-        methods = {
-            n.name for n in self.nodes
-            if n.kind == "Function" and n.parent_name == "Point"
-        }
+        methods = {n.name for n in self.nodes if n.kind == "Function" and n.parent_name == "Point"}
         assert {"init", "distance"} <= methods
 
     def test_finds_struct_enum_union_classes(self):
-        classes = {
-            n.name: n.extra.get("zig_kind") for n in self.nodes
-            if n.kind == "Class"
-        }
+        classes = {n.name: n.extra.get("zig_kind") for n in self.nodes if n.kind == "Class"}
         assert classes.get("Point") == "struct"
         assert classes.get("Color") == "enum"
         assert classes.get("Shape") == "union"
@@ -3895,8 +3746,7 @@ class TestZigParsing:
         # the absolute fixture path.
         assert "std" in targets
         assert any(
-            t.endswith("sample_zig_util.zig") and t != "./sample_zig_util.zig"
-            for t in targets
+            t.endswith("sample_zig_util.zig") and t != "./sample_zig_util.zig" for t in targets
         )
 
     def test_finds_calls(self):
@@ -3937,42 +3787,38 @@ class TestZigParsing:
 
         file_node = next(n for n in nodes if n.kind == "File")
         test_node = next(n for n in nodes if n.kind == "Test")
-        function_node = next(
-            n for n in nodes if n.kind == "Function" and n.name == "increment"
-        )
+        function_node = next(n for n in nodes if n.kind == "Function" and n.name == "increment")
         test_qname = self.parser._qualify(
-            test_node.name, test_node.file_path, test_node.parent_name,
+            test_node.name,
+            test_node.file_path,
+            test_node.parent_name,
         )
         function_qname = self.parser._qualify(
-            function_node.name, function_node.file_path, function_node.parent_name,
+            function_node.name,
+            function_node.file_path,
+            function_node.parent_name,
         )
 
         assert file_node.is_test is False
         assert any(
-            edge.kind == "CALLS"
-            and edge.source == test_qname
-            and edge.target == function_qname
+            edge.kind == "CALLS" and edge.source == test_qname and edge.target == function_qname
             for edge in edges
         )
         assert any(
-            edge.kind == "TESTED_BY"
-            and edge.source == function_qname
-            and edge.target == test_qname
+            edge.kind == "TESTED_BY" and edge.source == function_qname and edge.target == test_qname
             for edge in edges
         )
 
     def test_calls_inside_methods_have_qualified_source(self):
         # Point.distance calls helper(...) — the source should be the
         # qualified Point.distance name, not the bare file path.
-        sources = {
-            e.source.split("::")[-1] for e in self.edges
-            if e.kind == "CALLS"
-        }
+        sources = {e.source.split("::")[-1] for e in self.edges if e.kind == "CALLS"}
         assert "Point.distance" in sources
 
     def test_nodes_have_zig_language(self):
         for node in self.nodes:
             assert node.language == "zig"
+
 
 class TestHCLParsing:
     """HCL / Terraform parser — closes #199."""
@@ -4054,9 +3900,9 @@ class TestHCLParsing:
     def test_resource_references_variable(self):
         """resource.aws_instance.web references var.instance_type."""
         refs = [
-            e for e in self.edges
-            if e.kind == "REFERENCES"
-            and "resource.aws_instance.web" in e.source
+            e
+            for e in self.edges
+            if e.kind == "REFERENCES" and "resource.aws_instance.web" in e.source
         ]
         targets = {e.target for e in refs}
         assert any("var.instance_type" in t for t in targets)
@@ -4064,9 +3910,9 @@ class TestHCLParsing:
     def test_resource_references_other_resource(self):
         """resource.aws_instance.web references resource.aws_subnet.main."""
         refs = [
-            e for e in self.edges
-            if e.kind == "REFERENCES"
-            and "resource.aws_instance.web" in e.source
+            e
+            for e in self.edges
+            if e.kind == "REFERENCES" and "resource.aws_instance.web" in e.source
         ]
         targets = {e.target for e in refs}
         assert any("resource.aws_subnet.main" in t for t in targets)
@@ -4074,9 +3920,9 @@ class TestHCLParsing:
     def test_resource_references_data_source(self):
         """resource.aws_instance.web references data.aws_ami.ubuntu."""
         refs = [
-            e for e in self.edges
-            if e.kind == "REFERENCES"
-            and "resource.aws_instance.web" in e.source
+            e
+            for e in self.edges
+            if e.kind == "REFERENCES" and "resource.aws_instance.web" in e.source
         ]
         targets = {e.target for e in refs}
         assert any("data.aws_ami.ubuntu" in t for t in targets)
@@ -4084,30 +3930,20 @@ class TestHCLParsing:
     def test_output_references_resource(self):
         """output.instance_ip references resource.aws_instance.web."""
         refs = [
-            e for e in self.edges
-            if e.kind == "REFERENCES"
-            and "output.instance_ip" in e.source
+            e for e in self.edges if e.kind == "REFERENCES" and "output.instance_ip" in e.source
         ]
         targets = {e.target for e in refs}
         assert any("resource.aws_instance.web" in t for t in targets)
 
     def test_module_references_resource(self):
         """module.security references resource.aws_vpc.main."""
-        refs = [
-            e for e in self.edges
-            if e.kind == "REFERENCES"
-            and "module.security" in e.source
-        ]
+        refs = [e for e in self.edges if e.kind == "REFERENCES" and "module.security" in e.source]
         targets = {e.target for e in refs}
         assert any("resource.aws_vpc.main" in t for t in targets)
 
     def test_provider_references_variable(self):
         """provider.aws references var.region."""
-        refs = [
-            e for e in self.edges
-            if e.kind == "REFERENCES"
-            and "provider.aws" in e.source
-        ]
+        refs = [e for e in self.edges if e.kind == "REFERENCES" and "provider.aws" in e.source]
         targets = {e.target for e in refs}
         assert any("var.region" in t for t in targets)
 
@@ -4119,9 +3955,7 @@ class TestHCLParsing:
     def test_resource_references_local(self):
         """resource.aws_vpc.main references local.full_name."""
         refs = [
-            e for e in self.edges
-            if e.kind == "REFERENCES"
-            and "resource.aws_vpc.main" in e.source
+            e for e in self.edges if e.kind == "REFERENCES" and "resource.aws_vpc.main" in e.source
         ]
         targets = {e.target for e in refs}
         assert any("local.full_name" in t for t in targets)
@@ -4133,9 +3967,9 @@ class TestHCLParsing:
     def test_count_with_function_extracts_var_ref(self):
         """length(var.subnet_ids) in count — var.subnet_ids must be extracted."""
         refs = [
-            e for e in self.edges
-            if e.kind == "REFERENCES"
-            and "resource.aws_instance.fleet" in e.source
+            e
+            for e in self.edges
+            if e.kind == "REFERENCES" and "resource.aws_instance.fleet" in e.source
         ]
         targets = {e.target for e in refs}
         assert any("var.subnet_ids" in t for t in targets), (
@@ -4148,30 +3982,21 @@ class TestHCLParsing:
 
     def test_each_value_produces_no_spurious_edge(self):
         """each.value.id should not produce any REFERENCES edge."""
-        each_edges = [
-            e for e in self.edges
-            if e.kind == "REFERENCES" and "each" in e.target
-        ]
+        each_edges = [e for e in self.edges if e.kind == "REFERENCES" and "each" in e.target]
         assert each_edges == [], (
             f"Spurious 'each' REFERENCES edges: {[e.target for e in each_edges]}"
         )
 
     def test_count_index_produces_no_spurious_edge(self):
         """count.index should not produce any REFERENCES edge."""
-        count_edges = [
-            e for e in self.edges
-            if e.kind == "REFERENCES" and "count" in e.target
-        ]
+        count_edges = [e for e in self.edges if e.kind == "REFERENCES" and "count" in e.target]
         assert count_edges == [], (
             f"Spurious 'count' REFERENCES edges: {[e.target for e in count_edges]}"
         )
 
     def test_path_module_produces_no_edge(self):
         """path.module must not produce a REFERENCES edge."""
-        path_edges = [
-            e for e in self.edges
-            if e.kind == "REFERENCES" and "path" in e.target
-        ]
+        path_edges = [e for e in self.edges if e.kind == "REFERENCES" and "path" in e.target]
         assert path_edges == [], (
             f"Spurious 'path' REFERENCES edges: {[e.target for e in path_edges]}"
         )
@@ -4179,9 +4004,9 @@ class TestHCLParsing:
     def test_terraform_workspace_produces_no_edge(self):
         """terraform.workspace must not produce a REFERENCES edge."""
         tf_edges = [
-            e for e in self.edges
-            if e.kind == "REFERENCES"
-            and e.target.rsplit("::", 1)[-1].startswith("terraform")
+            e
+            for e in self.edges
+            if e.kind == "REFERENCES" and e.target.rsplit("::", 1)[-1].startswith("terraform")
         ]
         assert tf_edges == [], (
             f"Spurious 'terraform' REFERENCES edges: {[e.target for e in tf_edges]}"
@@ -4194,9 +4019,9 @@ class TestHCLParsing:
     def test_for_each_resource_chaining(self):
         """for_each = aws_vpc.main emits REFERENCES to resource.aws_vpc.main."""
         refs = [
-            e for e in self.edges
-            if e.kind == "REFERENCES"
-            and "resource.aws_internet_gateway.gw" in e.source
+            e
+            for e in self.edges
+            if e.kind == "REFERENCES" and "resource.aws_internet_gateway.gw" in e.source
         ]
         targets = {e.target for e in refs}
         assert any("resource.aws_vpc.main" in t for t in targets), (
@@ -4210,9 +4035,9 @@ class TestHCLParsing:
     def test_template_interpolation_extracts_var_ref(self):
         """\"${var.region}-static-assets\" must produce a REFERENCES edge to var.region."""
         refs = [
-            e for e in self.edges
-            if e.kind == "REFERENCES"
-            and "resource.aws_s3_bucket.static" in e.source
+            e
+            for e in self.edges
+            if e.kind == "REFERENCES" and "resource.aws_s3_bucket.static" in e.source
         ]
         targets = {e.target for e in refs}
         assert any("var.region" in t for t in targets), (
@@ -4226,9 +4051,9 @@ class TestHCLParsing:
     def test_lifecycle_replace_triggered_by(self):
         """lifecycle { replace_triggered_by = [...] } must emit REFERENCES edges."""
         refs = [
-            e for e in self.edges
-            if e.kind == "REFERENCES"
-            and "resource.aws_autoscaling_group.web" in e.source
+            e
+            for e in self.edges
+            if e.kind == "REFERENCES" and "resource.aws_autoscaling_group.web" in e.source
         ]
         targets = {e.target for e in refs}
         assert any("resource.aws_launch_template.web" in t for t in targets), (
@@ -4238,9 +4063,9 @@ class TestHCLParsing:
     def test_dynamic_block_for_each_ref(self):
         """dynamic block: for_each = var.ingress_rules must produce REFERENCES edge."""
         refs = [
-            e for e in self.edges
-            if e.kind == "REFERENCES"
-            and "resource.aws_security_group.main" in e.source
+            e
+            for e in self.edges
+            if e.kind == "REFERENCES" and "resource.aws_security_group.main" in e.source
         ]
         targets = {e.target for e in refs}
         assert any("var.ingress_rules" in t for t in targets), (
@@ -4259,18 +4084,18 @@ class TestHCLParsing:
         """
         iterator_names = ("ingress", "setting", "srv", "origin_group", "origin")
         spurious = [
-            e for e in self.edges
+            e
+            for e in self.edges
             if e.kind == "REFERENCES"
             and any(f"resource.{name}." in e.target for name in iterator_names)
         ]
-        assert spurious == [], (
-            f"Spurious iterator REFERENCES edges: {[e.target for e in spurious]}"
-        )
+        assert spurious == [], f"Spurious iterator REFERENCES edges: {[e.target for e in spurious]}"
 
     def test_dynamic_block_default_iterator_for_each_extracted(self):
         """for_each = var.settings inside dynamic block must produce a REFERENCES edge."""
         refs = [
-            e for e in self.edges
+            e
+            for e in self.edges
             if e.kind == "REFERENCES"
             and "resource.aws_elastic_beanstalk_environment.tfenvtest" in e.source
         ]
@@ -4288,7 +4113,8 @@ class TestHCLParsing:
         iterator.  Both real refs must survive.
         """
         refs = [
-            e for e in self.edges
+            e
+            for e in self.edges
             if e.kind == "REFERENCES"
             and "resource.aws_elastic_beanstalk_environment.tfenvtest" in e.source
         ]
@@ -4300,9 +4126,9 @@ class TestHCLParsing:
     def test_dynamic_block_custom_iterator_for_each_extracted(self):
         """for_each = var.server_list with iterator = srv must still extract var.server_list."""
         refs = [
-            e for e in self.edges
-            if e.kind == "REFERENCES"
-            and "resource.aws_lb_listener_rule.hosts" in e.source
+            e
+            for e in self.edges
+            if e.kind == "REFERENCES" and "resource.aws_lb_listener_rule.hosts" in e.source
         ]
         targets = {e.target for e in refs}
         assert any("var.server_list" in t for t in targets), (
@@ -4312,9 +4138,9 @@ class TestHCLParsing:
     def test_nested_dynamic_outer_for_each_extracted(self):
         """Outer dynamic for_each = var.load_balancer_origin_groups must be extracted."""
         refs = [
-            e for e in self.edges
-            if e.kind == "REFERENCES"
-            and "resource.aws_cloudfront_distribution.cdn" in e.source
+            e
+            for e in self.edges
+            if e.kind == "REFERENCES" and "resource.aws_cloudfront_distribution.cdn" in e.source
         ]
         targets = {e.target for e in refs}
         assert any("var.load_balancer_origin_groups" in t for t in targets), (
@@ -4329,9 +4155,7 @@ class TestHCLParsing:
         resource.origin_group.value edge.
         """
         spurious = [
-            e for e in self.edges
-            if e.kind == "REFERENCES"
-            and "resource.origin_group." in e.target
+            e for e in self.edges if e.kind == "REFERENCES" and "resource.origin_group." in e.target
         ]
         assert spurious == [], (
             f"Spurious origin_group REFERENCES edges: {[e.target for e in spurious]}"
@@ -4344,6 +4168,7 @@ class TestHCLParsing:
 
 try:
     import yaml as _yaml_check  # noqa: F401
+
     _YAML_AVAILABLE = True
 except ImportError:
     _YAML_AVAILABLE = False
@@ -4404,14 +4229,14 @@ class TestAnsiblePlaybookParsing:
 
     def test_fqcn_module_stored_in_extra(self):
         task = next(
-            n for n in self.nodes
-            if n.kind == "Function" and n.name == "Verify connectivity"
+            n for n in self.nodes if n.kind == "Function" and n.name == "Verify connectivity"
         )
         assert task.extra.get("ansible_module") == "ansible.builtin.wait_for_connection"
 
     def test_finds_handlers(self):
         handlers = [
-            n for n in self.nodes
+            n
+            for n in self.nodes
             if n.kind == "Function" and n.extra.get("ansible_kind") == "handler"
         ]
         handler_names = {h.name for h in handlers}
@@ -4419,10 +4244,7 @@ class TestAnsiblePlaybookParsing:
         assert "restart db" in handler_names
 
     def test_handler_listen_stored(self):
-        handler = next(
-            n for n in self.nodes
-            if n.kind == "Function" and n.name == "restart app"
-        )
+        handler = next(n for n in self.nodes if n.kind == "Function" and n.name == "restart app")
         assert handler.extra.get("ansible_listen") == "app restarted"
 
     def test_notify_scalar_produces_calls(self):
@@ -4432,7 +4254,9 @@ class TestAnsiblePlaybookParsing:
     def test_notify_list_produces_multiple_calls(self):
         calls = {e.target for e in self.edges if e.kind == "CALLS"}
         assert any(target.endswith("::Configure database servers.restart db") for target in calls)
-        assert any(target.endswith("::Configure database servers.run migrations") for target in calls)
+        assert any(
+            target.endswith("::Configure database servers.run migrations") for target in calls
+        )
 
     def test_include_tasks_imports_from(self):
         targets = {e.target for e in self.edges if e.kind == "IMPORTS_FROM"}
@@ -4462,15 +4286,15 @@ class TestAnsiblePlaybookParsing:
 
     def test_block_tasks_parented_to_play(self):
         block_task = next(
-            n for n in self.nodes
-            if n.kind == "Function" and n.name == "Run migration script"
+            n for n in self.nodes if n.kind == "Function" and n.name == "Run migration script"
         )
         assert block_task.parent_name == "Configure web servers"
 
     def test_file_contains_plays(self):
         file_path_str = str(_PLAYBOOK)
-        file_contains = {e.target for e in self.edges
-                         if e.kind == "CONTAINS" and e.source == file_path_str}
+        file_contains = {
+            e.target for e in self.edges if e.kind == "CONTAINS" and e.source == file_path_str
+        }
         assert any("Configure web servers" in t for t in file_contains)
 
     def test_line_numbers_positive(self):

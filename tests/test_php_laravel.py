@@ -31,9 +31,7 @@ def _write_php(path: Path, source: str = "<?php\nclass Placeholder {}\n") -> Pat
 def _php_import_target(parser: CodeParser, caller: Path, module: str) -> str:
     _write_php(
         caller,
-        "<?php\n"
-        f"use {module};\n"
-        "class Caller {}\n",
+        f"<?php\nuse {module};\nclass Caller {{}}\n",
     )
     _, edges = parser.parse_file(caller)
     imports = [edge.target for edge in edges if edge.kind == "IMPORTS_FROM"]
@@ -210,7 +208,9 @@ class TestComposerPsr4:
         caller = _write_php(tmp_path / "outside/Caller.php")
 
         resolved = CodeParser(repo)._resolve_module_to_file(
-            "App\\User", str(caller), "php",
+            "App\\User",
+            str(caller),
+            "php",
         )
 
         assert resolved is None
@@ -222,25 +222,31 @@ class TestComposerPsr4:
         _write_php(tmp_path / "Outside/Foo.php")
 
         resolved = CodeParser(repo)._resolve_module_to_file(
-            "Outside\\Foo", str(caller), "php",
+            "Outside\\Foo",
+            str(caller),
+            "php",
         )
 
         assert resolved is None
 
     def test_php_ancestor_fallback_without_repo_does_not_climb_above_caller(
-        self, tmp_path,
+        self,
+        tmp_path,
     ):
         caller = _write_php(tmp_path / "project/src/Caller.php")
         _write_php(tmp_path / "project/Outside/Foo.php")
 
         resolved = CodeParser()._resolve_module_to_file(
-            "Outside\\Foo", str(caller), "php",
+            "Outside\\Foo",
+            str(caller),
+            "php",
         )
 
         assert resolved is None
 
     def test_php_ancestor_fallback_rejects_symlink_target_outside_repo(
-        self, tmp_path,
+        self,
+        tmp_path,
     ):
         repo = tmp_path / "repo"
         outside = tmp_path / "outside"
@@ -256,13 +262,17 @@ class TestComposerPsr4:
             pytest.skip(f"directory symlinks unavailable: {exc}")
 
         resolved = CodeParser(repo)._resolve_module_to_file(
-            "Outside\\Foo", str(caller), "php",
+            "Outside\\Foo",
+            str(caller),
+            "php",
         )
 
         assert resolved is None
 
     def test_php_ancestor_fallback_fails_soft_when_start_resolution_raises(
-        self, tmp_path, monkeypatch,
+        self,
+        tmp_path,
+        monkeypatch,
     ):
         repo = tmp_path / "repo"
         caller = _write_php(repo / "src/Caller.php")
@@ -283,7 +293,9 @@ class TestComposerPsr4:
         monkeypatch.setattr(Path, "resolve", raise_for_caller)
 
         resolved = parser._resolve_module_to_file(
-            "App\\Foo", str(caller), "php",
+            "App\\Foo",
+            str(caller),
+            "php",
         )
 
         assert target.is_file()
@@ -315,7 +327,9 @@ class TestComposerCache:
         assert cache_info().maxsize == 128
 
     def test_composer_cache_reuses_unchanged_file_across_parsers(
-        self, tmp_path, monkeypatch,
+        self,
+        tmp_path,
+        monkeypatch,
     ):
         repo = tmp_path / "repo"
         composer = _write_composer(
@@ -336,10 +350,14 @@ class TestComposerCache:
         monkeypatch.setattr(Path, "read_text", counting_read_text)
 
         first = CodeParser(repo)._resolve_module_to_file(
-            "App\\User", str(caller), "php",
+            "App\\User",
+            str(caller),
+            "php",
         )
         second = CodeParser(repo)._resolve_module_to_file(
-            "App\\User", str(caller), "php",
+            "App\\User",
+            str(caller),
+            "php",
         )
 
         assert first == second == target.resolve().as_posix()
@@ -355,7 +373,9 @@ class TestComposerCache:
         caller = _write_php(repo / "src/Caller.php")
 
         first = CodeParser(repo)._resolve_module_to_file(
-            "App\\User", str(caller), "php",
+            "App\\User",
+            str(caller),
+            "php",
         )
 
         composer.write_text(
@@ -366,7 +386,9 @@ class TestComposerCache:
         )
         updated = _write_php(repo / "updated-source/User.php")
         second = CodeParser(repo)._resolve_module_to_file(
-            "App\\User", str(caller), "php",
+            "App\\User",
+            str(caller),
+            "php",
         )
 
         assert first != second
@@ -389,10 +411,14 @@ class TestComposerCache:
         second_caller = _write_php(second_repo / "src/Caller.php")
 
         first = CodeParser(first_repo)._resolve_module_to_file(
-            "App\\User", str(first_caller), "php",
+            "App\\User",
+            str(first_caller),
+            "php",
         )
         second = CodeParser(second_repo)._resolve_module_to_file(
-            "App\\User", str(second_caller), "php",
+            "App\\User",
+            str(second_caller),
+            "php",
         )
 
         assert first == first_target.resolve().as_posix()
@@ -421,16 +447,8 @@ class TestBladeParsing:
         assert nodes[0].language == "blade"
         assert nodes[0].line_end == 7
 
-        imports = {
-            edge.target: edge.line
-            for edge in edges
-            if edge.kind == "IMPORTS_FROM"
-        }
-        references = {
-            edge.target: edge.line
-            for edge in edges
-            if edge.kind == "REFERENCES"
-        }
+        imports = {edge.target: edge.line for edge in edges if edge.kind == "IMPORTS_FROM"}
+        references = {edge.target: edge.line for edge in edges if edge.kind == "REFERENCES"}
         assert imports == {
             "layouts.app": 3,
             "partials.header": 4,
@@ -502,25 +520,16 @@ class TestBladeParsing:
 
         nodes, edges = CodeParser(tmp_path).parse_bytes(path, source)
 
-        assert any(
-            node.kind == "File" and node.language == "php"
-            for node in nodes
-        )
-        assert any(
-            node.kind == "Class" and node.name == "Ordinary"
-            for node in nodes
-        )
-        assert not any(
-            edge.kind == "IMPORTS_FROM" and edge.target == "not.blade"
-            for edge in edges
-        )
+        assert any(node.kind == "File" and node.language == "php" for node in nodes)
+        assert any(node.kind == "Class" and node.name == "Ordinary" for node in nodes)
+        assert not any(edge.kind == "IMPORTS_FROM" and edge.target == "not.blade" for edge in edges)
 
 
 def _laravel_edges(edges, kind: str | None = None):
     return [
-        edge for edge in edges
-        if edge.extra.get("framework") == "laravel"
-        and (kind is None or edge.kind == kind)
+        edge
+        for edge in edges
+        if edge.extra.get("framework") == "laravel" and (kind is None or edge.kind == kind)
     ]
 
 
@@ -533,7 +542,7 @@ class TestLaravelSemantics:
             "<?php\nnamespace App\\Http\\Controllers;\n"
             "class UserController { public function index(): void {} }\n",
         )
-        source = br"""<?php
+        source = rb"""<?php
 use Illuminate\Support\Facades\Route as Router;
 use App\Http\Controllers\{UserController as Users};
 Router::get('/users', [Users::class, 'index']);
@@ -545,20 +554,21 @@ Router::get('/users', [Users::class, 'index']);
         assert [(edge.target, edge.extra["laravel_kind"]) for edge in semantic] == [
             (f"{controller.resolve().as_posix()}::UserController.index", "route"),
         ]
-        assert len([
-            edge for edge in edges
-            if edge.kind == "CALLS" and edge.target == "Router::get"
-        ]) == 1
+        assert (
+            len([edge for edge in edges if edge.kind == "CALLS" and edge.target == "Router::get"])
+            == 1
+        )
 
     def test_laravel_route_accepts_fully_qualified_framework_and_controller(
-        self, tmp_path,
+        self,
+        tmp_path,
     ):
         repo = tmp_path / "repo"
         _write_composer(repo, {"autoload": {"psr-4": {"App\\": "app/"}}})
         controller = _write_php(
             repo / "app/Http/Controllers/UserController.php",
         )
-        source = br"""<?php
+        source = rb"""<?php
 \Illuminate\Support\Facades\Route::post(
     '/users',
     [\App\Http\Controllers\UserController::class, "store"]
@@ -571,11 +581,17 @@ Router::get('/users', [Users::class, 'index']);
         assert [edge.target for edge in semantic] == [
             f"{controller.resolve().as_posix()}::UserController.store",
         ]
-        assert len([
-            edge for edge in edges
-            if edge.kind == "CALLS"
-            and edge.target == "Illuminate\\Support\\Facades\\Route::post"
-        ]) == 1
+        assert (
+            len(
+                [
+                    edge
+                    for edge in edges
+                    if edge.kind == "CALLS"
+                    and edge.target == "Illuminate\\Support\\Facades\\Route::post"
+                ]
+            )
+            == 1
+        )
 
     def test_laravel_eloquent_aliases_resolve_model_reference(self, tmp_path):
         repo = tmp_path / "repo"
@@ -584,7 +600,7 @@ Router::get('/users', [Users::class, 'index']);
             repo / "app/Models/Post.php",
             "<?php\nnamespace App\\Models;\nclass Post {}\n",
         )
-        source = br"""<?php
+        source = rb"""<?php
 namespace App\Models;
 use Illuminate\Database\Eloquent\Model as BaseModel;
 use App\Models\Post as Article;
@@ -602,16 +618,15 @@ class User extends BaseModel {
         assert [(edge.target, edge.extra["relationship"]) for edge in semantic] == [
             (f"{post.resolve().as_posix()}::Post", "hasMany"),
         ]
-        assert len([
-            edge for edge in edges
-            if edge.kind == "CALLS" and edge.target == "hasMany"
-        ]) == 1
+        assert (
+            len([edge for edge in edges if edge.kind == "CALLS" and edge.target == "hasMany"]) == 1
+        )
 
     def test_laravel_eloquent_accepts_fully_qualified_model_names(self, tmp_path):
         repo = tmp_path / "repo"
         _write_composer(repo, {"autoload": {"psr-4": {"App\\": "app/"}}})
         post = _write_php(repo / "app/Models/Post.php")
-        source = br"""<?php
+        source = rb"""<?php
 namespace App\Models;
 class User extends \Illuminate\Database\Eloquent\Model {
     public function post() {
@@ -632,7 +647,7 @@ class User extends \Illuminate\Database\Eloquent\Model {
         repo = tmp_path / "repo"
         _write_composer(repo, {"autoload": {"psr-4": {"App\\": "app/"}}})
         post = _write_php(repo / "app/Models/Post.php")
-        source = br"""<?php
+        source = rb"""<?php
 namespace App\Good {
     use Illuminate\Database\Eloquent\Model;
     use App\Models\Post;
@@ -656,9 +671,10 @@ namespace App\Bad {
         assert semantic[0].source.endswith("::User.posts")
 
     def test_laravel_requires_route_framework_and_static_handler_evidence(
-        self, tmp_path,
+        self,
+        tmp_path,
     ):
-        source = br"""<?php
+        source = rb"""<?php
 use Acme\Routing\Route;
 use App\Http\Controllers\UserController;
 Route::get('/unrelated', [UserController::class, 'index']);
@@ -671,26 +687,21 @@ Router::get('/dynamic', [UserController::class, $method]);
         _, edges = CodeParser(tmp_path).parse_bytes(tmp_path / "routes.php", source)
 
         assert _laravel_edges(edges, "CALLS") == []
-        generic_targets = {
-            edge.target for edge in edges if edge.kind == "CALLS"
-        }
+        generic_targets = {edge.target for edge in edges if edge.kind == "CALLS"}
         assert {"Route::get", "Router::get"} <= generic_targets
 
     def test_laravel_requires_route_import_when_short_facade_is_used(self, tmp_path):
-        source = br"""<?php
+        source = rb"""<?php
 Route::get('/users', [UserController::class, 'index']);
 """
 
         _, edges = CodeParser(tmp_path).parse_bytes(tmp_path / "routes.php", source)
 
         assert _laravel_edges(edges, "CALLS") == []
-        assert any(
-            edge.kind == "CALLS" and edge.target == "Route::get"
-            for edge in edges
-        )
+        assert any(edge.kind == "CALLS" and edge.target == "Route::get" for edge in edges)
 
     def test_laravel_requires_model_class_receiver_and_class_argument(self, tmp_path):
-        source = br"""<?php
+        source = rb"""<?php
 use Illuminate\Database\Eloquent\Model;
 use App\Models\Post;
 
@@ -713,15 +724,13 @@ class User extends Model {
         _, edges = CodeParser(tmp_path).parse_bytes(tmp_path / "Models.php", source)
 
         assert _laravel_edges(edges, "REFERENCES") == []
-        generic_targets = [
-            edge.target for edge in edges if edge.kind == "CALLS"
-        ]
+        generic_targets = [edge.target for edge in edges if edge.kind == "CALLS"]
         assert generic_targets.count("hasMany") == 2
         assert "hasManyCustom" in generic_targets
         assert "belongsTo" in generic_targets
 
     def test_laravel_unresolved_model_keeps_stable_short_target(self, tmp_path):
-        source = br"""<?php
+        source = rb"""<?php
 use Illuminate\Database\Eloquent\Model;
 use App\Models\Missing;
 class User extends Model {
@@ -770,18 +779,17 @@ def test_composer_process_pool_matches_serial_build(tmp_path):
     )
     callers = []
     for index in range(8):
-        callers.append(_write_php(
-            repo / f"app/Services/Service{index}.php",
-            "<?php\n"
-            f"namespace App\\Services;\nuse App\\Models\\User;\n"
-            f"class Service{index} {{\n"
-            "    public function build(): User { return new User(); }\n"
-            "}\n",
-        ))
-    tracked = [
-        str(path.relative_to(repo))
-        for path in [user, *callers]
-    ]
+        callers.append(
+            _write_php(
+                repo / f"app/Services/Service{index}.php",
+                "<?php\n"
+                f"namespace App\\Services;\nuse App\\Models\\User;\n"
+                f"class Service{index} {{\n"
+                "    public function build(): User { return new User(); }\n"
+                "}\n",
+            )
+        )
+    tracked = [str(path.relative_to(repo)) for path in [user, *callers]]
 
     serial_store = GraphStore(repo / "serial.db")
     parallel_store = GraphStore(repo / "parallel.db")

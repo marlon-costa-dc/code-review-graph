@@ -404,7 +404,10 @@ class TestGetProviderValidation:
     @patch("code_review_graph.embeddings.LocalEmbeddingProvider")
     @patch("code_review_graph.embeddings._check_available", return_value=True)
     def test_explicit_blank_stays_local_when_openai_env_configured(
-        self, _mock_available, local_cls, openai_cls,
+        self,
+        _mock_available,
+        local_cls,
+        openai_cls,
     ):
         """Only an omitted provider should use the configured OpenAI default."""
         local_cls.return_value = MagicMock()
@@ -657,12 +660,14 @@ class TestGetProviderMiniMax:
 
 
 def _make_voyage_response(vectors: list[list[float]]) -> MagicMock:
-    body = json.dumps({
-        "data": [{"embedding": v, "index": i} for i, v in enumerate(vectors)],
-        "model": "voyage-code-3",
-        "object": "list",
-        "usage": {"total_tokens": 5},
-    }).encode("utf-8")
+    body = json.dumps(
+        {
+            "data": [{"embedding": v, "index": i} for i, v in enumerate(vectors)],
+            "model": "voyage-code-3",
+            "object": "list",
+            "usage": {"total_tokens": 5},
+        }
+    ).encode("utf-8")
     mock = MagicMock()
     mock.read.return_value = body
     mock.__enter__ = MagicMock(return_value=mock)
@@ -682,10 +687,7 @@ class TestVoyageEmbeddingProvider:
             output_dtype="float",
         )
 
-        assert (
-            provider.name
-            == "voyage:voyage-code-3:dim1024:float@https://api.voyageai.com/v1"
-        )
+        assert provider.name == "voyage:voyage-code-3:dim1024:float@https://api.voyageai.com/v1"
 
     def test_default_dimension_before_call(self):
         provider = VoyageEmbeddingProvider(api_key="k")
@@ -743,12 +745,14 @@ class TestVoyageEmbeddingProvider:
 
     def test_response_without_index_field_falls_back_to_server_order(self):
         provider = VoyageEmbeddingProvider(api_key="k")
-        body = json.dumps({
-            "data": [
-                {"embedding": [1.0]},
-                {"embedding": [2.0]},
-            ],
-        }).encode("utf-8")
+        body = json.dumps(
+            {
+                "data": [
+                    {"embedding": [1.0]},
+                    {"embedding": [2.0]},
+                ],
+            }
+        ).encode("utf-8")
         mock = MagicMock()
         mock.read.return_value = body
         mock.__enter__ = MagicMock(return_value=mock)
@@ -804,9 +808,7 @@ class TestGetProviderVoyage:
             provider = get_provider("voyage")
 
         assert isinstance(provider, VoyageEmbeddingProvider)
-        assert provider.name == (
-            "voyage:voyage-code-3:dim1024:float@https://api.voyageai.com/v1"
-        )
+        assert provider.name == ("voyage:voyage-code-3:dim1024:float@https://api.voyageai.com/v1")
 
     def test_get_provider_voyage_without_key_raises(self):
         with patch.dict(os.environ, {}, clear=True):
@@ -828,9 +830,7 @@ class TestGetProviderVoyage:
 
         assert isinstance(provider, VoyageEmbeddingProvider)
         assert provider._min_interval_sec == 21.0
-        assert provider.name == (
-            "voyage:voyage-code-3:dim512:float@https://voyage.example.test/v1"
-        )
+        assert provider.name == ("voyage:voyage-code-3:dim512:float@https://voyage.example.test/v1")
 
     def test_get_provider_voyage_ignores_local_embedding_model_env(self):
         env = {
@@ -842,9 +842,7 @@ class TestGetProviderVoyage:
             provider = get_provider("voyage")
 
         assert isinstance(provider, VoyageEmbeddingProvider)
-        assert provider.name == (
-            "voyage:voyage-code-3:dim1024:float@https://api.voyageai.com/v1"
-        )
+        assert provider.name == ("voyage:voyage-code-3:dim1024:float@https://api.voyageai.com/v1")
 
 
 class TestEmbeddingStoreContextManager:
@@ -1034,7 +1032,8 @@ class TestOpenAIEmbeddingProvider:
         assert payload["dimensions"] == 256
 
     def test_loopback_auto_learned_dimension_is_never_resent(
-        self, openai_loopback_server,
+        self,
+        openai_loopback_server,
     ):
         base_url, payloads = openai_loopback_server
         provider = OpenAIEmbeddingProvider(
@@ -1051,7 +1050,8 @@ class TestOpenAIEmbeddingProvider:
         assert all("dimensions" not in payload for payload in payloads)
 
     def test_loopback_explicit_dimension_is_sent_for_custom_model_alias(
-        self, openai_loopback_server,
+        self,
+        openai_loopback_server,
     ):
         base_url, payloads = openai_loopback_server
         provider = OpenAIEmbeddingProvider(
@@ -1062,11 +1062,13 @@ class TestOpenAIEmbeddingProvider:
         )
 
         assert len(provider.embed_query("custom alias")) == 4
-        assert payloads == [{
-            "model": "azure-production-deployment",
-            "input": ["custom alias"],
-            "dimensions": 4,
-        }]
+        assert payloads == [
+            {
+                "model": "azure-production-deployment",
+                "input": ["custom alias"],
+                "dimensions": 4,
+            }
+        ]
 
     def test_auto_learned_dimension_omitted_for_non_v3_models(self):
         # Many OpenAI-compatible providers (SiliconFlow, Cohere, voyage-3,
@@ -1074,7 +1076,8 @@ class TestOpenAIEmbeddingProvider:
         # HTTP 400. The provider auto-learns dimension from the first
         # response and would otherwise forward it on every subsequent call.
         p = OpenAIEmbeddingProvider(
-            api_key="k", base_url="http://localhost:3000/v1",
+            api_key="k",
+            base_url="http://localhost:3000/v1",
             model="BAAI/bge-m3",
         )
         with patch(
@@ -1102,8 +1105,10 @@ class TestOpenAIEmbeddingProvider:
         # compatible gateways can expose dimension-capable models under
         # arbitrary aliases.
         p = OpenAIEmbeddingProvider(
-            api_key="k", base_url="http://localhost:3000/v1",
-            model="BAAI/bge-m3", dimension=1024,
+            api_key="k",
+            base_url="http://localhost:3000/v1",
+            model="BAAI/bge-m3",
+            dimension=1024,
         )
         with patch(
             "urllib.request.urlopen",
@@ -1116,8 +1121,10 @@ class TestOpenAIEmbeddingProvider:
     def test_explicit_dimension_forwarded_for_v3_models(self):
         # Regression guard: v3 models must still honor the pinned dimension.
         p = OpenAIEmbeddingProvider(
-            api_key="k", base_url="http://localhost:3000/v1",
-            model="text-embedding-3-large", dimension=512,
+            api_key="k",
+            base_url="http://localhost:3000/v1",
+            model="text-embedding-3-large",
+            dimension=512,
         )
         with patch(
             "urllib.request.urlopen",

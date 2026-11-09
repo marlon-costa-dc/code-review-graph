@@ -43,7 +43,8 @@ from code_review_graph.skills import (
 )
 
 _needs_tomllib = pytest.mark.skipif(
-    tomllib is None, reason="tomllib requires Python 3.11+",
+    tomllib is None,
+    reason="tomllib requires Python 3.11+",
 )
 
 
@@ -54,14 +55,14 @@ class TestStripJsonc:
         # The original #553 repro: a comma inside a string, immediately before a
         # line whose first non-space char is `}`. A naive regex deleted it.
         src = (
-            '{\n'
+            "{\n"
             '  "mcp": {\n'
             '    "my-server": {\n'
             '      "command": ["x"],\n'
             '      "description": "foo, bar"\n'
-            '    }\n'
-            '  }\n'
-            '}\n'
+            "    }\n"
+            "  }\n"
+            "}\n"
         )
         parsed = json.loads(_strip_jsonc(src))
         assert parsed["mcp"]["my-server"]["description"] == "foo, bar"
@@ -220,9 +221,7 @@ class TestGenerateSkills:
         skills_dir = generate_skills(tmp_path)
         for subdir in skills_dir.iterdir():
             content = (subdir / "SKILL.md").read_text()
-            assert "detail_level" in content, (
-                f"{subdir.name} missing detail_level reference"
-            )
+            assert "detail_level" in content, f"{subdir.name} missing detail_level reference"
 
     def test_idempotent(self, tmp_path):
         """Running twice should not fail and files should still be valid."""
@@ -337,13 +336,11 @@ class TestGenerateHooksConfig:
                     f"{event_name} entry has a flat `command` field; "
                     "it must be wrapped in an inner `hooks` array"
                 )
-                assert "hooks" in entry, (
-                    f"{event_name} entry is missing the inner `hooks` array"
-                )
+                assert "hooks" in entry, f"{event_name} entry is missing the inner `hooks` array"
                 assert isinstance(entry["hooks"], list)
                 for hook in entry["hooks"]:
                     assert hook.get("type") == "command", (
-                        f"{event_name} inner hook missing type=\"command\""
+                        f'{event_name} inner hook missing type="command"'
                     )
                     assert "command" in hook
                     assert "timeout" in hook
@@ -360,9 +357,7 @@ class TestShippedHooksFiles:
     STDIN_DRAIN = "cat >/dev/null || true; "
 
     def test_hooks_json_commands_drain_stdin(self):
-        data = json.loads(
-            (self.HOOKS_DIR / "hooks.json").read_text(encoding="utf-8")
-        )
+        data = json.loads((self.HOOKS_DIR / "hooks.json").read_text(encoding="utf-8"))
         commands = [
             hook["command"]
             for entries in data.values()
@@ -387,9 +382,7 @@ class TestShippedHooksFiles:
 class TestInstallGitHook:
     def _make_git_repo(self, tmp_path: Path) -> Path:
         self._git("init", cwd=tmp_path)
-        self._git(
-            "config", "core.hooksPath", str(tmp_path / ".git" / "hooks"), cwd=tmp_path
-        )
+        self._git("config", "core.hooksPath", str(tmp_path / ".git" / "hooks"), cwd=tmp_path)
         return tmp_path
 
     def _git(self, *args: str, cwd: Path) -> str:
@@ -467,21 +460,24 @@ class TestInstallGitHook:
         """Linked worktree: .git is a file; the hook must still be installed
         into the hooks path git actually consults (issue #313)."""
         main = self._init_real_repo(tmp_path / "main")
+        self._git("config", "core.hooksPath", str(main / ".git" / "hooks"), cwd=main)
         self._git(
-            "config", "core.hooksPath", str(main / ".git" / "hooks"), cwd=main
-        )
-        self._git(
-            "-c", "user.email=test@example.com", "-c", "user.name=Test",
-            "commit", "--allow-empty", "-m", "init", cwd=main,
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "init",
+            cwd=main,
         )
         worktree = tmp_path / "wt"
         self._git("worktree", "add", str(worktree), "-b", "wt-branch", cwd=main)
         assert (worktree / ".git").is_file()  # precondition: not a directory
         hook_path = install_git_hook(worktree)
         assert hook_path is not None
-        git_hooks_dir = worktree / self._git(
-            "rev-parse", "--git-path", "hooks", cwd=worktree
-        )
+        git_hooks_dir = worktree / self._git("rev-parse", "--git-path", "hooks", cwd=worktree)
         assert hook_path.resolve() == (git_hooks_dir / "pre-commit").resolve()
         assert "code-review-graph detect-changes" in hook_path.read_text()
 
@@ -554,7 +550,6 @@ class TestGenerateCodexHooksConfig:
         assert "status" in inner["command"]
         assert inner["command"].startswith("cat >/dev/null || true; ")
         assert inner["statusMessage"] == "Checking code-review-graph status"
-
 
     def test_post_tool_use_command_handles_large_stdin_payload(self, tmp_path):
         config = generate_codex_hooks_config(tmp_path)
@@ -873,8 +868,12 @@ class TestInjectPlatformInstructionsFiltering:
     def test_all_writes_every_file(self, tmp_path):
         updated = inject_platform_instructions(tmp_path, target="all")
         assert set(updated) == {
-            "AGENTS.md", "GEMINI.md", ".cursorrules", ".windsurfrules",
-            "QODER.md", ".kiro/steering/code-review-graph.md",
+            "AGENTS.md",
+            "GEMINI.md",
+            ".cursorrules",
+            ".windsurfrules",
+            "QODER.md",
+            ".kiro/steering/code-review-graph.md",
             ".github/instructions/code-review-graph.instructions.md",
             "CODEBUDDY.md",
         }
@@ -882,8 +881,12 @@ class TestInjectPlatformInstructionsFiltering:
     def test_default_is_all(self, tmp_path):
         updated = inject_platform_instructions(tmp_path)
         assert set(updated) == {
-            "AGENTS.md", "GEMINI.md", ".cursorrules", ".windsurfrules",
-            "QODER.md", ".kiro/steering/code-review-graph.md",
+            "AGENTS.md",
+            "GEMINI.md",
+            ".cursorrules",
+            ".windsurfrules",
+            "QODER.md",
+            ".kiro/steering/code-review-graph.md",
             ".github/instructions/code-review-graph.instructions.md",
             "CODEBUDDY.md",
         }
@@ -897,10 +900,7 @@ class TestInjectPlatformInstructionsFiltering:
         assert not (tmp_path / ".windsurfrules").exists()
         assert not (tmp_path / "QODER.md").exists()
         assert not (
-            tmp_path
-            / ".github"
-            / "instructions"
-            / "code-review-graph.instructions.md"
+            tmp_path / ".github" / "instructions" / "code-review-graph.instructions.md"
         ).exists()
 
     def test_cursor_writes_only_cursor_files(self, tmp_path):
@@ -983,9 +983,7 @@ class TestInstructionGuardrails:
         inject_claude_md(tmp_path)
         inject_platform_instructions(tmp_path, target="all")
         names = ["CLAUDE.md", *skills_module._PLATFORM_INSTRUCTION_FILES]
-        return {
-            name: (tmp_path / name).read_text(encoding="utf-8") for name in names
-        }
+        return {name: (tmp_path / name).read_text(encoding="utf-8") for name in names}
 
     def test_every_instruction_file_has_all_guardrails(self, tmp_path):
         written = self._instruction_files(tmp_path)
@@ -1025,9 +1023,7 @@ class TestCodeBuddyPlatform:
         platform = PLATFORMS["codebuddy"]
 
         assert platform["name"] == "CodeBuddy Code"
-        assert platform["config_path"](Path("/tmp/project")) == Path(
-            "/tmp/project/.mcp.json"
-        )
+        assert platform["config_path"](Path("/tmp/project")) == Path("/tmp/project/.mcp.json")
         assert platform["key"] == "mcpServers"
         assert platform["format"] == "object"
         assert platform["needs_type"] is True
@@ -1053,9 +1049,7 @@ class TestCodeBuddyPlatform:
         assert data["mcpServers"]["existing"]["command"] == "existing"
         assert data["mcpServers"]["code-review-graph"]["type"] == "stdio"
 
-    def test_all_dedupes_only_claude_and_codebuddy_shared_contract(
-        self, tmp_path, capsys
-    ):
+    def test_all_dedupes_only_claude_and_codebuddy_shared_contract(self, tmp_path, capsys):
         shared_path = tmp_path / ".mcp.json"
         other_platform = {
             "name": "Other shared client",
@@ -1084,9 +1078,7 @@ class TestCodeBuddyPlatform:
         # contract that happens to share the path must still be processed.
         assert capsys.readouterr().out.count(f"configured {shared_path}") == 2
 
-    def test_all_does_not_credit_shared_alias_when_write_is_unsafe(
-        self, tmp_path, capsys
-    ):
+    def test_all_does_not_credit_shared_alias_when_write_is_unsafe(self, tmp_path, capsys):
         original = "{ this is not valid JSONC }\n"
         (tmp_path / ".mcp.json").write_text(original, encoding="utf-8")
         with patch.dict(
@@ -1122,9 +1114,7 @@ class TestCodeBuddyPlatform:
             assert "description:" in content
             assert "get_minimal_context" in content
 
-    def test_project_hooks_preserve_user_settings_and_resolve_repo_at_runtime(
-        self, tmp_path
-    ):
+    def test_project_hooks_preserve_user_settings_and_resolve_repo_at_runtime(self, tmp_path):
         from code_review_graph.skills import install_codebuddy_hooks
 
         repo_root = tmp_path / "repo with spaces"
@@ -1893,12 +1883,7 @@ class TestCopilotPlatform:
 
     def test_copilot_instructions_idempotent(self, tmp_path):
         """Running inject twice produces identical content."""
-        instructions = (
-            tmp_path
-            / ".github"
-            / "instructions"
-            / "code-review-graph.instructions.md"
-        )
+        instructions = tmp_path / ".github" / "instructions" / "code-review-graph.instructions.md"
         inject_platform_instructions(tmp_path, target="copilot")
         first = instructions.read_text()
         inject_platform_instructions(tmp_path, target="copilot")
@@ -1915,9 +1900,7 @@ class TestCopilotPlatform:
     def test_copilot_writes_only_copilot_instructions(self, tmp_path):
         """inject_platform_instructions with target='copilot' writes only copilot file."""
         updated = inject_platform_instructions(tmp_path, target="copilot")
-        assert updated == [
-            ".github/instructions/code-review-graph.instructions.md"
-        ]
+        assert updated == [".github/instructions/code-review-graph.instructions.md"]
         assert not (tmp_path / "AGENTS.md").exists()
         assert not (tmp_path / "GEMINI.md").exists()
         assert not (tmp_path / ".cursorrules").exists()
@@ -1927,9 +1910,7 @@ class TestCopilotPlatform:
     def test_copilot_included_in_all_when_detected(self, tmp_path):
         """Auto-detection requires the Copilot extension, not only VS Code."""
         fake_home = tmp_path / "fakehome"
-        (fake_home / ".vscode" / "extensions" / "github.copilot-1.2.3").mkdir(
-            parents=True
-        )
+        (fake_home / ".vscode" / "extensions" / "github.copilot-1.2.3").mkdir(parents=True)
         with (
             patch("code_review_graph.skills.Path.home", return_value=fake_home),
             patch("code_review_graph.skills.platform.system", return_value="Unknown"),
@@ -1966,9 +1947,7 @@ class TestCopilotPlatform:
     def test_copilot_not_detected_from_vscode_alone(self, tmp_path):
         """An unrelated VS Code install must not trigger Copilot configuration."""
         fake_home = tmp_path / "fakehome"
-        (fake_home / ".vscode" / "extensions" / "ms-python.python-1.0.0").mkdir(
-            parents=True
-        )
+        (fake_home / ".vscode" / "extensions" / "ms-python.python-1.0.0").mkdir(parents=True)
         with (
             patch("code_review_graph.skills.Path.home", return_value=fake_home),
             patch("code_review_graph.skills.platform.system", return_value="Unknown"),
@@ -2117,9 +2096,7 @@ class TestCopilotCLIPlatform:
         assert "servers" not in data
         assert "code-review-graph" in data["mcpServers"]
 
-    def test_install_copilot_cli_reinstall_is_byte_for_byte_idempotent(
-        self, tmp_path
-    ):
+    def test_install_copilot_cli_reinstall_is_byte_for_byte_idempotent(self, tmp_path):
         """A second install must not rewrite an already valid client config."""
         config_path = tmp_path / "fakehome" / ".copilot" / "mcp-config.json"
         with patch.dict(
@@ -2149,9 +2126,7 @@ class TestCopilotCLIPlatform:
         content = instructions.read_text()
         assert _CLAUDE_MD_SECTION_MARKER in content
 
-    def test_copilot_cli_reinstall_migrates_generated_legacy_instruction(
-        self, tmp_path
-    ):
+    def test_copilot_cli_reinstall_migrates_generated_legacy_instruction(self, tmp_path):
         """Reinstall removes only CRG content from the superseded path."""
         legacy = tmp_path / ".github" / "code-review-graph.instruction.md"
         legacy.parent.mkdir(parents=True)
@@ -2163,17 +2138,10 @@ class TestCopilotCLIPlatform:
         inject_platform_instructions(tmp_path, target="copilot-cli")
 
         assert legacy.read_text(encoding="utf-8") == "# User notes\n"
-        current = (
-            tmp_path
-            / ".github"
-            / "instructions"
-            / "code-review-graph.instructions.md"
-        )
+        current = tmp_path / ".github" / "instructions" / "code-review-graph.instructions.md"
         assert current.exists()
 
-    def test_copilot_cli_reinstall_deletes_generated_only_legacy_instruction(
-        self, tmp_path
-    ):
+    def test_copilot_cli_reinstall_deletes_generated_only_legacy_instruction(self, tmp_path):
         """A legacy file containing only the generated section is removed."""
         legacy = tmp_path / ".github" / "code-review-graph.instruction.md"
         legacy.parent.mkdir(parents=True)
@@ -2183,9 +2151,7 @@ class TestCopilotCLIPlatform:
 
         assert not legacy.exists()
 
-    def test_copilot_cli_reinstall_leaves_user_legacy_instruction_untouched(
-        self, tmp_path
-    ):
+    def test_copilot_cli_reinstall_leaves_user_legacy_instruction_untouched(self, tmp_path):
         """A user-authored file without the CRG marker is never rewritten."""
         legacy = tmp_path / ".github" / "code-review-graph.instruction.md"
         legacy.parent.mkdir(parents=True)
@@ -2548,10 +2514,7 @@ class TestInstallConfigDataLoss:
         settings = tmp_path / "zed" / "settings.json"
         settings.parent.mkdir(parents=True)
         settings.write_text(
-            "{\n"
-            '  // user theme preference\n'
-            '  "theme": "One Dark",\n'
-            "}\n",
+            '{\n  // user theme preference\n  "theme": "One Dark",\n}\n',
             encoding="utf-8",
         )
 
@@ -2563,9 +2526,7 @@ class TestInstallConfigDataLoss:
         assert data["theme"] == "One Dark"
         assert "code-review-graph" in data["context_servers"]
 
-    def test_array_platform_preserves_wrong_typed_server_collection(
-        self, tmp_path, capsys
-    ):
+    def test_array_platform_preserves_wrong_typed_server_collection(self, tmp_path, capsys):
         config = tmp_path / ".continue" / "config.json"
         config.parent.mkdir(parents=True)
         original = '{\n  "mcpServers": {"legacy": "keep-me"}\n}\n'
@@ -2580,9 +2541,7 @@ class TestInstallConfigDataLoss:
         assert "expected a JSON array" in out
         assert "skipping to avoid data loss" in out
 
-    def test_object_platform_preserves_wrong_typed_server_collection(
-        self, tmp_path, capsys
-    ):
+    def test_object_platform_preserves_wrong_typed_server_collection(self, tmp_path, capsys):
         settings = tmp_path / "zed" / "settings.json"
         settings.parent.mkdir(parents=True)
         original = '{\n  "context_servers": ["legacy-server"]\n}\n'
@@ -2688,7 +2647,8 @@ class TestNonAsciiConfigPreservation:
         settings_dir = tmp_path / ".claude"
         settings_dir.mkdir()
         (settings_dir / "settings.json").write_text(
-            json.dumps({"customSetting": self.NON_ASCII}), encoding="utf-8",
+            json.dumps({"customSetting": self.NON_ASCII}),
+            encoding="utf-8",
         )
 
         install_hooks(tmp_path, platform="claude")
@@ -2702,7 +2662,8 @@ class TestNonAsciiConfigPreservation:
         codex_dir = tmp_path / ".codex"
         codex_dir.mkdir()
         (codex_dir / "hooks.json").write_text(
-            json.dumps({"customSetting": self.NON_ASCII}), encoding="utf-8",
+            json.dumps({"customSetting": self.NON_ASCII}),
+            encoding="utf-8",
         )
 
         install_codex_hooks(tmp_path / "repo")
@@ -2715,7 +2676,8 @@ class TestNonAsciiConfigPreservation:
         settings_dir = tmp_path / ".gemini"
         settings_dir.mkdir()
         (settings_dir / "settings.json").write_text(
-            json.dumps({"customSetting": self.NON_ASCII}), encoding="utf-8",
+            json.dumps({"customSetting": self.NON_ASCII}),
+            encoding="utf-8",
         )
 
         install_gemini_cli_hooks(tmp_path)
@@ -2729,7 +2691,8 @@ class TestNonAsciiConfigPreservation:
         cursor_dir = tmp_path / ".cursor"
         cursor_dir.mkdir()
         (cursor_dir / "hooks.json").write_text(
-            json.dumps({"customSetting": self.NON_ASCII}), encoding="utf-8",
+            json.dumps({"customSetting": self.NON_ASCII}),
+            encoding="utf-8",
         )
 
         install_cursor_hooks()

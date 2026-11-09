@@ -65,7 +65,10 @@ def test_operator_definition_uses_operator_name(signature, expected):
     ],
 )
 def test_long_form_operator_definition_uses_operator_identity(
-    signature, expected_name, expected_parent, expected_qualifier,
+    signature,
+    expected_name,
+    expected_parent,
+    expected_qualifier,
 ):
     nodes, _ = _parse(signature)
 
@@ -206,8 +209,7 @@ def test_qualified_method_body_uses_lexical_scope_for_bare_calls():
     targets = {
         edge.target
         for edge in edges
-        if edge.kind == "CALLS"
-        and edge.source == "/repo/case.jl::Demo.Base.show"
+        if edge.kind == "CALLS" and edge.source == "/repo/case.jl::Demo.Base.show"
     }
     assert targets == {
         "/repo/case.jl::Demo.helper",
@@ -229,11 +231,7 @@ def test_nested_symbols_do_not_collide_between_local_and_qualified_methods():
         "end\n"
     )
 
-    assert {
-        (node.name, node.parent_name)
-        for node in nodes
-        if node.name == "inner"
-    } == {
+    assert {(node.name, node.parent_name) for node in nodes if node.name == "inner"} == {
         ("inner", "Demo.show"),
         ("inner", "Demo.Base.show"),
     }
@@ -251,11 +249,7 @@ def test_nested_symbols_do_not_collide_between_local_and_qualified_methods():
 
 
 def test_wrapped_qualified_signature_is_not_a_self_call():
-    nodes, edges = _parse(
-        "function A.B.f(x)::Int where {T}\n"
-        "    x\n"
-        "end\n"
-    )
+    nodes, edges = _parse("function A.B.f(x)::Int where {T}\n    x\nend\n")
 
     function = next(node for node in nodes if node.kind == "Function")
     assert (function.name, function.parent_name) == ("f", "A.B")
@@ -263,19 +257,12 @@ def test_wrapped_qualified_signature_is_not_a_self_call():
 
 
 def test_wrapped_signature_keeps_evaluated_return_type_call():
-    _, edges = _parse(
-        "g() = Int\n"
-        "function f(x)::g()\n"
-        "    x\n"
-        "end\n"
-    )
+    _, edges = _parse("g() = Int\nfunction f(x)::g()\n    x\nend\n")
 
     calls = [edge for edge in edges if edge.kind == "CALLS"]
     assert not any(edge.target == "/repo/case.jl::f" for edge in calls)
     assert any(
-        edge.source == "/repo/case.jl::f"
-        and edge.target == "/repo/case.jl::g"
-        for edge in calls
+        edge.source == "/repo/case.jl::f" and edge.target == "/repo/case.jl::g" for edge in calls
     )
 
 
@@ -380,12 +367,7 @@ def test_calls_through_import_aliases_use_real_module_paths():
 
 
 def test_selected_import_alias_keeps_multi_segment_module_path():
-    _, edges = _parse(
-        "module Demo\n"
-        "import Foo.Bar: thing as alias\n"
-        "f() = alias()\n"
-        "end\n"
-    )
+    _, edges = _parse("module Demo\nimport Foo.Bar: thing as alias\nf() = alias()\nend\n")
 
     assert any(
         edge.kind == "CALLS"
@@ -398,11 +380,7 @@ def test_selected_import_alias_keeps_multi_segment_module_path():
 def test_enum_variants_use_the_full_lexical_type_parent():
     nodes, edges = _parse("module Demo\n@enum Color RED\nend\n")
 
-    variant = next(
-        node
-        for node in nodes
-        if node.extra.get("julia_kind") == "enum_variant"
-    )
+    variant = next(node for node in nodes if node.extra.get("julia_kind") == "enum_variant")
     assert (variant.name, variant.parent_name) == ("RED", "Demo.Color")
     assert any(
         edge.kind == "CONTAINS"
@@ -484,10 +462,7 @@ def test_full_build_persists_distinct_qualified_nodes_and_callers(tmp_path):
 
         callers = store.get_edges_by_target(base_qn)
         invoke_qn = f"{source_path.as_posix()}::Demo.invoke"
-        assert any(
-            edge.kind == "CALLS" and edge.source_qualified == invoke_qn
-            for edge in callers
-        )
+        assert any(edge.kind == "CALLS" and edge.source_qualified == invoke_qn for edge in callers)
         assert result["errors"] == []
     finally:
         store.close()

@@ -33,19 +33,12 @@ class TestGoGenericReceiverEdges:
 
     def test_unnamed_generic_receivers(self):
         nodes, _ = self.parse(
-            b"package s\n"
-            b"type Box[T any] struct{}\n"
-            b"func (Box[T]) A() {}\n"
-            b"func (*Box[T]) B() {}\n"
+            b"package s\ntype Box[T any] struct{}\nfunc (Box[T]) A() {}\nfunc (*Box[T]) B() {}\n"
         )
         assert _parents(nodes) == {"A": "Box", "B": "Box"}
 
     def test_underscore_receiver_name(self):
-        nodes, _ = self.parse(
-            b"package s\n"
-            b"type Box[T any] struct{}\n"
-            b"func (_ Box[T]) C() {}\n"
-        )
+        nodes, _ = self.parse(b"package s\ntype Box[T any] struct{}\nfunc (_ Box[T]) C() {}\n")
         assert _parents(nodes) == {"C": "Box"}
 
     def test_non_generic_receivers_unchanged(self):
@@ -61,9 +54,7 @@ class TestGoGenericReceiverEdges:
 
     def test_unicode_receiver_type_name(self):
         nodes, _ = self.parse(
-            "package s\n"
-            "type Böx[T any] struct{}\n"
-            "func (b Böx[T]) J() {}\n".encode()
+            "package s\ntype Böx[T any] struct{}\nfunc (b Böx[T]) J() {}\n".encode()
         )
         assert _parents(nodes) == {"J": "Böx"}
 
@@ -74,16 +65,12 @@ class TestGoGenericReceiverEdges:
         assert _parents(nodes).get("D") == "Box"
 
     def test_comment_inside_receiver_before_pointer(self):
-        nodes, _ = self.parse(
-            b"package s\ntype T struct{}\nfunc (b /*c*/ *T) G() {}\n"
-        )
+        nodes, _ = self.parse(b"package s\ntype T struct{}\nfunc (b /*c*/ *T) G() {}\n")
         assert _parents(nodes) == {"G": "T"}
 
     def test_comment_between_generic_base_and_type_args(self):
         nodes, _ = self.parse(
-            b"package s\n"
-            b"type Box[T any] struct{}\n"
-            b"func (b Box /*c*/ [T]) E() {}\n"
+            b"package s\ntype Box[T any] struct{}\nfunc (b Box /*c*/ [T]) E() {}\n"
         )
         assert _parents(nodes) == {"E": "Box"}
 

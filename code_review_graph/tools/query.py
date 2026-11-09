@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import re
 import sqlite3
+from collections import deque
 from pathlib import Path
 from typing import Any, Literal
 
@@ -25,6 +26,7 @@ from ._common import (
     _get_store_for_read,
     _not_built_response,
     _resolve_graph_file_paths,
+    _validate_positive_int,
 )
 
 logger = logging.getLogger(__name__)
@@ -106,7 +108,8 @@ def _java_fqn_candidates(store: GraphStore, target: str) -> list[GraphNode] | No
 
 
 def _rank_disambiguation_candidates(
-    candidates: list[GraphNode], target: str,
+    candidates: list[GraphNode],
+    target: str,
 ) -> list[dict[str, Any]]:
     """Return deterministic, sanitized candidates ordered by match quality."""
     target_lower = target.lower()
@@ -174,9 +177,7 @@ def get_impact_radius(
         # Resolve user-facing paths to the file paths stored in the graph.
         original_tokens = estimate_file_tokens(root, changed_files)
         abs_files = _resolve_graph_file_paths(store, root, changed_files)
-        result = store.get_impact_radius(
-            abs_files, max_depth=max_depth, max_nodes=max_results
-        )
+        result = store.get_impact_radius(abs_files, max_depth=max_depth, max_nodes=max_results)
 
         impact_scores = result.get("impact_scores", {})
         changed_dicts = [node_to_dict(n) for n in result["changed_nodes"]]
@@ -208,10 +209,15 @@ def get_impact_radius(
         confidence = None
         if not impacted_dicts:
             changed_language = next(
-                (n.language for n in result["changed_nodes"] if n.language), None,
+                (n.language for n in result["changed_nodes"] if n.language),
+                None,
             )
             confidence = empty_impact_confidence(
-                store, root, changed_files, abs_files, changed_language,
+                store,
+                root,
+                changed_files,
+                abs_files,
+                changed_language,
             )
 
         if detail_level == "minimal":
@@ -297,8 +303,7 @@ def query_graph(
             return {
                 "status": "error",
                 "error": (
-                    f"Unknown pattern '{pattern}'. "
-                    f"Available: {list(_QUERY_PATTERNS.keys())}"
+                    f"Unknown pattern '{pattern}'. Available: {list(_QUERY_PATTERNS.keys())}"
                 ),
             }
 
@@ -320,23 +325,17 @@ def query_graph(
         # For callers_of, skip common builtins early (bare names only)
         # "Who calls .map()?" returns hundreds of useless hits.
         # Qualified names (e.g. "utils.py::map") bypass this filter.
-        if (
-            pattern == "callers_of"
-            and target in _BUILTIN_CALL_NAMES
-            and "::" not in target
-        ):
+        if pattern == "callers_of" and target in _BUILTIN_CALL_NAMES and "::" not in target:
             return {
                 "status": "ok",
                 "pattern": pattern,
                 "target": target,
                 "description": _QUERY_PATTERNS[pattern],
-                "summary": (
-                    f"'{target}' is a common builtin "
-                    "— callers_of skipped to avoid noise."
-                ),
+                "summary": (f"'{target}' is a common builtin — callers_of skipped to avoid noise."),
                 "result_count": 0,
                 "results_omitted": 0,
-                "results": [], "edges": [],
+                "results": [],
+                "edges": [],
             }
 
         # Resolve target - try as-is, then as absolute path, then search.
@@ -388,8 +387,7 @@ def query_graph(
                         "candidate_count": candidate_count,
                         "candidates_truncated": candidate_count > len(candidates),
                         "hint": (
-                            "Use a qualified_name from disambiguation as the "
-                            "target parameter."
+                            "Use a qualified_name from disambiguation as the target parameter."
                         ),
                     }
 
@@ -456,10 +454,7 @@ def query_graph(
         elif pattern == "references_to":
             seen_reference_sources: set[str] = set()
             for e in store.iter_edges_by_target(qn):
-                if (
-                    e.kind != "REFERENCES"
-                    or e.source_qualified in seen_reference_sources
-                ):
+                if e.kind != "REFERENCES" or e.source_qualified in seen_reference_sources:
                     continue
                 source = store.get_node(e.source_qualified)
                 if source:
@@ -481,9 +476,8 @@ def query_graph(
                             or "::" not in e.target_qualified
                             or (node is not None and node.language == "cpp")
                         ):
-                            unresolved = (
-                                e.extra.get("ambiguous_targets")
-                                or e.extra.get("unresolved_targets")
+                            unresolved = e.extra.get("ambiguous_targets") or e.extra.get(
+                                "unresolved_targets"
                             )
                             result: dict[str, Any] = {
                                 "kind": "Function",
@@ -525,19 +519,20 @@ def query_graph(
             # Find edges where target matches this file.
             # Use resolve() to canonicalize the path, matching how
             # _resolve_module_to_file stores edge targets.
-            abs_target = (
-                str((root / target).resolve()) if node is None else node.file_path
-            )
+            abs_target = str((root / target).resolve()) if node is None else node.file_path
             seen_importers: set[str] = set()
             for e in store.iter_edges_by_target(abs_target):
                 if e.kind == "IMPORTS_FROM":
                     if e.source_qualified in seen_importers:
                         continue
                     seen_importers.add(e.source_qualified)
-                    add_result({
-                        "importer": e.source_qualified,
-                        "file": e.file_path,
-                    }, e)
+                    add_result(
+                        {
+                            "importer": e.source_qualified,
+                            "file": e.file_path,
+                        },
+                        e,
+                    )
             # C# fallback: `using X.Y;` directives produce IMPORTS_FROM edges
             # whose target is the raw namespace string, not a file path, so
             # the path lookup above misses them. Resolve the target file's
@@ -547,9 +542,7 @@ def query_graph(
                 declared_ns: list[str] = []
                 for n in store.iter_nodes_by_file(node.file_path):
                     if n.kind == "File":
-                        declared_ns = list(
-                            n.extra.get("csharp_namespaces", []) or []
-                        )
+                        declared_ns = list(n.extra.get("csharp_namespaces", []) or [])
                         break
                 for ns in declared_ns:
                     for e in store.iter_edges_by_target(ns):
@@ -558,10 +551,13 @@ def query_graph(
                         if e.source_qualified in seen_importers:
                             continue
                         seen_importers.add(e.source_qualified)
-                        add_result({
-                            "importer": e.source_qualified,
-                            "file": e.file_path,
-                        }, e)
+                        add_result(
+                            {
+                                "importer": e.source_qualified,
+                                "file": e.file_path,
+                            },
+                            e,
+                        )
 
         elif pattern == "children_of":
             for e in store.iter_edges_by_source(qn):
@@ -593,7 +589,8 @@ def query_graph(
                     node.name,
                     language="cpp",
                     kinds=("Function", "Test"),
-                ) > 1
+                )
+                > 1
             )
             test_nodes = []
             if not cpp_overload_set:
@@ -619,7 +616,9 @@ def query_graph(
             if total_results == 0 and node:
                 for kind in ("INHERITS", "IMPLEMENTS"):
                     for e in store.iter_edges_by_target_name(
-                        node.name, kind=kind, language=node.language or None,
+                        node.name,
+                        kind=kind,
+                        language=node.language or None,
                     ):
                         child = store.get_node(e.source_qualified)
                         if child:
@@ -697,10 +696,7 @@ def query_graph(
 
         results_omitted = max(0, total_results - len(results))
         truncated = results_omitted > 0
-        summary = (
-            f"Found {total_results} result(s) "
-            f"for {pattern}('{target}')"
-        )
+        summary = f"Found {total_results} result(s) for {pattern}('{target}')"
         if results_omitted:
             summary += f" — showing {len(results)}, {results_omitted} omitted"
 
@@ -716,11 +712,7 @@ def query_graph(
 
         if detail_level == "minimal":
             minimal_results = [
-                {
-                    k: r[k]
-                    for k in ("name", "kind", "file_path", "indirect")
-                    if k in r
-                }
+                {k: r[k] for k in ("name", "kind", "file_path", "indirect") if k in r}
                 for r in results[:5]
             ]
             minimal_omitted = max(0, total_results - len(minimal_results))
@@ -797,16 +789,25 @@ def semantic_search_nodes(
     Returns:
         Ranked list of matching nodes.
     """
+    effective_limit = _validate_positive_int(limit, "limit")
     store, root, not_built = _get_store_for_read(repo_root)
     if store is None or root is None:
         return not_built if not_built is not None else _not_built_response()
     try:
         mode_out: list[str] = []
         results = hybrid_search(
-            store, query, kind=kind, limit=limit, context_files=context_files,
-            model=model, provider=provider, mode=search_mode, _out_mode=mode_out,
+            store,
+            query,
+            kind=kind,
+            limit=effective_limit,
+            context_files=context_files,
+            model=model,
+            provider=provider,
+            mode=search_mode,
+            _out_mode=mode_out,
         )
 
+        observed, truncated = len(results), False
         selected_mode = mode_out[0] if mode_out else search_mode
 
         summary = f"Found {len(results)} node(s) matching '{query}'" + (
@@ -815,9 +816,7 @@ def semantic_search_nodes(
 
         # Zero hits can mean "no such symbol" or "never indexed"/"stale index";
         # only the marker distinguishes them.
-        confidence = (
-            empty_search_confidence(store, root, query) if not results else None
-        )
+        confidence = empty_search_confidence(store, root, query) if not results else None
 
         if detail_level == "minimal":
             minimal_results = [
@@ -831,6 +830,10 @@ def semantic_search_nodes(
                 "summary": summary,
                 "results": minimal_results,
                 "result_count": len(results),
+                "result_count_lower_bound": observed,
+                "truncated": truncated or len(results) > len(minimal_results),
+                "requested_limit": limit,
+                "effective_limit": effective_limit,
                 "results_omitted": max(0, len(results) - len(minimal_results)),
             }
             if confidence:
@@ -844,12 +847,14 @@ def semantic_search_nodes(
             "search_mode": selected_mode,
             "summary": summary,
             "results": results,
+            "result_count_lower_bound": observed,
+            "truncated": truncated,
+            "requested_limit": limit,
+            "effective_limit": effective_limit,
         }
         if confidence:
             result["confidence"] = confidence
-        result["_hints"] = generate_hints(
-            "semantic_search_nodes", result, get_session()
-        )
+        result["_hints"] = generate_hints("semantic_search_nodes", result, get_session())
         return result
     finally:
         store.close()
@@ -941,6 +946,7 @@ def find_large_functions(
     Returns:
         Oversized nodes with line counts, ordered largest first.
     """
+    effective_limit = _validate_positive_int(limit, "limit")
     store, root, not_built = _get_store_for_read(repo_root)
     if store is None or root is None:
         return not_built if not_built is not None else _not_built_response()
@@ -949,15 +955,14 @@ def find_large_functions(
             min_lines=min_lines,
             kind=kind,
             file_path_pattern=file_path_pattern,
-            limit=limit,
+            limit=effective_limit,
         )
 
+        observed, truncated = len(nodes), False
         results = []
         for n in nodes:
             d = node_to_dict(n)
-            d["line_count"] = (
-                (n.line_end - n.line_start + 1) if n.line_start and n.line_end else 0
-            )
+            d["line_count"] = (n.line_end - n.line_start + 1) if n.line_start and n.line_end else 0
             # Make file_path relative for readability
             try:
                 d["relative_path"] = str(Path(n.file_path).relative_to(root))
@@ -983,6 +988,10 @@ def find_large_functions(
             "status": "ok",
             "summary": "\n".join(summary_parts),
             "total_found": len(results),
+            "total_found_lower_bound": observed,
+            "truncated": truncated,
+            "requested_limit": limit,
+            "effective_limit": effective_limit,
             "min_lines": min_lines,
             "results": results,
         }
@@ -1011,6 +1020,9 @@ def traverse_graph_func(
         token_budget: Approximate token limit for results.
         repo_root: Repository root path.
     """
+    effective_budget = _validate_positive_int(token_budget, "token_budget")
+    if mode not in {"bfs", "dfs"}:
+        raise ValueError("mode must be bfs or dfs")
     store, root, not_built = _get_store_for_read(repo_root)
     if store is None or root is None:
         return not_built if not_built is not None else _not_built_response()
@@ -1027,15 +1039,13 @@ def traverse_graph_func(
 
         # BFS / DFS traversal
         visited: dict[str, int] = {}  # qn -> depth
-        queue: list[tuple[str, int]] = [
-            (start_qn, 0),
-        ]
+        queue = deque([(start_qn, 0)])
         traversal: list[dict] = []
         approx_tokens = 0
 
         while queue:
             if mode == "bfs":
-                current_qn, cur_depth = queue.pop(0)
+                current_qn, cur_depth = queue.popleft()
             else:
                 current_qn, cur_depth = queue.pop()
 
@@ -1057,7 +1067,7 @@ def traverse_graph_func(
                 "depth": cur_depth,
             }
             approx_tokens += len(str(entry)) // 4
-            if approx_tokens > token_budget:
+            if approx_tokens > effective_budget:
                 break
 
             traversal.append(entry)
@@ -1079,11 +1089,13 @@ def traverse_graph_func(
             "mode": mode,
             "max_depth": depth,
             "nodes_visited": len(traversal),
+            "requested_token_budget": token_budget,
+            "effective_token_budget": effective_budget,
             "traversal": traversal,
-            "truncated": approx_tokens > token_budget,
+            "truncated": approx_tokens > effective_budget,
             "next_tool_suggestions": [
-                "query_graph callers_of" " -- focused relationship query",
-                "get_impact_radius" " -- blast radius analysis",
+                "query_graph callers_of -- focused relationship query",
+                "get_impact_radius -- blast radius analysis",
             ],
         }
     finally:

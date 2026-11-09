@@ -54,9 +54,7 @@ def _validate_config(config: object, path: Path) -> dict:
     if test_commits:
         latest = test_commits[-1].get("sha")
         if not latest or config.get("commit") != latest:
-            raise ValueError(
-                f"{path}: commit pin must equal latest test_commit {latest}"
-            )
+            raise ValueError(f"{path}: commit pin must equal latest test_commit {latest}")
     return config
 
 
@@ -96,7 +94,8 @@ def _assert_standalone_repo(repo_path: Path) -> None:
         text=True,
     )
     toplevel = (
-        Path(proc.stdout.strip()).resolve() if proc.returncode == 0 and proc.stdout.strip()
+        Path(proc.stdout.strip()).resolve()
+        if proc.returncode == 0 and proc.stdout.strip()
         else None
     )
     if toplevel != repo_path.resolve():
@@ -134,9 +133,7 @@ def clone_or_update(config: dict, repos_dir: Path | None = None) -> Path:
             text=True,
         )
         if proc.returncode != 0:
-            raise RuntimeError(
-                f"git fetch failed in {repo_path}: {proc.stderr.strip()}"
-            )
+            raise RuntimeError(f"git fetch failed in {repo_path}: {proc.stderr.strip()}")
     else:
         proc = subprocess.run(
             ["git", "clone", config["url"], str(repo_path)],
@@ -144,9 +141,7 @@ def clone_or_update(config: dict, repos_dir: Path | None = None) -> Path:
             text=True,
         )
         if proc.returncode != 0:
-            raise RuntimeError(
-                f"git clone failed for {config['url']}: {proc.stderr.strip()}"
-            )
+            raise RuntimeError(f"git clone failed for {config['url']}: {proc.stderr.strip()}")
 
     commit = config.get("commit", "HEAD")
     if commit != "HEAD":
@@ -158,8 +153,7 @@ def clone_or_update(config: dict, repos_dir: Path | None = None) -> Path:
         )
         if proc.returncode != 0:
             raise RuntimeError(
-                f"git checkout {commit} failed in {repo_path}: "
-                f"{proc.stderr.strip()}"
+                f"git checkout {commit} failed in {repo_path}: {proc.stderr.strip()}"
             )
 
     return repo_path
@@ -341,7 +335,10 @@ def run_eval(
             # affected rows are dropped from the aggregate as "no_graph_results".
             if embed:
                 _build_embedding_index(
-                    store, db_path, embedding_provider, embedding_model,
+                    store,
+                    db_path,
+                    embedding_provider,
+                    embedding_model,
                 )
             _warn_if_semantic_index_missing(store, benchmark_names)
         except BaseException:

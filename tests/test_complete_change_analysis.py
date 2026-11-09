@@ -77,16 +77,22 @@ def _no_opt_in_bounds(monkeypatch):
 
 
 def _detect(big_change: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
-    return asyncio.run(crg_main.detect_changes_tool(
-        repo_root=big_change["root"], changed_files=big_change["files"],
-        detail_level="standard", **kwargs,
-    ))
+    return asyncio.run(
+        crg_main.detect_changes_tool(
+            repo_root=big_change["root"],
+            changed_files=big_change["files"],
+            detail_level="standard",
+            **kwargs,
+        )
+    )
 
 
 def _review(big_change: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
     return crg_main.get_review_context_tool(
-        repo_root=big_change["root"], changed_files=big_change["files"],
-        detail_level="standard", **kwargs,
+        repo_root=big_change["root"],
+        changed_files=big_change["files"],
+        detail_level="standard",
+        **kwargs,
     )
 
 
@@ -162,13 +168,10 @@ class TestCallerLimitsAreExact:
         assert len(result["affected_flows"]) == 3
         assert result["affected_flows_total"] > 200
         assert (
-            f"Response bounded: 7 of {result['changed_functions_total']} "
-            "changed function(s)"
+            f"Response bounded: 7 of {result['changed_functions_total']} changed function(s)"
         ) in result["summary"]
         assert f"3 of {result['affected_flows_total']} flow(s)" in result["summary"]
-        assert (
-            f"7 of {len(big_change['files'])} changed file(s) shown"
-        ) in result["summary"]
+        assert (f"7 of {len(big_change['files'])} changed file(s) shown") in result["summary"]
 
     def test_detect_changes_limits_above_former_ceilings(self, big_change):
         """450 functions and 210 flows are more than the old 100/200 clamps."""
@@ -191,7 +194,9 @@ class TestCallerLimitsAreExact:
         assert result["changed_functions_total"] > len(result["changed_functions"])
 
     def test_detect_changes_opt_in_function_bound_is_reported(
-        self, big_change, monkeypatch,
+        self,
+        big_change,
+        monkeypatch,
     ):
         monkeypatch.setenv("CRG_MAX_CHANGED_FUNCS", "40")
         result = _detect(big_change)

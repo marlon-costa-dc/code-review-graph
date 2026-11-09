@@ -12,8 +12,11 @@ from __future__ import annotations
 
 import json
 import shutil
+import sqlite3
 import subprocess
 from pathlib import Path
+
+import pytest
 
 from code_review_graph.forget import forget_files
 from code_review_graph.graph import GraphStore
@@ -36,11 +39,7 @@ _FILES = {
 _AMBIGUOUS_IMPORT_FILES = {
     "src_one/pkg/util.py": "def helper():\n    return 1\n",
     "src_two/pkg/util.py": "def helper():\n    return 2\n",
-    "main.py": (
-        "from pkg.util import helper\n\n"
-        "def run():\n"
-        "    return helper()\n"
-    ),
+    "main.py": ("from pkg.util import helper\n\ndef run():\n    return helper()\n"),
 }
 
 _EMBEDDINGS_DDL = """
@@ -57,9 +56,9 @@ def _git_init(repo: Path) -> None:
     subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
     subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
     subprocess.run(
-        ["git", "-c", "user.email=t@e.st", "-c", "user.name=t",
-         "commit", "-qm", "init"],
-        cwd=repo, check=True,
+        ["git", "-c", "user.email=t@e.st", "-c", "user.name=t", "commit", "-qm", "init"],
+        cwd=repo,
+        check=True,
     )
 
 
@@ -135,10 +134,7 @@ def _snapshot(store: GraphStore, repo: Path) -> dict:
     }
     flows = []
     for row in flow_rows:
-        path = tuple(
-            norm(node_names_by_id[node_id])
-            for node_id in json.loads(row["path_json"])
-        )
+        path = tuple(norm(node_names_by_id[node_id]) for node_id in json.loads(row["path_json"]))
         memberships = store._conn.execute(
             "SELECT fm.position, n.qualified_name "
             "FROM flow_memberships fm JOIN nodes n ON n.id = fm.node_id "
@@ -185,29 +181,18 @@ def _snapshot(store: GraphStore, repo: Path) -> dict:
         "ORDER BY qualified_name"
     ).fetchall()
     embeddings = store._conn.execute(
-        "SELECT qualified_name, vector, text_hash, provider "
-        "FROM embeddings ORDER BY qualified_name"
+        "SELECT qualified_name, vector, text_hash, provider FROM embeddings ORDER BY qualified_name"
     ).fetchall()
 
     return {
         "nodes": [tuple(norm(value) for value in row) for row in nodes],
         "edges": [tuple(norm(value) for value in row) for row in edges],
         "flows": flows,
-        "communities": [
-            tuple(norm(value) for value in row) for row in communities
-        ],
-        "community_summaries": [
-            tuple(norm(value) for value in row) for row in community_summaries
-        ],
-        "flow_snapshots": [
-            tuple(norm(value) for value in row) for row in flow_snapshots
-        ],
-        "risk_index": [
-            tuple(norm(value) for value in row) for row in risk_index
-        ],
-        "embeddings": [
-            tuple(norm(value) for value in row) for row in embeddings
-        ],
+        "communities": [tuple(norm(value) for value in row) for row in communities],
+        "community_summaries": [tuple(norm(value) for value in row) for row in community_summaries],
+        "flow_snapshots": [tuple(norm(value) for value in row) for row in flow_snapshots],
+        "risk_index": [tuple(norm(value) for value in row) for row in risk_index],
+        "embeddings": [tuple(norm(value) for value in row) for row in embeddings],
     }
 
 
@@ -239,9 +224,7 @@ def test_forget_matches_full_rebuild_without_file(tmp_path):
 
     assert forgotten_qns
     assert summary["embeddings_purged"] == len(forgotten_qns)
-    assert not forgotten_qns.intersection(
-        row[0] for row in after_forget["embeddings"]
-    )
+    assert not forgotten_qns.intersection(row[0] for row in after_forget["embeddings"])
 
     # Rebuild at the same root so repository-derived community names remain
     # comparable. The forgotten file stays on disk during forget itself, then
@@ -360,13 +343,52 @@ def test_forget_purges_orphaned_embeddings(tmp_path):
 
         remaining = {
             r["qualified_name"]
-            for r in store._conn.execute(
-                "SELECT qualified_name FROM embeddings"
-            ).fetchall()
+            for r in store._conn.execute("SELECT qualified_name FROM embeddings").fetchall()
         }
         # Every vector for a forgotten node is gone; survivors are kept.
         assert not (remaining & util_qns)
         assert "main.py" in " ".join(remaining) or remaining
         assert summary["embeddings_purged"] >= len(util_qns)
+    finally:
+        store.close()
+
+
+def test_forget_denied_commit_preserves_the_complete_graph(tmp_path):
+    repo = _make_repo(tmp_path, "commit-denied", _FILES)
+    store = _build(repo)
+    try:
+        before = tuple(store._conn.iterdump())
+
+        def deny_commit(action, operation, _argument, _database, _trigger):
+            if action == sqlite3.SQLITE_TRANSACTION and operation == "COMMIT":
+                return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+
+        store._conn.set_authorizer(deny_commit)
+        with pytest.raises(sqlite3.DatabaseError, match="not authorized"):
+            forget_files(store, repo, [str(repo / "util.py"), str(repo / "shared.py")])
+        assert tuple(store._conn.iterdump()) == before
+    finally:
+        store._conn.set_authorizer(None)
+        store.close()
+
+
+def test_forget_rejects_open_transaction_without_discarding_caller_work(tmp_path):
+    repo = _make_repo(tmp_path, "caller-transaction", _FILES)
+    store = _build(repo)
+    try:
+        store._conn.execute("BEGIN IMMEDIATE")
+        store._conn.execute(
+            "INSERT INTO metadata (key, value) VALUES (?, ?)",
+            ("caller_repository", str(repo)),
+        )
+        assert store._conn.in_transaction
+        pending = tuple(store._conn.iterdump())
+        with pytest.raises(RuntimeError, match="open transaction"):
+            forget_files(store, repo, [str(repo / "util.py")])
+        assert store._conn.in_transaction
+        assert tuple(store._conn.iterdump()) == pending
+        store.commit()
+        assert store.get_metadata("caller_repository") == str(repo)
     finally:
         store.close()

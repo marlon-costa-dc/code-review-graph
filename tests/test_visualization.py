@@ -26,9 +26,7 @@ class _ScriptExtractor(HTMLParser):
         self.inline_scripts: list[str] = []
         self._inline_chunks: list[str] | None = None
 
-    def handle_starttag(
-        self, tag: str, attrs: list[tuple[str, str | None]]
-    ) -> None:
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         if tag != "script":
             return
         source = dict(attrs).get("src")
@@ -194,9 +192,7 @@ def test_export_json_writes_utf8_graph_data(store_with_data, tmp_path):
     }
 
 
-def test_export_json_failure_preserves_existing_file(
-    store_with_data, tmp_path, monkeypatch
-):
+def test_export_json_failure_preserves_existing_file(store_with_data, tmp_path, monkeypatch):
     from code_review_graph import exports
 
     output_path = tmp_path / "graph.json"
@@ -299,26 +295,50 @@ def test_graph_data_containing_script_sentinel_is_not_expanded(tmp_path, vis_mod
     store = GraphStore(tmp_path / "test.db")
     store.upsert_node(
         NodeInfo(
-            kind="File", name="evil.py", file_path="src/evil.py",
-            line_start=1, line_end=10, language="python", parent_name=None,
-            params=None, return_type=None, modifiers=None, is_test=False,
+            kind="File",
+            name="evil.py",
+            file_path="src/evil.py",
+            line_start=1,
+            line_end=10,
+            language="python",
+            parent_name=None,
+            params=None,
+            return_type=None,
+            modifiers=None,
+            is_test=False,
             extra={},
         )
     )
     store.upsert_node(
         NodeInfo(
-            kind="Function", name="__D3_SCRIPTS__", file_path="src/evil.py",
-            line_start=2, line_end=4, language="python", parent_name=None,
-            params=None, return_type=None, modifiers=None, is_test=False,
+            kind="Function",
+            name="__D3_SCRIPTS__",
+            file_path="src/evil.py",
+            line_start=2,
+            line_end=4,
+            language="python",
+            parent_name=None,
+            params=None,
+            return_type=None,
+            modifiers=None,
+            is_test=False,
             extra={},
         )
     )
     store.upsert_node(
         NodeInfo(
-            kind="Function", name="<img src=x onerror=alert(1)>",
-            file_path="src/evil.py", line_start=6, line_end=8,
-            language="python", parent_name=None, params=None,
-            return_type=None, modifiers=None, is_test=False, extra={},
+            kind="Function",
+            name="<img src=x onerror=alert(1)>",
+            file_path="src/evil.py",
+            line_start=6,
+            line_end=8,
+            language="python",
+            parent_name=None,
+            params=None,
+            return_type=None,
+            modifiers=None,
+            is_test=False,
+            extra={},
         )
     )
 
@@ -334,14 +354,13 @@ def test_graph_data_containing_script_sentinel_is_not_expanded(tmp_path, vis_mod
     for script in data_scripts:
         assert "<script" not in script
     # The parser must not see repo-derived markup as real elements.
+
     class _TagCollector(HTMLParser):
         def __init__(self) -> None:
             super().__init__(convert_charrefs=False)
             self.tags: set[str] = set()
 
-        def handle_starttag(
-            self, tag: str, attrs: list[tuple[str, str | None]]
-        ) -> None:
+        def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
             self.tags.add(tag)
 
     collector = _TagCollector()
@@ -414,16 +433,14 @@ def test_cpp_include_resolution(tmp_path):
     store.commit()
 
     data = export_graph_data(store)
-    resolved_targets = {
-        e["target"] for e in data["edges"] if e["kind"] == "IMPORTS_FROM"
-    }
+    resolved_targets = {e["target"] for e in data["edges"] if e["kind"] == "IMPORTS_FROM"}
 
-    assert (
-        "/abs/libs/rendering/Renderer.hpp" in resolved_targets
-    ), "bare relative include 'rendering/Renderer.hpp' was not resolved to its absolute path"
-    assert (
-        "/abs/libs/utils/Utils.hpp" in resolved_targets
-    ), "bare filename include 'Utils.hpp' was not resolved to its absolute path"
+    assert "/abs/libs/rendering/Renderer.hpp" in resolved_targets, (
+        "bare relative include 'rendering/Renderer.hpp' was not resolved to its absolute path"
+    )
+    assert "/abs/libs/utils/Utils.hpp" in resolved_targets, (
+        "bare filename include 'Utils.hpp' was not resolved to its absolute path"
+    )
 
 
 def test_generate_html_overwrites(store_with_data, tmp_path):
@@ -455,9 +472,7 @@ def test_export_includes_communities(store_with_data):
     assert isinstance(data["communities"], list)
 
 
-def test_export_reads_stored_communities_without_detector_import(
-    large_store, monkeypatch
-):
+def test_export_reads_stored_communities_without_detector_import(large_store, monkeypatch):
     """Rendering stored communities must not import igraph-backed detection."""
     from code_review_graph.visualization import export_graph_data
 
@@ -465,9 +480,7 @@ def test_export_reads_stored_communities_without_detector_import(
 
     def fail_communities_import(name, globals=None, locals=None, fromlist=(), level=0):
         if name == "code_review_graph.communities":
-            raise AssertionError(
-                "visualization export must not import community detector"
-            )
+            raise AssertionError("visualization export must not import community detector")
         return real_import(name, globals, locals, fromlist, level)
 
     monkeypatch.setattr(builtins, "__import__", fail_communities_import)
@@ -480,9 +493,7 @@ def test_export_does_not_hide_broken_communities_schema(large_store):
     from code_review_graph.visualization import export_graph_data
 
     large_store._conn.execute("DROP TABLE communities")
-    large_store._conn.execute(
-        "CREATE VIEW communities AS SELECT * FROM missing_communities_table"
-    )
+    large_store._conn.execute("CREATE VIEW communities AS SELECT * FROM missing_communities_table")
     large_store.commit()
 
     with pytest.raises(sqlite3.OperationalError, match="missing_communities_table"):
@@ -630,7 +641,7 @@ def _assert_responsive_graph_script(content):
     assert "if (retries === undefined) retries = 10;" in content
     assert "requestAnimationFrame(function() { fitGraph(retries - 1); });" in content
     assert 'window.addEventListener("resize", function() {' in content
-    assert r'window.addEventListener(\"resize\"' not in content
+    assert r"window.addEventListener(\"resize\"" not in content
 
     node = shutil.which("node")
     if node is None:
@@ -775,9 +786,7 @@ def large_store(tmp_path):
     store._conn.execute(
         "UPDATE nodes SET community_id = 1 WHERE file_path IN ('src/mod2.py', 'src/mod3.py')"
     )
-    store._conn.execute(
-        "UPDATE nodes SET community_id = 2 WHERE file_path = 'src/mod4.py'"
-    )
+    store._conn.execute("UPDATE nodes SET community_id = 2 WHERE file_path = 'src/mod4.py'")
 
     # Create communities table and insert communities
     store._conn.execute("""
@@ -909,8 +918,11 @@ def test_auto_mode_switches_on_edge_count(large_store, tmp_path):
     # Under both limits -> full template
     output_full = tmp_path / "auto_under_both.html"
     generate_html(
-        large_store, output_full, mode="auto",
-        max_full_nodes=100000, max_full_edges=100000,
+        large_store,
+        output_full,
+        mode="auto",
+        max_full_nodes=100000,
+        max_full_edges=100000,
     )
     content_full = output_full.read_text()
     assert "btn-community" in content_full
@@ -919,8 +931,11 @@ def test_auto_mode_switches_on_edge_count(large_store, tmp_path):
     # Under the node limit but over the edge limit -> aggregated template
     output_agg = tmp_path / "auto_over_edges.html"
     generate_html(
-        large_store, output_agg, mode="auto",
-        max_full_nodes=100000, max_full_edges=1,
+        large_store,
+        output_agg,
+        mode="auto",
+        max_full_nodes=100000,
+        max_full_edges=1,
     )
     content_agg = output_agg.read_text()
     assert "btn-back" in content_agg
@@ -944,36 +959,52 @@ def test_auto_mode_decision_at_issue_609_boundary():
     assert DEFAULT_MAX_FULL_EDGES == 3 * DEFAULT_MAX_FULL_NODES
 
     # A graph under both caps stays in full mode
-    assert _resolve_auto_mode(
-        node_count=2792, edge_count=8000,
-        max_full_nodes=DEFAULT_MAX_FULL_NODES,
-        max_full_edges=DEFAULT_MAX_FULL_EDGES,
-        has_communities=True,
-    ) == "full"
+    assert (
+        _resolve_auto_mode(
+            node_count=2792,
+            edge_count=8000,
+            max_full_nodes=DEFAULT_MAX_FULL_NODES,
+            max_full_edges=DEFAULT_MAX_FULL_EDGES,
+            has_communities=True,
+        )
+        == "full"
+    )
 
     # The exact graph from issue #609: 2792 nodes (under), 17488 edges (over)
-    assert _resolve_auto_mode(
-        node_count=2792, edge_count=17488,
-        max_full_nodes=DEFAULT_MAX_FULL_NODES,
-        max_full_edges=DEFAULT_MAX_FULL_EDGES,
-        has_communities=True,
-    ) == "community"
+    assert (
+        _resolve_auto_mode(
+            node_count=2792,
+            edge_count=17488,
+            max_full_nodes=DEFAULT_MAX_FULL_NODES,
+            max_full_edges=DEFAULT_MAX_FULL_EDGES,
+            has_communities=True,
+        )
+        == "community"
+    )
 
     # Node count over the cap still switches (pre-existing behavior)
-    assert _resolve_auto_mode(
-        node_count=3001, edge_count=100,
-        max_full_nodes=DEFAULT_MAX_FULL_NODES,
-        max_full_edges=DEFAULT_MAX_FULL_EDGES,
-        has_communities=True,
-    ) == "community"
+    assert (
+        _resolve_auto_mode(
+            node_count=3001,
+            edge_count=100,
+            max_full_nodes=DEFAULT_MAX_FULL_NODES,
+            max_full_edges=DEFAULT_MAX_FULL_EDGES,
+            has_communities=True,
+        )
+        == "community"
+    )
 
     # Without community data the aggregated view falls back to file mode
-    assert _resolve_auto_mode(
-        node_count=2792, edge_count=17488,
-        max_full_nodes=DEFAULT_MAX_FULL_NODES,
-        max_full_edges=DEFAULT_MAX_FULL_EDGES,
-        has_communities=False,
-    ) == "file"
+    assert (
+        _resolve_auto_mode(
+            node_count=2792,
+            edge_count=17488,
+            max_full_nodes=DEFAULT_MAX_FULL_NODES,
+            max_full_edges=DEFAULT_MAX_FULL_EDGES,
+            has_communities=False,
+        )
+        == "file"
+    )
 
 
 def test_generate_html_defaults_match_constants():
@@ -991,17 +1022,18 @@ def test_generate_html_defaults_match_constants():
     assert sig.parameters["max_full_edges"].default == DEFAULT_MAX_FULL_EDGES
 
 
-def test_auto_mode_falls_back_to_file_without_communities(
-    store_with_data, tmp_path
-):
+def test_auto_mode_falls_back_to_file_without_communities(store_with_data, tmp_path):
     """Auto-switch without community data must aggregate by file, not lump
     everything into a single 'Uncategorized' community super-node."""
     from code_review_graph.visualization import generate_html
 
     output_path = tmp_path / "auto_no_communities.html"
     generate_html(
-        store_with_data, output_path, mode="auto",
-        max_full_nodes=1, max_full_edges=100000,
+        store_with_data,
+        output_path,
+        mode="auto",
+        max_full_nodes=1,
+        max_full_edges=100000,
     )
     content = output_path.read_text()
     # Aggregated template, file mode data
@@ -1078,6 +1110,6 @@ def test_community_detail_data_complete(large_store):
         for n in detail["nodes"]:
             all_detail_qns.add(n["qualified_name"])
     original_qns = {n["qualified_name"] for n in data["nodes"]}
-    assert (
-        original_qns == all_detail_qns
-    ), "All original nodes should be accounted for in community details"
+    assert original_qns == all_detail_qns, (
+        "All original nodes should be accounted for in community details"
+    )

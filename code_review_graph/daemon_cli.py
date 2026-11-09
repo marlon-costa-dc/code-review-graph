@@ -166,10 +166,7 @@ def _handle_status(_args: argparse.Namespace) -> None:
             f"{'PID':<8}  {'Event':<6}  Path"
         )
         print(header)
-        print(
-            f"  {'-' * alias_width}  {'-' * 8}  {'-' * 8}  {'-' * 8}  "
-            f"{'-' * 6}  {'-' * 40}"
-        )
+        print(f"  {'-' * alias_width}  {'-' * 8}  {'-' * 8}  {'-' * 8}  {'-' * 6}  {'-' * 40}")
         stalled = False
         degraded = False
         for repo in config.repos:
@@ -194,19 +191,12 @@ def _handle_status(_args: argparse.Namespace) -> None:
             )
         if stalled:
             print()
-            print(
-                "  A stalled watcher means the process is up but its filesystem "
-                "observer is not;"
-            )
-            print(
-                "  the graph is no longer updating. Check the log, then: "
-                "crg-daemon restart"
-            )
+            print("  A stalled watcher means the process is up but its filesystem observer is not;")
+            print("  the graph is no longer updating. Check the log, then: crg-daemon restart")
         if degraded:
             print()
             print(
-                "  A partial watcher ran out of watch slots and fell back to one "
-                "recursive watch:"
+                "  A partial watcher ran out of watch slots and fell back to one recursive watch:"
             )
             print(
                 "  still complete, but ignored trees are watched again. Raise "

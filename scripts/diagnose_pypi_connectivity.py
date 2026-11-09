@@ -24,16 +24,11 @@ def main() -> int:
     if ok_tls and ok_url:
         print("PyPI check: OK (this Python can use HTTPS to pypi.org).")
         return 0
-    print(
-        "PyPI check: FAILED (pip/pipx may be unable to download build deps like hatchling)."
-    )
-    print(
-        "Workaround: from the repo root, with https://github.com/astral-sh/uv installed:"
-    )
+    print("PyPI check: FAILED (pip/pipx may be unable to download build deps like hatchling).")
+    print("Workaround: from the repo root, with https://github.com/astral-sh/uv installed:")
     print("  uv tool install . --force")
     print(
-        "Or run pipx from macOS Terminal.app (outside the IDE) "
-        "if the failure is terminal-specific."
+        "Or run pipx from macOS Terminal.app (outside the IDE) if the failure is terminal-specific."
     )
     return 1
 

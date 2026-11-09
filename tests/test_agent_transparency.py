@@ -33,7 +33,9 @@ def _set_build_metadata(store: GraphStore, sha: str) -> None:
 
 class TestLiveHeadProvenance:
     def test_reports_commit_match_without_claiming_clean_worktree(
-        self, tmp_path, monkeypatch,
+        self,
+        tmp_path,
+        monkeypatch,
     ):
         sha = "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678"
         root, store = _make_repo(tmp_path)
@@ -83,7 +85,8 @@ class TestLiveHeadProvenance:
             subprocess,
             "run",
             lambda *args, **kwargs: SimpleNamespace(
-                returncode=0, stdout=head_sha + "\n",
+                returncode=0,
+                stdout=head_sha + "\n",
             ),
         )
 
@@ -118,39 +121,47 @@ def _seed_callers(
     include_orphan: bool = False,
 ) -> str:
     target = str(root / "target.py") + "::target"
-    store.upsert_node(NodeInfo(
-        kind="Function",
-        name="target",
-        file_path=str(root / "target.py"),
-        line_start=1,
-        line_end=3,
-        language="python",
-    ))
-    for index in range(count):
-        source = str(root / f"caller_{index}.py") + f"::caller_{index}"
-        store.upsert_node(NodeInfo(
+    store.upsert_node(
+        NodeInfo(
             kind="Function",
-            name=f"caller_{index}",
-            file_path=str(root / f"caller_{index}.py"),
+            name="target",
+            file_path=str(root / "target.py"),
             line_start=1,
             line_end=3,
             language="python",
-        ))
-        store.upsert_edge(EdgeInfo(
-            kind="CALLS",
-            source=source,
-            target=target,
-            file_path=str(root / f"caller_{index}.py"),
-            line=2,
-        ))
+        )
+    )
+    for index in range(count):
+        source = str(root / f"caller_{index}.py") + f"::caller_{index}"
+        store.upsert_node(
+            NodeInfo(
+                kind="Function",
+                name=f"caller_{index}",
+                file_path=str(root / f"caller_{index}.py"),
+                line_start=1,
+                line_end=3,
+                language="python",
+            )
+        )
+        store.upsert_edge(
+            EdgeInfo(
+                kind="CALLS",
+                source=source,
+                target=target,
+                file_path=str(root / f"caller_{index}.py"),
+                line=2,
+            )
+        )
     if include_orphan:
-        store.upsert_edge(EdgeInfo(
-            kind="CALLS",
-            source=str(root / "missing.py") + "::missing",
-            target=target,
-            file_path=str(root / "missing.py"),
-            line=2,
-        ))
+        store.upsert_edge(
+            EdgeInfo(
+                kind="CALLS",
+                source=str(root / "missing.py") + "::missing",
+                target=target,
+                file_path=str(root / "missing.py"),
+                line=2,
+            )
+        )
     store.commit()
     return target
 
@@ -166,22 +177,32 @@ class TestBoundedQueryResults:
 
         with pytest.raises(ValueError, match="max_results"):
             query_graph(
-                "callers_of", target, str(root), max_results=invalid,
+                "callers_of",
+                target,
+                str(root),
+                max_results=invalid,
             )
 
     def test_standard_cap_counts_only_real_results_and_keeps_edges_aligned(
-        self, tmp_path,
+        self,
+        tmp_path,
     ):
         root, store = _make_repo(tmp_path)
         try:
             target = _seed_callers(
-                store, root, count=6, include_orphan=True,
+                store,
+                root,
+                count=6,
+                include_orphan=True,
             )
         finally:
             store.close()
 
         result = query_graph(
-            "callers_of", target, str(root), max_results=2,
+            "callers_of",
+            target,
+            str(root),
+            max_results=2,
         )
 
         assert result["result_count"] == 6
@@ -210,7 +231,9 @@ class TestBoundedQueryResults:
         assert len(result["results"]) == 2
 
     def test_streams_edges_instead_of_materializing_the_full_edge_list(
-        self, tmp_path, monkeypatch,
+        self,
+        tmp_path,
+        monkeypatch,
     ):
         root, store = _make_repo(tmp_path)
         target = _seed_callers(store, root, count=6)
@@ -226,7 +249,10 @@ class TestBoundedQueryResults:
         )
 
         result = query_graph(
-            "callers_of", target, str(root), max_results=2,
+            "callers_of",
+            target,
+            str(root),
+            max_results=2,
         )
         assert result["result_count"] == 6
 
@@ -236,14 +262,16 @@ class TestSymbolDisambiguation:
         root, store = _make_repo(tmp_path)
         try:
             for path in (root / "a.py", root / "b.py"):
-                store.upsert_node(NodeInfo(
-                    kind="Function",
-                    name="process",
-                    file_path=str(path),
-                    line_start=10,
-                    line_end=20,
-                    language="python",
-                ))
+                store.upsert_node(
+                    NodeInfo(
+                        kind="Function",
+                        name="process",
+                        file_path=str(path),
+                        line_start=10,
+                        line_end=20,
+                        language="python",
+                    )
+                )
             store.commit()
         finally:
             store.close()
@@ -255,8 +283,7 @@ class TestSymbolDisambiguation:
         assert len(result["disambiguation"]) == 2
         assert "qualified_name" in result["hint"]
         assert all(
-            {"qualified_name", "name", "kind", "file_path", "line_start"}
-            <= candidate.keys()
+            {"qualified_name", "name", "kind", "file_path", "line_start"} <= candidate.keys()
             for candidate in result["disambiguation"]
         )
 
@@ -265,38 +292,46 @@ class TestSymbolDisambiguation:
         try:
             java_target = str(root / "OrderHandler.java") + "::OrderHandler.process"
             java_caller = str(root / "OrderRouter.java") + "::route"
-            store.upsert_node(NodeInfo(
-                kind="Function",
-                name="process",
-                parent_name="OrderHandler",
-                file_path=str(root / "OrderHandler.java"),
-                line_start=10,
-                line_end=20,
-                language="java",
-            ))
-            store.upsert_node(NodeInfo(
-                kind="Function",
-                name="route",
-                file_path=str(root / "OrderRouter.java"),
-                line_start=1,
-                line_end=5,
-                language="java",
-            ))
-            store.upsert_node(NodeInfo(
-                kind="Function",
-                name="process",
-                file_path=str(root / "worker.py"),
-                line_start=1,
-                line_end=5,
-                language="python",
-            ))
-            store.upsert_edge(EdgeInfo(
-                kind="CALLS",
-                source=java_caller,
-                target=java_target,
-                file_path=str(root / "OrderRouter.java"),
-                line=3,
-            ))
+            store.upsert_node(
+                NodeInfo(
+                    kind="Function",
+                    name="process",
+                    parent_name="OrderHandler",
+                    file_path=str(root / "OrderHandler.java"),
+                    line_start=10,
+                    line_end=20,
+                    language="java",
+                )
+            )
+            store.upsert_node(
+                NodeInfo(
+                    kind="Function",
+                    name="route",
+                    file_path=str(root / "OrderRouter.java"),
+                    line_start=1,
+                    line_end=5,
+                    language="java",
+                )
+            )
+            store.upsert_node(
+                NodeInfo(
+                    kind="Function",
+                    name="process",
+                    file_path=str(root / "worker.py"),
+                    line_start=1,
+                    line_end=5,
+                    language="python",
+                )
+            )
+            store.upsert_edge(
+                EdgeInfo(
+                    kind="CALLS",
+                    source=java_caller,
+                    target=java_target,
+                    file_path=str(root / "OrderRouter.java"),
+                    line=3,
+                )
+            )
             store.commit()
         finally:
             store.close()
@@ -314,14 +349,16 @@ class TestSymbolDisambiguation:
     def test_java_fqn_never_falls_back_to_unrelated_global_name(self, tmp_path):
         root, store = _make_repo(tmp_path)
         try:
-            store.upsert_node(NodeInfo(
-                kind="Function",
-                name="process",
-                file_path=str(root / "worker.py"),
-                line_start=1,
-                line_end=5,
-                language="python",
-            ))
+            store.upsert_node(
+                NodeInfo(
+                    kind="Function",
+                    name="process",
+                    file_path=str(root / "worker.py"),
+                    line_start=1,
+                    line_end=5,
+                    language="python",
+                )
+            )
             store.commit()
         finally:
             store.close()
@@ -337,15 +374,17 @@ class TestSymbolDisambiguation:
         root, store = _make_repo(tmp_path)
         try:
             for directory in ("v1", "v2"):
-                store.upsert_node(NodeInfo(
-                    kind="Function",
-                    name="process",
-                    parent_name="OrderHandler",
-                    file_path=str(root / directory / "OrderHandler.java"),
-                    line_start=1,
-                    line_end=5,
-                    language="java",
-                ))
+                store.upsert_node(
+                    NodeInfo(
+                        kind="Function",
+                        name="process",
+                        parent_name="OrderHandler",
+                        file_path=str(root / directory / "OrderHandler.java"),
+                        line_start=1,
+                        line_end=5,
+                        language="java",
+                    )
+                )
             store.commit()
         finally:
             store.close()
@@ -361,20 +400,24 @@ class TestSymbolDisambiguation:
     def test_file_summary_path_does_not_enter_symbol_resolution(self, tmp_path):
         root, store = _make_repo(tmp_path)
         try:
-            store.upsert_node(NodeInfo(
-                kind="Function",
-                name="handle",
-                file_path=str(root / "src" / "service.v2.py"),
-                line_start=1,
-                line_end=5,
-                language="python",
-            ))
+            store.upsert_node(
+                NodeInfo(
+                    kind="Function",
+                    name="handle",
+                    file_path=str(root / "src" / "service.v2.py"),
+                    line_start=1,
+                    line_end=5,
+                    language="python",
+                )
+            )
             store.commit()
         finally:
             store.close()
 
         result = query_graph(
-            "file_summary", "src/service.v2.py", str(root),
+            "file_summary",
+            "src/service.v2.py",
+            str(root),
         )
         assert result["status"] == "ok"
         assert [node["name"] for node in result["results"]] == ["handle"]
@@ -384,20 +427,25 @@ def test_semantic_search_minimal_reports_hidden_returned_results(tmp_path):
     root, store = _make_repo(tmp_path)
     try:
         for index in range(10):
-            store.upsert_node(NodeInfo(
-                kind="Function",
-                name=f"do_thing_{index}",
-                file_path=str(root / f"module_{index}.py"),
-                line_start=1,
-                line_end=5,
-                language="python",
-            ))
+            store.upsert_node(
+                NodeInfo(
+                    kind="Function",
+                    name=f"do_thing_{index}",
+                    file_path=str(root / f"module_{index}.py"),
+                    line_start=1,
+                    line_end=5,
+                    language="python",
+                )
+            )
         store.commit()
     finally:
         store.close()
 
     result = semantic_search_nodes(
-        "do_thing", limit=10, repo_root=str(root), detail_level="minimal",
+        "do_thing",
+        limit=10,
+        repo_root=str(root),
+        detail_level="minimal",
     )
     assert len(result["results"]) == 5
     assert result["results_omitted"] == 5
@@ -406,21 +454,37 @@ def test_semantic_search_minimal_reports_hidden_returned_results(tmp_path):
 def test_impact_minimal_reports_nodes_omitted(tmp_path, monkeypatch):
     store = GraphStore(tmp_path / "impact.db")
     seed = "/seed.py::seed"
-    store.upsert_node(NodeInfo(
-        kind="Function", name="seed", file_path="/seed.py",
-        line_start=1, line_end=3, language="python",
-    ))
+    store.upsert_node(
+        NodeInfo(
+            kind="Function",
+            name="seed",
+            file_path="/seed.py",
+            line_start=1,
+            line_end=3,
+            language="python",
+        )
+    )
     for index in range(5):
         impacted = f"/impacted_{index}.py::impacted_{index}"
-        store.upsert_node(NodeInfo(
-            kind="Function", name=f"impacted_{index}",
-            file_path=f"/impacted_{index}.py", line_start=1,
-            line_end=3, language="python",
-        ))
-        store.upsert_edge(EdgeInfo(
-            kind="CALLS", source=impacted, target=seed,
-            file_path=f"/impacted_{index}.py", line=1,
-        ))
+        store.upsert_node(
+            NodeInfo(
+                kind="Function",
+                name=f"impacted_{index}",
+                file_path=f"/impacted_{index}.py",
+                line_start=1,
+                line_end=3,
+                language="python",
+            )
+        )
+        store.upsert_edge(
+            EdgeInfo(
+                kind="CALLS",
+                source=impacted,
+                target=seed,
+                file_path=f"/impacted_{index}.py",
+                line=1,
+            )
+        )
     store.commit()
 
     monkeypatch.setattr(
@@ -454,10 +518,14 @@ def test_mcp_query_wrapper_forwards_max_results(monkeypatch):
 
     monkeypatch.setattr(main_module, "query_graph", fake_query_graph)
     monkeypatch.setattr(
-        main_module, "_resolve_repo_root", lambda repo_root=None: "/repo",
+        main_module,
+        "_resolve_repo_root",
+        lambda repo_root=None: "/repo",
     )
     monkeypatch.setattr(
-        main_module, "with_provenance", lambda result, repo_root=None: result,
+        main_module,
+        "with_provenance",
+        lambda result, repo_root=None: result,
     )
 
     tool = getattr(main_module.query_graph_tool, "fn", None)

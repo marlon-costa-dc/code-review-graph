@@ -30,12 +30,36 @@ def _bounded_float_env(
         return default
     return value
 
-SECURITY_KEYWORDS: frozenset[str] = frozenset({
-    "auth", "login", "password", "token", "session", "crypt", "secret",
-    "credential", "permission", "sql", "query", "execute", "connect",
-    "socket", "request", "http", "sanitize", "validate", "encrypt",
-    "decrypt", "hash", "sign", "verify", "admin", "privilege",
-})
+
+SECURITY_KEYWORDS: frozenset[str] = frozenset(
+    {
+        "auth",
+        "login",
+        "password",
+        "token",
+        "session",
+        "crypt",
+        "secret",
+        "credential",
+        "permission",
+        "sql",
+        "query",
+        "execute",
+        "connect",
+        "socket",
+        "request",
+        "http",
+        "sanitize",
+        "validate",
+        "encrypt",
+        "decrypt",
+        "hash",
+        "sign",
+        "verify",
+        "admin",
+        "privilege",
+    }
+)
 
 # ---------------------------------------------------------------------------
 # Configurable limits (override via environment variables)
@@ -92,10 +116,16 @@ IMPACT_EDGE_DIRECTIONS: dict[str, str] = {
 IMPACT_DEFAULT_EDGE_DIRECTION = IMPACT_DIRECTION_INCOMING
 
 IMPACT_DEPTH_DECAY = _bounded_float_env(
-    "CRG_IMPACT_DEPTH_DECAY", 0.6, lower=0.0, upper=1.0,
+    "CRG_IMPACT_DEPTH_DECAY",
+    0.6,
+    lower=0.0,
+    upper=1.0,
 )
 IMPACT_SCORE_FLOOR = _bounded_float_env(
-    "CRG_IMPACT_SCORE_FLOOR", 0.05, lower=0.0, upper=1.0,
+    "CRG_IMPACT_SCORE_FLOOR",
+    0.05,
+    lower=0.0,
+    upper=1.0,
 )
 
 

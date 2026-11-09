@@ -146,9 +146,7 @@ def test_get_store_for_read_built(tmp_path):
 
 def test_query_graph_unbuilt_returns_not_built(tmp_path):
     _make_unbuilt_repo(tmp_path)
-    result = query_graph(
-        pattern="callers_of", target="anything", repo_root=str(tmp_path)
-    )
+    result = query_graph(pattern="callers_of", target="anything", repo_root=str(tmp_path))
     assert result["status"] == "not_built"
     assert "build_or_update_graph_tool" in result["next_tool_suggestions"]
 
@@ -220,9 +218,7 @@ def test_semantic_search_without_embeddings_reports_lexical_mode(tmp_path):
     assert result["search_mode"] == "fts"
 
 
-def test_semantic_search_without_embeddings_does_not_import_provider(
-    tmp_path, monkeypatch
-):
+def test_semantic_search_without_embeddings_does_not_import_provider(tmp_path, monkeypatch):
     _make_built_repo(tmp_path)
     real_import = builtins.__import__
 
@@ -231,8 +227,7 @@ def test_semantic_search_without_embeddings_does_not_import_provider(
             level and fromlist and "EmbeddingStore" in fromlist
         ):
             raise AssertionError(
-                "semantic_search_nodes must not import embedding providers "
-                "when no vectors exist"
+                "semantic_search_nodes must not import embedding providers when no vectors exist"
             )
         return real_import(name, globals, locals, fromlist, level)
 

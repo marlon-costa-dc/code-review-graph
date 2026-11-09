@@ -25,24 +25,41 @@ logger = logging.getLogger(__name__)
 # Base class names that indicate a framework-managed class (ORM models,
 # Pydantic schemas, settings).  Classes inheriting from these are invoked
 # via metaclass/framework magic and should not be flagged as dead code.
-_FRAMEWORK_BASE_CLASSES = frozenset({
-    "Base", "DeclarativeBase", "Model", "BaseModel", "BaseSettings",
-    "db.Model", "TableBase",
-    # AWS CDK constructs -- instantiated by CDK app wiring, not explicit CALLS.
-    "Stack", "NestedStack", "Construct", "Resource",
-    # Protocol classes are interface definitions; their methods are contract,
-    # not dead code.
-    "Protocol", "typing.Protocol",
-    # Abstract base classes define contracts implemented by subclasses.
-    "ABC", "abc.ABC",
-    # Test framework bases -- test helpers and TestCase subclasses are wired by runner.
-    "TestCase", "unittest.TestCase", "AsyncTestCase", "IsolatedAsyncioTestCase",
-    # Python stdlib handlers -- instantiated by the HTTP server framework.
-    "BaseHTTPRequestHandler",
-    # Tornado handlers -- subclassed and wired by the Tornado app.
-    "RequestHandler", "tornado.web.RequestHandler",
-    "WebSocketHandler", "tornado.websocket.WebSocketHandler",
-})
+_FRAMEWORK_BASE_CLASSES = frozenset(
+    {
+        "Base",
+        "DeclarativeBase",
+        "Model",
+        "BaseModel",
+        "BaseSettings",
+        "db.Model",
+        "TableBase",
+        # AWS CDK constructs -- instantiated by CDK app wiring, not explicit CALLS.
+        "Stack",
+        "NestedStack",
+        "Construct",
+        "Resource",
+        # Protocol classes are interface definitions; their methods are contract,
+        # not dead code.
+        "Protocol",
+        "typing.Protocol",
+        # Abstract base classes define contracts implemented by subclasses.
+        "ABC",
+        "abc.ABC",
+        # Test framework bases -- test helpers and TestCase subclasses are wired by runner.
+        "TestCase",
+        "unittest.TestCase",
+        "AsyncTestCase",
+        "IsolatedAsyncioTestCase",
+        # Python stdlib handlers -- instantiated by the HTTP server framework.
+        "BaseHTTPRequestHandler",
+        # Tornado handlers -- subclassed and wired by the Tornado app.
+        "RequestHandler",
+        "tornado.web.RequestHandler",
+        "WebSocketHandler",
+        "tornado.websocket.WebSocketHandler",
+    }
+)
 
 # Class name suffixes that indicate CDK/IaC constructs.
 # These are instantiated by framework wiring, not direct CALLS edges.
@@ -50,15 +67,23 @@ _FRAMEWORK_BASE_CLASSES = frozenset({
 _CDK_CLASS_SUFFIXES = ("Stack", "Construct", "Pipeline", "Resources", "Layer")
 
 # Python stdlib/base classes that mark a class as a value namespace (enum).
-_ENUM_BASE_CLASSES = frozenset({
-    "Enum", "enum.Enum", "StrEnum", "enum.StrEnum",
-    "IntEnum", "enum.IntEnum", "Flag", "enum.Flag",
-})
+_ENUM_BASE_CLASSES = frozenset(
+    {
+        "Enum",
+        "enum.Enum",
+        "StrEnum",
+        "enum.StrEnum",
+        "IntEnum",
+        "enum.IntEnum",
+        "Flag",
+        "enum.Flag",
+    }
+)
 
 # Patterns for mock/stub variables in test files that should not be flagged dead.
 _MOCK_NAME_RE = re.compile(
     r"^(mock[A-Z_]|Mock[A-Z]|createMock[A-Z])|"  # mockDynamoClient, MockService, createMockX
-    r"(Mock|Stub|Fake|Spy)$",                      # s3ClientMock, dbStub
+    r"(Mock|Stub|Fake|Spy)$",  # s3ClientMock, dbStub
     re.IGNORECASE,
 )
 
@@ -75,7 +100,8 @@ def _cleanup_expired() -> int:
     """Remove expired refactors from the pending dict.  Returns count removed."""
     now = time.time()
     expired = [
-        rid for rid, r in _pending_refactors.items()
+        rid
+        for rid, r in _pending_refactors.items()
         if now - r["created_at"] > REFACTOR_EXPIRY_SECONDS
     ]
     for rid in expired:
@@ -118,25 +144,29 @@ def rename_preview(
     edits: list[dict[str, Any]] = []
 
     # --- Definition site ---
-    edits.append({
-        "file": node.file_path,
-        "line": node.line_start,
-        "old": old_name,
-        "new": new_name,
-        "confidence": "high",
-    })
+    edits.append(
+        {
+            "file": node.file_path,
+            "line": node.line_start,
+            "old": old_name,
+            "new": new_name,
+            "confidence": "high",
+        }
+    )
 
     # --- Call sites (CALLS edges targeting this node) ---
     call_edges = store.get_edges_by_target(node.qualified_name)
     for edge in call_edges:
         if edge.kind == "CALLS":
-            edits.append({
-                "file": edge.file_path,
-                "line": edge.line,
-                "old": old_name,
-                "new": new_name,
-                "confidence": "high",
-            })
+            edits.append(
+                {
+                    "file": edge.file_path,
+                    "line": edge.line,
+                    "old": old_name,
+                    "new": new_name,
+                    "confidence": "high",
+                }
+            )
 
     # Also search by bare name for unqualified edges.
     bare_edges = store.search_edges_by_target_name(
@@ -148,13 +178,15 @@ def rename_preview(
     for edge in bare_edges:
         key = (edge.file_path, edge.line)
         if key not in seen:
-            edits.append({
-                "file": edge.file_path,
-                "line": edge.line,
-                "old": old_name,
-                "new": new_name,
-                "confidence": "high",
-            })
+            edits.append(
+                {
+                    "file": edge.file_path,
+                    "line": edge.line,
+                    "old": old_name,
+                    "new": new_name,
+                    "confidence": "high",
+                }
+            )
             seen.add(key)
 
     # --- Import sites (IMPORTS_FROM edges targeting this node) ---
@@ -163,13 +195,15 @@ def rename_preview(
         if edge.kind == "IMPORTS_FROM":
             key = (edge.file_path, edge.line)
             if key not in seen:
-                edits.append({
-                    "file": edge.file_path,
-                    "line": edge.line,
-                    "old": old_name,
-                    "new": new_name,
-                    "confidence": "high",
-                })
+                edits.append(
+                    {
+                        "file": edge.file_path,
+                        "line": edge.line,
+                        "old": old_name,
+                        "new": new_name,
+                        "confidence": "high",
+                    }
+                )
                 seen.add(key)
 
     # --- Stats ---
@@ -194,7 +228,10 @@ def rename_preview(
 
     logger.info(
         "rename_preview: created refactor %s (%s -> %s, %d edits)",
-        refactor_id, old_name, new_name, len(edits),
+        refactor_id,
+        old_name,
+        new_name,
+        len(edits),
     )
     return preview
 
@@ -288,7 +325,8 @@ def _path_segments(file_path: str) -> tuple[str, ...]:
     """Return directory segments long enough to serve as package-name anchors."""
     parts = file_path.replace("\\", "/").split("/")
     return tuple(
-        p for p in parts[:-1]  # skip the filename itself
+        p
+        for p in parts[:-1]  # skip the filename itself
         if len(p) >= _MIN_PKG_SEGMENT_LEN and p not in ("home", "src", "lib", "app")
     )
 
@@ -320,9 +358,7 @@ class _DeadCodeContext:
         self.conn = store._conn
         # Load all Function/Class/Test nodes once and derive name stats.
         all_nodes = self.store.get_nodes_by_kind(kinds=["Function", "Class", "Test"])
-        self.source_languages = {
-            node.qualified_name: node.language for node in all_nodes
-        }
+        self.source_languages = {node.qualified_name: node.language for node in all_nodes}
         self.type_ref_names = self._collect_type_referenced_names(all_nodes)
         self.name_counts = self._build_name_counts(all_nodes)
         # Class hierarchy and MRO.
@@ -331,9 +367,7 @@ class _DeadCodeContext:
         self.mro_resolver = _MROResolver(self.class_bases, self.class_name_to_qns)
         # Import graph for bare-name plausibility.
         self.importer_files = self._build_importer_files()
-        self.plausibility = _CallerPlausibilityChecker(
-            self.importer_files, self.name_counts
-        )
+        self.plausibility = _CallerPlausibilityChecker(self.importer_files, self.name_counts)
         # Batch-load and index all relevant edges.
         self.edges_by_kind = self._load_edges_by_kind()
         self.incoming, self.outgoing = self._build_adjacency_indexes()
@@ -468,12 +502,8 @@ class _DeadCodeContext:
         self,
     ) -> tuple[dict[str, dict[str, list[Any]]], dict[str, dict[str, list[Any]]]]:
         """Build incoming/outgoing adjacency dicts per edge kind."""
-        incoming: dict[str, dict[str, list[Any]]] = {
-            k: {} for k in self._EDGE_KINDS
-        }
-        outgoing: dict[str, dict[str, list[Any]]] = {
-            k: {} for k in self._EDGE_KINDS
-        }
+        incoming: dict[str, dict[str, list[Any]]] = {k: {} for k in self._EDGE_KINDS}
+        outgoing: dict[str, dict[str, list[Any]]] = {k: {} for k in self._EDGE_KINDS}
         for kind, edges in self.edges_by_kind.items():
             in_kind = incoming[kind]
             out_kind = outgoing[kind]
@@ -529,9 +559,7 @@ class _DeadCodeContext:
                 bare_tested_by.setdefault(edge.source_qualified, []).append(edge)
         return bare_tested_by
 
-    def _build_class_children(
-        self, nodes: list[Any]
-    ) -> dict[str, list[Any]]:
+    def _build_class_children(self, nodes: list[Any]) -> dict[str, list[Any]]:
         """Map class qualified_name -> immediate child nodes (Class/Function)."""
         children: dict[str, list[Any]] = {}
         for n in nodes:
@@ -544,9 +572,7 @@ class _DeadCodeContext:
                 children.setdefault(parent_qn, []).append(n)
         return children
 
-    def _build_class_method_names(
-        self, nodes: list[Any]
-    ) -> dict[str, set[str]]:
+    def _build_class_method_names(self, nodes: list[Any]) -> dict[str, set[str]]:
         """Map class qualified_name -> set of method names defined in the class."""
         method_names: dict[str, set[str]] = {}
         for n in nodes:
@@ -630,9 +656,7 @@ class _CallerPlausibilityChecker:
         self.importer_files = importer_files
         self.name_counts = name_counts
 
-    def is_plausible(
-        self, edge_file: str, node_file: str, node_name: str = ""
-    ) -> bool:
+    def is_plausible(self, edge_file: str, node_file: str, node_name: str = "") -> bool:
         """A bare-name edge is plausible if it comes from the same file,
         from a file that has an IMPORTS_FROM edge whose target matches
         the node's file path, or the name is globally unique (no ambiguity).
@@ -876,16 +900,31 @@ class _NodeFilter:
         # names like ``format_date`` are regular utilities and must remain
         # eligible for dead-code detection.
         prefixes = (
-            "_handle_", "_format_", "_process_", "_parse_", "_serialize_",
-            "_validate_", "_dispatch_", "_route_", "_emit_", "_on_",
+            "_handle_",
+            "_format_",
+            "_process_",
+            "_parse_",
+            "_serialize_",
+            "_validate_",
+            "_dispatch_",
+            "_route_",
+            "_emit_",
+            "_on_",
         )
         if any(name.startswith(p) for p in prefixes):
             return True
         # Common bare handler names used by plugin/dispatch systems.
         bare = {
-            "_handle", "_format", "_process", "_dispatch", "_route", "_emit",
+            "_handle",
+            "_format",
+            "_process",
+            "_dispatch",
+            "_route",
+            "_emit",
             # Flask / web framework request lifecycle hooks
-            "_before_request_hook", "_after_request_hook", "_error_handler",
+            "_before_request_hook",
+            "_after_request_hook",
+            "_error_handler",
         }
         return name in bare
 
@@ -936,12 +975,7 @@ class _NodeFilter:
         # Part/mixin modules contain classes composed via inheritance even when
         # the base is an unresolved external/framework alias (e.g. ``m.Model``).
         norm = node.file_path.replace("\\", "/")
-        if (
-            "/_parts/" in norm
-            or "/_mixins/" in norm
-            or "_part_" in norm
-            or "_mixin_" in norm
-        ):
+        if "/_parts/" in norm or "/_mixins/" in norm or "_part_" in norm or "_mixin_" in norm:
             return bool(self.context.class_bases.get(class_qn))
         return False
 
@@ -1090,9 +1124,7 @@ class _DeadCodeDetector:
             dead.append(self._to_dead_entry(node))
         return dead
 
-    def _qualified_and_class_incoming(
-        self, node: Any, kind: str
-    ) -> list[Any]:
+    def _qualified_and_class_incoming(self, node: Any, kind: str) -> list[Any]:
         """Return incoming *kind* edges for *node* plus class-qualified variants."""
         incoming = self.context.incoming[kind].get(node.qualified_name, [])
         if node.parent_name:
@@ -1133,11 +1165,10 @@ class _DeadCodeDetector:
             all_bare = bare + partial
             compatible = _compatible_edge_languages(node.language)
             all_bare = [
-                e for e in all_bare
+                e
+                for e in all_bare
                 if self.context.source_languages.get(e.source_qualified) in compatible
-                if self.context.plausibility.is_plausible(
-                    e.file_path, node.file_path, node.name
-                )
+                if self.context.plausibility.is_plausible(e.file_path, node.file_path, node.name)
             ]
             incoming = incoming + all_bare
         return incoming
@@ -1153,10 +1184,7 @@ class _DeadCodeDetector:
                 return True
         # Fall back to collecting edges (handles bare-name and partial targets).
         incoming = self._collect_call_edges(node)
-        if any(
-            e.kind == "CALLS" and e.extra.get("reachable", True)
-            for e in incoming
-        ):
+        if any(e.kind == "CALLS" and e.extra.get("reachable", True) for e in incoming):
             return True
         # Fallback: method calls inside f-string interpolations (and other
         # parser edge cases) may not produce CALLS edges.  If the same file
@@ -1174,9 +1202,7 @@ class _DeadCodeDetector:
         parser, so a tested production node is the *source* of its TESTED_BY
         edge -- look outgoing, not incoming. See: #515
         """
-        outgoing_tb = self.context.outgoing["TESTED_BY"].get(
-            node.qualified_name, []
-        )[:]
+        outgoing_tb = self.context.outgoing["TESTED_BY"].get(node.qualified_name, [])[:]
         if not outgoing_tb and node.parent_name:
             # Class-qualified source (e.g. "ClassName::method") which lacks the
             # file-path prefix used in node.qualified_name.
@@ -1189,10 +1215,9 @@ class _DeadCodeDetector:
             # production function by its plain name (e.g. "authenticate").
             bare_rows = self.context.bare_tested_by_sources.get(node.name, [])
             outgoing_tb += [
-                e for e in bare_rows
-                if self.context.plausibility.is_plausible(
-                    e.file_path, node.file_path, node.name
-                )
+                e
+                for e in bare_rows
+                if self.context.plausibility.is_plausible(e.file_path, node.file_path, node.name)
             ]
         return bool(outgoing_tb)
 
@@ -1206,10 +1231,7 @@ class _DeadCodeDetector:
             return False
         member_prefix = node.qualified_name + "."
         bare_prefix = node.name + "."
-        return any(
-            member_prefix in t or bare_prefix in t
-            for t in self.context.calls_targets
-        )
+        return any(member_prefix in t or bare_prefix in t for t in self.context.calls_targets)
 
     def _is_alive_via_mro(self, node: Any) -> bool:
         """Return True if a same-named method in the MRO component has callers."""
@@ -1304,12 +1326,14 @@ def suggest_refactorings(store: GraphStore) -> list[dict[str, Any]]:
     # --- Dead code suggestions ---
     dead = find_dead_code(store)
     for d in dead:
-        suggestions.append({
-            "type": "remove",
-            "description": f"Remove unused {d['kind'].lower()} '{d['name']}'",
-            "symbols": [d["qualified_name"]],
-            "rationale": "No callers, no test references, no importers, not an entry point.",
-        })
+        suggestions.append(
+            {
+                "type": "remove",
+                "description": f"Remove unused {d['kind'].lower()} '{d['name']}'",
+                "symbols": [d["qualified_name"]],
+                "rationale": "No callers, no test references, no importers, not an entry point.",
+            }
+        )
 
     # --- Cross-community move suggestions ---
     # Only attempt if communities table exists and has data.
@@ -1324,13 +1348,12 @@ def suggest_refactorings(store: GraphStore) -> list[dict[str, Any]]:
             for qn in member_qns:
                 node_community[qn] = cid
 
-        community_names: dict[int, str] = {
-            r["id"]: r["name"] for r in community_rows
-        }
+        community_names: dict[int, str] = {r["id"]: r["name"] for r in community_rows}
 
         # Check functions called only by members of a different community.
         all_funcs = [
-            node for node in store.get_nodes_by_kind(["Function"])
+            node
+            for node in store.get_nodes_by_kind(["Function"])
             if not node.extra.get("verilog_kind")
         ]
 
@@ -1340,8 +1363,7 @@ def suggest_refactorings(store: GraphStore) -> list[dict[str, Any]]:
                 continue
 
             incoming_calls = [
-                e for e in store.get_edges_by_target(fnode.qualified_name)
-                if e.kind == "CALLS"
+                e for e in store.get_edges_by_target(fnode.qualified_name) if e.kind == "CALLS"
             ]
             if not incoming_calls:
                 continue
@@ -1360,18 +1382,20 @@ def suggest_refactorings(store: GraphStore) -> list[dict[str, Any]]:
                     tgt_name = community_names.get(
                         target_community, f"community-{target_community}"
                     )
-                    suggestions.append({
-                        "type": "move",
-                        "description": (
-                            f"Move '{_sanitize_name(fnode.name)}' from "
-                            f"'{src_name}' to '{tgt_name}'"
-                        ),
-                        "symbols": [_sanitize_name(fnode.qualified_name)],
-                        "rationale": (
-                            f"Function is in community '{src_name}' but only "
-                            f"called by members of community '{tgt_name}'."
-                        ),
-                    })
+                    suggestions.append(
+                        {
+                            "type": "move",
+                            "description": (
+                                f"Move '{_sanitize_name(fnode.name)}' from "
+                                f"'{src_name}' to '{tgt_name}'"
+                            ),
+                            "symbols": [_sanitize_name(fnode.qualified_name)],
+                            "rationale": (
+                                f"Function is in community '{src_name}' but only "
+                                f"called by members of community '{tgt_name}'."
+                            ),
+                        }
+                    )
 
     logger.info("suggest_refactorings: produced %d suggestions", len(suggestions))
     return suggestions
@@ -1433,9 +1457,13 @@ def apply_refactor(
     if not edits:
         if dry_run:
             return {
-                "status": "ok", "dry_run": True, "applied": 0,
-                "files_modified": [], "edits_applied": 0,
-                "would_modify": [], "diffs": {},
+                "status": "ok",
+                "dry_run": True,
+                "applied": 0,
+                "files_modified": [],
+                "edits_applied": 0,
+                "would_modify": [],
+                "diffs": {},
             }
         return {"status": "ok", "applied": 0, "files_modified": [], "edits_applied": 0}
 
@@ -1447,7 +1475,8 @@ def apply_refactor(
         except ValueError:
             logger.error(
                 "apply_refactor: path traversal blocked for %s (repo_root=%s)",
-                edit_path, repo_root,
+                edit_path,
+                repo_root,
             )
             return {
                 "status": "error",
@@ -1459,6 +1488,7 @@ def apply_refactor(
     # sequentially against the updated content rather than stomping each
     # other. Dry-run and write modes then share this computation.
     from collections import defaultdict
+
     edits_by_file: dict[str, list[dict]] = defaultdict(list)
     for edit in edits:
         edits_by_file[edit["file"]].append(edit)
@@ -1483,7 +1513,8 @@ def apply_refactor(
             if old_text not in content:
                 logger.warning(
                     "apply_refactor: old text %r not found in %s",
-                    old_text, file_path,
+                    old_text,
+                    file_path,
                 )
                 continue
             target_line = edit.get("line")
@@ -1505,15 +1536,18 @@ def apply_refactor(
     # --- Dry-run path: return diffs, no writes ---
     if dry_run:
         import difflib
+
         diffs: dict[str, str] = {}
         for file_str, (original, new_content, _count) in planned.items():
-            diff_lines = list(difflib.unified_diff(
-                original.splitlines(keepends=True),
-                new_content.splitlines(keepends=True),
-                fromfile=f"a/{file_str}",
-                tofile=f"b/{file_str}",
-                n=3,
-            ))
+            diff_lines = list(
+                difflib.unified_diff(
+                    original.splitlines(keepends=True),
+                    new_content.splitlines(keepends=True),
+                    fromfile=f"a/{file_str}",
+                    tofile=f"b/{file_str}",
+                    n=3,
+                )
+            )
             diffs[file_str] = "".join(diff_lines)
         total_edits = sum(count for _o, _n, count in planned.values())
         result = {
@@ -1527,7 +1561,9 @@ def apply_refactor(
         }
         logger.info(
             "apply_refactor: dry-run %s — %d edits would be applied to %d files",
-            refactor_id, total_edits, len(planned),
+            refactor_id,
+            total_edits,
+            len(planned),
         )
         # Do NOT pop the pending refactor — let the user commit via a
         # second call with dry_run=False.

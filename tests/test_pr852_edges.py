@@ -47,7 +47,11 @@ class TestPR852Edges:
 
     def _add_call(self, source_qn: str, target_qn: str, path: str) -> None:
         edge = EdgeInfo(
-            kind="CALLS", source=source_qn, target=target_qn, file_path=path, line=5,
+            kind="CALLS",
+            source=source_qn,
+            target=target_qn,
+            file_path=path,
+            line=5,
         )
         self.store.upsert_edge(edge)
         self.store.commit()
@@ -150,7 +154,10 @@ class TestPR852Edges:
     def test_empty_changed_files(self):
         self._build_flow()
         result = analyze_changes(
-            self.store, changed_files=[], changed_ranges={}, repo_root=self.root,
+            self.store,
+            changed_files=[],
+            changed_ranges={},
+            repo_root=self.root,
         )
         assert result["affected_flows"] == []
         assert result["changed_functions"] == []

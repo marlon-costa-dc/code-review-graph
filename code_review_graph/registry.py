@@ -17,6 +17,7 @@ from .constants import crg_home
 
 logger = logging.getLogger(__name__)
 
+
 def default_registry_path() -> Path:
     """Return the full path to ``registry.json``.
 

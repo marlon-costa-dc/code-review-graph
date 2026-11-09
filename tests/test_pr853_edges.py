@@ -29,39 +29,68 @@ class _FlowFixture:
         self.store = GraphStore(db_path)
 
         shared_py = (self.root / "shared.py").as_posix()
-        self.store.upsert_node(NodeInfo(
-            kind="File", name="shared.py", file_path=shared_py,
-            line_start=1, line_end=50, language="python",
-        ))
-        self.store.upsert_node(NodeInfo(
-            kind="Function", name="shared_helper", file_path=shared_py,
-            line_start=5, line_end=20, language="python",
-        ))
+        self.store.upsert_node(
+            NodeInfo(
+                kind="File",
+                name="shared.py",
+                file_path=shared_py,
+                line_start=1,
+                line_end=50,
+                language="python",
+            )
+        )
+        self.store.upsert_node(
+            NodeInfo(
+                kind="Function",
+                name="shared_helper",
+                file_path=shared_py,
+                line_start=5,
+                line_end=20,
+                language="python",
+            )
+        )
 
         for i in range(n_flows):
             entry_file = (self.root / f"entry_{i}.py").as_posix()
-            self.store.upsert_node(NodeInfo(
-                kind="File", name=f"entry_{i}.py", file_path=entry_file,
-                line_start=1, line_end=30, language="python",
-            ))
-            self.store.upsert_node(NodeInfo(
-                kind="Function", name=f"entry_point_{i}", file_path=entry_file,
-                line_start=3, line_end=15, language="python",
-            ))
-            self.store.upsert_edge(EdgeInfo(
-                kind="CALLS",
-                source=f"{entry_file}::entry_point_{i}",
-                target=f"{shared_py}::shared_helper",
-                file_path=entry_file, line=7,
-            ))
+            self.store.upsert_node(
+                NodeInfo(
+                    kind="File",
+                    name=f"entry_{i}.py",
+                    file_path=entry_file,
+                    line_start=1,
+                    line_end=30,
+                    language="python",
+                )
+            )
+            self.store.upsert_node(
+                NodeInfo(
+                    kind="Function",
+                    name=f"entry_point_{i}",
+                    file_path=entry_file,
+                    line_start=3,
+                    line_end=15,
+                    language="python",
+                )
+            )
+            self.store.upsert_edge(
+                EdgeInfo(
+                    kind="CALLS",
+                    source=f"{entry_file}::entry_point_{i}",
+                    target=f"{shared_py}::shared_helper",
+                    file_path=entry_file,
+                    line=7,
+                )
+            )
         self.store.commit()
 
         from code_review_graph.flows import store_flows, trace_flows
+
         store_flows(self.store, trace_flows(self.store))
 
     def teardown_method(self):
         self.store.close()
         import shutil
+
         shutil.rmtree(self.tmp_dir, ignore_errors=True)
 
     def affected(self, **kwargs):
@@ -113,9 +142,7 @@ class TestMaxFlowsBoundaries(_FlowFixture):
         assert len(result["affected_flows"]) == 5
 
     def test_truncated_key_present_when_nothing_matches(self):
-        result = get_affected_flows_func(
-            changed_files=["unrelated.py"], repo_root=str(self.root)
-        )
+        result = get_affected_flows_func(changed_files=["unrelated.py"], repo_root=str(self.root))
         assert result["status"] == "ok"
         assert result["total"] == 0
         assert result["truncated"] is False

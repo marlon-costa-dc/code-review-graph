@@ -61,10 +61,8 @@ class TestExemptListEdges:
         A diff touching only the constructor also overlaps the enclosing
         Class node, which is not exempt, so the class-level gap remains.
         """
-        self._add_node("Foo", kind="Class", path="foo.py",
-                       line_start=1, line_end=20)
-        self._add_node("__init__", parent="Foo", path="foo.py",
-                       line_start=2, line_end=5)
+        self._add_node("Foo", kind="Class", path="foo.py", line_start=1, line_end=20)
+        self._add_node("__init__", parent="Foo", path="foo.py", line_start=2, line_end=5)
 
         result = self._analyze("foo.py", 3, 4)
         gap_names = {g["name"] for g in result["test_gaps"]}
@@ -74,17 +72,19 @@ class TestExemptListEdges:
     def test_exemption_is_exact_match_no_substring_or_case_leakage(self):
         """Only the exact names are exempt; near-misses stay flagged."""
         for i, name in enumerate(
-            ["setUpX", "mysetUp", "__CONSTRUCT", "Setup_Method",
-             "__init__x", "teardown"]
+            ["setUpX", "mysetUp", "__CONSTRUCT", "Setup_Method", "__init__x", "teardown"]
         ):
-            self._add_node(name, path="near.py",
-                           line_start=i * 10 + 1, line_end=i * 10 + 5)
+            self._add_node(name, path="near.py", line_start=i * 10 + 1, line_end=i * 10 + 5)
 
         result = self._analyze("near.py", 1, 60)
         gap_names = {g["name"] for g in result["test_gaps"]}
         assert gap_names == {
-            "setUpX", "mysetUp", "__CONSTRUCT", "Setup_Method",
-            "__init__x", "teardown",
+            "setUpX",
+            "mysetUp",
+            "__CONSTRUCT",
+            "Setup_Method",
+            "__init__x",
+            "teardown",
         }
 
     def test_summary_count_matches_filtered_gap_list(self):
@@ -92,17 +92,13 @@ class TestExemptListEdges:
         exempt = ["setUp", "tearDown", "__construct"]
         real = ["alpha", "beta"]
         for i, name in enumerate(exempt + real):
-            self._add_node(name, path="mix.php",
-                           line_start=i * 10 + 1, line_end=i * 10 + 5)
+            self._add_node(name, path="mix.php", line_start=i * 10 + 1, line_end=i * 10 + 5)
 
         result = self._analyze("mix.php", 1, 50)
         assert len(result["test_gaps"]) == 2
         assert "  - 2 test gap(s)" in result["summary"]
         assert "Untested: " in result["summary"]
-        untested_line = next(
-            line for line in result["summary"].splitlines()
-            if "Untested:" in line
-        )
+        untested_line = next(line for line in result["summary"].splitlines() if "Untested:" in line)
         for name in exempt:
             assert name not in untested_line
         for name in real:
@@ -111,8 +107,7 @@ class TestExemptListEdges:
     def test_all_gaps_exempt_gives_zero_and_no_untested_line(self):
         """A diff of only lifecycle methods reports zero gaps cleanly."""
         for i, name in enumerate(sorted(_TEST_GAP_EXEMPT_NAMES)):
-            self._add_node(name, path="life.py",
-                           line_start=i * 10 + 1, line_end=i * 10 + 5)
+            self._add_node(name, path="life.py", line_start=i * 10 + 1, line_end=i * 10 + 5)
 
         result = self._analyze("life.py", 1, len(_TEST_GAP_EXEMPT_NAMES) * 10)
         assert result["test_gaps"] == []
@@ -134,10 +129,15 @@ class TestExemptListEdges:
         self._add_node("__construct", path="cov.php", line_start=1, line_end=5)
         # TESTED_BY: source=production, target=test (see #515).
         qn = self.store.get_nodes_by_file("cov.php")[0].qualified_name
-        self.store.upsert_edge(EdgeInfo(
-            kind="TESTED_BY", source=qn, target="tests::t_construct",
-            file_path="cov.php", line=1,
-        ))
+        self.store.upsert_edge(
+            EdgeInfo(
+                kind="TESTED_BY",
+                source=qn,
+                target="tests::t_construct",
+                file_path="cov.php",
+                line=1,
+            )
+        )
         self.store.commit()
 
         result = self._analyze("cov.php", 1, 5)
@@ -146,8 +146,7 @@ class TestExemptListEdges:
     def test_unicode_and_whitespace_names_not_exempt(self):
         """Odd names never match the frozenset accidentally."""
         for i, name in enumerate(["初始化", " setUp", "setUp "]):
-            self._add_node(name, path="uni.py",
-                           line_start=i * 10 + 1, line_end=i * 10 + 5)
+            self._add_node(name, path="uni.py", line_start=i * 10 + 1, line_end=i * 10 + 5)
 
         result = self._analyze("uni.py", 1, 30)
         assert len(result["test_gaps"]) == 3

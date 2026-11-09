@@ -35,10 +35,10 @@ def test_webflux_routes_link_endpoints_to_actual_typed_handlers(tmp_path: Path) 
     endpoints = [node for node in nodes if node.kind == "Endpoint"]
     handles = [edge for edge in edges if edge.kind == "HANDLES"]
 
-    assert {
-        (node.extra["http_method"], node.extra["route"])
-        for node in endpoints
-    } == {("GET", "/orders"), ("POST", "/orders")}
+    assert {(node.extra["http_method"], node.extra["route"]) for node in endpoints} == {
+        ("GET", "/orders"),
+        ("POST", "/orders"),
+    }
     assert {edge.source for edge in handles} == {
         f"{path.as_posix()}::OrderHandler.list",
         f"{path.as_posix()}::OrderHandler.create",
@@ -57,9 +57,7 @@ def test_webflux_endpoint_queries_use_addressable_nodes(tmp_path: Path) -> None:
         store.store_file_nodes_edges(str(path), nodes, edges, "hash")
 
     endpoint = next(
-        node
-        for node in nodes
-        if node.kind == "Endpoint" and node.extra["http_method"] == "GET"
+        node for node in nodes if node.kind == "Endpoint" and node.extra["http_method"] == "GET"
     )
     endpoint_qn = f"{path.as_posix()}::Routes.{endpoint.name}"
     handler_qn = f"{path.as_posix()}::OrderHandler.list"
@@ -76,7 +74,7 @@ def test_webflux_endpoint_queries_use_addressable_nodes(tmp_path: Path) -> None:
 
 
 def test_unrelated_or_nested_get_calls_are_not_webflux_endpoints(tmp_path: Path) -> None:
-    unrelated = b"class Client { void call(Api api) { api.GET(\"/orders\"); } }"
+    unrelated = b'class Client { void call(Api api) { api.GET("/orders"); } }'
     nested = b"""
 import static org.springframework.web.reactive.function.server.RouterFunctions.route;
 class Routes {

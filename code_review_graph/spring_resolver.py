@@ -189,12 +189,16 @@ def resolve_spring_di_calls(store: GraphStore) -> dict:
         resolved += 1
         logger.debug(
             "Spring resolved: %s → %s (was %s, receiver=%s)",
-            source_qual, new_target, method_name, receiver,
+            source_qual,
+            new_target,
+            method_name,
+            receiver,
         )
 
     if resolved:
         conn.commit()
 
-    logger.info("Spring DI resolver: resolved %d CALLS edges in %d Java files",
-                resolved, len(java_files))
+    logger.info(
+        "Spring DI resolver: resolved %d CALLS edges in %d Java files", resolved, len(java_files)
+    )
     return {"files_indexed": len(java_files), "calls_resolved": resolved}

@@ -126,64 +126,83 @@ class TestLoader:
         assert "tree-sitter-erlang" in lang.comment
 
     def test_extensions_normalised_to_lowercase(self, tmp_path):
-        write_config(tmp_path, """\
+        write_config(
+            tmp_path,
+            """\
 [languages.erlang]
 extensions = [".ERL"]
 grammar = "erlang"
 function_node_types = ["function_clause"]
-""")
+""",
+        )
         result = load(tmp_path)
         assert result["erlang"].extensions == (".erl",)
 
     def test_bad_grammar_skipped(self, tmp_path, caplog):
-        write_config(tmp_path, """\
+        write_config(
+            tmp_path,
+            """\
 [languages.mylang]
 extensions = [".myl"]
 grammar = "not_a_real_grammar"
 function_node_types = ["function_definition"]
-""")
+""",
+        )
         with caplog.at_level(logging.WARNING):
             assert load(tmp_path) == {}
         assert "not_a_real_grammar" in caplog.text
         assert "tree_sitter_language_pack" in caplog.text
 
     def test_builtin_extension_collision_skipped(self, tmp_path, caplog):
-        write_config(tmp_path, """\
+        write_config(
+            tmp_path,
+            """\
 [languages.notpython]
 extensions = [".py"]
 grammar = "erlang"
 function_node_types = ["function_clause"]
-""")
+""",
+        )
         with caplog.at_level(logging.WARNING):
             assert load(tmp_path) == {}
         assert "built-in" in caplog.text
 
     def test_extension_without_dot_skipped(self, tmp_path, caplog):
-        write_config(tmp_path, """\
+        write_config(
+            tmp_path,
+            """\
 [languages.erlang]
 extensions = ["erl"]
 grammar = "erlang"
 function_node_types = ["function_clause"]
-""")
+""",
+        )
         with caplog.at_level(logging.WARNING):
             assert load(tmp_path) == {}
         assert "must start with a dot" in caplog.text
 
     def test_builtin_language_name_shadowing_skipped(self, tmp_path, caplog):
-        write_config(tmp_path, """\
+        write_config(
+            tmp_path,
+            """\
 [languages.python]
 extensions = [".pyq"]
 grammar = "python"
 function_node_types = ["function_definition"]
-""")
+""",
+        )
         with caplog.at_level(logging.WARNING):
             assert load(tmp_path) == {}
         assert "shadows a built-in language" in caplog.text
 
     def test_duplicate_extension_across_custom_languages_skipped(
-        self, tmp_path, caplog,
+        self,
+        tmp_path,
+        caplog,
     ):
-        write_config(tmp_path, """\
+        write_config(
+            tmp_path,
+            """\
 [languages.first]
 extensions = [".dup"]
 grammar = "erlang"
@@ -193,39 +212,49 @@ function_node_types = ["function_clause"]
 extensions = [".dup"]
 grammar = "erlang"
 function_node_types = ["function_clause"]
-""")
+""",
+        )
         with caplog.at_level(logging.WARNING):
             result = load(tmp_path)
         assert set(result) == {"first"}
         assert "already claimed" in caplog.text
 
     def test_missing_grammar_key_skipped(self, tmp_path, caplog):
-        write_config(tmp_path, """\
+        write_config(
+            tmp_path,
+            """\
 [languages.nogramma]
 extensions = [".ng"]
 function_node_types = ["function_definition"]
-""")
+""",
+        )
         with caplog.at_level(logging.WARNING):
             assert load(tmp_path) == {}
         assert "grammar" in caplog.text
 
     def test_no_node_types_skipped(self, tmp_path, caplog):
-        write_config(tmp_path, """\
+        write_config(
+            tmp_path,
+            """\
 [languages.empty]
 extensions = [".emp"]
 grammar = "erlang"
-""")
+""",
+        )
         with caplog.at_level(logging.WARNING):
             assert load(tmp_path) == {}
         assert "no node types" in caplog.text
 
     def test_invalid_node_type_list_skipped(self, tmp_path, caplog):
-        write_config(tmp_path, """\
+        write_config(
+            tmp_path,
+            """\
 [languages.badtypes]
 extensions = [".bt"]
 grammar = "erlang"
 function_node_types = "function_clause"
-""")
+""",
+        )
         with caplog.at_level(logging.WARNING):
             assert load(tmp_path) == {}
         assert "list of non-empty strings" in caplog.text
@@ -338,13 +367,16 @@ class TestNameFieldLoader:
     """Loader validation for the optional name_field key (issue #691)."""
 
     def test_name_field_string_normalised_to_tuple(self, tmp_path):
-        write_config(tmp_path, (
-            "[languages.bibtex]\n"
-            'extensions = [".bib"]\n'
-            'grammar = "bibtex"\n'
-            'class_node_types = ["entry"]\n'
-            'name_field = "key"\n'
-        ))
+        write_config(
+            tmp_path,
+            (
+                "[languages.bibtex]\n"
+                'extensions = [".bib"]\n'
+                'grammar = "bibtex"\n'
+                'class_node_types = ["entry"]\n'
+                'name_field = "key"\n'
+            ),
+        )
         result = load(tmp_path)
         assert result["bibtex"].name_field == ("key",)
 
@@ -358,44 +390,53 @@ class TestNameFieldLoader:
         assert load(tmp_path)["erlang"].name_field == ()
 
     def test_invalid_name_field_type_skips_entry(self, tmp_path, caplog):
-        write_config(tmp_path, (
-            "[languages.bibtex]\n"
-            'extensions = [".bib"]\n'
-            'grammar = "bibtex"\n'
-            'class_node_types = ["entry"]\n'
-            "name_field = 5\n"
-        ))
+        write_config(
+            tmp_path,
+            (
+                "[languages.bibtex]\n"
+                'extensions = [".bib"]\n'
+                'grammar = "bibtex"\n'
+                'class_node_types = ["entry"]\n'
+                "name_field = 5\n"
+            ),
+        )
         with caplog.at_level(logging.WARNING):
             result = load(tmp_path)
         assert "bibtex" not in result
         assert "name_field" in caplog.text
 
     def test_empty_name_field_element_skips_entry(self, tmp_path, caplog):
-        write_config(tmp_path, (
-            "[languages.bibtex]\n"
-            'extensions = [".bib"]\n'
-            'grammar = "bibtex"\n'
-            'class_node_types = ["entry"]\n'
-            'name_field = ["key", ""]\n'
-        ))
+        write_config(
+            tmp_path,
+            (
+                "[languages.bibtex]\n"
+                'extensions = [".bib"]\n'
+                'grammar = "bibtex"\n'
+                'class_node_types = ["entry"]\n'
+                'name_field = ["key", ""]\n'
+            ),
+        )
         with caplog.at_level(logging.WARNING):
             result = load(tmp_path)
         assert "bibtex" not in result
 
     def test_one_bad_name_field_does_not_break_others(self, tmp_path, caplog):
-        write_config(tmp_path, (
-            "[languages.bibtex]\n"
-            'extensions = [".bib"]\n'
-            'grammar = "bibtex"\n'
-            'class_node_types = ["entry"]\n'
-            "name_field = 5\n"
-            "\n"
-            "[languages.markdown]\n"
-            'extensions = [".md"]\n'
-            'grammar = "markdown"\n'
-            'class_node_types = ["section"]\n'
-            'name_field = ["inline"]\n'
-        ))
+        write_config(
+            tmp_path,
+            (
+                "[languages.bibtex]\n"
+                'extensions = [".bib"]\n'
+                'grammar = "bibtex"\n'
+                'class_node_types = ["entry"]\n'
+                "name_field = 5\n"
+                "\n"
+                "[languages.markdown]\n"
+                'extensions = [".md"]\n'
+                'grammar = "markdown"\n'
+                'class_node_types = ["section"]\n'
+                'name_field = ["inline"]\n'
+            ),
+        )
         with caplog.at_level(logging.WARNING):
             result = load(tmp_path)
         assert "bibtex" not in result
@@ -447,27 +488,34 @@ class TestNameFieldResolution:
     def test_without_name_field_definitions_are_dropped(self, tmp_path):
         # Same BibTeX source but no name_field → entry has no resolvable name
         # and is dropped, proving the feature is the reason it now appears.
-        write_config(tmp_path, (
-            "[languages.bibtex]\n"
-            'extensions = [".bib"]\n'
-            'grammar = "bibtex"\n'
-            'class_node_types = ["entry"]\n'
-        ))
+        write_config(
+            tmp_path,
+            (
+                "[languages.bibtex]\n"
+                'extensions = [".bib"]\n'
+                'grammar = "bibtex"\n'
+                'class_node_types = ["entry"]\n'
+            ),
+        )
         src = tmp_path / "refs.bib"
         src.write_text(BIBTEX_SOURCE, encoding="utf-8")
         nodes, _ = CodeParser(tmp_path).parse_file(src)
         assert self._named(nodes, "Class") == set()
 
     def test_configured_name_field_precedes_unrelated_direct_identifier(
-        self, tmp_path,
+        self,
+        tmp_path,
     ):
-        write_config(tmp_path, (
-            "[languages.java_custom]\n"
-            'extensions = [".jcustom"]\n'
-            'grammar = "java"\n'
-            'function_node_types = ["method_declaration"]\n'
-            'name_field = ["name"]\n'
-        ))
+        write_config(
+            tmp_path,
+            (
+                "[languages.java_custom]\n"
+                'extensions = [".jcustom"]\n'
+                'grammar = "java"\n'
+                'function_node_types = ["method_declaration"]\n'
+                'name_field = ["name"]\n'
+            ),
+        )
         src = tmp_path / "sample.jcustom"
         src.write_text(
             "class Example { Result build() { return null; } }\n",

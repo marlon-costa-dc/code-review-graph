@@ -56,10 +56,7 @@ def test_same_line_trailing_comment(tmp_path: Path) -> None:
 def test_comment_that_looks_like_an_import_is_not_recorded(tmp_path: Path) -> None:
     source = _write(
         tmp_path,
-        "package app\n\n"
-        "import real.Thing\n\n"
-        "/** import fake.Ghost */\n"
-        "class Main\n",
+        "package app\n\nimport real.Thing\n\n/** import fake.Ghost */\nclass Main\n",
     )
     targets = _import_targets(tmp_path, source)
     assert "real.Thing" in targets
@@ -70,10 +67,7 @@ def test_comment_containing_as_keyword_does_not_alias(tmp_path: Path) -> None:
     # " as " inside the folded comment must not be mistaken for an alias.
     source = _write(
         tmp_path,
-        "package app\n\n"
-        "import real.Thing\n\n"
-        "/** used as helper as needed */\n"
-        "class Main\n",
+        "package app\n\nimport real.Thing\n\n/** used as helper as needed */\nclass Main\n",
     )
     targets = _import_targets(tmp_path, source)
     assert "real.Thing" in targets
@@ -83,10 +77,7 @@ def test_comment_containing_as_keyword_does_not_alias(tmp_path: Path) -> None:
 def test_kdoc_adjacent_without_blank_line(tmp_path: Path) -> None:
     source = _write(
         tmp_path,
-        "package app\n\n"
-        "import real.Thing\n"
-        "/** doc right below the import */\n"
-        "class Main\n",
+        "package app\n\nimport real.Thing\n/** doc right below the import */\nclass Main\n",
     )
     targets = _import_targets(tmp_path, source)
     assert "real.Thing" in targets
@@ -96,9 +87,7 @@ def test_kdoc_adjacent_without_blank_line(tmp_path: Path) -> None:
 def test_aliased_import_with_same_line_comment(tmp_path: Path) -> None:
     source = _write(
         tmp_path,
-        "package app\n\n"
-        "import real.Thing as Alias // why we alias\n\n"
-        "class Main\n",
+        "package app\n\nimport real.Thing as Alias // why we alias\n\nclass Main\n",
     )
     targets = _import_targets(tmp_path, source)
     assert "real.Thing" in targets
@@ -116,10 +105,7 @@ def test_semicolon_terminated_import(tmp_path: Path) -> None:
 def test_unicode_identifier_import(tmp_path: Path) -> None:
     source = _write(
         tmp_path,
-        "package app\n\n"
-        "import pkg.日本語クラス\n\n"
-        "/** doc */\n"
-        "class Main\n",
+        "package app\n\nimport pkg.日本語クラス\n\n/** doc */\nclass Main\n",
     )
     targets = _import_targets(tmp_path, source)
     assert "pkg.日本語クラス" in targets
@@ -127,12 +113,7 @@ def test_unicode_identifier_import(tmp_path: Path) -> None:
 
 def test_crlf_line_endings(tmp_path: Path) -> None:
     source = tmp_path / "Main.kt"
-    source.write_bytes(
-        b"package app\r\n\r\n"
-        b"import real.Thing\r\n\r\n"
-        b"/** doc */\r\n"
-        b"class Main\r\n"
-    )
+    source.write_bytes(b"package app\r\n\r\nimport real.Thing\r\n\r\n/** doc */\r\nclass Main\r\n")
     targets = _import_targets(tmp_path, source)
     assert "real.Thing" in targets
     assert not any("/**" in t for t in targets)
@@ -141,10 +122,7 @@ def test_crlf_line_endings(tmp_path: Path) -> None:
 def test_deep_wildcard_with_trailing_line_comment(tmp_path: Path) -> None:
     source = _write(
         tmp_path,
-        "package app\n\n"
-        "import a.b.c.d.e.*\n\n"
-        "// trailing note\n"
-        "class Main\n",
+        "package app\n\nimport a.b.c.d.e.*\n\n// trailing note\nclass Main\n",
     )
     targets = _import_targets(tmp_path, source)
     assert "a.b.c.d.e.*" in targets
@@ -193,10 +171,7 @@ def test_trailing_comment_import_resolves_to_local_file(tmp_path: Path) -> None:
     dep.write_text("package dep\n\nclass Helper\n", encoding="utf-8")
     source = _write(
         tmp_path,
-        "package app\n\n"
-        "import dep.Helper\n\n"
-        "/** doc after last import */\n"
-        "class Main\n",
+        "package app\n\nimport dep.Helper\n\n/** doc after last import */\nclass Main\n",
     )
     targets = _import_targets(tmp_path, source)
     assert str(dep.resolve()) in {str(Path(t)) for t in targets}

@@ -157,28 +157,28 @@ def test_qt_structural_macros_do_not_hide_classes_or_become_functions(
     function_names = {node.name for node in nodes if node.kind == "Function"}
 
     assert {"MyWidget", "MyWidgetClass"} <= class_names
-    assert function_names.isdisjoint({
-        "QT_BEGIN_NAMESPACE",
-        "QT_END_NAMESPACE",
-        "Q_OBJECT",
-        "Q_SLOTS",
-        "Q_SIGNALS",
-    })
+    assert function_names.isdisjoint(
+        {
+            "QT_BEGIN_NAMESPACE",
+            "QT_END_NAMESPACE",
+            "Q_OBJECT",
+            "Q_SLOTS",
+            "Q_SIGNALS",
+        }
+    )
 
 
 def test_qt_macro_shielding_preserves_class_source_span(tmp_path: Path) -> None:
     _, nodes, _ = _parse(tmp_path, "MyWidget.hpp", QT_HEADER)
 
-    widget = next(
-        node for node in nodes if node.kind == "Class" and node.name == "MyWidget"
-    )
+    widget = next(node for node in nodes if node.kind == "Class" and node.name == "MyWidget")
     assert (widget.line_start, widget.line_end) == (7, 23)
 
 
 def test_qt_macro_shielding_leaves_literals_comments_and_directives_unchanged(
     tmp_path: Path,
 ) -> None:
-    source = b'''#define Q_OBJECT custom_object
+    source = b"""#define Q_OBJECT custom_object
 #include "Q_OBJECT"
 constexpr auto marker = R"tag(Q_SIGNALS \" Q_EMIT)tag";
 // Q_SLOTS
@@ -190,7 +190,7 @@ class Widget {
  Q_SIGNALS:
   void ready();
 };
-'''
+"""
 
     masked = CodeParser._mask_cpp_qt_macros(source)
 
@@ -344,9 +344,7 @@ def test_four_file_cpp_qt_fixture_survives_full_build(tmp_path: Path) -> None:
 
         qt_header_nodes = store.get_nodes_by_file(str(tmp_path / "MyWidget.h"))
         widget = next(
-            node
-            for node in qt_header_nodes
-            if node.kind == "Class" and node.name == "MyWidget"
+            node for node in qt_header_nodes if node.kind == "Class" and node.name == "MyWidget"
         )
         assert (widget.line_start, widget.line_end) == (7, 26)
         assert all(

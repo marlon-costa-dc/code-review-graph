@@ -7,7 +7,6 @@ and updates the graph accordingly. Also supports CLI invocation for hooks.
 from __future__ import annotations
 
 import concurrent.futures
-import errno
 import fnmatch
 import hashlib
 import json
@@ -23,7 +22,12 @@ import threading
 import time
 import uuid
 from pathlib import Path, PurePosixPath
-from typing import Any, Callable, NamedTuple, Optional
+from typing import Any, Callable, NamedTuple, Optional, Protocol, runtime_checkable
+
+from watchdog.events import FileSystemEventHandler
+from watchdog.observers.api import BaseObserver, EventEmitter, ObservedWatch
+
+from code_review_graph.daemon import watch_health_path
 
 from .graph import GraphStore
 from .parser import CodeParser, normalize_file_path
@@ -1276,87 +1280,14 @@ def _assert_graph_matches_root(repo_root: Path, store: GraphStore) -> None:
     )
 
 
-_MAX_DEPENDENT_HOPS = int(os.environ.get("CRG_DEPENDENT_HOPS", "2"))
-_MAX_DEPENDENT_FILES = 500
-
-
-def _single_hop_dependents(store: GraphStore, file_path: str) -> set[str]:
-    """Find files that directly depend on *file_path* (single hop)."""
-    dependents: set[str] = set()
-    edges = store.get_edges_by_target(file_path)
-    for e in edges:
-        if e.kind == "IMPORTS_FROM":
-            dependents.add(e.file_path)
-
-    nodes = store.get_nodes_by_file(file_path)
-    for node in nodes:
-        for e in store.get_edges_by_target(node.qualified_name):
-            if e.kind in ("CALLS", "IMPORTS_FROM", "INHERITS", "IMPLEMENTS"):
-                dependents.add(e.file_path)
-
-    dependents.discard(file_path)
-    return dependents
-
-
-class DependentList(list):
-    """A ``list[str]`` with a ``.truncated`` flag.
-
-    When :func:`find_dependents` hits ``_MAX_DEPENDENT_FILES`` it truncates
-    the result and sets ``truncated = True`` so callers can distinguish a
-    complete expansion from a capped one.  See issue #261.
-
-    This is a transparent ``list`` subclass — existing callers that iterate,
-    ``len()``, or slice continue to work unchanged; only callers that
-    specifically check ``.truncated`` benefit from the signal.
-    """
-
-    truncated: bool
-
-    def __init__(self, items: list, *, truncated: bool = False) -> None:
-        super().__init__(items)
-        self.truncated = truncated
-
-
-def find_dependents(
-    store: GraphStore,
-    file_path: str,
-    max_hops: int = _MAX_DEPENDENT_HOPS,
-) -> DependentList:
-    """Find files that import from or depend on the given file.
-
-    Performs up to *max_hops* iterations of expansion (default 2).
-    Stops early if the total exceeds 500 files.
-
-    Returns a :class:`DependentList` — a regular ``list[str]`` that also
-    carries a ``.truncated`` flag.  When ``truncated is True`` the
-    returned list is capped at ``_MAX_DEPENDENT_FILES`` and the full
-    set of dependents was not explored.  See issue #261.
-    """
-    all_dependents: set[str] = set()
-    visited: set[str] = {file_path}
-    frontier: set[str] = {file_path}
-    for _hop in range(max_hops):
-        next_frontier: set[str] = set()
-        for fp in frontier:
-            deps = _single_hop_dependents(store, fp)
-            new_deps = deps - visited
-            all_dependents.update(new_deps)
-            next_frontier.update(new_deps)
-        visited.update(next_frontier)
-        frontier = next_frontier
-        if not frontier:
-            break
-        if len(all_dependents) > _MAX_DEPENDENT_FILES:
-            logger.warning(
-                "Dependent expansion capped at %d files for %s",
-                len(all_dependents),
-                file_path,
-            )
-            return DependentList(
-                list(all_dependents)[:_MAX_DEPENDENT_FILES],
-                truncated=True,
-            )
-    return DependentList(list(all_dependents))
+def _repository_relative_path(repo_root: Path, path: Path) -> str:
+    """Require lexical and physical repository ownership before indexing."""
+    try:
+        relative = path.relative_to(repo_root)
+        path.resolve().relative_to(repo_root)
+    except ValueError as exc:
+        raise RuntimeError(f"index path escapes repository root: {path}") from exc
+    return str(relative)
 
 
 def _parse_single_file(
@@ -1582,32 +1513,60 @@ def incremental_update(
     if changed_files is None:
         changed_files = get_changed_files(repo_root, base)
     stale_files = _reconcile_stale_files(repo_root, store, remove=False) if reconcile_stale else []
+    for stale_path in stale_files:
+        _repository_relative_path(repo_root, Path(stale_path))
 
-    if not changed_files and not stale_files:
+    # Filesystem notifications do not prove changed content. Eliminate no-op
+    # seeds before expanding their dependency closure; read failures stay fatal.
+    changed_content: list[str] = []
+    for rel_path in changed_files:
+        changed_path = repo_root / rel_path
+        _repository_relative_path(repo_root, changed_path)
+        if _should_ignore(rel_path, ignore_patterns):
+            continue
+        if changed_path.is_file():
+            existing_nodes = store.get_nodes_by_file(str(changed_path))
+            if existing_nodes:
+                try:
+                    digest = hashlib.sha256(changed_path.read_bytes()).hexdigest()
+                except FileNotFoundError:
+                    # A deletion racing its notification is still a changed seed.
+                    changed_content.append(rel_path)
+                    continue
+                if existing_nodes[0].file_hash == digest:
+                    continue
+        changed_content.append(rel_path)
+
+    if not changed_content and not stale_files:
         return {
             "files_updated": 0,
             "total_nodes": 0,
             "total_edges": 0,
-            "changed_files": [],
+            "changed_files": list(changed_files),
             "dependent_files": [],
             "stale_files_removed": 0,
             "errors": [],
         }
 
-    # Find dependent files (files that import from changed files)
+    # Expand all seeds together before any graph publication. Deletions still
+    # have their old incoming edges here and must invalidate their dependents.
     dependent_files: set[str] = set()
-    for rel_path in changed_files:
-        full_path = normalize_file_path(repo_root / rel_path)
-        deps = find_dependents(store, full_path)
-        for d in deps:
-            # Convert back to relative path if needed
-            try:
-                dependent_files.add(str(Path(d).relative_to(repo_root)))
-            except ValueError:
-                dependent_files.add(d)
+    for path in store.get_dependent_files(
+        [normalize_file_path(repo_root / path) for path in changed_content] + stale_files
+    ):
+        dependent_files.add(_repository_relative_path(repo_root, Path(path)))
+    deleted_paths = set(stale_files) | {
+        normalize_file_path(repo_root / path)
+        for path in changed_content
+        if not (repo_root / path).is_file()
+    }
+    # Permanent deletion removes incoming edges owned by direct dependents.
+    # Reconstruct those files even with identical bytes; other unchanged files
+    # retain their evidence and use the existing repository-wide resolvers.
+    forced_reparse = set(store.get_dependent_files(sorted(deleted_paths), max_hops=1))
 
     # Combine changed + dependent
-    all_files = set(changed_files) | dependent_files
+    all_files = set(changed_content) | dependent_files
 
     total_nodes = 0
     total_edges = 0
@@ -1616,7 +1575,7 @@ def incremental_update(
 
     # Separate deleted/unparseable files from files that need re-parsing
     to_parse: list[str] = []
-    for rel_path in all_files:
+    for rel_path in sorted(all_files):
         if _should_ignore(rel_path, ignore_patterns):
             continue
         abs_path = repo_root / rel_path
@@ -1631,14 +1590,18 @@ def incremental_update(
             raw = abs_path.read_bytes()
             fhash = hashlib.sha256(raw).hexdigest()
             existing_nodes = store.get_nodes_by_file(str(abs_path))
-            if existing_nodes and existing_nodes[0].file_hash == fhash:
+            if (
+                normalize_file_path(abs_path) not in forced_reparse
+                and existing_nodes
+                and existing_nodes[0].file_hash == fhash
+            ):
                 continue
         except (OSError, PermissionError):
             pass
         to_parse.append(rel_path)
 
-    # Persist deletions before store_file_nodes_edges() opens its own
-    # explicit transaction — avoids nested transaction errors.
+    # Parse the complete candidate before publishing replacements and deletions
+    # together in the store owner's atomic transaction.
     use_serial = os.environ.get("CRG_SERIAL_PARSE", "") == "1"
     parsed_files = 0
     parsed_batch: list[tuple[str, list, list, str]] = []
@@ -1738,7 +1701,7 @@ def incremental_update(
         "total_nodes": total_nodes,
         "total_edges": total_edges,
         "changed_files": list(changed_files),
-        "dependent_files": list(dependent_files),
+        "dependent_files": sorted(dependent_files),
         "stale_files_removed": len(stale_files),
         "errors": errors,
         "python_resolution": python_stats,
@@ -1912,38 +1875,27 @@ def _plan_watch_paths(
     return [(repo_root, True)]
 
 
-def _run_time_boxed(operation: Callable[[], Any], description: str, timeout: float = 10.0) -> None:
-    """Run *operation* on a throwaway thread so a wedged watcher cannot hang exit.
-
-    Watchdog's teardown joins its emitter threads, and the whole point of this
-    module's health check is that one of those threads may be stuck.  Every
-    watchdog thread is a daemon thread, so abandoning the join is safe.
-    """
+def _run_time_boxed(
+    operation: Callable[[], Any],
+    description: str,
+    timeout: float = _WATCH_STOP_TIMEOUT,
+) -> None:
+    """Propagate completion, operation failure or timeout of native teardown."""
+    failures: list[BaseException] = []
 
     def _call() -> None:
         try:
             operation()
-        except Exception as exc:  # noqa: BLE001 - teardown must not mask the real error
-            logger.debug("%s failed: %s", description, exc)
+        except BaseException as exc:
+            failures.append(exc)
 
     thread = threading.Thread(target=_call, name="crg-watch-teardown", daemon=True)
     thread.start()
     thread.join(timeout)
     if thread.is_alive():
-        logger.warning(
-            "%s did not finish in %.0fs; leaving it to process exit", description, timeout
-        )
-
-
-def _watch_health_path(repo_root: Path) -> Path | None:
-    """Where this watcher publishes its health, or None if that is unavailable."""
-    try:
-        from .daemon import watch_health_path
-
-        return watch_health_path(repo_root)
-    except Exception as exc:  # noqa: BLE001 - health reporting is best-effort
-        logger.debug("Watcher health reporting disabled: %s", exc)
-        return None
+        raise TimeoutError(f"{description} did not finish in {timeout:g}s")
+    if failures:
+        raise failures[0]
 
 
 def _watch_identity(path: str | Path) -> tuple[int, int, float] | None:
@@ -2046,9 +1998,11 @@ class _WatchSupervisor:
             return
         try:
             handle = self._observer.schedule(self._handler, key, recursive=recursive)
-        except OSError as exc:
-            logger.warning("Could not watch %s: %s", key, exc)
-            return
+        except FileNotFoundError:
+            if not path.exists():
+                logger.debug("Watch directory vanished during scheduling: %s", key)
+                return
+            raise
         self._watches[key] = _WatchEntry(handle, _watch_identity(key))
         if recursive:
             self._shallow.discard(key)
@@ -2220,8 +2174,7 @@ class _WatchSupervisor:
         still the live watch for a directory that is still the same directory.
         Three things are deliberately not deaths:
 
-        * a thread never seen alive — an emitter caught between construction
-          and start is not a corpse;
+        * a thread never started — its native identity is still absent;
         * a thread whose watch we have already released, or whose root is gone.
           Both backends stop an emitter when its own root disappears, so a
           plain ``rm -rf lib/`` would otherwise exit the watcher, and the
@@ -2245,7 +2198,7 @@ class _WatchSupervisor:
             if thread.is_alive():
                 still_present[key] = thread
                 continue
-            if key not in self._live_threads:
+            if key not in self._live_threads and thread.ident is None:
                 continue
             if root is None:
                 dead.append(thread.name)
@@ -2321,17 +2274,14 @@ class _WatchSupervisor:
             "degraded": self._degraded,
             "phase": phase,
         }
-        try:
-            self._health_path.parent.mkdir(parents=True, exist_ok=True)
-            # Unique per writer, not per process: two supervisors in one
-            # process would otherwise race on the same temp file and hand a
-            # reader a torn document.
-            temporary = self._health_path.with_name(f"{self._health_path.name}.{self._token}.tmp")
-            temporary.write_text(json.dumps(payload), encoding="utf-8")
-            os.replace(temporary, self._health_path)
-        except OSError as exc:
-            logger.debug("Could not write watcher health to %s: %s", self._health_path, exc)
-            return
+        self._health_path.parent.mkdir(parents=True, exist_ok=True)
+        # Unique per writer, not per process: two supervisors in one
+        # process would otherwise race on the same temp file and hand a
+        # reader a torn document.
+        temporary = self._health_path.with_name(f"{self._health_path.name}.{self._token}.tmp")
+        temporary.write_text(json.dumps(payload), encoding="utf-8")
+        os.replace(temporary, self._health_path)
+
         self._last_health_write = now
         self._last_health_state = state
 
@@ -2339,10 +2289,7 @@ class _WatchSupervisor:
         """Remove the health file on a clean shutdown."""
         if self._health_path is None:
             return
-        try:
-            self._health_path.unlink(missing_ok=True)
-        except OSError:  # pragma: no cover - best-effort cleanup
-            pass
+        self._health_path.unlink(missing_ok=True)
 
 
 def _create_watch_handler(
@@ -2351,8 +2298,9 @@ def _create_watch_handler(
     on_files_updated: Optional[Callable],
 ):
     """Create the debounced watchdog handler for one repository."""
+    from queue import Empty, Queue
+
     from watchdog.events import FileSystemEvent, FileSystemEventHandler
-    from watchdog.utils.event_debouncer import EventDebouncer
 
     ignore_patterns = _load_ignore_patterns(repo_root)
     parser = CodeParser(repo_root)
@@ -2485,7 +2433,28 @@ def _create_watch_handler(
                 raise RuntimeError("watch update failed") from self.failure
 
     processor = WatchBatchProcessor()
-    debouncer = EventDebouncer(_DEBOUNCE_SECONDS, processor.process)
+    pending: Queue[FileSystemEvent | None] = Queue()
+
+    def process_batches() -> None:
+        while True:
+            event = pending.get()
+            if event is None:
+                return
+            batch = [event]
+            deadline = time.monotonic() + _DEBOUNCE_SECONDS
+            while (remaining := deadline - time.monotonic()) > 0:
+                try:
+                    event = pending.get(timeout=remaining)
+                except Empty:
+                    break
+                if event is None:
+                    break
+                batch.append(event)
+            processor.process(batch)
+            if event is None or processor.failure is not None:
+                return
+
+    worker = threading.Thread(target=process_batches, name="crg-watch-batches", daemon=True)
 
     class GraphUpdateHandler(FileSystemEventHandler):
         def dispatch(self, event: FileSystemEvent) -> None:
@@ -2493,21 +2462,18 @@ def _create_watch_handler(
                 return
             if event.is_directory and event.event_type == "modified":
                 return
-            debouncer.handle_event(event)
+            pending.put(event)
 
         def start(self) -> None:
-            debouncer.start()
+            worker.start()
 
         def stop(self) -> None:
-            debouncer.stop()
+            pending.put(None)
             # A startup failure can reach this before the debouncer thread
             # ever started (a watch deleted while startup is still
             # scheduling); Thread.join() raises on an unstarted thread.
-            if debouncer.is_alive():
-                debouncer.join()
-
-        def process(self, events: list[FileSystemEvent]) -> None:
-            processor.process(events)
+            if worker.is_alive():
+                worker.join()
 
         def raise_if_failed(self) -> None:
             processor.raise_if_failed()
@@ -2523,13 +2489,7 @@ def _create_watch_handler(
     return GraphUpdateHandler()
 
 
-def _sync_watch_tree(
-    supervisor: _WatchSupervisor,
-    handler: Any,
-    repo_root: Path,
-    store: GraphStore,
-    on_files_updated: Optional[Callable] = None,
-) -> None:
+def _sync_watch_tree(supervisor: _WatchSupervisor, handler: Any) -> None:
     """Reconcile watches, then bring the graph in line with what changed.
 
     A directory adopted this tick may already hold files, and one that
@@ -2545,29 +2505,6 @@ def _sync_watch_tree(
         handler.dispatch(DirCreatedEvent(path))
     for path in vanished:
         handler.dispatch(DirDeletedEvent(path))
-    # Poll-based indexing of an adopted directory's current contents: the
-    # synthesized DirCreatedEvent only covers what existed at adoption time,
-    # and filesystem event delivery is not guaranteed on every platform (the
-    # deterministic watch-robustness CI failure).  incremental_update filters
-    # ignore patterns and unparseable files internally.
-    poll_targets: list[str] = []
-    for directory in adopted:
-        directory_path = Path(directory)
-        if directory_path.is_dir():
-            poll_targets.extend(
-                str(path) for path in directory_path.rglob("*") if path.is_file()
-            )
-    if poll_targets:
-        republished = incremental_update(
-            repo_root,
-            store,
-            changed_files=poll_targets,
-            reconcile_stale=False,
-        )
-        _raise_watch_update_errors(republished, "adopted-directory poll indexing")
-        if republished.get("files_updated", 0) > 0 and on_files_updated is not None:
-            postprocess_result = on_files_updated(store)
-            _raise_watch_postprocess_warnings(postprocess_result)
 
 
 def _install_sigterm_interrupt() -> Callable[[], None]:
@@ -2595,11 +2532,34 @@ def _install_sigterm_interrupt() -> Callable[[], None]:
     return _restore
 
 
+@runtime_checkable
+class ObserverProtocol(Protocol):
+    """Native observer operations owned by one watcher lifecycle."""
+
+    @property
+    def ident(self) -> int | None: ...
+
+    @property
+    def emitters(self) -> set[EventEmitter]: ...
+
+    def schedule(
+        self, event_handler: FileSystemEventHandler, path: str, *, recursive: bool = False
+    ) -> ObservedWatch: ...
+
+    def unschedule(self, watch: ObservedWatch) -> None: ...
+    def start(self) -> None: ...
+    def stop(self) -> None: ...
+    def join(self, timeout: float | None = None) -> None: ...
+    def is_alive(self) -> bool: ...
+
+
 def watch(
     repo_root: Path,
     store: GraphStore,
     on_files_updated: Optional[Callable] = None,
     stop_event: threading.Event | None = None,
+    *,
+    observer: ObserverProtocol | None = None,
 ) -> None:
     """Watch for file changes and auto-update the graph.
 
@@ -2617,6 +2577,8 @@ def watch(
             batch of file updates completes.  Receives the store as its
             only argument.  Used by the CLI to run post-processing
             (FTS, flows, communities) after watch updates.
+        observer: Unused native observer supplied by the host; this watcher
+            owns its scheduling and complete lifecycle.
         stop_event: Optional event that ends the loop cleanly, for callers
             that run ``watch`` on a thread they need to shut down.
 
@@ -2631,6 +2593,10 @@ def watch(
     # comparison below — stored file paths, watch keys, event paths — assumes
     # they are all spelled the same way.
     repo_root = _canonical_repo_root(repo_root)
+    if observer is not None and (
+        not isinstance(observer, BaseObserver) or observer.ident is not None or observer.emitters
+    ):
+        raise ValueError("watch requires an unused native observer")
     # Before anything is built or watched: a store from another root is a
     # misconfiguration, and the startup build below would rewrite every row
     # onto it.  Refusing here also keeps the Observer unconstructed, so the
@@ -2640,36 +2606,27 @@ def watch(
         None,
         repo_root,
         _load_ignore_patterns(repo_root),
-        health_path=_watch_health_path(repo_root),
+        health_path=watch_health_path(repo_root),
     )
     # The first build of a large repository takes minutes.  Without a
     # heartbeat up front, ``crg-daemon status`` calls that healthy watcher
     # stalled for the whole build.
     supervisor.report_health(observer_alive=True, phase="initial-build", force=True)
-    observer = Observer()
+    observer = Observer() if observer is None else observer
     supervisor.attach(observer)
     handler = _create_watch_handler(repo_root, store, on_files_updated)
-    supervisor.schedule_initial(handler)
-    handler.start()
     restore_sigterm = _install_sigterm_interrupt()
+
+    def stop_observer() -> None:
+        _run_time_boxed(observer.stop, "observer stop", timeout=_WATCH_STOP_TIMEOUT)
+        if observer.is_alive():
+            observer.join(timeout=_WATCH_STOP_TIMEOUT)
+        if observer.is_alive():
+            raise TimeoutError(f"watch observer did not stop in {_WATCH_STOP_TIMEOUT:g}s")
+
     try:
-        while True:
-            try:
-                observer.start()
-                break
-            except OSError as exc:
-                if exc.errno != errno.ENOENT:
-                    raise
-                # A planned watch vanished between the schedule and the
-                # inotify arm — a deletion racing startup, which the runner
-                # traceback proved.  watchdog removed the dead emitter and
-                # left the surviving emitters and the consumer thread
-                # unstarted; start the survivors.  The first sync tick
-                # releases the stale entry and re-adopts the directory if it
-                # returns, and the build below converges the store either
-                # way.  Each ENOENT retires one emitter, so the loop is
-                # bounded by the plan size.
-                logger.warning("Watch root vanished while arming the observer: %s", exc)
+        observer.start()
+        supervisor.schedule_initial(handler)
         # Capture the observer threads before publishing readiness.  Otherwise a
         # watched directory can disappear after the health file is visible but
         # before the first tick records its emitter as live; that dead emitter is
@@ -2699,16 +2656,18 @@ def watch(
                 postprocess_result = on_files_updated(store)
                 _raise_watch_postprocess_warnings(postprocess_result)
 
+        handler.start()
         supervisor.report_health(observer_alive=True, force=True)
-    except BaseException:
-        # Startup failed after (or while) the observer went live: stop its
-        # threads and the debouncer before propagating, or they outlive this
-        # watcher.  If start() itself raised, the thread never began — join
-        # would raise on it and mask the real failure.
-        _run_time_boxed(observer.stop, "observer stop")
-        if observer.is_alive():
-            observer.join(timeout=_WATCH_STOP_TIMEOUT)
-        handler.stop()
+    except BaseException as original_failure:
+        try:
+            stop_observer()
+            handler.stop()
+        except BaseException:
+            logger.exception("Watch startup cleanup failed")
+            raise original_failure
+        finally:
+            supervisor.clear_health()
+            restore_sigterm()
         raise
 
     logger.info("Watching %s for changes... (Ctrl+C to stop)", repo_root)
@@ -2720,7 +2679,7 @@ def watch(
             else:
                 _sleep_watch_tick(_WATCH_TICK_SECONDS)
             handler.raise_if_failed()
-            _sync_watch_tree(supervisor, handler, repo_root, store, on_files_updated)
+            _sync_watch_tree(supervisor, handler)
             dead, repaired = supervisor.check_liveness()
             for path in repaired:
                 # A rescheduled watch missed whatever happened while it was
@@ -2756,12 +2715,20 @@ def watch(
         supervisor.clear_health()
     except KeyboardInterrupt:
         supervisor.clear_health()
-        _run_time_boxed(observer.stop, "observer stop")
     finally:
+        active_failure = sys.exc_info()[1]
         restore_sigterm()
-        _run_time_boxed(observer.stop, "observer stop")
-        observer.join(timeout=_WATCH_STOP_TIMEOUT)
-        handler.stop()
+        try:
+            stop_observer()
+            handler.stop()
+            if active_failure is None:
+                handler.raise_if_failed()
+        except BaseException:
+            if active_failure is not None:
+                logger.exception("Watch cleanup failed while propagating the original failure")
+                raise active_failure
+            raise
+
     logger.info("Watch stopped.")
 
 

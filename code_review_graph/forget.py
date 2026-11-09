@@ -49,7 +49,7 @@ def _referrer_files(
     referrers: set[str] = set()
     names = list(deleted_qualified_names)
     for start in range(0, len(names), _SQL_PARAM_CHUNK):
-        window = names[start:start + _SQL_PARAM_CHUNK]
+        window = names[start : start + _SQL_PARAM_CHUNK]
         placeholders = ",".join("?" for _ in window)
         rows = conn.execute(
             f"SELECT DISTINCT file_path FROM edges "
@@ -97,11 +97,16 @@ def forget_files(
     Returns:
         A summary dict with the forgotten files, the referrer files that were
         re-parsed, and the number of orphaned embedding vectors purged.
+
+    Raises:
+        RuntimeError: If the connection holds a caller-owned transaction.
     """
     from .parser import CodeParser
     from .postprocessing import run_post_processing
     from .python_resolver import resolve_python_imports
 
+    if store._conn.in_transaction:
+        raise RuntimeError("forget requires a connection without an open transaction")
     forgotten = set(targets)
 
     # 1. Snapshot the qualified names about to disappear so we can find the
@@ -114,11 +119,7 @@ def forget_files(
     referrers = _referrer_files(store, deleted_qualified_names, forgotten)
 
     # 2. Drop the forgotten files' own nodes and edges.
-    for file_path in targets:
-        store.remove_file_data(file_path)
-    # Persist deletions before store_file_nodes_edges() opens its own
-    # explicit transaction (BEGIN IMMEDIATE) during the re-parse below.
-    store.commit()
+    store.apply_file_changes_atomic([(file_path, [], [], "") for file_path in targets])
 
     # 3. Re-parse the surviving referrers so their cross-file edges are
     #    re-derived exactly as a build would: edges that had resolved into a

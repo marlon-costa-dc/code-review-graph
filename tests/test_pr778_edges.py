@@ -46,9 +46,7 @@ def _uninstall(config: Path, hermes_home: Path) -> uninstall.UninstallReport:
 class TestInstallEdges:
     def test_header_with_trailing_comment_is_still_a_block(self, config: Path) -> None:
         config.write_text(
-            "mcp_servers:  # user comment on the header\n"
-            "  other:\n"
-            "    command: npx\n",
+            "mcp_servers:  # user comment on the header\n  other:\n    command: npx\n",
             encoding="utf-8",
         )
         assert _install(config) is True
@@ -67,10 +65,7 @@ class TestInstallEdges:
 
     def test_four_space_child_indent(self, config: Path) -> None:
         config.write_text(
-            "mcp_servers:\n"
-            "    other:\n"
-            "        command: npx\n"
-            "after: 1\n",
+            "mcp_servers:\n    other:\n        command: npx\nafter: 1\n",
             encoding="utf-8",
         )
         assert _install(config) is True
@@ -88,12 +83,7 @@ class TestInstallEdges:
     def test_duplicate_top_level_sections_refused_unchanged(self, config: Path) -> None:
         # PyYAML resolves duplicate keys last-wins; a text edit into the
         # first block would silently vanish. The validator must refuse.
-        original = (
-            "mcp_servers:\n"
-            "  first: {command: a}\n"
-            "mcp_servers:\n"
-            "  second: {command: b}\n"
-        )
+        original = "mcp_servers:\n  first: {command: a}\nmcp_servers:\n  second: {command: b}\n"
         config.write_text(original, encoding="utf-8")
         assert _install(config) is None
         assert config.read_text(encoding="utf-8") == original
@@ -114,8 +104,7 @@ class TestInstallEdges:
 
     def test_unicode_comments_and_values_survive(self, config: Path) -> None:
         config.write_text(
-            "# café ☕配置\nmodel:\n  default: 模型\nmcp_servers:\n"
-            "  other:\n    command: npx\n",
+            "# café ☕配置\nmodel:\n  default: 模型\nmcp_servers:\n  other:\n    command: npx\n",
             encoding="utf-8",
         )
         assert _install(config) is True
@@ -142,12 +131,7 @@ class TestInstallEdges:
 
     def test_section_last_line_comment_keeps_separator(self, config: Path) -> None:
         config.write_text(
-            "mcp_servers:\n"
-            "  other:\n"
-            "    command: npx\n"
-            "  # trailing note\n"
-            "\n"
-            "theme: dark\n",
+            "mcp_servers:\n  other:\n    command: npx\n  # trailing note\n\ntheme: dark\n",
             encoding="utf-8",
         )
         assert _install(config) is True
@@ -159,9 +143,7 @@ class TestInstallEdges:
 
 
 class TestUninstallEdges:
-    def test_similarly_named_sibling_survives(
-        self, config: Path, hermes_home: Path
-    ) -> None:
+    def test_similarly_named_sibling_survives(self, config: Path, hermes_home: Path) -> None:
         config.write_text(
             "mcp_servers:\n"
             "  code-review-graph-extra:\n"
@@ -189,9 +171,7 @@ class TestUninstallEdges:
         data = yaml.safe_load(config.read_text(encoding="utf-8"))
         assert set(data["mcp_servers"]) == {"other"}
 
-    def test_entry_mid_section_removes_only_entry(
-        self, config: Path, hermes_home: Path
-    ) -> None:
+    def test_entry_mid_section_removes_only_entry(self, config: Path, hermes_home: Path) -> None:
         original = (
             "mcp_servers:\n"
             "  before:\n"

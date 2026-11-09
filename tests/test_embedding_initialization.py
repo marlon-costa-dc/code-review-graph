@@ -84,7 +84,9 @@ def test_availability_import_and_model_load_do_not_overlap(monkeypatch):
     provider = embeddings.LocalEmbeddingProvider("test-model")
 
     availability_thread = _run_in_thread(
-        embeddings._check_available, results, errors,
+        embeddings._check_available,
+        results,
+        errors,
     )
     assert first_import_entered.wait(timeout=1)
     model_thread = _run_in_thread(provider._get_model, results, errors)

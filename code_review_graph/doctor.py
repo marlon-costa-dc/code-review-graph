@@ -202,9 +202,7 @@ def check_freshness(repo_root: Path) -> CheckResult:
         name="freshness",
         ok=False,
         critical=False,
-        message=(
-            f"Graph built at {stored_sha[:12]}, HEAD is now {current_sha[:12]}"
-        ),
+        message=(f"Graph built at {stored_sha[:12]}, HEAD is now {current_sha[:12]}"),
         hint="Run `code-review-graph update` to refresh the graph.",
     )
 
@@ -397,9 +395,7 @@ def check_embeddings(repo_root: Path) -> CheckResult:
         try:
             conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5)
             try:
-                row = conn.execute(
-                    "SELECT COUNT(*) FROM embeddings"
-                ).fetchone()
+                row = conn.execute("SELECT COUNT(*) FROM embeddings").fetchone()
                 count = int(row[0]) if row else 0
             finally:
                 conn.close()
@@ -418,10 +414,7 @@ def check_embeddings(repo_root: Path) -> CheckResult:
         name="embeddings",
         ok=True,  # not having embeddings is a fine, fully-supported state
         critical=False,
-        message=(
-            "No embeddings — semantic search falls back to keyword (FTS5) "
-            "matching"
-        ),
+        message=("No embeddings — semantic search falls back to keyword (FTS5) matching"),
         hint="Optional: `code-review-graph embed --provider local`.",
     )
 
@@ -465,9 +458,7 @@ def latest_token_savings(repo_root: Path) -> str | None:
 
         store = GraphStore(db_path)
         try:
-            result = analyze_changes(
-                store, changed, repo_root=str(repo_root), base="HEAD~1"
-            )
+            result = analyze_changes(store, changed, repo_root=str(repo_root), base="HEAD~1")
         finally:
             store.close()
 
@@ -517,11 +508,9 @@ def print_report(results: list[CheckResult], *, repo_root: Path) -> None:
     print()
     if critical_failures:
         names = ", ".join(r.name for r in critical_failures)
-        print(f"Result: NOT healthy — {len(critical_failures)} critical "
-              f"issue(s): {names}")
+        print(f"Result: NOT healthy — {len(critical_failures)} critical issue(s): {names}")
     elif warnings:
-        print(f"Result: healthy with {len(warnings)} warning(s) — "
-              f"see hints above")
+        print(f"Result: healthy with {len(warnings)} warning(s) — see hints above")
     else:
         print("Result: healthy — all checks passed")
 

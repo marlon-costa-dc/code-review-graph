@@ -4,6 +4,7 @@ Each `*_callback` function is passed as an argument to another call, either
 directly or as a keyword value. They are never invoked with parens, so without
 REFERENCES edge tracking they would be flagged as dead code.
 """
+
 from concurrent.futures import ThreadPoolExecutor
 
 

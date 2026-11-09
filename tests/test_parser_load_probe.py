@@ -125,8 +125,7 @@ def test_nonzero_probe_logs_the_subprocess_failure_reason(monkeypatch, caplog):
 
     assert (
         "Skipping unavailable tree-sitter parser for java: "
-        "ModuleNotFoundError: No module named 'tree_sitter_language_pack'"
-        in caplog.text
+        "ModuleNotFoundError: No module named 'tree_sitter_language_pack'" in caplog.text
     )
 
 
@@ -139,8 +138,7 @@ def test_probe_can_load_language_pack_from_user_site(tmp_path, monkeypatch):
         [
             base_executable,
             "-c",
-            "import site; print(site.ENABLE_USER_SITE); "
-            "print(site.getusersitepackages())",
+            "import site; print(site.ENABLE_USER_SITE); print(site.getusersitepackages())",
         ],
         env=env,
         capture_output=True,
@@ -155,9 +153,7 @@ def test_probe_can_load_language_pack_from_user_site(tmp_path, monkeypatch):
     package_dir = user_site_path / "tree_sitter_language_pack"
     package_dir.mkdir(parents=True)
     (package_dir / "__init__.py").write_text(
-        "def get_parser(grammar):\n"
-        "    assert grammar == 'user-site-only'\n"
-        "    return object()\n",
+        "def get_parser(grammar):\n    assert grammar == 'user-site-only'\n    return object()\n",
         encoding="utf-8",
     )
 

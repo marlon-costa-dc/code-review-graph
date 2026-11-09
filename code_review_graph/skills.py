@@ -50,23 +50,14 @@ def _copilot_vscode_detected() -> bool:
                 "Visual Studio Code - Insiders.app",
             ):
                 extension_dirs.append(
-                    applications_dir
-                    / app_name
-                    / "Contents"
-                    / "Resources"
-                    / "app"
-                    / "extensions"
+                    applications_dir / app_name / "Contents" / "Resources" / "app" / "extensions"
                 )
     elif system == "Windows":
         for env_name in ("LOCALAPPDATA", "PROGRAMFILES", "PROGRAMFILES(X86)"):
             if install_root := os.environ.get(env_name):
                 for app_name in ("Microsoft VS Code", "Microsoft VS Code Insiders"):
                     extension_dirs.append(
-                        Path(install_root)
-                        / app_name
-                        / "resources"
-                        / "app"
-                        / "extensions"
+                        Path(install_root) / app_name / "resources" / "app" / "extensions"
                     )
     elif system == "Linux":
         extension_dirs.extend(
@@ -106,16 +97,12 @@ def _copilot_vscode_detected() -> bool:
             if "copilot" not in name:
                 continue
             try:
-                manifest = json.loads(
-                    (extension_path / "package.json").read_text(encoding="utf-8")
-                )
+                manifest = json.loads((extension_path / "package.json").read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
                 continue
-            if (
-                str(manifest.get("publisher", "")).lower() == "github"
-                and str(manifest.get("name", "")).lower()
-                in {"copilot", "copilot-chat"}
-            ):
+            if str(manifest.get("publisher", "")).lower() == "github" and str(
+                manifest.get("name", "")
+            ).lower() in {"copilot", "copilot-chat"}:
                 return True
     return False
 
@@ -371,7 +358,9 @@ def _detect_serve_command() -> tuple[str, list[str]]:
 
 
 def _build_server_entry(
-    plat: dict[str, Any], key: str = "", repo_root: "Path | None" = None,
+    plat: dict[str, Any],
+    key: str = "",
+    repo_root: "Path | None" = None,
 ) -> dict[str, Any]:
     """Build the MCP server entry for a platform."""
     command, args = _detect_serve_command()
@@ -405,9 +394,7 @@ def _warn_legacy_opencode_config(repo_root: Path) -> None:
     if not legacy.exists():
         return
     try:
-        parsed = json.loads(
-            _strip_jsonc(legacy.read_text(encoding="utf-8", errors="replace"))
-        )
+        parsed = json.loads(_strip_jsonc(legacy.read_text(encoding="utf-8", errors="replace")))
     except (json.JSONDecodeError, OSError):
         return
     if not isinstance(parsed, dict):
@@ -590,8 +577,7 @@ def _merge_yaml_mcp_server(
         reparsed = yaml.safe_load(rewritten)
     except yaml.YAMLError as exc:  # pragma: no cover - defensive validation
         print(
-            f"  {config_path}: safe YAML edit failed "
-            f"({exc.__class__.__name__}) — left unchanged."
+            f"  {config_path}: safe YAML edit failed ({exc.__class__.__name__}) — left unchanged."
         )
         return None
     if not isinstance(reparsed, dict) or server_name not in (reparsed.get(server_key) or {}):
@@ -608,8 +594,7 @@ def _indent_block(text: str, indent: int) -> str:
     """Indent every non-empty line of ``text`` by ``indent`` spaces."""
     pad = " " * indent
     return "".join(
-        f"{pad}{line}" if line.strip() else line
-        for line in text.splitlines(keepends=True)
+        f"{pad}{line}" if line.strip() else line for line in text.splitlines(keepends=True)
     )
 
 
@@ -719,12 +704,10 @@ def install_platform_configs(
         claude = platforms_to_install.get("claude")
         codebuddy = platforms_to_install.get("codebuddy")
         if claude is not None and codebuddy is not None:
-            same_contract = (
-                claude["config_path"](repo_root) == codebuddy["config_path"](repo_root)
-                and all(
-                    claude[field] == codebuddy[field]
-                    for field in ("key", "format", "needs_type")
-                )
+            same_contract = claude["config_path"](repo_root) == codebuddy["config_path"](
+                repo_root
+            ) and all(
+                claude[field] == codebuddy[field] for field in ("key", "format", "needs_type")
             )
             if same_contract:
                 shared_aliases["claude"] = ("codebuddy",)
@@ -794,26 +777,28 @@ def install_platform_configs(
                 try:
                     parsed = json.loads(stripped)
                 except (json.JSONDecodeError, OSError):
-                    print(f"  {plat['name']}: {config_path} contains "
-                          f"unparseable JSON — skipping to avoid data loss. "
-                          f"Please add the MCP config manually.")
+                    print(
+                        f"  {plat['name']}: {config_path} contains "
+                        f"unparseable JSON — skipping to avoid data loss. "
+                        f"Please add the MCP config manually."
+                    )
                     continue
                 if not isinstance(parsed, dict):
                     # Valid JSON, but the top level is a list/scalar rather
                     # than an object. Writing our server object would clobber
                     # the user's data, and the ``.get()`` calls below would
                     # raise AttributeError. Refuse and skip. See #344.
-                    print(f"  {plat['name']}: {config_path} is valid JSON but "
-                          f"not a top-level object "
-                          f"({type(parsed).__name__}) — skipping to avoid "
-                          f"data loss. Please add the MCP config manually.")
+                    print(
+                        f"  {plat['name']}: {config_path} is valid JSON but "
+                        f"not a top-level object "
+                        f"({type(parsed).__name__}) — skipping to avoid "
+                        f"data loss. Please add the MCP config manually."
+                    )
                     continue
                 existing = parsed
 
         expected_container = list if plat["format"] == "array" else dict
-        if server_key in existing and not isinstance(
-            existing[server_key], expected_container
-        ):
+        if server_key in existing and not isinstance(existing[server_key], expected_container):
             expected_name = "array" if expected_container is list else "object"
             actual_name = type(existing[server_key]).__name__
             print(
@@ -840,10 +825,7 @@ def install_platform_configs(
             migrated = False
             for legacy_key in plat.get("legacy_keys", ()):
                 legacy = existing.get(legacy_key)
-                if (
-                    isinstance(legacy, dict)
-                    and "code-review-graph" in legacy
-                ):
+                if isinstance(legacy, dict) and "code-review-graph" in legacy:
                     del legacy["code-review-graph"]
                     if not legacy:
                         del existing[legacy_key]
@@ -1057,7 +1039,7 @@ def generate_hooks_config(repo_root: Path) -> dict[str, Any]:
                                 "command -v code-review-graph >/dev/null 2>&1 || exit 0; "
                                 "git rev-parse --git-dir >/dev/null 2>&1"
                                 " && code-review-graph update --skip-flows"
-                                " --repo \"$(git rev-parse --show-toplevel 2>/dev/null)\""
+                                ' --repo "$(git rev-parse --show-toplevel 2>/dev/null)"'
                                 " || true"
                             ),
                             "timeout": 30,
@@ -1076,7 +1058,7 @@ def generate_hooks_config(repo_root: Path) -> dict[str, Any]:
                                 "command -v code-review-graph >/dev/null 2>&1 || exit 0; "
                                 "git rev-parse --git-dir >/dev/null 2>&1"
                                 " && code-review-graph status"
-                                " --repo \"$(git rev-parse --show-toplevel 2>/dev/null)\""
+                                ' --repo "$(git rev-parse --show-toplevel 2>/dev/null)"'
                                 " || echo 'Not a git repo, skipping'"
                             ),
                             "timeout": 10,
@@ -1341,17 +1323,19 @@ MCP tools to narrow scope, then read the source.** The graph is cheaper than
 scanning files and gives you structural context (callers, dependents, test
 coverage) that file search cannot."""
 
-_INSTRUCTION_GUARDRAILS = """### Verify in the source
-
-- Narrow scope with the graph, then read the source. Do not change code from graph
-  output alone.
-- For any non-trivial change, read the implementation and the relevant tests before concluding.
-- Verify the exact source when touching behavior, database logic, migrations, retries, fallbacks,
-  recovery, or compatibility code.
-- When the graph and the source disagree, the source wins. The graph may be stale or
-  may not model that relationship.
-- An empty graph result can mean "not indexed" or "not statically visible", not
-  "does not exist"."""
+_INSTRUCTION_GUARDRAILS = (
+    "### Verify in the source\n\n"
+    "- Narrow scope with the graph, then read the source. "
+    "Do not change code from graph output alone.\n"
+    "- For any non-trivial change, read the implementation and the relevant "
+    "tests before concluding.\n"
+    "- Verify the exact source when touching behavior, database logic, "
+    "migrations, retries, fallbacks, recovery, or compatibility code.\n"
+    "- When the graph and the source disagree, the source wins. "
+    "The graph may be stale or may not model that relationship.\n"
+    '- An empty graph result can mean "not indexed" or "not statically visible", '
+    'not "does not exist".'
+)
 
 _CLAUDE_MD_SECTION = f"""{_CLAUDE_MD_SECTION_MARKER}
 ## MCP Tools: code-review-graph
@@ -1470,9 +1454,7 @@ def _upgrade_managed_block(existing: str, section: str) -> str | None:
     known block is, meaning someone edited the block by hand.
     """
     stale = [
-        block
-        for block in _known_instruction_sections()
-        if block != section and block in existing
+        block for block in _known_instruction_sections() if block != section and block in existing
     ]
     if not stale:
         return None
@@ -1663,7 +1645,11 @@ exit 0
         hooks_obj = {}
 
     def _ensure_group(
-        event_name: str, matcher: str, hook_command: str, name: str, timeout: int,
+        event_name: str,
+        matcher: str,
+        hook_command: str,
+        name: str,
+        timeout: int,
     ) -> None:
         arr = hooks_obj.get(event_name, [])
         if not isinstance(arr, list):
@@ -1677,8 +1663,11 @@ exit 0
             if not isinstance(nested, list):
                 return False
             for h in nested:
-                if isinstance(h, dict) and h.get("type") == "command" \
-                        and h.get("command") == hook_command:
+                if (
+                    isinstance(h, dict)
+                    and h.get("type") == "command"
+                    and h.get("command") == hook_command
+                ):
                     return True
             return False
 
@@ -1735,11 +1724,7 @@ def install_gemini_cli_skills(repo_root: Path) -> Path:
         skill_dir.mkdir(parents=True, exist_ok=True)
         skill_path = skill_dir / "SKILL.md"
         content = (
-            "---\n"
-            f"name: {slug}\n"
-            f"description: {skill['description']}\n"
-            "---\n\n"
-            f"{skill['body']}\n"
+            f"---\nname: {slug}\ndescription: {skill['description']}\n---\n\n{skill['body']}\n"
         )
         skill_path.write_text(content, encoding="utf-8")
         logger.info("Wrote Gemini CLI skill: %s", skill_path)
@@ -1758,11 +1743,7 @@ def install_codebuddy_skills(repo_root: Path) -> Path:
         skill_dir.mkdir(parents=True, exist_ok=True)
         skill_path = skill_dir / "SKILL.md"
         content = (
-            "---\n"
-            f"name: {slug}\n"
-            f"description: {skill['description']}\n"
-            "---\n\n"
-            f"{skill['body']}\n"
+            f"---\nname: {slug}\ndescription: {skill['description']}\n---\n\n{skill['body']}\n"
         )
         skill_path.write_text(content, encoding="utf-8")
         logger.info("Wrote CodeBuddy skill: %s", skill_path)

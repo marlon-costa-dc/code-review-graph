@@ -5,9 +5,9 @@ OS register a watch inside every ignored tree.  A build tool churning through
 ``target/`` then killed a watchdog thread, the process stayed up, and the graph
 silently stopped updating while ``crg-daemon status`` still said "alive".
 
-Every test here is deterministic: observers are fakes, and a "dead" watchdog
-thread is a real thread that has been joined, never a crash we tried to
-provoke through the filesystem.
+Supervisor unit cases isolate scheduling and liveness. The real-observer
+cohort uses actual files, SQLite connections and OS events to prove indexing,
+startup writes, directory recreation and deletion through the public watcher.
 """
 
 from __future__ import annotations
@@ -42,7 +42,6 @@ from code_review_graph.incremental import (
     incremental_update,
     watch,
 )
-from code_review_graph.parser import NodeInfo
 
 
 @pytest.fixture(autouse=True)
@@ -120,7 +119,6 @@ def _live_thread() -> tuple[threading.Thread, threading.Event]:
     thread = threading.Thread(target=gate.wait, name="fake-inotify-buffer", daemon=True)
     thread.start()
     return thread, gate
-
 
 
 def _tick_driver(*actions):
@@ -209,9 +207,7 @@ class TestIgnoreAwareScheduling:
         for index in range(6):
             (tmp_path / "node_modules" / f"dep{index}").mkdir(parents=True)
 
-        plan = _plan_watch_paths(
-            tmp_path, _load_ignore_patterns(tmp_path), max_schedules=3
-        )
+        plan = _plan_watch_paths(tmp_path, _load_ignore_patterns(tmp_path), max_schedules=3)
 
         assert plan == [(tmp_path, True)]
 
@@ -301,65 +297,6 @@ class TestNewDirectoryAdoption:
         supervisor.schedule_initial(MagicMock())
         return supervisor, observer
 
-    def test_new_top_level_directory_is_picked_up(self, tmp_path):
-        """A non-recursive root watch only helps if new children get scheduled."""
-        supervisor, observer = self._supervisor(tmp_path)
-        before = list(observer.scheduled)
-
-        created = tmp_path / "services"
-        created.mkdir()
-        adopted, vanished = supervisor.sync_watches()
-
-        assert adopted == [str(created)]
-        assert vanished == []
-        assert (str(created), True) in observer.scheduled
-        assert (str(created), True) not in before
-
-    def test_recreated_directory_is_watched_again(self, tmp_path):
-        """`rm -rf src && mkdir src` must not leave src unwatched forever."""
-        supervisor, observer = self._supervisor(tmp_path)
-
-        shutil.rmtree(tmp_path / "src")
-        _, vanished = supervisor.sync_watches()
-        assert vanished == [str(tmp_path / "src")]
-        assert observer.unscheduled == [str(tmp_path / "src")]
-
-        (tmp_path / "src").mkdir()
-        adopted, _ = supervisor.sync_watches()
-
-        assert adopted == [str(tmp_path / "src")]
-        assert observer.scheduled.count((str(tmp_path / "src"), True)) == 2
-
-    def test_new_ignored_directory_is_not_picked_up(self, tmp_path):
-        supervisor, observer = self._supervisor(tmp_path)
-
-        created = tmp_path / "dist"
-        created.mkdir()
-        adopted, _ = supervisor.sync_watches()
-
-        assert adopted == []
-        assert not any(path == str(created) for path, _ in observer.scheduled)
-
-    def test_directory_inside_a_recursive_watch_is_not_rescheduled(self, tmp_path):
-        """watchdog already covers those; a second watch would be waste."""
-        supervisor, observer = self._supervisor(tmp_path)
-
-        created = tmp_path / "src" / "nested"
-        created.mkdir()
-        adopted, _ = supervisor.sync_watches()
-
-        assert adopted == []
-        assert not any(path == str(created) for path, _ in observer.scheduled)
-
-    def test_deleted_directory_releases_its_watch(self, tmp_path):
-        supervisor, observer = self._supervisor(tmp_path)
-
-        shutil.rmtree(tmp_path / "src")
-        adopted, vanished = supervisor.sync_watches()
-
-        assert vanished == [str(tmp_path / "src")]
-        assert observer.unscheduled == [str(tmp_path / "src")]
-
     def test_a_quiet_tick_touches_nothing(self, tmp_path):
         supervisor, observer = self._supervisor(tmp_path)
         before = list(observer.scheduled)
@@ -408,9 +345,9 @@ class TestNewDirectoryAdoption:
         assert adopted == [str(module)]
         assert (str(module), False) in observer.scheduled, "module needs a shallow watch"
         assert (str(module / "src"), True) in observer.scheduled
-        assert not any(
-            "node_modules" in path for path, _ in observer.scheduled
-        ), "the adopted module's node_modules was handed to the OS"
+        assert not any("node_modules" in path for path, _ in observer.scheduled), (
+            "the adopted module's node_modules was handed to the OS"
+        )
 
     def test_a_tight_budget_narrows_the_plan_before_promoting(self, tmp_path):
         """A fix for #811 must not be able to re-create #811.
@@ -699,10 +636,9 @@ class TestObserverLiveness:
         gate.set()
         thread.join(timeout=5)
         observer.schedule = MagicMock(side_effect=OSError("No space left on device"))
-        dead, repaired = supervisor.check_liveness()
+        with pytest.raises(OSError, match="No space left on device"):
+            supervisor.check_liveness()
 
-        assert repaired == [], "an unwatched directory was reported as repaired"
-        assert dead == ["fake-inotify-buffer"]
         assert str(watched) not in supervisor._repaired_roots, "bookkeeping outlived the watch"
 
     def test_replaced_directory_is_released_and_re_adopted(self, tmp_path):
@@ -752,39 +688,59 @@ class TestWatchLoop:
         ):
             watch(tmp_path, store, **kwargs)
 
-    def test_dead_observer_exits_loudly_instead_of_stalling(self, tmp_path, caplog):
-        """The whole point of #811: never keep running with a dead watcher."""
-        (tmp_path / "src").mkdir()
-        thread, gate = _live_thread()
-        observer = FakeObserver()
-        observer.emitters = [FakeEmitter(thread)]
-        store = GraphStore(tmp_path / "graph.db")
+    def test_dead_observer_exits_loudly_instead_of_stalling(
+        self,
+        tmp_path,
+        caplog,
+        watch_repository,
+    ):
+        from watchdog.observers import Observer
 
-        def kill_the_reader():
-            gate.set()
-            thread.join(timeout=5)
+        repo = tmp_path / "repo"
+        (repo / "src").mkdir(parents=True)
+        observer = Observer()
+        harness = TestRealObserver()
+        with (
+            caplog.at_level(logging.ERROR),
+            pytest.raises(RuntimeError, match="watch observer stopped"),
+        ):
+            with watch_repository(repo, observer=observer) as (_reader, thread):
+                assert harness._wait_for(
+                    lambda: (read_watch_health(repo) or {}).get("phase") == "watching"
+                ), "the watcher did not finish its initial build"
+                if sys.platform.startswith("linux"):
+                    from watchdog.observers.inotify_buffer import InotifyBuffer
 
-        try:
-            with caplog.at_level(logging.ERROR):
-                with pytest.raises(RuntimeError, match="watch observer stopped"):
-                    self._watch_with(
-                        tmp_path,
-                        store,
-                        observer,
-                        _tick_driver(lambda: None, kill_the_reader),
-                    )
-        finally:
-            store.close()
+                    def readers():
+                        return [
+                            value
+                            for emitter in observer.emitters
+                            if emitter.watch.path == str(repo)
+                            for value in vars(emitter).values()
+                            if isinstance(value, InotifyBuffer)
+                        ]
 
-        assert "fake-inotify-buffer" in caplog.text
-        assert str(tmp_path) in caplog.text
-        assert observer.stopped is True
+                    assert harness._wait_for(lambda: bool(readers()))
+                    first = readers()[0]
+                    first.close()
+                    assert harness._wait_for(
+                        lambda: any(reader is not first for reader in readers())
+                    ), "the failed reader was not repaired"
+                    second = next(reader for reader in readers() if reader is not first)
+                    second.close()
+                    failed_name = second.name
+                else:
+                    observer.stop()
+                    failed_name = observer.name
+                thread.join(timeout=20)
+                assert not thread.is_alive()
 
-        health = read_watch_health(tmp_path)
+        assert str(repo) in caplog.text
+        health = read_watch_health(repo)
         assert health is not None
         assert health["observer_alive"] is False
         assert health["stalled"] is True
-        assert health["dead_threads"] == ["fake-inotify-buffer"]
+        assert failed_name in health["dead_threads"]
 
     def test_cli_watch_turns_a_dead_observer_into_exit_code_1(self):
         """The daemon restarts on process exit, so the exit code has to be non-zero."""
@@ -805,274 +761,261 @@ class TestWatchLoop:
 
         assert exit_info.value.code == 1
 
-    def test_live_observer_publishes_health_for_daemon_status(self, tmp_path):
-        (tmp_path / "src").mkdir()
-        thread, gate = _live_thread()
-        observer = FakeObserver()
-        observer.emitters = [FakeEmitter(thread)]
-        store = GraphStore(tmp_path / "graph.db")
-        seen: list[dict] = []
-
-        try:
-            self._watch_with(
-                tmp_path,
-                store,
-                observer,
-                _tick_driver(
-                    lambda: seen.append(read_watch_health(tmp_path) or {}),
-                ),
-            )
-        finally:
-            gate.set()
-            store.close()
-
-        assert seen and seen[0]["observer_alive"] is True
-        assert seen[0]["stalled"] is False
-        assert seen[0]["watched_paths"] >= 1
-        # A clean Ctrl+C removes the file it published.
-        assert not watch_health_path(tmp_path).exists()
-
-    def test_normal_file_change_still_updates_the_graph(self, tmp_path):
-        """End to end: scheduling changes must not break ordinary updates."""
-        from watchdog.events import FileCreatedEvent
-
-        (tmp_path / "src").mkdir()
-        for index in range(6):
-            (tmp_path / "node_modules" / f"pkg{index}").mkdir(parents=True)
-        source = tmp_path / "src" / "app.py"
-        source.write_text("def handler():\n    return 1\n", encoding="utf-8")
-
-        observer = FakeObserver()
-        store = GraphStore(tmp_path / "graph.db")
-        callbacks: list[int] = []
-        health: dict[str, object] = {}
-
-        def deliver_event():
-            observer.handler.process([FileCreatedEvent(str(source))])
-
-        def capture_health():
-            health.update(json.loads(watch_health_path(tmp_path).read_text("utf-8")))
-
-        try:
-            self._watch_with(
-                tmp_path,
-                store,
-                observer,
-                _tick_driver(deliver_event, capture_health),
-                on_files_updated=lambda _store: callbacks.append(1),
-            )
-            assert store.get_nodes_by_file(str(source)), "watch never parsed the change"
-        finally:
-            store.close()
-
-        assert callbacks, "the post-processing callback never ran"
-        assert health["observer_alive"] is True
-        assert isinstance(health["last_event_at"], float)
-        assert health["events_seen"] == 1
-        # src is watched, node_modules is not.
-        assert (str(tmp_path / "src"), True) in observer.scheduled
-        assert not any("node_modules" in path for path, _ in observer.scheduled)
-
-    def test_relative_repo_keeps_a_graph_built_with_an_absolute_root(
-        self, tmp_path, monkeypatch
-    ):
-        """`watch --repo .` used to reconcile every file away on startup.
-
-        Stored paths are spelled by whoever built the graph, and reconciliation
-        deletes anything it cannot place under the current root — so a
-        relative root deleted the lot.
-        """
-        (tmp_path / "src").mkdir()
-        source = tmp_path / "src" / "app.py"
-        source.write_text("def handler():\n    return 1\n", encoding="utf-8")
-        store = GraphStore(tmp_path / "graph.db")
-        incremental_update(tmp_path, store, changed_files=["src/app.py"])
-        assert store.get_all_files(), "precondition: the graph has files"
-
-        monkeypatch.chdir(tmp_path)
-        try:
-            self._watch_with(Path("."), store, FakeObserver(), _tick_driver())
-            survivors = store.get_all_files()
-        finally:
-            store.close()
-
-        assert survivors, "the relative root reconciled the whole graph away"
-
-    def test_a_graph_from_another_root_is_refused_not_emptied(self, tmp_path):
-        """A total mismatch is a misconfiguration, not a mass deletion."""
+    def test_live_observer_publishes_health_for_daemon_status(self, tmp_path, watch_repository):
         repo = tmp_path / "repo"
         (repo / "src").mkdir(parents=True)
-        (repo / "src" / "app.py").write_text("def handler():\n    return 1\n", encoding="utf-8")
-        subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
-        subprocess.run(["git", "add", "src/app.py"], cwd=repo, check=True)
-        store = GraphStore(tmp_path / "graph.db")
-        incremental_update(tmp_path / "elsewhere", store, changed_files=[])
-        store.store_file_nodes_edges(
-            "/somewhere/else/mod.py",
-            [
-                NodeInfo(
-                    kind="File",
-                    name="mod.py",
-                    file_path="/somewhere/else/mod.py",
-                    line_start=1,
-                    line_end=2,
-                    language="python",
-                )
-            ],
-            [],
-            "hash",
-        )
-        store.commit()
+        observer = TestRealObserver()
+        with watch_repository(repo) as (_reader, thread):
+            assert observer._wait_for(
+                lambda: (read_watch_health(repo) or {}).get("phase") == "watching"
+            ), "the watcher did not finish its initial build"
+            health = read_watch_health(repo)
+            assert health is not None
+            assert health["observer_alive"] is True
+            assert health["stalled"] is False
+            assert health["watched_paths"] >= 1
+            assert thread.is_alive()
+        assert not watch_health_path(repo).exists()
 
-        try:
-            with (
-                patch("watchdog.observers.Observer") as observer,
-                pytest.raises(RuntimeError, match="different repository root"),
-            ):
-                watch(repo, store)
-            assert store.get_all_files() == ["/somewhere/else/mod.py"], "nothing was deleted"
-            observer.assert_not_called()
-        finally:
-            store.close()
-
-    def test_repair_reconciles_files_deleted_during_the_outage(self, tmp_path):
-        """A repaired watch must re-read the directory in both directions.
-
-        Only the deletion event contributes the *stored* descendants, and watch
-        batches run with ``reconcile_stale=False``, so a file removed while the
-        watch was down keeps its rows forever if the repair only announces a
-        creation — the silent divergence this whole issue is about.
-        """
-        source_dir = tmp_path / "src"
-        source_dir.mkdir()
+    def test_normal_file_change_still_updates_the_graph(self, tmp_path, watch_repository):
+        """A real observer indexes the change and excludes ignored directories."""
+        repo = tmp_path / "repo"
+        source_dir = repo / "src"
+        source_dir.mkdir(parents=True)
         for index in range(6):
-            (tmp_path / "node_modules" / f"pkg{index}").mkdir(parents=True)
-        (source_dir / "doomed.py").write_text("def doomed():\n    return 1\n", encoding="utf-8")
-        (source_dir / "keeper.py").write_text("def keeper():\n    return 2\n", encoding="utf-8")
-        store = GraphStore(tmp_path / "graph.db")
-        incremental_update(
-            tmp_path, store, changed_files=["src/doomed.py", "src/keeper.py"]
+            (repo / "node_modules" / f"pkg{index}").mkdir(parents=True)
+        source = source_dir / "app.py"
+        ignored = repo / "node_modules" / "pkg0" / "ignored.py"
+        callbacks: list[int] = []
+        observer = TestRealObserver()
+        with watch_repository(repo, lambda _store: callbacks.append(1)) as (reader, thread):
+            assert observer._wait_for(
+                lambda: (read_watch_health(repo) or {}).get("phase") == "watching"
+            ), "the watcher did not finish its initial build"
+            initial_callbacks = len(callbacks)
+            source.write_text("def handler():\n    return 1\n", encoding="utf-8")
+            ignored.write_text("def ignored():\n    return 1\n", encoding="utf-8")
+            assert observer._wait_for(lambda: bool(reader.get_nodes_by_file(str(source))))
+            assert observer._wait_for(lambda: len(callbacks) > initial_callbacks)
+            assert observer._wait_for(
+                lambda: bool((read_watch_health(repo) or {}).get("events_seen"))
+            ), "the watcher did not publish event health"
+            health = read_watch_health(repo)
+            assert health is not None and health["observer_alive"] is True
+            assert isinstance(health["last_event_at"], float)
+            assert thread.is_alive()
+            assert str(ignored) not in reader.get_all_files()
+
+    def test_relative_repo_keeps_a_graph_built_with_an_absolute_root(self, tmp_path):
+        """A real watcher using ``.`` preserves the absolute-root graph."""
+        repo = tmp_path / "repo"
+        (repo / "src").mkdir(parents=True)
+        source = repo / "src" / "app.py"
+        source.write_text("def handler():\n    return 1\n", encoding="utf-8")
+        database = tmp_path / "graph.db"
+        with GraphStore(database) as store:
+            incremental_update(repo, store, changed_files=["src/app.py"])
+            before = store.get_all_files()
+        assert before == [str(source)]
+        command = (
+            "from pathlib import Path\n"
+            "from threading import Event\n"
+            "from code_review_graph.graph import GraphStore\n"
+            "from code_review_graph.incremental import watch\n"
+            "import sys\n"
+            "stop = Event()\n"
+            "stop.set()\n"
+            "with GraphStore(Path(sys.argv[1])) as store:\n"
+            "    watch(Path('.'), store, stop_event=stop)\n"
         )
-        assert any(p.endswith("doomed.py") for p in store.get_all_files())
+        subprocess.run(
+            [sys.executable, "-c", command, str(database)],
+            cwd=repo,
+            check=True,
+            timeout=30,
+        )
+        with GraphStore(database) as store:
+            assert store.get_all_files() == before
 
-        observer = FakeObserver()
-        thread, gate = _live_thread()
-        reader = GraphStore(tmp_path / "graph.db")
-        # The tick driver replaces time.sleep; keep the real one for polling.
-        real_sleep = time.sleep
+    def test_a_graph_from_another_root_is_refused_not_emptied(self, tmp_path):
+        """A graph built from a different real repository is never rewritten."""
+        repo = tmp_path / "repo"
+        other = tmp_path / "other"
+        repo.mkdir()
+        other.mkdir()
+        source = other / "module.py"
+        source.write_text("def handler():\n    return 1\n", encoding="utf-8")
+        with GraphStore(tmp_path / "graph.db") as store:
+            incremental_update(other, store, changed_files=[str(source.relative_to(other))])
+            original_files = store.get_all_files()
+            assert original_files == [str(source)]
+            with pytest.raises(RuntimeError, match="different repository root"):
+                watch(repo, store)
+            assert store.get_all_files() == original_files
+            assert not watch_health_path(repo).exists()
 
-        def emitter_appears():
-            observer.emitters = [FakeEmitter(thread, root=str(source_dir))]
+    def test_repair_reconciles_files_deleted_during_the_outage(self, tmp_path, watch_repository):
+        """A real stopped emitter must reconcile both deleted and new files."""
+        from watchdog.observers import Observer
 
-        def outage():
-            gate.set()
-            thread.join(timeout=5)
-            (source_dir / "doomed.py").unlink()
-            (source_dir / "arrived.py").write_text(
-                "def arrived():\n    return 3\n", encoding="utf-8"
+        repo = tmp_path / "repo"
+        source_dir = repo / "src"
+        source_dir.mkdir(parents=True)
+        for index in range(6):
+            (repo / "node_modules" / f"pkg{index}").mkdir(parents=True)
+        doomed = source_dir / "doomed.py"
+        keeper = source_dir / "keeper.py"
+        arrived = source_dir / "arrived.py"
+        doomed.write_text("def doomed():\n    return 1\n", encoding="utf-8")
+        keeper.write_text("def keeper():\n    return 2\n", encoding="utf-8")
+        observer = Observer()
+        harness = TestRealObserver()
+        with watch_repository(repo, observer=observer) as (reader, thread):
+            assert harness._wait_for(
+                lambda: (read_watch_health(repo) or {}).get("phase") == "watching"
+            ), "the watcher did not finish its initial build"
+            assert str(doomed) in reader.get_all_files()
+            emitter = next(
+                emitter for emitter in observer.emitters if emitter.watch.path == str(source_dir)
             )
-
-        def settle():
-            deadline = time.monotonic() + 10
-            while time.monotonic() < deadline:
-                files = reader.get_all_files()
-                if any(p.endswith("arrived.py") for p in files) and not any(
-                    p.endswith("doomed.py") for p in files
-                ):
-                    return
-                real_sleep(0.05)
-
-        try:
-            with patch("code_review_graph.incremental._DEBOUNCE_SECONDS", 0.01):
-                self._watch_with(
-                    tmp_path,
-                    store,
-                    observer,
-                    _tick_driver(emitter_appears, outage, settle),
+            emitter.stop()
+            doomed.unlink()
+            arrived.write_text("def arrived():\n    return 3\n", encoding="utf-8")
+            assert harness._wait_for(
+                lambda: (
+                    str(arrived) in reader.get_all_files()
+                    and str(doomed) not in reader.get_all_files()
                 )
-            files = reader.get_all_files()
-        finally:
-            store.close()
-            reader.close()
-
-        assert any(p.endswith("arrived.py") for p in files), "the repair never re-read the tree"
-        assert any(p.endswith("keeper.py") for p in files), "an untouched file was dropped"
-        assert not any(
-            p.endswith("doomed.py") for p in files
-        ), "a file deleted during the outage kept its rows"
+            ), "the repaired watch did not reconcile the outage"
+            assert str(keeper) in reader.get_all_files()
+            assert thread.is_alive()
 
     def test_health_is_published_before_the_first_build(self, tmp_path):
-        """A repo whose first build takes minutes must not read as stalled."""
-        (tmp_path / "src").mkdir()
-        source = tmp_path / "src" / "app.py"
-        source.write_text("def handler():\n    return 1\n", encoding="utf-8")
-        store = GraphStore(tmp_path / "graph.db")
-        seen: list[dict] = []
+        """A real blocked graph write cannot hide the initial-build heartbeat."""
+        import sqlite3
+        from concurrent.futures import ThreadPoolExecutor
 
-        def record_initial_health(*args, **kwargs):
-            seen.append(read_watch_health(tmp_path) or {})
-            return {"files_parsed": 0, "stale_files_removed": 0}
-
-        try:
-            with (
-                patch("watchdog.observers.Observer", return_value=FakeObserver()),
-                patch(
-                    "code_review_graph.incremental._sleep_watch_tick",
-                    side_effect=KeyboardInterrupt,
-                ),
-                patch(
-                    "code_review_graph.incremental.full_build",
-                    side_effect=record_initial_health,
-                ),
-            ):
-                watch(tmp_path, store)
-        finally:
-            store.close()
-
-        assert seen, "full_build was never reached"
-        assert seen[0].get("phase") == "initial-build"
-        assert seen[0].get("stalled") is False
+        repo = tmp_path / "repo"
+        source = repo / "src"
+        source.mkdir(parents=True)
+        (source / "app.py").write_text("def handler():\n    return 1\n", encoding="utf-8")
+        database = repo / "graph.db"
+        stop = threading.Event()
+        with GraphStore(database) as store, sqlite3.connect(database) as blocker:
+            blocker.execute("BEGIN IMMEDIATE")
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(watch, repo, store, stop_event=stop)
+                try:
+                    assert TestRealObserver()._wait_for(
+                        lambda: (read_watch_health(repo) or {}).get("phase") == "initial-build"
+                    ), "the initial build did not expose its health"
+                    health = read_watch_health(repo)
+                    assert health is not None and health["stalled"] is False
+                finally:
+                    blocker.rollback()
+                    stop.set()
+                future.result(timeout=20)
 
     @pytest.mark.skipif(
         sys.platform == "win32",
         reason="os.kill(SIGTERM) terminates Windows processes before the handler can run",
     )
     def test_sigterm_clears_the_health_file(self, tmp_path):
-        """`crg-daemon stop` sends SIGTERM; a leftover file reads as stalled."""
-        import os
+        """The native SIGTERM handler clears health and restores the handler."""
         import signal
 
-        (tmp_path / "src").mkdir()
-        store = GraphStore(tmp_path / "graph.db")
-
-        def send_sigterm():
-            os.kill(os.getpid(), signal.SIGTERM)
-
+        repo = tmp_path / "repo"
+        (repo / "src").mkdir(parents=True)
+        command = (
+            "import signal, sys\n"
+            "from pathlib import Path\n"
+            "from code_review_graph.graph import GraphStore\n"
+            "from code_review_graph.incremental import watch\n"
+            "repo = Path(sys.argv[1])\n"
+            'with GraphStore(repo / "graph.db") as store:\n'
+            "    watch(repo, store)\n"
+            "print(signal.getsignal(signal.SIGTERM) == signal.SIG_DFL)\n"
+        )
+        process = subprocess.Popen(
+            [sys.executable, "-c", command, str(repo)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
         try:
-            self._watch_with(tmp_path, store, FakeObserver(), _tick_driver(send_sigterm))
+            assert TestRealObserver()._wait_for(
+                lambda: (read_watch_health(repo) or {}).get("phase") == "watching"
+            ), "the watcher did not finish its initial build"
+            process.send_signal(signal.SIGTERM)
+            stdout, stderr = process.communicate(timeout=20)
         finally:
-            store.close()
-
-        assert not watch_health_path(tmp_path).exists()
-        assert signal.getsignal(signal.SIGTERM) is signal.SIG_DFL, "handler not restored"
+            if process.poll() is None:
+                process.terminate()
+                process.wait(timeout=20)
+        assert process.returncode == 0, stderr
+        assert stdout.strip() == "True"
+        assert not watch_health_path(repo).exists()
 
     def test_health_is_not_rewritten_on_every_tick(self, tmp_path):
-        """Watch mode runs for days; the heartbeat must stay rate-limited."""
-        (tmp_path / "src").mkdir()
-        supervisor = _WatchSupervisor(
-            FakeObserver(), tmp_path, [], health_path=tmp_path / "health.json"
+        """Real watch ticks respect the heartbeat interval but failures do not."""
+        import os
+
+        repo = tmp_path / "repo"
+        (repo / "src").mkdir(parents=True)
+        for index in range(6):
+            (repo / "node_modules" / f"pkg{index}").mkdir(parents=True)
+        command = (
+            "import sys, threading\n"
+            "from pathlib import Path\n"
+            "from watchdog.observers import Observer\n"
+            "from code_review_graph.graph import GraphStore\n"
+            "from code_review_graph.incremental import watch\n"
+            "repo = Path(sys.argv[1])\n"
+            "observer = Observer()\n"
+            "def control():\n"
+            "    sys.stdin.readline()\n"
+            "    observer.stop()\n"
+            "threading.Thread(target=control, daemon=True).start()\n"
+            'with GraphStore(repo / "graph.db") as store:\n'
+            "    watch(repo, store, observer=observer)\n"
         )
-        supervisor.report_health(observer_alive=True, force=True)
-        first = (tmp_path / "health.json").read_text(encoding="utf-8")
-
-        for _ in range(30):
-            supervisor.report_health(observer_alive=True, last_event_at=time.time())
-
-        assert (tmp_path / "health.json").read_text(encoding="utf-8") == first
-
-        supervisor.report_health(observer_alive=False, dead_threads=("Thread-3",))
-
-        assert (tmp_path / "health.json").read_text(encoding="utf-8") != first
+        environment = dict(os.environ, CRG_WATCH_HEALTH_INTERVAL="3600")
+        process = subprocess.Popen(
+            [sys.executable, "-c", command, str(repo)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=environment,
+        )
+        try:
+            assert TestRealObserver()._wait_for(
+                lambda: (read_watch_health(repo) or {}).get("phase") == "watching"
+            ), "the watcher did not finish its initial build"
+            health_path = watch_health_path(repo)
+            before = health_path.read_bytes()
+            service = repo / "services"
+            service.mkdir()
+            source = service / "app.py"
+            source.write_text("def handler():\n    return 1\n", encoding="utf-8")
+            with GraphStore(repo / "graph.db") as reader:
+                assert TestRealObserver()._wait_for(
+                    lambda: str(source) in reader.get_all_files()
+                ), "the watcher did not complete an adoption tick"
+            assert health_path.read_bytes() == before
+            assert process.stdin is not None
+            process.stdin.write("stop\n")
+            process.stdin.flush()
+            _stdout, stderr = process.communicate(timeout=20)
+        finally:
+            if process.poll() is None:
+                process.terminate()
+                process.wait(timeout=20)
+        assert process.returncode != 0
+        assert "watch observer stopped" in stderr
+        health = read_watch_health(repo)
+        assert health is not None and health["stalled"] is True
+        assert health_path.read_bytes() != before
 
 
 class TestRealObserver:
@@ -1093,146 +1036,290 @@ class TestRealObserver:
             time.sleep(interval)
         return False
 
-    def test_new_top_level_directory_is_indexed(self, tmp_path):
+    def test_write_during_initial_postprocessing_reaches_graph(self, tmp_path, watch_repository):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        source = repo / "app.py"
+        source.write_text("def original():\n    return 1\n", encoding="utf-8")
+        changed = threading.Event()
+
+        def postprocess(_store):
+            if not changed.is_set():
+                source.write_text("def replacement():\n    return 2\n", encoding="utf-8")
+                changed.set()
+                # Real observer events arrive while initial derived-state work
+                # is still running, before the watcher publishes readiness.
+                time.sleep(0.2)
+
+        with watch_repository(repo, postprocess) as (reader, thread):
+            assert changed.wait(20), "initial postprocessing never ran"
+            indexed = self._wait_for(
+                lambda: any(
+                    node.name == "replacement" for node in reader.get_nodes_by_file(str(source))
+                ),
+                timeout=5,
+            )
+
+        assert indexed, "a write during initial postprocessing stayed unindexed"
+
+    def test_clean_stop_publishes_a_pending_source_change(self, tmp_path, watch_repository):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        source = repo / "app.py"
+        source.write_text("def original():\n    return 1\n", encoding="utf-8")
+        changed = threading.Event()
+
+        def postprocess(_store):
+            if not changed.is_set():
+                source.write_text("def replacement():\n    return 2\n", encoding="utf-8")
+                time.sleep(0.2)
+                changed.set()
+
+        with watch_repository(repo, postprocess):
+            assert changed.wait(20), "initial postprocessing never ran"
+
+        with GraphStore(repo / "graph.db") as persisted:
+            names = {node.name for node in persisted.get_nodes_by_file(str(source))}
+        assert "replacement" in names, "shutdown discarded the accepted source change"
+        assert "original" not in names
+
+    def test_clean_stop_propagates_a_pending_callback_failure(self, tmp_path, watch_repository):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        source = repo / "app.py"
+        source.write_text("def original():\n    return 1\n", encoding="utf-8")
+        changed = threading.Event()
+        failure = ValueError("postprocessing refused the changed source")
+
+        def postprocess(_store):
+            if changed.is_set():
+                raise failure
+            source.write_text("def replacement():\n    return 2\n", encoding="utf-8")
+            time.sleep(0.2)
+            changed.set()
+
+        with pytest.raises(RuntimeError, match="watch update failed") as caught:
+            with watch_repository(repo, postprocess):
+                assert changed.wait(20), "initial postprocessing never ran"
+        assert caught.value.__cause__ is failure
+
+    def test_continuous_source_changes_publish_before_the_writer_stops(
+        self,
+        tmp_path,
+        watch_repository,
+    ):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        source = repo / "app.py"
+        source.write_text("def version():\n    return 0\n", encoding="utf-8")
+        ready = threading.Event()
+        published = threading.Event()
+        stop_writer = threading.Event()
+
+        def postprocess(_store):
+            if ready.is_set():
+                published.set()
+            else:
+                ready.set()
+
+        def write_sources():
+            version = 1
+            staged = source.with_suffix(".writing")
+            while not stop_writer.is_set():
+                staged.write_text(f"def version():\n    return {version}\n", encoding="utf-8")
+                staged.replace(source)
+                version += 1
+                stop_writer.wait(0.02)
+
+        with watch_repository(repo, postprocess) as (reader, _thread):
+            assert ready.wait(20), "initial postprocessing never ran"
+            original_hash = reader.get_nodes_by_file(str(source))[0].file_hash
+            writer = threading.Thread(target=write_sources, name="source-writer", daemon=True)
+            writer.start()
+            try:
+                assert published.wait(5), "continuous events postponed publication indefinitely"
+                assert writer.is_alive()
+                assert any(
+                    node.file_hash != original_hash
+                    for node in reader.get_nodes_by_file(str(source))
+                )
+            finally:
+                stop_writer.set()
+                writer.join(timeout=20)
+                assert not writer.is_alive()
+
+    def test_real_observer_teardown_timeout_is_a_failure(self, tmp_path):
+        from watchdog.events import FileSystemEventHandler
+        from watchdog.observers import Observer
+
+        from code_review_graph.incremental import _run_time_boxed
+
+        entered = threading.Event()
+        release = threading.Event()
+        source = tmp_path / "blocked.py"
+
+        class BlockingHandler(FileSystemEventHandler):
+            def on_created(self, event):
+                if event.src_path == str(source):
+                    entered.set()
+                    release.wait(20)
+
+        observer = Observer()
+        observer.schedule(BlockingHandler(), str(tmp_path), recursive=False)
+        observer.start()
+        try:
+            source.write_text("def blocked():\n    return 1\n", encoding="utf-8")
+            assert entered.wait(20), "the real observer never dispatched the source event"
+            with pytest.raises(TimeoutError, match="observer stop"):
+                _run_time_boxed(observer.stop, "observer stop", timeout=0.05)
+        finally:
+            release.set()
+            observer.stop()
+            observer.join(timeout=20)
+            assert not observer.is_alive()
+
+    def test_teardown_propagates_the_real_operation_failure(self, tmp_path):
+        from code_review_graph.incremental import _run_time_boxed
+
+        missing = tmp_path / "already-removed.txt"
+        with pytest.raises(FileNotFoundError) as caught:
+            _run_time_boxed(missing.unlink, "remove unavailable file", timeout=1)
+        assert caught.value.filename == str(missing)
+
+    def test_new_top_level_directory_is_indexed(self, tmp_path, watch_repository):
+        from watchdog.observers import Observer
+
         repo = tmp_path / "repo"
         (repo / "src").mkdir(parents=True)
-        # Enough ignored directories that the root is planned non-recursively;
-        # a recursive root watch would hide the bug this test exists for.
         for index in range(6):
             (repo / "node_modules" / f"pkg{index}").mkdir(parents=True)
         (repo / "src" / "app.py").write_text("def handler():\n    return 1\n", encoding="utf-8")
         subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
         subprocess.run(["git", "add", "src/app.py"], cwd=repo, check=True)
 
-        store = GraphStore(repo / "graph.db")
-        reader = GraphStore(repo / "graph.db")
-        stop = threading.Event()
-        failure: list[BaseException] = []
+        observer = Observer()
+        with watch_repository(repo, observer=observer) as (reader, thread):
+            assert self._wait_for(
+                lambda: (read_watch_health(repo) or {}).get("phase") == "watching"
+            ), "the watcher did not finish its initial build"
+            assert any(
+                emitter.watch.path == str(repo) and not emitter.watch.is_recursive
+                for emitter in observer.emitters
+            ), "the repository root was not watched shallowly"
+            ignored = repo / "dist"
+            ignored.mkdir()
+            ignored_file = ignored / "ignored.py"
+            ignored_file.write_text("def ignored():\n    return 0\n", encoding="utf-8")
+            created = repo / "services"
+            assert all(emitter.watch.path != str(created) for emitter in observer.emitters)
+            created.mkdir()
+            (created / "svc.py").write_text("def service():\n    return 3\n", encoding="utf-8")
+            subprocess.run(["git", "add", "services/svc.py"], cwd=repo, check=True)
+            assert self._wait_for(
+                lambda: any(
+                    emitter.watch.path == str(created) and emitter.watch.is_recursive
+                    for emitter in observer.emitters
+                )
+            ), "the new directory did not receive a recursive watch"
+            assert self._wait_for(lambda: str(created / "svc.py") in reader.get_all_files()), (
+                "the new directory was not indexed"
+            )
+            assert all(emitter.watch.path != str(ignored) for emitter in observer.emitters)
+            assert str(ignored_file) not in reader.get_all_files()
+            nested = repo / "src" / "nested"
+            assert any(
+                emitter.watch.path == str(repo / "src") and emitter.watch.is_recursive
+                for emitter in observer.emitters
+            ), "the parent directory lacks its recursive watch"
+            nested.mkdir()
+            nested_file = nested / "child.py"
+            nested_file.write_text("def child():\n    return 4\n", encoding="utf-8")
+            subprocess.run(["git", "add", "src/nested/child.py"], cwd=repo, check=True)
+            assert self._wait_for(lambda: str(nested_file) in reader.get_all_files())
+            assert all(emitter.watch.path != str(nested) for emitter in observer.emitters)
+            assert thread.is_alive()
 
-        def run_watch():
-            try:
-                watch(repo, store, stop_event=stop)
-            except BaseException as exc:  # noqa: BLE001 - surfaced by the assertions
-                failure.append(exc)
+    def test_recreated_directory_survives_and_is_reindexed(self, tmp_path, watch_repository):
+        """Re-adopt a directory after separate and same-tick replacement."""
+        from watchdog.observers import Observer
 
-        with patch("code_review_graph.incremental._WATCH_TICK_SECONDS", 0.05):
-            thread = threading.Thread(target=run_watch, name="watch-under-test", daemon=True)
-            thread.start()
-            try:
-                assert self._wait_for(
-                    lambda: watch_health_path(repo).exists()
-                ), "the watch loop never started"
-
-                # The whole point: this directory did not exist when the
-                # watches were planned.
-                created = repo / "services"
-                created.mkdir()
-                (created / "svc.py").write_text("def service():\n    return 3\n", encoding="utf-8")
-                subprocess.run(["git", "add", "services/svc.py"], cwd=repo, check=True)
-
-                indexed = self._wait_for(
-                    lambda: any(
-                        path.endswith("svc.py") for path in reader.get_all_files()
+        repo = tmp_path / "repo"
+        source = repo / "src"
+        source.mkdir(parents=True)
+        for index in range(6):
+            (repo / "node_modules" / f"pkg{index}").mkdir(parents=True)
+        original = source / "app.py"
+        original.write_text("def handler():\n    return 1\n", encoding="utf-8")
+        observer = Observer()
+        with watch_repository(repo, observer=observer) as (reader, thread):
+            assert self._wait_for(
+                lambda: (read_watch_health(repo) or {}).get("phase") == "watching"
+            )
+            first = next(
+                emitter for emitter in observer.emitters if emitter.watch.path == str(source)
+            )
+            assert str(original) in reader.get_all_files()
+            shutil.rmtree(source)
+            assert self._wait_for(
+                lambda: (
+                    all(emitter.watch.path != str(source) for emitter in observer.emitters)
+                    and str(original) not in reader.get_all_files()
+                )
+            ), "the removed directory was not released"
+            assert thread.is_alive()
+            source.mkdir()
+            restored = source / "restored.py"
+            restored.write_text("def restored():\n    return 2\n", encoding="utf-8")
+            assert self._wait_for(
+                lambda: (
+                    any(
+                        emitter is not first and emitter.watch.path == str(source)
+                        for emitter in observer.emitters
                     )
+                    and str(restored) in reader.get_all_files()
                 )
-            finally:
-                stop.set()
-                thread.join(timeout=20)
-                store.close()
-                reader.close()
+            ), "the restored directory was not re-adopted"
+            shutil.rmtree(source)
+            source.mkdir()
+            reborn = source / "reborn.py"
+            reborn.write_text("def reborn():\n    return 5\n", encoding="utf-8")
+            assert self._wait_for(
+                lambda: (
+                    str(reborn) in reader.get_all_files()
+                    and str(restored) not in reader.get_all_files()
+                )
+            ), "the same-tick replacement was not reindexed"
+            assert thread.is_alive()
 
-        assert not failure, f"watch() raised: {failure[0]!r}"
-        assert indexed, (
-            "a top-level directory created after startup was never watched or indexed"
-        )
+    def test_deleting_a_watched_directory_does_not_kill_the_watcher(
+        self,
+        tmp_path,
+        watch_repository,
+    ):
+        """A deleted directory loses its emitter and graph rows without a crash."""
+        from watchdog.observers import Observer
 
-    def test_recreated_directory_survives_and_is_reindexed(self, tmp_path):
-        """`rm -rf src && mkdir src` inside one tick, on a real Observer.
-
-        Both halves matter and only fail together: the emitter stops itself on
-        the delete, so a path-keyed watch list calls it a death and exits 1,
-        and nothing re-adopts the replacement, so its files never reach the
-        graph — while ``crg-daemon status`` still reports ok.
-        """
         repo = tmp_path / "repo"
-        (repo / "src").mkdir(parents=True)
+        library = repo / "lib"
+        library.mkdir(parents=True)
         for index in range(6):
             (repo / "node_modules" / f"pkg{index}").mkdir(parents=True)
-        (repo / "src" / "app.py").write_text("def handler():\n    return 1\n", encoding="utf-8")
-
-        store = GraphStore(repo / "graph.db")
-        incremental_update(repo, store, changed_files=["src/app.py"])
-        assert store.get_all_files(), "precondition: the graph knows the original file"
-        reader = GraphStore(repo / "graph.db")
-        stop = threading.Event()
-        failure: list[BaseException] = []
-
-        def run_watch():
-            try:
-                watch(repo, store, stop_event=stop)
-            except BaseException as exc:  # noqa: BLE001 - surfaced by the assertions
-                failure.append(exc)
-
-        with patch("code_review_graph.incremental._WATCH_TICK_SECONDS", 0.05):
-            thread = threading.Thread(target=run_watch, name="watch-under-test", daemon=True)
-            thread.start()
-            try:
-                assert self._wait_for(lambda: watch_health_path(repo).exists())
-
-                # Delete and recreate back to back, well inside one tick.
-                shutil.rmtree(repo / "src")
-                (repo / "src").mkdir()
-                (repo / "src" / "reborn.py").write_text(
-                    "def reborn():\n    return 5\n", encoding="utf-8"
+        (library / "mod.py").write_text("def mod():\n    return 1\n", encoding="utf-8")
+        observer = Observer()
+        with watch_repository(repo, observer=observer) as (reader, thread):
+            assert self._wait_for(
+                lambda: (read_watch_health(repo) or {}).get("phase") == "watching"
+            )
+            assert any(emitter.watch.path == str(library) for emitter in observer.emitters)
+            assert reader.get_all_files()
+            shutil.rmtree(library)
+            assert self._wait_for(
+                lambda: (
+                    all(emitter.watch.path != str(library) for emitter in observer.emitters)
+                    and not reader.get_all_files()
                 )
-
-                reindexed = self._wait_for(
-                    lambda: any(p.endswith("reborn.py") for p in reader.get_all_files())
-                )
-                survived = thread.is_alive()
-            finally:
-                stop.set()
-                thread.join(timeout=20)
-                store.close()
-                reader.close()
-
-        assert not failure, f"delete-and-recreate killed the watcher: {failure[0]!r}"
-        assert survived, "the watcher exited on a recreated directory"
-        assert reindexed, "the recreated directory's files never reached the graph"
-
-    def test_deleting_a_watched_directory_does_not_kill_the_watcher(self, tmp_path):
-        """The emitter stops itself when its root vanishes; that is not a death."""
-        repo = tmp_path / "repo"
-        (repo / "lib").mkdir(parents=True)
-        for index in range(6):
-            (repo / "node_modules" / f"pkg{index}").mkdir(parents=True)
-        (repo / "lib" / "mod.py").write_text("def mod():\n    return 1\n", encoding="utf-8")
-
-        store = GraphStore(repo / "graph.db")
-        stop = threading.Event()
-        failure: list[BaseException] = []
-
-        def run_watch():
-            try:
-                watch(repo, store, stop_event=stop)
-            except BaseException as exc:  # noqa: BLE001 - surfaced by the assertions
-                failure.append(exc)
-
-        with patch("code_review_graph.incremental._WATCH_TICK_SECONDS", 0.05):
-            thread = threading.Thread(target=run_watch, name="watch-under-test", daemon=True)
-            thread.start()
-            try:
-                assert self._wait_for(lambda: watch_health_path(repo).exists())
-                shutil.rmtree(repo / "lib")
-                time.sleep(1.0)  # several ticks
-                still_running = thread.is_alive()
-            finally:
-                stop.set()
-                thread.join(timeout=20)
-                store.close()
-
-        assert not failure, f"deleting a watched directory killed the watcher: {failure[0]!r}"
-        assert still_running
+            ), "the removed directory retained its watch or graph rows"
+            assert thread.is_alive()
 
 
 # ---------------------------------------------------------------------------
@@ -1309,10 +1396,13 @@ class TestStatusSurfacesStalls:
         )
         daemon = WatchDaemon(config=config, config_path=tmp_path / "watch.toml")
 
-        with patch(
-            "code_review_graph.daemon.load_state",
-            return_value={"repo": {"pid": 4242, "path": str(repo)}},
-        ), patch("code_review_graph.daemon._is_pid_alive", return_value=True):
+        with (
+            patch(
+                "code_review_graph.daemon.load_state",
+                return_value={"repo": {"pid": 4242, "path": str(repo)}},
+            ),
+            patch("code_review_graph.daemon._is_pid_alive", return_value=True),
+        ):
             entry = daemon.status()["repos"][0]
 
         assert entry["alive"] is True, "the process really is still running"

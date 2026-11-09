@@ -28,8 +28,7 @@ def test_java_method_references_chained_calls_and_constructors_are_calls() -> No
     route_calls = [edge for edge in calls if edge.source.endswith("RouterConfig.routes")]
 
     method_reference = next(
-        edge for edge in route_calls
-        if edge.target == f"{path.as_posix()}::Handler.handle"
+        edge for edge in route_calls if edge.target == f"{path.as_posix()}::Handler.handle"
     )
     assert method_reference.extra["receiver"] == "handler"
     assert method_reference.extra["call_syntax"] == "method_reference"
@@ -40,7 +39,7 @@ def test_java_method_references_chained_calls_and_constructors_are_calls() -> No
 @pytest.mark.parametrize(
     "decorator",
     [
-        "KafkaListener(topics = \"orders\")",
+        'KafkaListener(topics = "orders")',
         "WorkflowMethod",
         "ActivityMethod",
     ],
@@ -53,34 +52,38 @@ def test_java_framework_callbacks_remain_flow_entry_points(
     caller_path = (tmp_path / "Caller.java").as_posix()
     callback_qn = f"{callback_path}::Callback.execute"
     with GraphStore(tmp_path / "graph.db") as store:
-        store.upsert_node(NodeInfo(
-            kind="Function",
-            name="execute",
-            file_path=callback_path,
-            line_start=1,
-            line_end=2,
-            language="java",
-            parent_name="Callback",
-            extra={"decorators": [decorator]},
-        ))
-        store.upsert_node(NodeInfo(
-            kind="Function",
-            name="invoke",
-            file_path=caller_path,
-            line_start=1,
-            line_end=2,
-            language="java",
-            parent_name="Caller",
-        ))
-        store.upsert_edge(EdgeInfo(
-            kind="CALLS",
-            source=f"{caller_path}::Caller.invoke",
-            target=callback_qn,
-            file_path=caller_path,
-            line=2,
-        ))
+        store.upsert_node(
+            NodeInfo(
+                kind="Function",
+                name="execute",
+                file_path=callback_path,
+                line_start=1,
+                line_end=2,
+                language="java",
+                parent_name="Callback",
+                extra={"decorators": [decorator]},
+            )
+        )
+        store.upsert_node(
+            NodeInfo(
+                kind="Function",
+                name="invoke",
+                file_path=caller_path,
+                line_start=1,
+                line_end=2,
+                language="java",
+                parent_name="Caller",
+            )
+        )
+        store.upsert_edge(
+            EdgeInfo(
+                kind="CALLS",
+                source=f"{caller_path}::Caller.invoke",
+                target=callback_qn,
+                file_path=caller_path,
+                line=2,
+            )
+        )
         store.commit()
 
-        assert callback_qn in {
-            node.qualified_name for node in detect_entry_points(store)
-        }
+        assert callback_qn in {node.qualified_name for node in detect_entry_points(store)}
