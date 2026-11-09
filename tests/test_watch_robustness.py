@@ -674,6 +674,82 @@ class TestObserverLiveness:
 
 
 class TestWatchLoop:
+    def test_native_batch_observer_stop_joins_its_real_streams(self, tmp_path):
+        from watchdog.events import FileSystemEventHandler
+
+        from code_review_graph._watchfiles import WatchfilesObserver
+
+        original = set(threading.enumerate())
+        observer = WatchfilesObserver(timeout=5, max_streams=2)
+        observer.schedule(FileSystemEventHandler(), str(tmp_path), recursive=False)
+        observer.start()
+        observer.stop()
+        observer.join(timeout=5)
+        assert not observer.is_alive()
+        assert not (set(threading.enumerate()) - original)
+
+    def test_native_batch_observer_join_preserves_a_callback_failure(self, tmp_path):
+        from watchdog.events import FileSystemEventHandler
+
+        from code_review_graph._watchfiles import WatchfilesObserver
+
+        called = threading.Event()
+
+        class FailingHandler(FileSystemEventHandler):
+            def on_created(self, event):
+                called.set()
+                raise RuntimeError("native callback failed")
+
+        original = set(threading.enumerate())
+        observer = WatchfilesObserver(timeout=5, max_streams=2)
+        observer.schedule(FailingHandler(), str(tmp_path), recursive=False)
+        observer.start()
+        (tmp_path / "source.py").write_text("value = 1\n", encoding="utf-8")
+        assert called.wait(5)
+        observer.stop()
+        with pytest.raises(RuntimeError, match="native callback failed"):
+            observer.join(timeout=5)
+        assert not observer.is_alive()
+        assert not (set(threading.enumerate()) - original)
+
+    def test_default_observer_bounds_threads_across_many_ignored_subtrees(
+        self, tmp_path, watch_repository
+    ):
+        """Many real schedules retain coverage without one thread pair per path."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / ".gitignore").write_text("**/target/\n", encoding="utf-8")
+        (repo / ".code-review-graphignore").write_text("**/target/\n", encoding="utf-8")
+        for index in range(32):
+            module = repo / f"module{index}"
+            (module / "target").mkdir(parents=True)
+            (module / "source.py").write_text("def value():\n    return 1\n", encoding="utf-8")
+        subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+        subprocess.run(["git", "add", "."], cwd=repo, check=True)
+        original_threads = set(threading.enumerate())
+        wait_for = TestRealObserver()._wait_for
+        with watch_repository(repo) as (reader, thread):
+            assert wait_for(
+                lambda: (read_watch_health(repo) or {}).get("phase") == "watching"
+            ), "the native multi-path observer did not become ready"
+            health = read_watch_health(repo)
+            assert health is not None and health["watched_paths"] >= 32
+            assert len(set(threading.enumerate()) - original_threads) <= 8
+            changed = repo / "module31" / "source.py"
+            changed.write_text("def changed():\n    return 2\n", encoding="utf-8")
+            assert wait_for(
+                lambda: any(
+                    node.name == "changed" for node in reader.get_nodes_by_file(str(changed))
+                )
+            ), "the last scheduled module stopped receiving events"
+            ignored = repo / "module31" / "target" / "ignored.py"
+            ignored.write_text("def excluded():\n    return 3\n", encoding="utf-8")
+            assert str(ignored) not in reader.get_all_files()
+            assert thread.is_alive()
+        assert not (set(threading.enumerate()) - original_threads), "observer threads leaked"
+        with GraphStore(repo / "graph.db") as stopped:
+            assert str(ignored) not in stopped.get_all_files()
+
     def _watch_with(self, tmp_path, store, observer, sleeper, health_interval=0.0, **kwargs):
         with (
             patch("watchdog.observers.Observer", return_value=observer),
