@@ -1422,6 +1422,70 @@ def _write_health(repo_root: Path, **fields) -> None:
 
 
 class TestStatusSurfacesStalls:
+    def test_concurrent_health_reads_allow_atomic_replacement(self, tmp_path):
+        from concurrent.futures import ThreadPoolExecutor
+
+        path = watch_health_path(tmp_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        padding = "heartbeat" * 8192
+
+        def payload(generation):
+            return json.dumps(
+                {"updated_at": time.time(), "generation": generation, "data": padding}
+            )
+
+        path.write_text(payload(0), encoding="utf-8")
+        ready = threading.Barrier(5)
+        stop = threading.Event()
+
+        def read_continuously():
+            ready.wait(timeout=10)
+            reads = 0
+            while not stop.is_set():
+                health = read_watch_health(tmp_path)
+                assert health is not None
+                assert health["data"] == padding
+                assert isinstance(health["generation"], int)
+                reads += 1
+            return reads
+
+        with ThreadPoolExecutor(max_workers=4) as readers:
+            futures = [readers.submit(read_continuously) for _ in range(4)]
+            try:
+                ready.wait(timeout=10)
+                temporary = path.with_suffix(".tmp")
+                for generation in range(1, 201):
+                    temporary.write_text(payload(generation), encoding="utf-8")
+                    temporary.replace(path)
+            finally:
+                stop.set()
+            assert all(future.result(timeout=10) > 0 for future in futures)
+
+        final = read_watch_health(tmp_path)
+        assert final is not None and final["generation"] == 200
+        if sys.platform == "win32":
+            import ctypes
+            from ctypes import wintypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.GetProcessHandleCount.argtypes = (
+                wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)
+            )
+            kernel32.GetProcessHandleCount.restype = wintypes.BOOL
+
+            def handle_count():
+                count = wintypes.DWORD()
+                if not kernel32.GetProcessHandleCount(wintypes.HANDLE(-1), ctypes.byref(count)):
+                    raise ctypes.WinError(ctypes.get_last_error())
+                return count.value
+
+            before = handle_count()
+            for _ in range(100):
+                assert read_watch_health(tmp_path) is not None
+            assert handle_count() == before, "heartbeat readers leaked native Windows handles"
+        path.unlink()
+        assert read_watch_health(tmp_path) is None
+
     def test_missing_health_reads_as_unknown(self, tmp_path):
         assert read_watch_health(tmp_path) is None
         assert watcher_status(True, None) == "unknown"
