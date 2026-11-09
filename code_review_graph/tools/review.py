@@ -6,7 +6,7 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from ..changes import analyze_changes, parse_diff_ranges, parse_git_diff_ranges  # noqa: F401
+from ..changes import analyze_changes, parse_diff_ranges
 from ..context_savings import attach_context_savings, estimate_file_tokens, estimate_tokens
 from ..flows import get_affected_flows as _get_affected_flows
 from ..graph import edge_to_dict, node_to_dict
