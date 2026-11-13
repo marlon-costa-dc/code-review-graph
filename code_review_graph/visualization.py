@@ -47,8 +47,7 @@ def _d3_script_tags() -> str:
     """
     local_tag = f'<script src="{D3_LOCAL_FILENAME}" integrity="{D3_SRI_HASH}"></script>'
     cdn_tag = (
-        f'<script src="{D3_CDN_URL}" integrity="{D3_SRI_HASH}" crossorigin="anonymous">'
-        "<\\/script>"
+        f'<script src="{D3_CDN_URL}" integrity="{D3_SRI_HASH}" crossorigin="anonymous"><\\/script>'
     )
     fallback_tag = f"<script>window.d3 || document.write('{cdn_tag}');</script>"
     return local_tag + "\n" + fallback_tag
@@ -83,6 +82,7 @@ def _write_d3_asset(directory: Path) -> Path | None:
         logger.warning("Could not write %s (%s); page will use the CDN fallback.", dest, exc)
         return None
     return dest
+
 
 # Auto-mode thresholds for the full D3 force layout. Rendering cost scales
 # with both counts: every simulation tick runs an O(E) link force on top of
@@ -170,9 +170,7 @@ def _resolve_target(
 
 def _get_stored_communities(store: GraphStore) -> list[dict[str, Any]]:
     try:
-        rows = store._conn.execute(
-            "SELECT * FROM communities ORDER BY size DESC"
-        ).fetchall()
+        rows = store._conn.execute("SELECT * FROM communities ORDER BY size DESC").fetchall()
     except sqlite3.OperationalError as exc:
         if "no such table: communities" in str(exc).lower():
             logger.debug("communities unavailable for export: %s", exc)
@@ -180,14 +178,11 @@ def _get_stored_communities(store: GraphStore) -> list[dict[str, Any]]:
         raise
 
     member_rows = store._conn.execute(
-        "SELECT community_id, qualified_name FROM nodes "
-        "WHERE community_id IS NOT NULL"
+        "SELECT community_id, qualified_name FROM nodes WHERE community_id IS NOT NULL"
     ).fetchall()
     members_by_cid: dict[int, list[str]] = defaultdict(list)
     for row in member_rows:
-        members_by_cid[row["community_id"]].append(
-            _sanitize_name(row["qualified_name"])
-        )
+        members_by_cid[row["community_id"]].append(_sanitize_name(row["qualified_name"]))
 
     return [
         {
@@ -509,8 +504,7 @@ def generate_html(
     stats = store.get_stats()
     if stats.total_nodes > 50000:
         logger.warning(
-            "Graph has %d nodes — visualization may be slow. "
-            "Consider filtering by file pattern.",
+            "Graph has %d nodes — visualization may be slow. Consider filtering by file pattern.",
             stats.total_nodes,
         )
     data = export_graph_data(store)
@@ -529,8 +523,11 @@ def generate_html(
             logger.info(
                 "auto mode: %d nodes / %d edges exceeds full-render budget "
                 "(%d nodes / %d edges) — using %s aggregation",
-                len(data["nodes"]), len(data["edges"]),
-                max_full_nodes, max_full_edges, effective_mode,
+                len(data["nodes"]),
+                len(data["edges"]),
+                max_full_nodes,
+                max_full_edges,
+                effective_mode,
             )
 
     if effective_mode == "community":

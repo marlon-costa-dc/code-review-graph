@@ -63,7 +63,9 @@ class TsconfigResolver:
             return self._match_and_probe(import_str, paths, base_dir)
         except (OSError, ValueError, TypeError):
             logger.debug(
-                "TsconfigResolver: unexpected error for %s", file_path, exc_info=True,
+                "TsconfigResolver: unexpected error for %s",
+                file_path,
+                exc_info=True,
             )
             return None
 
@@ -207,6 +209,7 @@ class TsconfigResolver:
         base_dir: Path,
     ) -> Optional[str]:
         """Match import_str against alias patterns and probe the filesystem."""
+
         def _pattern_specificity(item: tuple[str, list[str]]) -> int:
             pat = item[0]
             return len(pat.partition("*")[0])
@@ -247,7 +250,7 @@ def _match_pattern(pattern: str, import_str: str) -> Optional[str]:
         return None
 
     end = len(import_str) - len(suffix_pat) if suffix_pat else len(import_str)
-    return import_str[len(prefix):end]
+    return import_str[len(prefix) : end]
 
 
 def _probe_path(base: Path) -> Optional[Path]:

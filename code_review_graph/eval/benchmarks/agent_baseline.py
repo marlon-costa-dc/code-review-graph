@@ -38,19 +38,66 @@ logger = logging.getLogger(__name__)
 DEFAULT_TOP_K = 3
 
 _SOURCE_EXTS = (
-    ".py", ".js", ".ts", ".tsx", ".go", ".rs", ".java",
-    ".c", ".cpp", ".h", ".rb", ".php", ".swift", ".kt",
+    ".py",
+    ".js",
+    ".ts",
+    ".tsx",
+    ".go",
+    ".rs",
+    ".java",
+    ".c",
+    ".cpp",
+    ".h",
+    ".rb",
+    ".php",
+    ".swift",
+    ".kt",
 )
 
 _SKIP_DIRS = {
-    ".git", ".hg", ".svn", "node_modules", "__pycache__",
-    ".code-review-graph", ".venv", "venv", "dist", "build",
+    ".git",
+    ".hg",
+    ".svn",
+    "node_modules",
+    "__pycache__",
+    ".code-review-graph",
+    ".venv",
+    "venv",
+    "dist",
+    "build",
 }
 
 _STOPWORDS = {
-    "how", "does", "do", "the", "a", "an", "is", "are", "was", "what",
-    "where", "when", "which", "who", "why", "and", "or", "in", "on", "of",
-    "to", "for", "with", "via", "into", "from", "this", "that", "it", "its",
+    "how",
+    "does",
+    "do",
+    "the",
+    "a",
+    "an",
+    "is",
+    "are",
+    "was",
+    "what",
+    "where",
+    "when",
+    "which",
+    "who",
+    "why",
+    "and",
+    "or",
+    "in",
+    "on",
+    "of",
+    "to",
+    "for",
+    "with",
+    "via",
+    "into",
+    "from",
+    "this",
+    "that",
+    "it",
+    "its",
 }
 
 
@@ -88,7 +135,9 @@ def iter_source_files(repo_path: Path) -> Iterator[Path]:
 
 
 def grep_rank(
-    repo_path: Path, terms: list[str], k: int = DEFAULT_TOP_K,
+    repo_path: Path,
+    terms: list[str],
+    k: int = DEFAULT_TOP_K,
 ) -> list[tuple[str, int]]:
     """Rank source files by total case-insensitive term matches; take top-k.
 
@@ -147,6 +196,7 @@ def run(repo_path: Path, store, config: dict) -> list[dict]:
 
         try:
             from code_review_graph.search import hybrid_search
+
             hits = hybrid_search(
                 store,
                 question,
@@ -197,13 +247,7 @@ def aggregate(results: list[dict]) -> dict:
         # against a populated graph means the vector index is missing —
         # re-run the eval with --embed.
         "no_graph_results_rows": no_graph,
-        "no_baseline_match_rows": sum(
-            1 for r in results if r.get("status") == "no_baseline_match"
-        ),
-        "median_baseline_to_graph_ratio": (
-            round(statistics.median(ratios), 1) if ratios else None
-        ),
-        "mean_baseline_to_graph_ratio": (
-            round(statistics.mean(ratios), 1) if ratios else None
-        ),
+        "no_baseline_match_rows": sum(1 for r in results if r.get("status") == "no_baseline_match"),
+        "median_baseline_to_graph_ratio": (round(statistics.median(ratios), 1) if ratios else None),
+        "mean_baseline_to_graph_ratio": (round(statistics.mean(ratios), 1) if ratios else None),
     }

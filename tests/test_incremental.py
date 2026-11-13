@@ -4,6 +4,8 @@ import hashlib
 import io
 import sqlite3
 import subprocess
+import threading
+import time
 from pathlib import Path
 from unittest.mock import MagicMock, call, patch  # noqa: F401 – used in tests
 
@@ -23,10 +25,8 @@ from code_review_graph.incremental import (
     _run_spring_resolver,
     _run_temporal_resolver,
     _should_ignore,
-    _single_hop_dependents,
     collect_all_files,
     ensure_repo_gitignore_excludes_crg,
-    find_dependents,
     find_project_root,
     find_repo_root,
     full_build,
@@ -45,7 +45,10 @@ class TestParseExecutorSelection:
     def test_stdio_mcp_uses_threads_on_unix(self, monkeypatch):
         monkeypatch.delenv("CRG_PARSE_EXECUTOR", raising=False)
         monkeypatch.setattr(
-            incremental_module, "_MCP_STDIO_ACTIVE", True, raising=False,
+            incremental_module,
+            "_MCP_STDIO_ACTIVE",
+            True,
+            raising=False,
         )
         monkeypatch.setattr(incremental_module.sys, "platform", "linux")
         monkeypatch.setattr(incremental_module.sys.stdin, "isatty", lambda: False)
@@ -55,7 +58,10 @@ class TestParseExecutorSelection:
     def test_non_mcp_unix_automation_keeps_process_default(self, monkeypatch):
         monkeypatch.delenv("CRG_PARSE_EXECUTOR", raising=False)
         monkeypatch.setattr(
-            incremental_module, "_MCP_STDIO_ACTIVE", False, raising=False,
+            incremental_module,
+            "_MCP_STDIO_ACTIVE",
+            False,
+            raising=False,
         )
         monkeypatch.setattr(incremental_module.sys, "platform", "linux")
         monkeypatch.setattr(incremental_module.sys.stdin, "isatty", lambda: False)
@@ -65,7 +71,10 @@ class TestParseExecutorSelection:
     def test_explicit_process_override_wins_in_stdio_mcp(self, monkeypatch):
         monkeypatch.setenv("CRG_PARSE_EXECUTOR", "process")
         monkeypatch.setattr(
-            incremental_module, "_MCP_STDIO_ACTIVE", True, raising=False,
+            incremental_module,
+            "_MCP_STDIO_ACTIVE",
+            True,
+            raising=False,
         )
 
         assert incremental_module._select_executor_kind() == "process"
@@ -195,8 +204,7 @@ class TestGetDbPath:
         legacy = tmp_path / ".code-review-graph.db"
         legacy.write_text("legacy data")
         side_files = [
-            tmp_path / f".code-review-graph.db{suffix}"
-            for suffix in ("-wal", "-shm", "-journal")
+            tmp_path / f".code-review-graph.db{suffix}" for suffix in ("-wal", "-shm", "-journal")
         ]
         for side_file in side_files:
             side_file.write_text("side")
@@ -216,10 +224,7 @@ class TestEnsureRepoGitignoreExcludesCrg:
 
         gitignore = tmp_path / ".gitignore"
         assert gitignore.exists()
-        assert gitignore.read_text() == (
-            "# Added by code-review-graph\n"
-            ".code-review-graph/\n"
-        )
+        assert gitignore.read_text() == ("# Added by code-review-graph\n.code-review-graph/\n")
 
     def test_appends_rule_when_missing(self, tmp_path):
         gitignore = tmp_path / ".gitignore"
@@ -228,9 +233,7 @@ class TestEnsureRepoGitignoreExcludesCrg:
         state = ensure_repo_gitignore_excludes_crg(tmp_path)
         assert state == "updated"
         assert gitignore.read_text() == (
-            "node_modules/\n"
-            "# Added by code-review-graph\n"
-            ".code-review-graph/\n"
+            "node_modules/\n# Added by code-review-graph\n.code-review-graph/\n"
         )
 
     def test_idempotent_when_present(self, tmp_path):
@@ -290,7 +293,10 @@ class TestIgnorePatterns:
     def test_should_ignore_nested_dependency_dirs(self):
         """Nested node_modules / vendor / .gradle should be ignored (#91)."""
         patterns = [
-            "node_modules/**", "vendor/**", ".gradle/**", ".venv/**",
+            "node_modules/**",
+            "vendor/**",
+            ".gradle/**",
+            ".venv/**",
         ]
         # Monorepo: nested node_modules
         assert _should_ignore("packages/app/node_modules/react/index.js", patterns)
@@ -368,6 +374,7 @@ class TestDataDir:
         """Without CRG_DATA_DIR, graphs live at <repo>/.code-review-graph."""
         monkeypatch.delenv("CRG_DATA_DIR", raising=False)
         from code_review_graph.incremental import get_data_dir
+
         result = get_data_dir(tmp_path)
         assert result == tmp_path / ".code-review-graph"
         assert result.is_dir()
@@ -387,6 +394,7 @@ class TestDataDir:
         """
         monkeypatch.delenv("CRG_DATA_DIR", raising=False)
         from code_review_graph.incremental import get_data_dir
+
         data_dir = get_data_dir(tmp_path)
         gi = data_dir / ".gitignore"
         assert gi.is_file()
@@ -415,6 +423,7 @@ class TestDataDir:
         repo.mkdir()
         monkeypatch.setenv("CRG_DATA_DIR", str(external))
         from code_review_graph.incremental import get_data_dir
+
         result = get_data_dir(repo)
         assert result == external.resolve()
         assert result.is_dir()
@@ -428,6 +437,7 @@ class TestDataDir:
         repo.mkdir()
         monkeypatch.setenv("CRG_DATA_DIR", str(external))
         from code_review_graph.incremental import get_db_path
+
         db_path = get_db_path(repo)
         assert db_path == external.resolve() / "graph.db"
         assert db_path.parent.is_dir()
@@ -435,22 +445,28 @@ class TestDataDir:
     def test_find_project_root_env_override(self, tmp_path, monkeypatch):
         """CRG_REPO_ROOT should override normal git-root resolution."""
         from pathlib import Path as PathType
+
         external_repo = tmp_path / "elsewhere"
         external_repo.mkdir()
         monkeypatch.setenv("CRG_REPO_ROOT", str(external_repo))
         from code_review_graph.incremental import find_project_root
+
         result = find_project_root(PathType.cwd())
         assert result == external_repo.resolve()
 
     def test_find_project_root_env_override_missing_dir_falls_through(
-        self, tmp_path, monkeypatch,
+        self,
+        tmp_path,
+        monkeypatch,
     ):
         """CRG_REPO_ROOT pointing at a non-existent path falls back to
         the usual resolution rather than crashing."""
         monkeypatch.setenv(
-            "CRG_REPO_ROOT", str(tmp_path / "does-not-exist-123"),
+            "CRG_REPO_ROOT",
+            str(tmp_path / "does-not-exist-123"),
         )
         from code_review_graph.incremental import find_project_root
+
         result = find_project_root(tmp_path)
         # Should NOT equal the bogus env value
         assert result != tmp_path / "does-not-exist-123"
@@ -640,9 +656,7 @@ class TestGitOperations:
         assert "--untracked-files=all" in command
 
     @patch("code_review_graph.incremental.subprocess.run")
-    def test_get_staged_and_unstaged_rejects_failed_status(
-        self, mock_run, tmp_path
-    ):
+    def test_get_staged_and_unstaged_rejects_failed_status(self, mock_run, tmp_path):
         mock_run.return_value = MagicMock(
             returncode=128,
             stdout=b"?? misleading.py\0",
@@ -661,9 +675,7 @@ class TestGitOperations:
         assert result == ["a.py", "b.py", "c.go"]
 
     @patch("code_review_graph.incremental.subprocess.run")
-    def test_get_all_tracked_files_recurse_submodules_param(
-        self, mock_run, tmp_path
-    ):
+    def test_get_all_tracked_files_recurse_submodules_param(self, mock_run, tmp_path):
         mock_run.return_value = MagicMock(
             returncode=0,
             stdout="a.py\nsub/b.py\n",
@@ -674,9 +686,7 @@ class TestGitOperations:
         assert "--recurse-submodules" in cmd
 
     @patch("code_review_graph.incremental.subprocess.run")
-    def test_get_all_tracked_files_no_recurse_by_default(
-        self, mock_run, tmp_path
-    ):
+    def test_get_all_tracked_files_no_recurse_by_default(self, mock_run, tmp_path):
         mock_run.return_value = MagicMock(
             returncode=0,
             stdout="a.py\n",
@@ -688,9 +698,7 @@ class TestGitOperations:
 
     @patch("code_review_graph.incremental.subprocess.run")
     @patch("code_review_graph.incremental._RECURSE_SUBMODULES", True)
-    def test_get_all_tracked_files_env_var_fallback(
-        self, mock_run, tmp_path
-    ):
+    def test_get_all_tracked_files_env_var_fallback(self, mock_run, tmp_path):
         mock_run.return_value = MagicMock(
             returncode=0,
             stdout="a.py\nsub/c.py\n",
@@ -703,9 +711,7 @@ class TestGitOperations:
 
     @patch("code_review_graph.incremental.subprocess.run")
     @patch("code_review_graph.incremental._RECURSE_SUBMODULES", True)
-    def test_get_all_tracked_files_param_overrides_env(
-        self, mock_run, tmp_path
-    ):
+    def test_get_all_tracked_files_param_overrides_env(self, mock_run, tmp_path):
         mock_run.return_value = MagicMock(
             returncode=0,
             stdout="a.py\n",
@@ -831,10 +837,13 @@ class TestFullBuild:
 
             assert result["stale_files_removed"] == 2
             assert store.get_nodes_by_file(orphan_path) == []
-            assert store._conn.execute(
-                "SELECT COUNT(*) FROM edges WHERE file_path = ?",
-                (orphan_edge_path,),
-            ).fetchone()[0] == 0
+            assert (
+                store._conn.execute(
+                    "SELECT COUNT(*) FROM edges WHERE file_path = ?",
+                    (orphan_edge_path,),
+                ).fetchone()[0]
+                == 0
+            )
         finally:
             store.close()
 
@@ -914,9 +923,7 @@ class TestIncrementalUpdate:
         db_path = tmp_path / "test.db"
         store = GraphStore(db_path)
         try:
-            result = incremental_update(
-                tmp_path, store, changed_files=["mod.py"]
-            )
+            result = incremental_update(tmp_path, store, changed_files=["mod.py"])
             assert result["files_updated"] >= 1
             assert result["total_nodes"] > 0
         finally:
@@ -954,7 +961,9 @@ class TestRacingSaveSnapshotCoherence:
     """
 
     def test_save_racing_parse_probe_does_not_wipe_extensionless_script(
-        self, tmp_path, monkeypatch,
+        self,
+        tmp_path,
+        monkeypatch,
     ):
         """A save racing the parse-stage shebang probe must not wipe an
         extension-less script from the graph.
@@ -977,13 +986,12 @@ class TestRacingSaveSnapshotCoherence:
         store = GraphStore(tmp_path / "test.db")
         try:
             incremental_update(
-                tmp_path, store, changed_files=["tool"], reconcile_stale=False,
+                tmp_path,
+                store,
+                changed_files=["tool"],
+                reconcile_stale=False,
             )
-            names = {
-                n.name
-                for n in store.get_nodes_by_file(str(script))
-                if n.kind == "Function"
-            }
+            names = {n.name for n in store.get_nodes_by_file(str(script)) if n.kind == "Function"}
             assert "damaged" in names
 
             script.write_bytes(v2)  # the user's edit
@@ -1002,15 +1010,17 @@ class TestRacingSaveSnapshotCoherence:
 
             monkeypatch.setattr(Path, "open", racing_open)
             incremental_update(
-                tmp_path, store, changed_files=["tool"], reconcile_stale=False,
+                tmp_path,
+                store,
+                changed_files=["tool"],
+                reconcile_stale=False,
             )
             monkeypatch.undo()
 
             nodes = store.get_nodes_by_file(str(script))
             names = {n.name for n in nodes if n.kind == "Function"}
             assert "damaged_v2" in names, (
-                "a save racing the parse-stage shebang probe wiped the "
-                "script from the graph"
+                "a save racing the parse-stage shebang probe wiped the script from the graph"
             )
             # The stored hash is the hash of the bytes actually parsed,
             # which here equal the final on-disk content.
@@ -1019,7 +1029,9 @@ class TestRacingSaveSnapshotCoherence:
             store.close()
 
     def test_mid_save_read_stores_hash_of_parsed_snapshot(
-        self, tmp_path, monkeypatch,
+        self,
+        tmp_path,
+        monkeypatch,
     ):
         """The serial incremental path must store the hash of the bytes it
         actually parsed. When the parse-stage read races a save and captures a
@@ -1156,8 +1168,7 @@ class TestParallelParsing:
         # Create several Python files
         for i in range(10):
             (tmp_path / f"mod{i}.py").write_text(
-                f"def func_{i}():\n    return {i}\n\n"
-                f"class Cls{i}:\n    pass\n"
+                f"def func_{i}():\n    return {i}\n\nclass Cls{i}:\n    pass\n"
             )
 
         tracked = [f"mod{i}.py" for i in range(10)]
@@ -1203,10 +1214,16 @@ class TestParallelParsing:
         broken.write_text("def broken():\n    return 1\n")
         store = GraphStore(tmp_path / "atomic-full.db")
         try:
-            store.upsert_node(NodeInfo(
-                kind="Function", name="old", file_path=str(old),
-                line_start=1, line_end=2, language="python",
-            ))
+            store.upsert_node(
+                NodeInfo(
+                    kind="Function",
+                    name="old",
+                    file_path=str(old),
+                    line_start=1,
+                    line_end=2,
+                    language="python",
+                )
+            )
             store.commit()
             old.unlink()
 
@@ -1217,11 +1234,13 @@ class TestParallelParsing:
                     raise RuntimeError("forced parse failure")
                 return original(parser, path, source)
 
-            with patch(
-                "code_review_graph.incremental.get_all_tracked_files",
-                return_value=["good.py", "broken.py"],
-            ), patch.object(CodeParser, "parse_bytes", fail_broken), patch.dict(
-                "os.environ", {"CRG_SERIAL_PARSE": "1"}
+            with (
+                patch(
+                    "code_review_graph.incremental.get_all_tracked_files",
+                    return_value=["good.py", "broken.py"],
+                ),
+                patch.object(CodeParser, "parse_bytes", fail_broken),
+                patch.dict("os.environ", {"CRG_SERIAL_PARSE": "1"}),
             ):
                 with pytest.raises(RuntimeError, match="forced parse failure"):
                     full_build(tmp_path, store)
@@ -1233,154 +1252,262 @@ class TestParallelParsing:
 
 
 class TestMultiHopDependents:
-    """Tests for N-hop dependent discovery."""
+    """Complete recorded dependencies through real parsed source files."""
 
-    def _make_chain_store(self, tmp_path):
-        """Build A -> B -> C chain in the graph."""
-        from code_review_graph.parser import EdgeInfo, NodeInfo
+    @pytest.fixture
+    def chain(self, tmp_path):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        for name, source in {
+            "a.ts": 'import { b } from "./b"; export function a() { return b(); }',
+            "b.ts": 'import { c } from "./c"; export function b() { return c(); }',
+            "c.ts": "export function c() { return 1; }",
+        }.items():
+            (repo / name).write_text(source, encoding="utf-8")
+        with GraphStore(tmp_path / "chain.db") as store:
+            full_build(repo, store)
+            yield repo, store
 
-        db_path = tmp_path / "chain.db"
-        store = GraphStore(db_path)
-        for name, path in [("a", "/a.py"), ("b", "/b.py"), ("c", "/c.py")]:
-            store.upsert_node(NodeInfo(
-                kind="File", name=path, file_path=path,
-                line_start=1, line_end=10, language="python",
-            ))
-            store.upsert_node(NodeInfo(
-                kind="Function", name=f"func_{name}", file_path=path,
-                line_start=2, line_end=8, language="python",
-            ))
-        # A imports B, B imports C
-        store.upsert_edge(EdgeInfo(
-            kind="IMPORTS_FROM", source="/a.py::func_a",
-            target="/b.py::func_b", file_path="/a.py", line=1,
-        ))
-        store.upsert_edge(EdgeInfo(
-            kind="IMPORTS_FROM", source="/b.py::func_b",
-            target="/c.py::func_c", file_path="/b.py", line=1,
-        ))
-        store.commit()
-        return store
+    def test_one_hop_finds_b_not_a(self, chain):
+        repo, store = chain
+        dependents = store.get_dependent_files([str(repo / "c.ts")], max_hops=1)
+        assert dependents == [(repo / "b.ts").as_posix()]
 
-    def test_single_hop_finds_direct_only(self, tmp_path):
-        store = self._make_chain_store(tmp_path)
-        try:
-            deps = _single_hop_dependents(store, "/c.py")
-            assert "/b.py" in deps
-            assert "/a.py" not in deps
-        finally:
-            store.close()
+    def test_two_hops_finds_b_and_a(self, chain):
+        repo, store = chain
+        assert store.get_dependent_files([str(repo / "c.ts")], max_hops=2) == [
+            (repo / "a.ts").as_posix(),
+            (repo / "b.ts").as_posix(),
+        ]
 
-    def test_one_hop_finds_b_not_a(self, tmp_path):
-        store = self._make_chain_store(tmp_path)
-        try:
-            deps = find_dependents(store, "/c.py", max_hops=1)
-            assert "/b.py" in deps
-            assert "/a.py" not in deps
-        finally:
-            store.close()
-
-    def test_two_hops_finds_b_and_a(self, tmp_path):
-        store = self._make_chain_store(tmp_path)
-        try:
-            deps = find_dependents(store, "/c.py", max_hops=2)
-            assert "/b.py" in deps
-            assert "/a.py" in deps
-        finally:
-            store.close()
-
-    def test_cap_triggers_on_many_files(self, tmp_path):
-        """The 500-file cap prevents runaway expansion."""
-        from code_review_graph.parser import EdgeInfo, NodeInfo
-
-        db_path = tmp_path / "big.db"
-        store = GraphStore(db_path)
-        try:
-            # Hub node that many files depend on
-            store.upsert_node(NodeInfo(
-                kind="File", name="/hub.py", file_path="/hub.py",
-                line_start=1, line_end=10, language="python",
-            ))
-            store.upsert_node(NodeInfo(
-                kind="Function", name="hub_func", file_path="/hub.py",
-                line_start=2, line_end=8, language="python",
-            ))
-            for i in range(600):
-                path = f"/dep{i}.py"
-                store.upsert_node(NodeInfo(
-                    kind="File", name=path, file_path=path,
-                    line_start=1, line_end=10, language="python",
-                ))
-                store.upsert_node(NodeInfo(
-                    kind="Function", name=f"func_{i}", file_path=path,
-                    line_start=2, line_end=8, language="python",
-                ))
-                store.upsert_edge(EdgeInfo(
-                    kind="IMPORTS_FROM", source=f"{path}::func_{i}",
-                    target="/hub.py::hub_func", file_path=path, line=1,
-                ))
-            store.commit()
-
-            # Even with high max_hops, cap should limit results
-            deps = find_dependents(store, "/hub.py", max_hops=5)
-            assert len(deps) <= 500
-        finally:
-            store.close()
-
-    def test_truncated_flag_set_when_capped(self, tmp_path):
-        """Regression test for #261: find_dependents must set
-        DependentList.truncated = True when the result is capped."""
-        from code_review_graph.parser import EdgeInfo, NodeInfo
-
-        db_path = tmp_path / "trunc.db"
-        store = GraphStore(db_path)
-        try:
-            store.upsert_node(NodeInfo(
-                kind="File", name="/hub.py", file_path="/hub.py",
-                line_start=1, line_end=10, language="python",
-            ))
-            store.upsert_node(NodeInfo(
-                kind="Function", name="hub_func", file_path="/hub.py",
-                line_start=2, line_end=8, language="python",
-            ))
-            for i in range(600):
-                path = f"/dep{i}.py"
-                store.upsert_node(NodeInfo(
-                    kind="File", name=path, file_path=path,
-                    line_start=1, line_end=10, language="python",
-                ))
-                store.upsert_node(NodeInfo(
-                    kind="Function", name=f"func_{i}", file_path=path,
-                    line_start=2, line_end=8, language="python",
-                ))
-                store.upsert_edge(EdgeInfo(
-                    kind="IMPORTS_FROM", source=f"{path}::func_{i}",
-                    target="/hub.py::hub_func", file_path=path, line=1,
-                ))
-            store.commit()
-
-            deps = find_dependents(store, "/hub.py", max_hops=5)
-            assert len(deps) <= 500
-            # The key assertion: truncated flag must be set.
-            assert deps.truncated is True, (
-                "DependentList.truncated should be True when capped at "
-                "_MAX_DEPENDENT_FILES, but it was False"
+    @pytest.mark.parametrize("change", ["rename", "delete"])
+    def test_complete_expansion_crosses_sql_batches_without_truncation(self, tmp_path, change):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "hub.ts").write_text("export function hub() { return 1; }", encoding="utf-8")
+        expected = []
+        for index in range(601):
+            path = repo / f"dep{index:04}.ts"
+            path.write_text(
+                'import { hub } from "./hub"; export function use() { return hub(); }',
+                encoding="utf-8",
             )
-        finally:
-            store.close()
-
-    def test_truncated_flag_false_when_not_capped(self, tmp_path):
-        """Regression test for #261: find_dependents must set
-        DependentList.truncated = False when the result is complete."""
-        store = self._make_chain_store(tmp_path)
-        try:
-            deps = find_dependents(store, "/c.py", max_hops=2)
-            assert deps.truncated is False, (
-                "DependentList.truncated should be False when the "
-                "expansion completed without hitting the cap"
+            expected.append(path.as_posix())
+        with GraphStore(tmp_path / "fanout.db") as store:
+            full_build(repo, store)
+            # Read-only dry run: complete affected set before any update.
+            started = time.perf_counter()
+            assert store.get_dependent_files([str(repo / "hub.ts")]) == expected
+            assert store.get_dependent_files([str(repo / "hub.ts"), *expected]) == []
+            expansion_seconds = time.perf_counter() - started
+            if change == "rename":
+                (repo / "hub.ts").write_text(
+                    "export function renamed() { return 2; }",
+                    encoding="utf-8",
+                )
+            else:
+                (repo / "hub.ts").unlink()
+            started = time.perf_counter()
+            result = incremental_update(repo, store, changed_files=["hub.ts"])
+            incremental_seconds = time.perf_counter() - started
+            assert result["files_updated"] == (1 if change == "rename" else 602)
+            assert sorted(result["dependent_files"]) == [Path(path).name for path in expected]
+            with GraphStore(tmp_path / "fanout-rebuilt.db") as rebuilt:
+                started = time.perf_counter()
+                full_build(repo, rebuilt)
+                rebuild_seconds = time.perf_counter() - started
+                assert {
+                    (edge.kind, edge.source_qualified, edge.target_qualified, edge.file_path)
+                    for edge in store.get_all_edges()
+                } == {
+                    (edge.kind, edge.source_qualified, edge.target_qualified, edge.file_path)
+                    for edge in rebuilt.get_all_edges()
+                }
+            print(
+                {
+                    "files": 602,
+                    "change": change,
+                    "expansion_seconds": expansion_seconds,
+                    "incremental_seconds": incremental_seconds,
+                    "rebuild_seconds": rebuild_seconds,
+                }
             )
-        finally:
-            store.close()
+
+    def test_cycle_terminates_and_explicit_depth_is_not_a_publication_default(self, chain):
+        repo, store = chain
+        (repo / "c.ts").write_text(
+            'import { a } from "./a"; export function c() { return a(); }',
+            encoding="utf-8",
+        )
+        full_build(repo, store)
+        assert store.get_dependent_files([str(repo / "c.ts")]) == [
+            (repo / "a.ts").as_posix(),
+            (repo / "b.ts").as_posix(),
+        ]
+        assert store.get_dependent_files([str(repo / "a.ts"), str(repo / "c.ts")]) == [
+            (repo / "b.ts").as_posix(),
+        ]
+        assert store.get_dependent_files([str(repo / "c.ts")], max_hops=0) == []
+        with pytest.raises(ValueError, match="max_hops"):
+            store.get_dependent_files([str(repo / "c.ts")], max_hops=-1)
+
+    def test_unchanged_notification_does_not_expand_or_publish(self, chain):
+        repo, store = chain
+        # Capture public graph state and metadata before the no-op invocation.
+        before_nodes = store.get_all_nodes(exclude_files=False)
+        before_edges = store.get_all_edges()
+        before_updated = store.get_metadata("last_updated")
+        before_build_type = store.get_metadata("last_build_type")
+        result = incremental_update(repo, store, changed_files=["c.ts"])
+        assert result["files_updated"] == 0
+        assert result["dependent_files"] == []
+        assert store.get_all_nodes(exclude_files=False) == before_nodes
+        assert store.get_all_edges() == before_edges
+        assert store.get_metadata("last_updated") == before_updated
+        assert store.get_metadata("last_build_type") == before_build_type
+
+    @pytest.mark.parametrize("escape", ["outside-row", "symlink"])
+    def test_outside_dependent_fails_before_graph_publication(self, chain, tmp_path, escape):
+        repo, store = chain
+        outside = tmp_path / "outside.ts"
+        if escape == "outside-row":
+            outside.write_text(
+                'import { c } from "./repo/c"; export function outside() { return c(); }',
+                encoding="utf-8",
+            )
+            full_build(tmp_path, store)
+        else:
+            (repo / "b.ts").rename(outside)
+            (repo / "b.ts").symlink_to(outside)
+        # Read-only affected-set inspection precedes the attempted publication.
+        assert store.get_dependent_files([str(repo / "c.ts")])
+        before_nodes = store.get_all_nodes(exclude_files=False)
+        before_edges = store.get_all_edges()
+        before_updated = store.get_metadata("last_updated")
+        outside_bytes = outside.read_bytes()
+        (repo / "c.ts").write_text("export function c() { return 2; }", encoding="utf-8")
+        with pytest.raises(RuntimeError, match="path escapes repository root"):
+            incremental_update(repo, store, changed_files=["c.ts"])
+        assert store.get_all_nodes(exclude_files=False) == before_nodes
+        assert store.get_all_edges() == before_edges
+        assert store.get_metadata("last_updated") == before_updated
+        assert outside.read_bytes() == outside_bytes
+
+    def test_in_repository_git_submodule_remains_a_valid_dependent(self, tmp_path):
+        repo = tmp_path / "repo"
+        source = tmp_path / "member-source"
+        repo.mkdir()
+        source.mkdir()
+        (repo / "c.ts").write_text("export function c() { return 1; }", encoding="utf-8")
+        (source / "member.ts").write_text(
+            'import { c } from "../../c"; export function member() { return c(); }',
+            encoding="utf-8",
+        )
+        for directory, arguments in (
+            (source, ["init", "-q"]),
+            (source, ["add", "member.ts"]),
+            (
+                source,
+                [
+                    "-c",
+                    "user.name=CRG Test",
+                    "-c",
+                    "user.email=crg-test@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "commit",
+                    "-qm",
+                    "Add member source",
+                ],
+            ),
+            (repo, ["init", "-q"]),
+            (
+                repo,
+                [
+                    "-c",
+                    "protocol.file.allow=always",
+                    "submodule",
+                    "add",
+                    "-q",
+                    str(source),
+                    "modules/member",
+                ],
+            ),
+            (repo, ["add", "c.ts"]),
+        ):
+            subprocess.run(["git", *arguments], cwd=directory, check=True, capture_output=True)
+        member = repo / "modules/member/member.ts"
+        assert (member.parent / ".git").is_file()
+        with GraphStore(tmp_path / "submodule.db") as store:
+            full_build(repo, store, recurse_submodules=True)
+            assert store.get_dependent_files([(repo / "c.ts").as_posix()]) == [member.as_posix()]
+            original = member.read_bytes()
+            (repo / "c.ts").write_text("export function c() { return 2; }", encoding="utf-8")
+            result = incremental_update(repo, store, changed_files=["c.ts"])
+            assert result["dependent_files"] == ["modules/member/member.ts"]
+            assert store.get_nodes_by_file(str(member))
+            assert member.read_bytes() == original
+
+    @pytest.mark.parametrize("change", ["rename", "delete"])
+    def test_unchanged_dependents_match_rebuild_after_api_change(self, tmp_path, change):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        for index in range(5):
+            source = (
+                f'import {{ f{index + 1} }} from "./m{index + 1}"; '
+                f"export function f{index}() {{ return f{index + 1}(); }}"
+                if index < 4
+                else "export function f4() { return 1; }"
+            )
+            (repo / f"m{index}.ts").write_text(source, encoding="utf-8")
+        with GraphStore(tmp_path / "incremental.db") as store:
+            full_build(repo, store)
+            unchanged = {path: path.read_bytes() for path in repo.glob("m[0-3].ts")}
+            # Plan and compare the existing cohort read-only before either DB write.
+            affected = store.get_dependent_files([str(repo / "m4.ts")])
+            assert affected == sorted(path.as_posix() for path in unchanged)
+            before = {
+                (edge.kind, edge.source_qualified, edge.target_qualified, edge.file_path)
+                for edge in store.get_all_edges()
+            }
+            if change == "rename":
+                (repo / "m4.ts").write_text(
+                    "export function renamed() { return 2; }",
+                    encoding="utf-8",
+                )
+            else:
+                (repo / "m4.ts").unlink()
+            result = incremental_update(
+                repo,
+                store,
+                changed_files=["m4.ts"] if change == "rename" else [],
+            )
+            assert result["files_updated"] == (1 if change == "rename" else 2)
+            assert sorted(result["dependent_files"]) == [f"m{index}.ts" for index in range(4)]
+            assert {path: path.read_bytes() for path in unchanged} == unchanged
+            with GraphStore(tmp_path / "rebuilt.db") as rebuilt:
+                full_build(repo, rebuilt)
+                incremental_edges = {
+                    (edge.kind, edge.source_qualified, edge.target_qualified, edge.file_path)
+                    for edge in store.get_all_edges()
+                }
+                rebuilt_edges = {
+                    (edge.kind, edge.source_qualified, edge.target_qualified, edge.file_path)
+                    for edge in rebuilt.get_all_edges()
+                }
+                assert incremental_edges == rebuilt_edges
+                assert incremental_edges != before
+                unchanged_edges_changed = {
+                    edge for edge in incremental_edges if edge[3] != (repo / "m4.ts").as_posix()
+                } != {edge for edge in before if edge[3] != (repo / "m4.ts").as_posix()}
+                assert unchanged_edges_changed == (change == "delete")
+                assert {
+                    (node.kind, node.qualified_name, node.file_path, node.file_hash)
+                    for node in store.get_all_nodes(exclude_files=False)
+                } == {
+                    (node.kind, node.qualified_name, node.file_path, node.file_hash)
+                    for node in rebuilt.get_all_nodes(exclude_files=False)
+                }
 
 
 class TestStartWatchThread:
@@ -1388,6 +1515,7 @@ class TestStartWatchThread:
     def test_starts_background_thread(self, mock_watch, tmp_path):
         """start_watch_thread returns a running thread when watchdog is available."""
         import threading
+
         barrier = threading.Event()
         mock_watch.side_effect = lambda *a, **kw: barrier.wait(timeout=5)
         db_path = tmp_path / "graph.db"
@@ -1403,6 +1531,64 @@ class TestStartWatchThread:
 
 
 class TestWatchReconciliation:
+    @pytest.mark.parametrize("started", [False, True])
+    def test_supplied_observer_is_refused_before_effects_when_owned(self, tmp_path, started):
+        from watchdog.events import FileSystemEventHandler
+        from watchdog.observers import Observer
+
+        from code_review_graph.incremental import ObserverProtocol
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "source.py").write_text("def source():\n    return 1\n")
+        observer = Observer()
+        assert isinstance(observer, ObserverProtocol)
+        if started:
+            observer.start()
+        else:
+            observer.schedule(FileSystemEventHandler(), str(repo), recursive=False)
+        try:
+            with GraphStore(repo / "graph.db") as store:
+                with pytest.raises(ValueError, match="unused native observer"):
+                    watch(repo, store, observer=observer)
+                assert store.get_all_files() == []
+            assert observer.is_alive() if started else observer.emitters
+        finally:
+            observer.stop()
+            if observer.ident is not None:
+                observer.join(timeout=20)
+            assert not observer.is_alive()
+
+    def test_supplied_native_observer_retains_the_full_lifecycle(self, tmp_path):
+        from watchdog.observers import Observer
+
+        source = tmp_path / "source.py"
+        source.write_text("def source():\n    return 1\n")
+        observer = Observer()
+        stop = threading.Event()
+        stop.set()
+        with GraphStore(tmp_path / "graph.db") as store:
+            watch(tmp_path, store, observer=observer, stop_event=stop)
+            assert store.get_nodes_by_file(str(source))
+        assert observer.ident is not None
+        assert not observer.is_alive()
+        assert observer.emitters == set()
+
+    def test_invalid_health_directory_fails_before_graph_publication(self, tmp_path, monkeypatch):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "source.py").write_text("def source():\n    return 1\n")
+        unavailable = tmp_path / "state-is-a-file"
+        unavailable.write_text("preserve this file")
+        monkeypatch.setenv("CRG_HOME", str(unavailable))
+        stop = threading.Event()
+        stop.set()
+        with GraphStore(repo / "graph.db") as store:
+            with pytest.raises(OSError):
+                watch(repo, store, stop_event=stop)
+            assert store.get_all_files() == []
+        assert unavailable.read_text() == "preserve this file"
+
     @pytest.mark.parametrize(
         "event_factory",
         [
@@ -1416,97 +1602,59 @@ class TestWatchReconciliation:
         from watchdog import events
 
         store = GraphStore(tmp_path / "graph.db")
-        debouncer = MagicMock()
-        with patch(
-            "watchdog.utils.event_debouncer.EventDebouncer",
-            return_value=debouncer,
-        ):
-            handler = _create_watch_handler(tmp_path, store, None)
+        handler = _create_watch_handler(tmp_path, store, None)
+        handler.start()
         try:
             event_type = getattr(events, event_factory)
 
             handler.dispatch(event_type(str(tmp_path / "source.py")))
-
-            debouncer.handle_event.assert_not_called()
+            time.sleep(1.1)
+            handler.raise_if_failed()
+            assert handler.events_seen == 0
         finally:
+            handler.stop()
             store.close()
 
-    def test_watch_file_batch_skips_repository_inventory(self, tmp_path):
+    def test_watch_file_batch_preserves_unrelated_offline_rows(self, tmp_path):
         source = tmp_path / "source.py"
         source.write_text("def source():\n    return 1\n")
-        store = GraphStore(tmp_path / "graph.db")
-        handler = _create_watch_handler(tmp_path, store, None)
-        try:
+        with GraphStore(tmp_path / "graph.db") as store:
+            offline = self._offline_source(tmp_path, store)
+            handler = _create_watch_handler(tmp_path, store, None)
             from watchdog.events import FileModifiedEvent
 
-            with patch(
-                "code_review_graph.incremental.collect_all_files",
-                side_effect=AssertionError("watch batch inventoried repository"),
-            ):
-                handler.process([FileModifiedEvent(str(source))])
-
+            self._dispatch_events(handler, [FileModifiedEvent(str(source))])
             assert store.get_nodes_by_file(str(source))
-        finally:
-            store.close()
+            assert store.get_nodes_by_file(str(offline))
 
-    def test_watch_reconciles_before_observer_startup(self, tmp_path):
+    def test_watch_startup_reconciles_stale_rows(self, tmp_path):
         deleted = tmp_path / "offline.py"
         deleted.write_text("def offline():\n    pass\n")
-        store = GraphStore(tmp_path / "graph.db")
-        incremental_update(tmp_path, store, changed_files=["offline.py"])
-        deleted.unlink()
-        callback_count = 0
+        with GraphStore(tmp_path / "graph.db") as store:
+            incremental_update(tmp_path, store, changed_files=["offline.py"])
+            deleted.unlink()
+            callbacks = []
+            stop = threading.Event()
 
-        def on_files_updated(_store):
-            nonlocal callback_count
-            callback_count += 1
+            def on_files_updated(value):
+                callbacks.append(value)
+                stop.set()
 
-        try:
-            with (
-                patch("watchdog.observers.Observer") as observer,
-                patch(
-                    "code_review_graph.incremental._sleep_watch_tick",
-                    side_effect=KeyboardInterrupt,
-                ),
-            ):
-                watch(tmp_path, store, on_files_updated=on_files_updated)
-            assert callback_count == 1
+            watch(tmp_path, store, on_files_updated=on_files_updated, stop_event=stop)
+            assert callbacks == [store]
             assert store.get_all_files() == []
-            observer.return_value.start.assert_called_once()
-        finally:
-            store.close()
 
-    def test_watch_startup_postprocess_warning_prevents_observer_start(self, tmp_path):
-        import sqlite3
-
+    def test_watch_startup_postprocess_schema_failure_aborts(self, tmp_path):
         from code_review_graph.postprocessing import run_post_processing
 
         deleted = tmp_path / "offline.py"
         deleted.write_text("def offline():\n    pass\n")
-        store = GraphStore(tmp_path / "graph.db")
-        incremental_update(tmp_path, store, changed_files=["offline.py"])
-        deleted.unlink()
-        try:
-            with (
-                patch("watchdog.observers.Observer") as observer,
-                patch(
-                    "code_review_graph.incremental._sleep_watch_tick",
-                    side_effect=KeyboardInterrupt,
-                ),
-                patch(
-                    "code_review_graph.search.rebuild_fts_index",
-                    side_effect=sqlite3.OperationalError("forced FTS failure"),
-                ),
-                pytest.raises(
-                    RuntimeError,
-                    match="post-processing reported warnings",
-                ),
-            ):
+        with GraphStore(tmp_path / "graph.db") as store:
+            incremental_update(tmp_path, store, changed_files=["offline.py"])
+            deleted.unlink()
+            self._invalid_fts_schema(store)
+            with pytest.raises(RuntimeError, match="post-processing reported warnings"):
                 watch(tmp_path, store, on_files_updated=run_post_processing)
-
-            observer.assert_not_called()
-        finally:
-            store.close()
 
     def test_watch_file_move_runs_one_serialized_callback(self, tmp_path):
         source = tmp_path / "source.py"
@@ -1515,6 +1663,7 @@ class TestWatchReconciliation:
         store = GraphStore(tmp_path / "graph.db")
         incremental_update(tmp_path, store, changed_files=["source.py"])
         callback_count = 0
+
         def on_files_updated(_store):
             nonlocal callback_count
             callback_count += 1
@@ -1524,7 +1673,7 @@ class TestWatchReconciliation:
             from watchdog.events import FileMovedEvent
 
             source.rename(destination)
-            handler.process([FileMovedEvent(str(source), str(destination))])
+            self._dispatch_events(handler, [FileMovedEvent(str(source), str(destination))])
             assert callback_count == 1
             assert store.get_nodes_by_file(str(source)) == []
             assert store.get_nodes_by_file(str(destination))
@@ -1547,7 +1696,7 @@ class TestWatchReconciliation:
             from watchdog.events import FileModifiedEvent
 
             source.touch()
-            handler.process([FileModifiedEvent(str(source))])
+            self._dispatch_events(handler, [FileModifiedEvent(str(source))])
             assert callback_count == 0
         finally:
             store.close()
@@ -1558,14 +1707,18 @@ class TestWatchReconciliation:
         store = GraphStore(tmp_path / "graph.db")
         incremental_update(tmp_path, store, changed_files=["deleted.py"])
         source.unlink()
-        callback = MagicMock()
+        callbacks = []
+
+        def callback(value):
+            callbacks.append(value)
+
         handler = _create_watch_handler(tmp_path, store, callback)
         try:
             from watchdog.events import FileDeletedEvent
 
-            handler.process([FileDeletedEvent(str(source))])
+            self._dispatch_events(handler, [FileDeletedEvent(str(source))])
 
-            callback.assert_called_once_with(store)
+            assert callbacks == [store]
             assert store.get_nodes_by_file(str(source)) == []
         finally:
             store.close()
@@ -1580,59 +1733,47 @@ class TestWatchReconciliation:
         try:
             from watchdog.events import DirCreatedEvent
 
-            handler.process([DirCreatedEvent(str(package))])
+            self._dispatch_events(handler, [DirCreatedEvent(str(package))])
 
             assert store.get_nodes_by_file(str(source))
         finally:
             store.close()
 
     def test_watch_directory_move_replaces_source_tree(self, tmp_path):
+        from watchdog.events import DirMovedEvent
+
         source_dir = tmp_path / "source"
         source_dir.mkdir()
         source = source_dir / "moved.py"
         source.write_text("def moved():\n    pass\n")
-        store = GraphStore(tmp_path / "graph.db")
-        incremental_update(tmp_path, store, changed_files=["source/moved.py"])
-        destination_dir = tmp_path / "destination"
-        source_dir.rename(destination_dir)
-        destination = destination_dir / "moved.py"
-        handler = _create_watch_handler(tmp_path, store, None)
-        try:
-            from watchdog.events import DirMovedEvent
-
-            with patch(
-                "code_review_graph.incremental.collect_all_files",
-                side_effect=AssertionError("directory move inventoried repository"),
-            ):
-                handler.process([DirMovedEvent(str(source_dir), str(destination_dir))])
-
+        with GraphStore(tmp_path / "graph.db") as store:
+            incremental_update(tmp_path, store, changed_files=["source/moved.py"])
+            offline = self._offline_source(tmp_path, store)
+            destination_dir = tmp_path / "destination"
+            source_dir.rename(destination_dir)
+            destination = destination_dir / "moved.py"
+            handler = _create_watch_handler(tmp_path, store, None)
+            self._dispatch_events(handler, [DirMovedEvent(str(source_dir), str(destination_dir))])
             assert store.get_nodes_by_file(str(source)) == []
             assert store.get_nodes_by_file(str(destination))
-        finally:
-            store.close()
+            assert store.get_nodes_by_file(str(offline))
 
     def test_watch_directory_delete_reconciles_descendants(self, tmp_path):
+        from watchdog.events import DirDeletedEvent
+
         package = tmp_path / "package"
         package.mkdir()
         source = package / "deleted.py"
         source.write_text("def deleted():\n    pass\n")
-        store = GraphStore(tmp_path / "graph.db")
-        incremental_update(tmp_path, store, changed_files=["package/deleted.py"])
-        source.unlink()
-        package.rmdir()
-        handler = _create_watch_handler(tmp_path, store, None)
-        try:
-            from watchdog.events import DirDeletedEvent
-
-            with patch(
-                "code_review_graph.incremental.collect_all_files",
-                side_effect=AssertionError("directory delete inventoried repository"),
-            ):
-                handler.process([DirDeletedEvent(str(package))])
-
+        with GraphStore(tmp_path / "graph.db") as store:
+            incremental_update(tmp_path, store, changed_files=["package/deleted.py"])
+            offline = self._offline_source(tmp_path, store)
+            source.unlink()
+            package.rmdir()
+            handler = _create_watch_handler(tmp_path, store, None)
+            self._dispatch_events(handler, [DirDeletedEvent(str(package))])
             assert store.get_nodes_by_file(str(source)) == []
-        finally:
-            store.close()
+            assert store.get_nodes_by_file(str(offline))
 
     def test_watch_symlink_events_are_rejected(self, tmp_path):
         target = tmp_path / "target.py"
@@ -1649,8 +1790,8 @@ class TestWatchReconciliation:
         try:
             from watchdog.events import DirCreatedEvent, FileCreatedEvent
 
-            handler.process(
-                [FileCreatedEvent(str(linked_file)), DirCreatedEvent(str(linked_dir))]
+            self._dispatch_events(
+                handler, [FileCreatedEvent(str(linked_file)), DirCreatedEvent(str(linked_dir))]
             )
 
             assert store.get_all_files() == []
@@ -1665,140 +1806,103 @@ class TestWatchReconciliation:
         linked_dir = tmp_path / "linked"
         linked_dir.symlink_to(outside, target_is_directory=True)
         store = GraphStore(tmp_path / "graph.db")
-        callback = MagicMock()
+        callbacks = []
+
+        def callback(value):
+            callbacks.append(value)
+
         handler = _create_watch_handler(tmp_path, store, callback)
         try:
             from watchdog.events import DirCreatedEvent, FileCreatedEvent
 
-            handler.process(
+            self._dispatch_events(
+                handler,
                 [
                     FileCreatedEvent(str(linked_dir / "escaped.py")),
                     DirCreatedEvent(str(linked_dir)),
-                ]
+                ],
             )
 
-            callback.assert_not_called()
+            assert callbacks == []
             assert store.get_all_files() == []
         finally:
             store.close()
             outside_file.unlink()
             outside.rmdir()
 
-    def test_watch_update_and_callback_never_overlap(self, tmp_path):
-        source = tmp_path / "source.py"
-        source.write_text("def source():\n    pass\n")
-        store = GraphStore(tmp_path / "graph.db")
-        active = False
-        phases = []
+    def test_watch_callback_observes_the_complete_atomic_batch(self, tmp_path):
+        from watchdog.events import FileCreatedEvent
 
-        def callback(_store):
-            nonlocal active
-            assert active is False
-            phases.append("callback")
+        paths = [tmp_path / "first.py", tmp_path / "second.py"]
+        for path in paths:
+            path.write_text(f"def {path.stem}():\n    return 1\n")
+        with GraphStore(tmp_path / "graph.db") as store:
+            observed = []
 
-        handler = _create_watch_handler(tmp_path, store, callback)
-        original_update = incremental_module.incremental_update
+            def callback(value):
+                observed.append(set(value.get_all_files()))
 
-        def tracked_update(*args, **kwargs):
-            nonlocal active
-            assert active is False
-            active = True
-            phases.append("update")
-            try:
-                return original_update(*args, **kwargs)
-            finally:
-                active = False
+            handler = _create_watch_handler(tmp_path, store, callback)
+            self._dispatch_events(handler, [FileCreatedEvent(str(path)) for path in paths])
+            assert observed == [{path.as_posix() for path in paths}]
 
-        try:
-            from watchdog.events import FileCreatedEvent
+    @pytest.mark.parametrize(
+        "trigger_sql",
+        [
+            "CREATE TRIGGER reject_write BEFORE INSERT ON nodes "
+            "BEGIN SELECT RAISE(ABORT, 'write rejected'); END",
+            "CREATE TRIGGER reject_write BEFORE INSERT ON edges "
+            "BEGIN SELECT RAISE(ABORT, 'write rejected'); END",
+        ],
+    )
+    def test_watch_database_failure_propagates_without_partial_rows(self, tmp_path, trigger_sql):
+        from watchdog.events import FileCreatedEvent
 
-            with patch("code_review_graph.incremental.incremental_update", tracked_update):
-                handler.process([FileCreatedEvent(str(source))])
-
-            assert phases == ["update", "callback"]
-        finally:
-            store.close()
-
-    def test_watch_update_failure_propagates_to_boundary(self, tmp_path):
-        broken = tmp_path / "broken.py"
-        broken.write_text("def broken():\n    pass\n")
-        store = GraphStore(tmp_path / "graph.db")
-        handler = _create_watch_handler(tmp_path, store, None)
-        try:
-            from watchdog.events import FileCreatedEvent
-
-            with patch(
-                "code_review_graph.incremental.incremental_update",
-                side_effect=RuntimeError("update failed"),
-            ):
-                handler.process([FileCreatedEvent(str(broken))])
-
-            with pytest.raises(RuntimeError, match="watch update failed"):
-                handler.raise_if_failed()
-        finally:
-            store.close()
-
-    def test_watch_incremental_error_result_propagates_to_boundary(self, tmp_path):
         source = tmp_path / "source.py"
         source.write_text("def source():\n    return 1\n")
-        store = GraphStore(tmp_path / "graph.db")
-        handler = _create_watch_handler(tmp_path, store, None)
-        try:
-            from watchdog.events import FileCreatedEvent
-
-            with patch(
-                "code_review_graph.incremental.CodeParser.parse_bytes",
-                side_effect=RuntimeError("forced parse failure"),
-            ):
-                handler.process([FileCreatedEvent(str(source))])
-
-            with pytest.raises(RuntimeError, match="watch update failed") as exc_info:
-                handler.raise_if_failed()
-            assert "source.py: forced parse failure" in str(exc_info.value.__cause__)
-        finally:
-            store.close()
+        with GraphStore(tmp_path / "graph.db") as store:
+            with sqlite3.connect(store.db_path) as connection:
+                connection.execute(trigger_sql)
+            handler = _create_watch_handler(tmp_path, store, None)
+            with pytest.raises(RuntimeError, match="watch update failed") as caught:
+                self._dispatch_events(handler, [FileCreatedEvent(str(source))])
+            assert isinstance(caught.value.__cause__, sqlite3.IntegrityError)
+            assert store.get_all_files() == []
 
     def test_watch_callback_failure_propagates_to_boundary(self, tmp_path):
+        from watchdog.events import FileCreatedEvent
+
         source = tmp_path / "source.py"
         source.write_text("def source():\n    pass\n")
-        store = GraphStore(tmp_path / "graph.db")
+        failure = ValueError("callback refused the source update")
 
         def failing_callback(_store):
-            raise RuntimeError("callback failed")
+            raise failure
 
-        handler = _create_watch_handler(tmp_path, store, failing_callback)
-        try:
-            from watchdog.events import FileCreatedEvent
+        with GraphStore(tmp_path / "graph.db") as store:
+            handler = _create_watch_handler(tmp_path, store, failing_callback)
+            with pytest.raises(RuntimeError, match="watch update failed") as caught:
+                self._dispatch_events(handler, [FileCreatedEvent(str(source))])
+            assert caught.value.__cause__ is failure
 
-            handler.process([FileCreatedEvent(str(source))])
+    @pytest.mark.parametrize(
+        "content",
+        [
+            '{"metadata": [], "cells": []}',
+            '{"metadata": {}, "cells": [1]}',
+        ],
+    )
+    def test_watch_invalid_notebook_parse_failure_propagates(self, tmp_path, content):
+        from watchdog.events import FileCreatedEvent
 
-            with pytest.raises(RuntimeError, match="watch update failed"):
-                handler.raise_if_failed()
-        finally:
-            store.close()
-
-    def test_watch_parse_errors_propagate_to_boundary(self, tmp_path):
-        broken = tmp_path / "broken.py"
-        broken.write_text("def broken():\n    pass\n")
-        store = GraphStore(tmp_path / "graph.db")
-        handler = _create_watch_handler(tmp_path, store, None)
-        result = {
-            "files_updated": 0,
-            "errors": [{"file": "broken.py", "error": "parse failed"}],
-        }
-        try:
-            from watchdog.events import FileCreatedEvent
-
-            with patch(
-                "code_review_graph.incremental.incremental_update",
-                return_value=result,
-            ):
-                handler.process([FileCreatedEvent(str(broken))])
-
-            with pytest.raises(RuntimeError, match="watch update failed"):
-                handler.raise_if_failed()
-        finally:
-            store.close()
+        source = tmp_path / "broken.ipynb"
+        source.write_text(content, encoding="utf-8")
+        with GraphStore(tmp_path / "graph.db") as store:
+            handler = _create_watch_handler(tmp_path, store, None)
+            with pytest.raises(RuntimeError, match="watch update failed") as caught:
+                self._dispatch_events(handler, [FileCreatedEvent(str(source))])
+            assert "broken.ipynb" in str(caught.value.__cause__)
+            assert store.get_all_files() == []
 
     @pytest.mark.parametrize("filename", ["unsupported.txt", "binary.py"])
     def test_watch_unsupported_or_binary_paths_skip_postprocessing(self, tmp_path, filename):
@@ -1806,41 +1910,35 @@ class TestWatchReconciliation:
         content = b"plain text" if filename.endswith(".txt") else b"\x00binary"
         source.write_bytes(content)
         store = GraphStore(tmp_path / "graph.db")
-        callback = MagicMock()
+        callbacks = []
+
+        def callback(value):
+            callbacks.append(value)
+
         handler = _create_watch_handler(tmp_path, store, callback)
         try:
             from watchdog.events import FileCreatedEvent
 
-            handler.process([FileCreatedEvent(str(source))])
+            self._dispatch_events(handler, [FileCreatedEvent(str(source))])
 
-            callback.assert_not_called()
+            assert callbacks == []
             assert store.get_all_files() == []
         finally:
             store.close()
 
-    def test_watch_postprocess_warning_result_propagates_to_boundary(self, tmp_path):
-        import sqlite3
-
+    def test_watch_postprocess_schema_failure_propagates(self, tmp_path):
         from watchdog.events import FileCreatedEvent
 
         from code_review_graph.postprocessing import run_post_processing
 
         source = tmp_path / "source.py"
         source.write_text("def source():\n    return 1\n")
-        store = GraphStore(tmp_path / "graph.db")
-        handler = _create_watch_handler(tmp_path, store, run_post_processing)
-        try:
-            with patch(
-                "code_review_graph.search.rebuild_fts_index",
-                side_effect=sqlite3.OperationalError("forced FTS failure"),
-            ):
-                handler.process([FileCreatedEvent(str(source))])
-
-            with pytest.raises(RuntimeError, match="watch update failed") as exc_info:
-                handler.raise_if_failed()
-            assert "FTS index rebuild failed" in str(exc_info.value.__cause__)
-        finally:
-            store.close()
+        with GraphStore(tmp_path / "graph.db") as store:
+            self._invalid_fts_schema(store)
+            handler = _create_watch_handler(tmp_path, store, run_post_processing)
+            with pytest.raises(RuntimeError, match="watch update failed") as caught:
+                self._dispatch_events(handler, [FileCreatedEvent(str(source))])
+            assert "FTS index rebuild failed" in str(caught.value.__cause__)
 
     def test_returns_none_when_watchdog_unavailable(self, tmp_path):
         """start_watch_thread returns None when watchdog is not installed."""
@@ -1853,6 +1951,32 @@ class TestWatchReconciliation:
         finally:
             store.close()
 
+    def _dispatch_events(self, handler, events) -> None:
+        handler.start()
+        try:
+            for event in events:
+                handler.dispatch(event)
+        finally:
+            handler.stop()
+        handler.raise_if_failed()
+
+    def _offline_source(self, root, store):
+        source = root / "unrelated.py"
+        source.write_text("def unrelated():\n    return 1\n")
+        incremental_update(root, store, changed_files=["unrelated.py"])
+        source.unlink()
+        return source
+
+    def _invalid_fts_schema(self, store) -> None:
+        with sqlite3.connect(store.db_path) as connection:
+            connection.executescript(
+                "DROP TRIGGER nodes_fts_insert;"
+                "DROP TRIGGER nodes_fts_delete;"
+                "DROP TRIGGER nodes_fts_update;"
+                "DROP TABLE nodes_fts;"
+                "CREATE VIEW nodes_fts AS SELECT name FROM nodes;"
+            )
+
 
 class TestRenamePurgeParity:
     """Issue #684: a rename must purge the old path so an incremental update
@@ -1861,7 +1985,9 @@ class TestRenamePurgeParity:
     def _git(self, cwd, *args):
         subprocess.run(
             ["git", "-c", "user.email=t@test", "-c", "user.name=t", *args],
-            cwd=str(cwd), check=True, capture_output=True,
+            cwd=str(cwd),
+            check=True,
+            capture_output=True,
         )
 
     def test_decode_name_status_emits_both_rename_paths(self):
@@ -1906,6 +2032,7 @@ class TestRenamePurgeParity:
             assert store.get_nodes_by_file(str(tmp_path / "b.py"))
         finally:
             store.close()
+
 
 class TestResolverWrappers:
     """Tests for the best-effort resolver wrappers in incremental.py."""

@@ -223,9 +223,7 @@ class TestStopRealProcess:
             "print('ready', flush=True)\n"
             "time.sleep(60)\n"
         )
-        proc = subprocess.Popen(
-            [sys.executable, "-c", child_src], stdout=subprocess.PIPE
-        )
+        proc = subprocess.Popen([sys.executable, "-c", child_src], stdout=subprocess.PIPE)
         try:
             assert proc.stdout is not None
             assert proc.stdout.readline().strip() == b"ready"

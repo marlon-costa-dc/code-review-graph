@@ -71,7 +71,10 @@ def _build_min_graph(db_path: Path) -> None:
 
 @pytest.mark.parametrize("command", READ_ONLY_COMMANDS)
 def test_registry_pointed_data_dir_is_not_created(
-    command, tmp_path, isolated_env, capsys,
+    command,
+    tmp_path,
+    isolated_env,
+    capsys,
 ):
     """A registry entry naming a missing data dir must stay a no-op."""
     repo = _make_repo(tmp_path)
@@ -99,7 +102,11 @@ def test_registry_pointed_data_dir_is_not_created(
 
 @pytest.mark.parametrize("command", READ_ONLY_COMMANDS)
 def test_deep_missing_crg_data_dir_tree_not_created(
-    command, tmp_path, isolated_env, monkeypatch, capsys,
+    command,
+    tmp_path,
+    isolated_env,
+    monkeypatch,
+    capsys,
 ):
     """No level of a deeply nested CRG_DATA_DIR may be materialized."""
     repo = _make_repo(tmp_path)
@@ -130,7 +137,9 @@ def test_legacy_migration_still_runs_for_wiki(tmp_path, isolated_env, capsys):
 
 
 def test_legacy_migration_still_runs_for_visualize_json(
-    tmp_path, isolated_env, capsys,
+    tmp_path,
+    isolated_env,
+    capsys,
 ):
     repo = _make_repo(tmp_path)
     legacy = repo / ".code-review-graph.db"
@@ -145,7 +154,10 @@ def test_legacy_migration_still_runs_for_visualize_json(
 
 
 def test_crg_data_dir_blocks_legacy_migration(
-    tmp_path, isolated_env, monkeypatch, capsys,
+    tmp_path,
+    isolated_env,
+    monkeypatch,
+    capsys,
 ):
     """With CRG_DATA_DIR set, the legacy DB must be left alone and no dir made."""
     repo = _make_repo(tmp_path)
@@ -164,7 +176,10 @@ def test_crg_data_dir_blocks_legacy_migration(
 
 @pytest.mark.parametrize("command", ["status", "visualize", "wiki", "watch"])
 def test_existing_empty_explicit_data_dir_gains_nothing(
-    command, tmp_path, isolated_env, capsys,
+    command,
+    tmp_path,
+    isolated_env,
+    capsys,
 ):
     """--data-dir on an existing but graph-less dir: exit 1, dir stays empty."""
     repo = _make_repo(tmp_path)
@@ -182,7 +197,10 @@ def test_existing_empty_explicit_data_dir_gains_nothing(
 
 
 def test_relative_explicit_data_dir_not_created(
-    tmp_path, isolated_env, monkeypatch, capsys,
+    tmp_path,
+    isolated_env,
+    monkeypatch,
+    capsys,
 ):
     repo = _make_repo(tmp_path)
     monkeypatch.chdir(tmp_path)
@@ -197,7 +215,9 @@ def test_relative_explicit_data_dir_not_created(
 
 
 def test_visualize_with_graph_and_data_dir_writes_no_registry(
-    tmp_path, isolated_env, capsys,
+    tmp_path,
+    isolated_env,
+    capsys,
 ):
     """A present graph under --data-dir exports there without registry writes."""
     repo = _make_repo(tmp_path)
@@ -205,8 +225,7 @@ def test_visualize_with_graph_and_data_dir_writes_no_registry(
     _build_min_graph(data_dir / "graph.db")
 
     _run_cli_ok(
-        ["visualize", "--repo", str(repo), "--format", "json",
-         "--data-dir", str(data_dir)],
+        ["visualize", "--repo", str(repo), "--format", "json", "--data-dir", str(data_dir)],
     )
 
     assert "JSON exported" in capsys.readouterr().out
@@ -216,7 +235,9 @@ def test_visualize_with_graph_and_data_dir_writes_no_registry(
 
 
 def test_wiki_with_graph_and_data_dir_writes_no_registry(
-    tmp_path, isolated_env, capsys,
+    tmp_path,
+    isolated_env,
+    capsys,
 ):
     repo = _make_repo(tmp_path)
     data_dir = tmp_path / "wiki-data"
@@ -231,7 +252,9 @@ def test_wiki_with_graph_and_data_dir_writes_no_registry(
 
 
 def test_status_with_graph_and_data_dir_reads_in_place(
-    tmp_path, isolated_env, capsys,
+    tmp_path,
+    isolated_env,
+    capsys,
 ):
     repo = _make_repo(tmp_path)
     data_dir = tmp_path / "status-data"
@@ -245,22 +268,36 @@ def test_status_with_graph_and_data_dir_reads_in_place(
 
 
 def test_detect_changes_no_graph_real_git_repo_with_commit(
-    tmp_path, isolated_env, capsys,
+    tmp_path,
+    isolated_env,
+    capsys,
 ):
     """Even with real history, detect-changes must not materialize a graph."""
     repo = _make_git_repo(tmp_path)
     (repo / "mod.py").write_text("def f():\n    return 1\n", encoding="utf-8")
     subprocess.run(
         ["git", "-C", str(repo), "add", "-A"],
-        check=True, capture_output=True, timeout=30,
+        check=True,
+        capture_output=True,
+        timeout=30,
     )
     subprocess.run(
         [
-            "git", "-C", str(repo),
-            "-c", "user.email=t@example.com", "-c", "user.name=t",
-            "commit", "-q", "-m", "init",
+            "git",
+            "-C",
+            str(repo),
+            "-c",
+            "user.email=t@example.com",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-q",
+            "-m",
+            "init",
         ],
-        check=True, capture_output=True, timeout=30,
+        check=True,
+        capture_output=True,
+        timeout=30,
     )
 
     exc_info = _run_cli(["detect-changes", "--repo", str(repo)])

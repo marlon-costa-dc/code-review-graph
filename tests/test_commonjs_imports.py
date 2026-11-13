@@ -20,8 +20,7 @@ def test_static_require_resolves_relative_file_and_deduplicates(tmp_path):
     dependency.write_text("export function run() {}\n", encoding="utf-8")
     path, (_nodes, edges) = _parse(
         tmp_path,
-        "const first = require('./dependency');\n"
-        "const second = require('./dependency');\n",
+        "const first = require('./dependency');\nconst second = require('./dependency');\n",
     )
 
     imports = _imports(edges)
@@ -35,8 +34,7 @@ def test_destructured_require_populates_import_map_for_call_resolution(tmp_path)
     dependency.write_text("export function run() {}\n", encoding="utf-8")
     _path, (_nodes, edges) = _parse(
         tmp_path,
-        "const { run } = require('./dependency');\n"
-        "run();\n",
+        "const { run } = require('./dependency');\nrun();\n",
     )
 
     calls = [edge for edge in edges if edge.kind == "CALLS"]

@@ -3,7 +3,7 @@
 import sqlite3
 import tempfile
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 from code_review_graph.graph import GraphStore
 from code_review_graph.incremental import full_build, incremental_update
@@ -298,10 +298,7 @@ class TestToolBuildUsesSharedPipeline:
         runner.parent.mkdir(parents=True)
         test_file.parent.mkdir()
         (runner.parent / "__init__.py").write_text("")
-        runner.write_text(
-            "def render_thing(code: str) -> str:\n"
-            "    return code.upper()\n"
-        )
+        runner.write_text("def render_thing(code: str) -> str:\n    return code.upper()\n")
         test_file.write_text(
             "from mypkg.runner import render_thing\n\n"
             "def test_render_thing_basic():\n"
@@ -371,8 +368,7 @@ class TestToolBuildUsesSharedPipeline:
             )
             assert update["python_resolution"]["imports_resolved"] == 1
             imported = store._conn.execute(
-                "SELECT target_qualified FROM edges "
-                "WHERE kind = 'IMPORTS_FROM' AND file_path = ?",
+                "SELECT target_qualified FROM edges WHERE kind = 'IMPORTS_FROM' AND file_path = ?",
                 (test_file.as_posix(),),
             ).fetchone()
             assert imported["target_qualified"] == runner.as_posix()
@@ -392,19 +388,9 @@ class TestToolBuildUsesSharedPipeline:
 
         production_files = []
         for package in ("a", "b"):
-            runner = (
-                tmp_path
-                / "packages"
-                / package
-                / "src"
-                / "mypkg"
-                / "runner.py"
-            )
+            runner = tmp_path / "packages" / package / "src" / "mypkg" / "runner.py"
             runner.parent.mkdir(parents=True)
-            runner.write_text(
-                "def render_thing(code: str) -> str:\n"
-                "    return code.upper()\n"
-            )
+            runner.write_text("def render_thing(code: str) -> str:\n    return code.upper()\n")
             production_files.append(runner)
 
         test_file = tmp_path / "tests" / "test_runner.py"
@@ -449,10 +435,7 @@ class TestToolBuildUsesSharedPipeline:
                 "CALLS",
                 "TESTED_BY",
             }
-            assert all(
-                '"ambiguous_target_count": 2' in row["extra"]
-                for row in endpoint_edges
-            )
+            assert all('"ambiguous_target_count": 2' in row["extra"] for row in endpoint_edges)
 
             for runner in production_files:
                 callers = query_graph(
@@ -466,41 +449,23 @@ class TestToolBuildUsesSharedPipeline:
 
 
 class TestWatchCallbackIntegration:
-    def test_watch_accepts_callback_parameter(self):
-        import inspect
+    def test_watch_callback_not_called_without_updates(self, tmp_path, watch_repository):
+        import time
 
-        from code_review_graph.incremental import watch
+        from code_review_graph.daemon import read_watch_health
 
-        sig = inspect.signature(watch)
-        assert "on_files_updated" in sig.parameters
+        calls = []
+        with watch_repository(tmp_path, lambda store: calls.append(store.get_all_files())):
+            deadline = time.monotonic() + 20
+            while (read_watch_health(tmp_path) or {}).get("phase") != "watching":
+                assert time.monotonic() < deadline, "the empty watcher never became ready"
+                time.sleep(0.05)
+        assert calls == []
 
-    def test_watch_callback_not_called_without_updates(self, tmp_path):
-        from code_review_graph.incremental import watch
+    def test_watch_deletion_reresolves_python_imports(self, tmp_path, watch_repository):
+        import time
 
-        (tmp_path / ".git").mkdir()
-        db_path = tmp_path / "test.db"
-        store = GraphStore(db_path)
-        callback = MagicMock()
-
-        try:
-            with (
-                patch("watchdog.observers.Observer") as observer,
-                patch(
-                    "code_review_graph.incremental._sleep_watch_tick",
-                    side_effect=KeyboardInterrupt,
-                ),
-            ):
-                watch(tmp_path, store, on_files_updated=callback)
-
-            callback.assert_not_called()
-            observer.return_value.start.assert_called_once()
-            observer.return_value.stop.assert_called()
-            observer.return_value.join.assert_called_once()
-        finally:
-            store.close()
-
-    def test_watch_deletion_reresolves_python_imports(self, tmp_path):
-        from code_review_graph.incremental import full_build, watch
+        from code_review_graph.daemon import read_watch_health
 
         runner = tmp_path / "src" / "mypkg" / "runner.py"
         duplicate = tmp_path / "packages" / "other" / "src" / "mypkg" / "runner.py"
@@ -516,47 +481,37 @@ class TestWatchCallbackIntegration:
             "def test_render_thing():\n"
             "    assert render_thing('a') == 'A'\n"
         )
-        (tmp_path / ".git").mkdir()
-        store = GraphStore(tmp_path / "graph.db")
-        observer = MagicMock()
 
-        try:
-            tracked = [
-                "src/mypkg/__init__.py",
-                "src/mypkg/runner.py",
-                "packages/other/src/mypkg/runner.py",
-                "tests/test_runner.py",
-            ]
-            with patch(
-                "code_review_graph.incremental.get_all_tracked_files",
-                return_value=tracked,
-            ):
-                full_build(tmp_path, store)
-            run_post_processing(store)
-            duplicate.unlink()
-
-            with (
-                patch("watchdog.observers.Observer", return_value=observer),
-                patch(
-                    "code_review_graph.incremental._sleep_watch_tick",
-                    side_effect=KeyboardInterrupt,
-                ),
-            ):
-                watch(tmp_path, store, on_files_updated=run_post_processing)
-
-            imported = store._conn.execute(
-                "SELECT target_qualified FROM edges "
+        with watch_repository(tmp_path, run_post_processing) as (reader, thread):
+            deadline = time.monotonic() + 20
+            while (read_watch_health(tmp_path) or {}).get("phase") != "watching":
+                assert time.monotonic() < deadline, "initial import resolution never completed"
+                time.sleep(0.05)
+            imported = reader._conn.execute(
+                "SELECT target_qualified, extra FROM edges "
                 "WHERE kind = 'IMPORTS_FROM' AND file_path = ?",
                 (test_file.as_posix(),),
             ).fetchone()
-            assert imported["target_qualified"] == runner.as_posix()
-            tests = store.get_transitive_tests(
-                f"{runner.as_posix()}::render_thing",
-                max_depth=0,
-            )
-            assert {test["name"] for test in tests} == {"test_render_thing"}
-        finally:
-            store.close()
+            assert '"import_resolution": "ambiguous"' in imported["extra"]
+            duplicate.unlink()
+            deadline = time.monotonic() + 20
+            while True:
+                imported = reader._conn.execute(
+                    "SELECT target_qualified FROM edges "
+                    "WHERE kind = 'IMPORTS_FROM' AND file_path = ?",
+                    (test_file.as_posix(),),
+                ).fetchone()
+                tests = reader.get_transitive_tests(
+                    f"{runner.as_posix()}::render_thing",
+                    max_depth=0,
+                )
+                if imported["target_qualified"] == runner.as_posix() and {
+                    test["name"] for test in tests
+                } == {"test_render_thing"}:
+                    break
+                assert thread.is_alive(), "watcher stopped before import resolution"
+                assert time.monotonic() < deadline, "deletion did not re-resolve imports"
+                time.sleep(0.05)
 
 
 class TestResolveBareEndpointsStep:
@@ -581,37 +536,45 @@ class TestResolveBareEndpointsStep:
             ("helper", util_file, False),
             ("test_parse", test_file, True),
         ]:
-            self.store.upsert_node(NodeInfo(
-                kind="Test" if is_test else "Function",
-                name=name,
-                file_path=path,
-                line_start=1,
-                line_end=5,
-                language="python",
-                is_test=is_test,
-            ))
+            self.store.upsert_node(
+                NodeInfo(
+                    kind="Test" if is_test else "Function",
+                    name=name,
+                    file_path=path,
+                    line_start=1,
+                    line_end=5,
+                    language="python",
+                    is_test=is_test,
+                )
+            )
         for imported in (app_file, util_file):
-            self.store.upsert_edge(EdgeInfo(
-                kind="IMPORTS_FROM",
-                source=test_file,
-                target=imported,
+            self.store.upsert_edge(
+                EdgeInfo(
+                    kind="IMPORTS_FROM",
+                    source=test_file,
+                    target=imported,
+                    file_path=test_file,
+                    line=1,
+                )
+            )
+        self.store.upsert_edge(
+            EdgeInfo(
+                kind="CALLS",
+                source=f"{test_file}::test_parse",
+                target="helper",
                 file_path=test_file,
-                line=1,
-            ))
-        self.store.upsert_edge(EdgeInfo(
-            kind="CALLS",
-            source=f"{test_file}::test_parse",
-            target="helper",
-            file_path=test_file,
-            line=2,
-        ))
-        self.store.upsert_edge(EdgeInfo(
-            kind="TESTED_BY",
-            source="parse",
-            target=f"{test_file}::test_parse",
-            file_path=test_file,
-            line=3,
-        ))
+                line=2,
+            )
+        )
+        self.store.upsert_edge(
+            EdgeInfo(
+                kind="TESTED_BY",
+                source="parse",
+                target=f"{test_file}::test_parse",
+                file_path=test_file,
+                line=3,
+            )
+        )
         self.store.commit()
 
     def test_resolves_before_derived_steps_and_reports_count(self):
@@ -624,7 +587,8 @@ class TestResolveBareEndpointsStep:
         ).fetchall()
         by_kind = {
             row["kind"]: (
-                row["source_qualified"], row["target_qualified"],
+                row["source_qualified"],
+                row["target_qualified"],
             )
             for row in rows
         }

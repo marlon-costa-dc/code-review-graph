@@ -204,8 +204,7 @@ class TestExplicitRefresh:
             ");"
         )
         graph._conn.execute(
-            "INSERT INTO embeddings (qualified_name, vector, text_hash) "
-            "VALUES (?, ?, ?)",
+            "INSERT INTO embeddings (qualified_name, vector, text_hash) VALUES (?, ?, ?)",
             (f"{(tmp_path / 'module.py').as_posix()}::keep", b"\x00" * 8, "old"),
         )
         graph.commit()
@@ -346,10 +345,7 @@ class TestRefreshWiring:
                 embedding_model="test-model",
             )
             assert result["signatures_computed"] == 2
-            assert any(
-                "Missing required environment" in warning
-                for warning in result["warnings"]
-            )
+            assert any("Missing required environment" in warning for warning in result["warnings"])
         finally:
             graph.close()
 

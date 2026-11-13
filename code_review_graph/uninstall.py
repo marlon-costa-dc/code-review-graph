@@ -23,9 +23,7 @@ from typing import Any, Iterable, Sequence
 
 from . import skills
 
-_tomllib: Any = importlib.import_module(
-    "tomllib" if sys.version_info >= (3, 11) else "tomli"
-)
+_tomllib: Any = importlib.import_module("tomllib" if sys.version_info >= (3, 11) else "tomli")
 
 _ENTRY_NAME = "code-review-graph"
 _GIT_HOOK_MARKER = (
@@ -282,12 +280,10 @@ def _object_members(tokens: Sequence[_Token], index: int) -> list[_Member]:
             raise ValueError("expected colon after JSON object key")
         value_index = cursor + 2
         value_end = _skip_value(tokens, value_index)
-        comma_index = value_end if (
-            value_end < len(tokens) and tokens[value_end].kind == ","
-        ) else None
-        members.append(
-            _Member(key_token.value, cursor, value_index, value_end, comma_index)
+        comma_index = (
+            value_end if (value_end < len(tokens) and tokens[value_end].kind == ",") else None
         )
+        members.append(_Member(key_token.value, cursor, value_index, value_end, comma_index))
         cursor = value_end + 1 if comma_index is not None else value_end
     return members
 
@@ -302,9 +298,9 @@ def _array_elements(tokens: Sequence[_Token], index: int) -> list[_Element]:
             cursor += 1
             continue
         value_end = _skip_value(tokens, cursor)
-        comma_index = value_end if (
-            value_end < len(tokens) and tokens[value_end].kind == ","
-        ) else None
+        comma_index = (
+            value_end if (value_end < len(tokens) and tokens[value_end].kind == ",") else None
+        )
         elements.append(_Element(cursor, value_end, comma_index))
         cursor = value_end + 1 if comma_index is not None else value_end
     return elements
@@ -383,9 +379,7 @@ def _remove_jsonc_paths(raw: str, paths: Iterable[Sequence[str | int]]) -> str:
     """Remove paths against one token snapshot, then merge overlapping spans."""
     tokens = _tokenize_jsonc(raw)
     ranges = [
-        source_range
-        for path in paths
-        for source_range in _removal_ranges(tokens, tuple(path))
+        source_range for path in paths for source_range in _removal_ranges(tokens, tuple(path))
     ]
     merged: list[tuple[int, int]] = []
     for start, end in sorted(set(ranges)):
@@ -560,9 +554,7 @@ def _remove_yaml_entry(
     lines = raw.splitlines(keepends=True)
     bounds = skills._yaml_section_bounds(lines, key)
     if bounds is None:
-        report.skipped_paths.append(
-            f"{path} ({key} is not a block mapping; left unchanged)"
-        )
+        report.skipped_paths.append(f"{path} ({key} is not a block mapping; left unchanged)")
         return
     header, section_end = bounds
     child_indent = skills._yaml_block_indent(lines, header + 1, section_end)
@@ -964,9 +956,7 @@ def _remove_git_hook(
         rewritten.append(line)
     new_text = "".join(rewritten).rstrip() + "\n"
     meaningful = [
-        line
-        for line in new_text.splitlines()
-        if line.strip() and not line.strip().startswith("#!")
+        line for line in new_text.splitlines() if line.strip() and not line.strip().startswith("#!")
     ]
     if meaningful:
         _write_text(
@@ -1088,13 +1078,9 @@ def _process_platform_configs(
                 continue
             seen.add(identity)
             if format_name == "toml":
-                _remove_toml_entry(
-                    path, entry_key, boundary, report, dry_run=dry_run
-                )
+                _remove_toml_entry(path, entry_key, boundary, report, dry_run=dry_run)
             elif format_name == "yaml":
-                _remove_yaml_entry(
-                    path, entry_key, boundary, report, dry_run=dry_run
-                )
+                _remove_yaml_entry(path, entry_key, boundary, report, dry_run=dry_run)
             elif format_name in {"object", "array"}:
                 _remove_mcp_entry(
                     path,
@@ -1106,8 +1092,7 @@ def _process_platform_configs(
                 )
             else:
                 report.skipped_paths.append(
-                    f"{path} ({platform_name} has unsupported config format "
-                    f"{format_name!r})"
+                    f"{path} ({platform_name} has unsupported config format {format_name!r})"
                 )
 
 
@@ -1392,9 +1377,7 @@ def _normalise_repo(path: Path, home: Path, report: UninstallReport) -> Path | N
         report.skipped_paths.append(f"{resolved} (cannot resolve repository root: {exc})")
         return None
     if repository_root in {Path(repository_root.anchor), home.resolve(strict=False)}:
-        report.skipped_paths.append(
-            f"{repository_root} (refusing unsafe repository boundary)"
-        )
+        report.skipped_paths.append(f"{repository_root} (refusing unsafe repository boundary)")
         return None
     return repository_root
 

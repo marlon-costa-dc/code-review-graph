@@ -147,9 +147,7 @@ def detect_query_kind_boost(query: str) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def rrf_merge(
-    *result_lists: list[tuple[int, float]], k: int = 60
-) -> list[tuple[int, float]]:
+def rrf_merge(*result_lists: list[tuple[int, float]], k: int = 60) -> list[tuple[int, float]]:
     """Merge multiple ranked result lists using Reciprocal Rank Fusion.
 
     Each input list contains ``(id, score)`` tuples, ordered by score
@@ -194,8 +192,7 @@ def _fts_search(
     safe_query = '"' + query.replace('"', '""') + '"'
 
     rows = conn.execute(
-        "SELECT rowid, rank FROM nodes_fts WHERE nodes_fts MATCH ? "
-        "ORDER BY rank LIMIT ?",
+        "SELECT rowid, rank FROM nodes_fts WHERE nodes_fts MATCH ? ORDER BY rank LIMIT ?",
         (safe_query, limit),
     ).fetchall()
     # FTS5 rank is negative BM25 (lower = better), negate for consistency
@@ -405,9 +402,7 @@ def hybrid_search(
     # ------ Phase 3+4: Batch-fetch nodes, apply boosting and kind filter ------
     kind_boosts = detect_query_kind_boost(query)
     # Stored file paths use POSIX separators (#774); bridge native spellings.
-    context_set = (
-        {normalize_file_path(p) for p in context_files} if context_files else set()
-    )
+    context_set = {normalize_file_path(p) for p in context_files} if context_files else set()
 
     # Batch-fetch all candidate nodes in one query
     candidate_ids = [node_id for node_id, _ in merged]

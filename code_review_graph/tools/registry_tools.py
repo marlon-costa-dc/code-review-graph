@@ -86,10 +86,7 @@ def cross_repo_search_func(
         if not repos:
             return {
                 "status": "ok",
-                "summary": (
-                    "No repositories registered. "
-                    "Use 'register' to add repos."
-                ),
+                "summary": ("No repositories registered. Use 'register' to add repos."),
                 "results": [],
             }
 
@@ -105,9 +102,7 @@ def cross_repo_search_func(
             try:
                 store = GraphStore(str(db_path))
                 try:
-                    results = hybrid_search(
-                        store, query, kind=kind, limit=limit
-                    )
+                    results = hybrid_search(store, query, kind=kind, limit=limit)
                     alias = repo_entry.get("alias", repo_path.name)
                     for local_rank, r in enumerate(results):
                         r["repo"] = alias
@@ -117,9 +112,7 @@ def cross_repo_search_func(
                 finally:
                     store.close()
             except Exception as exc:
-                logger.warning(
-                    "Search failed for %s: %s", repo_path, exc
-                )
+                logger.warning("Search failed for %s: %s", repo_path, exc)
 
         # Scores from different search paths are not comparable across repos.
         # Merge by each repo's local rank and use registry order as a stable tie-breaker.
@@ -134,8 +127,7 @@ def cross_repo_search_func(
             "status": "ok",
             "summary": (
                 f"Found {total} result(s) across "
-                f"{len(searched_repos)} repo(s) for '{query}'"
-                + _shown_of(len(all_results), total)
+                f"{len(searched_repos)} repo(s) for '{query}'" + _shown_of(len(all_results), total)
             ),
             "results": all_results,
             "total": total,

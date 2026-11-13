@@ -86,7 +86,8 @@ class TestResolveRepoRoot:
 
 
 def test_docs_wrapper_falls_back_to_packaged_docs_with_resolved_repo(
-    tmp_path, monkeypatch,
+    tmp_path,
+    monkeypatch,
 ):
     """The server's resolved repo must not hide wheel-packaged docs."""
     package_dir = tmp_path / "site-packages" / "code_review_graph"
@@ -125,7 +126,10 @@ class TestServeMainTransport:
 
         monkeypatch.delenv("CRG_PARSE_EXECUTOR", raising=False)
         monkeypatch.setattr(
-            incremental_module, "_MCP_STDIO_ACTIVE", False, raising=False,
+            incremental_module,
+            "_MCP_STDIO_ACTIVE",
+            False,
+            raising=False,
         )
         monkeypatch.setattr(crg_main.mcp, "run", fake_run)
         crg_main.main(repo_root=None)
@@ -140,7 +144,10 @@ class TestServeMainTransport:
             calls.append(kwargs)
 
         monkeypatch.setattr(
-            incremental_module, "_MCP_STDIO_ACTIVE", False, raising=False,
+            incremental_module,
+            "_MCP_STDIO_ACTIVE",
+            False,
+            raising=False,
         )
         monkeypatch.setattr(crg_main.mcp, "run", fake_run)
         crg_main.main(
@@ -158,9 +165,7 @@ class TestServeMainTransport:
         # cannot be driven cross-origin (e.g. via DNS rebinding). Behaviour is
         # covered end-to-end in tests/test_http_origin_guard.py; this only asserts
         # the entry point wires it up.
-        assert [middleware.cls for middleware in call["middleware"]] == [
-            LoopbackOriginGuard
-        ]
+        assert [middleware.cls for middleware in call["middleware"]] == [LoopbackOriginGuard]
 
     def test_streamable_http_without_host_port_raises(self):
         with pytest.raises(ValueError, match="requires host and port"):
@@ -271,7 +276,10 @@ class TestLongRunningToolsAreAsync:
     @pytest.mark.parametrize("tool_name,impl_name", HEAVY_TOOL_IMPLS.items())
     @pytest.mark.asyncio
     async def test_provenance_sqlite_read_runs_off_event_loop(
-        self, tool_name, impl_name, monkeypatch,
+        self,
+        tool_name,
+        impl_name,
+        monkeypatch,
     ):
         event_loop_thread = threading.get_ident()
         provenance_threads = []
@@ -286,7 +294,10 @@ class TestLongRunningToolsAreAsync:
         monkeypatch.delenv("CRG_TOOL_TIMEOUT", raising=False)
         monkeypatch.setattr(crg_main, impl_name, fake_impl)
         monkeypatch.setattr(
-            crg_main, "with_provenance", fake_with_provenance, raising=False,
+            crg_main,
+            "with_provenance",
+            fake_with_provenance,
+            raising=False,
         )
         tool = getattr(crg_main, tool_name)
         underlying = getattr(tool, "fn", None) or tool
@@ -381,30 +392,44 @@ class TestGraphBackedToolProvenanceCoverage:
     TOOL_CATEGORIES = {
         "build": {"build_or_update_graph_tool", "run_postprocess_tool"},
         "context_and_search": {
-            "get_minimal_context_tool", "get_impact_radius_tool",
-            "query_graph_tool", "get_review_context_tool",
-            "semantic_search_nodes_tool", "find_large_functions_tool",
+            "get_minimal_context_tool",
+            "get_impact_radius_tool",
+            "query_graph_tool",
+            "get_review_context_tool",
+            "semantic_search_nodes_tool",
+            "find_large_functions_tool",
             "traverse_graph_tool",
         },
         "embeddings_and_stats": {"embed_graph_tool", "list_graph_stats_tool"},
         "flows_and_communities": {
-            "list_flows_tool", "get_flow_tool", "get_affected_flows_tool",
-            "list_communities_tool", "get_community_tool",
+            "list_flows_tool",
+            "get_flow_tool",
+            "get_affected_flows_tool",
+            "list_communities_tool",
+            "get_community_tool",
             "get_architecture_overview_tool",
         },
         "review_and_refactor": {
-            "detect_changes_tool", "refactor_tool", "apply_refactor_tool",
+            "detect_changes_tool",
+            "refactor_tool",
+            "apply_refactor_tool",
         },
         "wiki_and_analysis": {
-            "generate_wiki_tool", "get_wiki_page_tool", "get_hub_nodes_tool",
-            "get_bridge_nodes_tool", "get_knowledge_gaps_tool",
-            "get_surprising_connections_tool", "get_suggested_questions_tool",
+            "generate_wiki_tool",
+            "get_wiki_page_tool",
+            "get_hub_nodes_tool",
+            "get_bridge_nodes_tool",
+            "get_knowledge_gaps_tool",
+            "get_surprising_connections_tool",
+            "get_suggested_questions_tool",
         },
     }
 
     @pytest.mark.parametrize("category,tool_names", TOOL_CATEGORIES.items())
     def test_every_graph_backed_tool_category_attaches_provenance(
-        self, category, tool_names,
+        self,
+        category,
+        tool_names,
     ):
         assert tool_names, f"{category} must name at least one tool"
         for tool_name in tool_names:
@@ -415,13 +440,19 @@ class TestGraphBackedToolProvenanceCoverage:
                 f"{category}: {tool_name} does not attach graph provenance"
             )
 
-    @pytest.mark.parametrize("tool_name", [
-        "get_docs_section_tool", "list_repos_tool", "cross_repo_search_tool",
-    ])
+    @pytest.mark.parametrize(
+        "tool_name",
+        [
+            "get_docs_section_tool",
+            "list_repos_tool",
+            "cross_repo_search_tool",
+        ],
+    )
     def test_non_single_repository_tools_do_not_claim_one_graph(self, tool_name):
         tool = getattr(crg_main, tool_name)
         underlying = getattr(tool, "fn", None) or tool
         assert "with_provenance" not in inspect.getsource(underlying)
+
 
 class TestApplyToolFilter:
     """Tests for _apply_tool_filter (``serve --tools`` / ``CRG_TOOLS``).
@@ -525,9 +556,7 @@ class TestApplyToolFilter:
     @pytest.mark.asyncio
     async def test_unknown_names_ignored_gracefully(self):
         """Unknown tool names don't error; only the valid ones survive."""
-        crg_main._apply_tool_filter(
-            "query_graph_tool,this_tool_does_not_exist,another_bogus_tool"
-        )
+        crg_main._apply_tool_filter("query_graph_tool,this_tool_does_not_exist,another_bogus_tool")
         remaining = await self._tool_names()
         assert remaining == {"query_graph_tool"}
 
@@ -647,11 +676,17 @@ class TestMcpWrapperDefaults:
         assert "max_results" in sig.parameters
         assert sig.parameters["max_results"].default == 100
 
-    def test_review_tools_have_max_tokens(self):
-        for name in ("get_review_context_tool", "detect_changes_tool"):
+    def test_review_tools_are_complete_by_default(self):
+        """Change analysis applies no limit unless the caller passes one."""
+        limits = {
+            "get_review_context_tool": ("max_results", "max_files"),
+            "detect_changes_tool": ("max_results", "max_flows"),
+        }
+        for name, limit_names in limits.items():
             sig = inspect.signature(self._wrapper(name))
-            assert "max_tokens" in sig.parameters
-            assert sig.parameters["max_tokens"].default == 6000
+            assert sig.parameters["max_tokens"].default == 0
+            for limit_name in limit_names:
+                assert sig.parameters[limit_name].default is None
 
 
 class TestServeDetailFlag:

@@ -10,11 +10,7 @@ from code_review_graph.refactor import find_dead_code
 def _call_targets(source: bytes) -> set[str]:
     """Return the bare names of Python CALLS targets in ``source``."""
     _, edges = CodeParser().parse_bytes(Path("guards.py"), source)
-    return {
-        edge.target.rsplit("::", 1)[-1]
-        for edge in edges
-        if edge.kind == "CALLS"
-    }
+    return {edge.target.rsplit("::", 1)[-1] for edge in edges if edge.kind == "CALLS"}
 
 
 def test_false_branch_calls_are_omitted_but_else_calls_remain() -> None:
@@ -71,12 +67,14 @@ if TC:
 """,
     )
 
-    assert targets.isdisjoint({
-        "direct_target",
-        "module_target",
-        "module_alias_target",
-        "name_alias_target",
-    })
+    assert targets.isdisjoint(
+        {
+            "direct_target",
+            "module_target",
+            "module_alias_target",
+            "name_alias_target",
+        }
+    )
 
 
 def test_reassigned_type_checking_name_is_not_treated_as_typing_sentinel() -> None:
@@ -167,11 +165,13 @@ if not TYPE_CHECKING:
 """,
     )
 
-    assert targets.isdisjoint({
-        "dead_not_target",
-        "dead_and_target",
-        "dead_or_target",
-    })
+    assert targets.isdisjoint(
+        {
+            "dead_not_target",
+            "dead_and_target",
+            "dead_or_target",
+        }
+    )
     assert "live_target" in targets
 
 
@@ -198,10 +198,7 @@ def test_graph_consumers_do_not_observe_dead_branch_call(
     targets_path = tmp_path / "targets.py"
     caller_path = tmp_path / "caller.py"
     targets_path.write_text(
-        "def dead_target():\n"
-        "    pass\n\n"
-        "def live_target():\n"
-        "    pass\n",
+        "def dead_target():\n    pass\n\ndef live_target():\n    pass\n",
         encoding="utf-8",
     )
     caller_path.write_text(
@@ -227,14 +224,10 @@ def test_graph_consumers_do_not_observe_dead_branch_call(
         store.commit()
 
         dead_callers = [
-            edge
-            for edge in store.get_edges_by_target(dead_qualified)
-            if edge.kind == "CALLS"
+            edge for edge in store.get_edges_by_target(dead_qualified) if edge.kind == "CALLS"
         ]
         live_callers = [
-            edge
-            for edge in store.get_edges_by_target(live_qualified)
-            if edge.kind == "CALLS"
+            edge for edge in store.get_edges_by_target(live_qualified) if edge.kind == "CALLS"
         ]
         assert dead_callers == []
         assert len(live_callers) == 1

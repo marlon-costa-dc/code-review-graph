@@ -37,10 +37,7 @@ import tree_sitter_language_pack as tslp
 if sys.version_info >= (3, 11):
     import tomllib
 else:
-    try:
-        import tomli as tomllib  # type: ignore[no-redef]
-    except ImportError:
-        tomllib = None  # type: ignore[assignment]
+    import tomli as tomllib
 
 logger = logging.getLogger(__name__)
 
@@ -152,13 +149,6 @@ def _load_uncached(
     builtin_extensions: Mapping[str, str],
     builtin_languages: frozenset[str],
 ) -> dict[str, CustomLanguage]:
-    if tomllib is None:
-        logger.warning(
-            "%s found but TOML parsing requires the 'tomli' package on "
-            "Python < 3.11 — no custom languages loaded",
-            config_path,
-        )
-        return {}
     try:
         raw = config_path.read_bytes()
     except (OSError, PermissionError) as exc:
@@ -186,12 +176,17 @@ def _load_uncached(
         if len(result) >= MAX_CUSTOM_LANGUAGES:
             logger.warning(
                 "%s defines more than %d custom languages — ignoring the rest",
-                config_path, MAX_CUSTOM_LANGUAGES,
+                config_path,
+                MAX_CUSTOM_LANGUAGES,
             )
             break
         lang = _validate_entry(
-            name, table, builtin_extensions, builtin_languages,
-            claimed_extensions, config_path,
+            name,
+            table,
+            builtin_extensions,
+            builtin_languages,
+            claimed_extensions,
+            config_path,
         )
         if lang is None:
             continue
@@ -218,14 +213,16 @@ def _validate_entry(
         logger.warning(
             "%s: invalid custom language name %r (expected lowercase "
             "letters/digits/_/-, max 32 chars) — skipping",
-            config_path, label,
+            config_path,
+            label,
         )
         return None
     if name in builtin_languages:
         logger.warning(
             "%s: custom language %r shadows a built-in language — skipping "
             "(built-ins cannot be overridden)",
-            config_path, name,
+            config_path,
+            name,
         )
         return None
 
@@ -233,7 +230,8 @@ def _validate_entry(
     if not isinstance(grammar, str) or not grammar.strip():
         logger.warning(
             "%s: custom language %r needs a non-empty 'grammar' string — skipping",
-            config_path, name,
+            config_path,
+            name,
         )
         return None
     grammar = grammar.strip()
@@ -242,7 +240,8 @@ def _validate_entry(
     if not isinstance(raw_extensions, list) or not raw_extensions:
         logger.warning(
             "%s: custom language %r needs a non-empty 'extensions' list — skipping",
-            config_path, name,
+            config_path,
+            name,
         )
         return None
     extensions: list[str] = []
@@ -251,28 +250,36 @@ def _validate_entry(
         if not normalized.startswith("."):
             logger.warning(
                 "%s: custom language %r: extension %r must start with a dot — skipping",
-                config_path, name, ext,
+                config_path,
+                name,
+                ext,
             )
             return None
         if not _EXTENSION_RE.match(normalized):
             logger.warning(
-                "%s: custom language %r: extension %r is not a valid file "
-                "extension — skipping",
-                config_path, name, ext,
+                "%s: custom language %r: extension %r is not a valid file extension — skipping",
+                config_path,
+                name,
+                ext,
             )
             return None
         if normalized in builtin_extensions:
             logger.warning(
                 "%s: custom language %r: extension %r is already handled by "
                 "the built-in %r parser — skipping (built-ins cannot be overridden)",
-                config_path, name, normalized, builtin_extensions[normalized],
+                config_path,
+                name,
+                normalized,
+                builtin_extensions[normalized],
             )
             return None
         if normalized in claimed_extensions:
             logger.warning(
                 "%s: custom language %r: extension %r is already claimed by "
                 "an earlier custom language — skipping",
-                config_path, name, normalized,
+                config_path,
+                name,
+                normalized,
             )
             return None
         if normalized not in extensions:
@@ -285,17 +292,18 @@ def _validate_entry(
             not isinstance(item, str) or not item.strip() for item in value
         ):
             logger.warning(
-                "%s: custom language %r: %s must be a list of non-empty "
-                "strings — skipping",
-                config_path, name, key,
+                "%s: custom language %r: %s must be a list of non-empty strings — skipping",
+                config_path,
+                name,
+                key,
             )
             return None
         node_types[key] = tuple(item.strip() for item in value)
     if not any(node_types.values()):
         logger.warning(
-            "%s: custom language %r defines no node types — nothing to "
-            "extract, skipping",
-            config_path, name,
+            "%s: custom language %r defines no node types — nothing to extract, skipping",
+            config_path,
+            name,
         )
         return None
 
@@ -312,14 +320,16 @@ def _validate_entry(
         logger.warning(
             "%s: custom language %r: name_field must be a string or a list of "
             "non-empty strings — skipping",
-            config_path, name,
+            config_path,
+            name,
         )
         return None
     if len(raw_name_field) > MAX_NAME_FIELD_CANDIDATES:
         logger.warning(
-            "%s: custom language %r: name_field has more than %d candidates — "
-            "skipping",
-            config_path, name, MAX_NAME_FIELD_CANDIDATES,
+            "%s: custom language %r: name_field has more than %d candidates — skipping",
+            config_path,
+            name,
+            MAX_NAME_FIELD_CANDIDATES,
         )
         return None
     name_field = tuple(item.strip() for item in raw_name_field)
@@ -336,7 +346,10 @@ def _validate_entry(
         logger.warning(
             "%s: custom language %r: grammar %r is not available in "
             "tree_sitter_language_pack (%s) — skipping",
-            config_path, name, grammar, exc,
+            config_path,
+            name,
+            grammar,
+            exc,
         )
         return None
 

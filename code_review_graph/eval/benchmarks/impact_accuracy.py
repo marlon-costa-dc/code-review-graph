@@ -96,22 +96,28 @@ def _base_row(repo: str, sha: str, mode: str, seed: str) -> dict:
 
 
 def _scored_row(
-    repo: str, sha: str, mode: str, seed: str,
-    predicted: set[str], actual: set[str],
+    repo: str,
+    sha: str,
+    mode: str,
+    seed: str,
+    predicted: set[str],
+    actual: set[str],
 ) -> dict:
     tp = len(predicted & actual)
     precision = tp / max(len(predicted), 1)
     recall = tp / max(len(actual), 1)
     f1 = 2 * precision * recall / max(precision + recall, 0.001)
     row = _base_row(repo, sha, mode, seed)
-    row.update({
-        "predicted_files": len(predicted),
-        "actual_files": len(actual),
-        "true_positives": tp,
-        "precision": round(precision, 3),
-        "recall": round(recall, 3),
-        "f1": round(f1, 3),
-    })
+    row.update(
+        {
+            "predicted_files": len(predicted),
+            "actual_files": len(actual),
+            "true_positives": tp,
+            "precision": round(precision, 3),
+            "recall": round(recall, 3),
+            "f1": round(f1, 3),
+        }
+    )
     return row
 
 
@@ -137,7 +143,10 @@ def run(repo_path: Path, store, config: dict) -> list[dict]:
         # --- Mode 1: graph-derived ground truth (circular — upper bound) ---
         try:
             analysis = analyze_changes(
-                store, changed, repo_root=str(repo_path), base=sha + "~1",
+                store,
+                changed,
+                repo_root=str(repo_path),
+                base=sha + "~1",
             )
         except Exception as exc:
             # Old behaviour set predicted = set(changed) here, which
@@ -149,9 +158,7 @@ def run(repo_path: Path, store, config: dict) -> list[dict]:
         if analysis is not None:
             predicted = set(changed) | _files_from_analysis(analysis)
             actual = set(changed) | _graph_neighbor_files(store, changed)
-            results.append(
-                _scored_row(repo, sha, MODE_GRAPH_DERIVED, "", predicted, actual)
-            )
+            results.append(_scored_row(repo, sha, MODE_GRAPH_DERIVED, "", predicted, actual))
 
         # --- Mode 2: co-change ground truth (honest) ---
         # Seed the predictor with a single changed file and grade against
@@ -177,9 +184,7 @@ def run(repo_path: Path, store, config: dict) -> list[dict]:
         co_predicted = _files_from_analysis(seed_analysis)
         co_predicted |= _graph_neighbor_files(store, [seed])
         co_predicted.discard(seed)
-        results.append(
-            _scored_row(repo, sha, MODE_CO_CHANGE, seed, co_predicted, co_actual)
-        )
+        results.append(_scored_row(repo, sha, MODE_CO_CHANGE, seed, co_predicted, co_actual))
 
     return results
 
@@ -199,22 +204,16 @@ def aggregate(results: list[dict]) -> dict:
         ("co_change", MODE_CO_CHANGE),
     ):
         rows = [
-            r for r in results
-            if r.get("ground_truth_mode") == mode and r.get("status") == "ok"
+            r for r in results if r.get("ground_truth_mode") == mode and r.get("status") == "ok"
         ]
         out[key] = {
             "ok_rows": len(rows),
             "mean_precision": (
-                round(statistics.mean(float(r["precision"]) for r in rows), 3)
-                if rows else None
+                round(statistics.mean(float(r["precision"]) for r in rows), 3) if rows else None
             ),
             "mean_recall": (
-                round(statistics.mean(float(r["recall"]) for r in rows), 3)
-                if rows else None
+                round(statistics.mean(float(r["recall"]) for r in rows), 3) if rows else None
             ),
-            "mean_f1": (
-                round(statistics.mean(float(r["f1"]) for r in rows), 3)
-                if rows else None
-            ),
+            "mean_f1": (round(statistics.mean(float(r["f1"]) for r in rows), 3) if rows else None),
         }
     return out

@@ -28,7 +28,8 @@ def _write_spring_event_trio(root: Path) -> Path:
     pkg = root / "alpha"
     pkg.mkdir(parents=True)
     (pkg / "SharedEvent.java").write_text(
-        "package alpha;\nclass SharedEvent {}\n", encoding="utf-8",
+        "package alpha;\nclass SharedEvent {}\n",
+        encoding="utf-8",
     )
     (pkg / "Publisher.java").write_text(
         "package alpha;\n"
@@ -52,7 +53,8 @@ def _write_spring_event_trio(root: Path) -> Path:
 def _build_mixed_repo(tmp_path: Path) -> GraphStore:
     _write_spring_event_trio(tmp_path)
     (tmp_path / "main.py").write_text(
-        "def greet():\n    return 'hi'\n", encoding="utf-8",
+        "def greet():\n    return 'hi'\n",
+        encoding="utf-8",
     )
     db_dir = tmp_path / ".code-review-graph"
     db_dir.mkdir()
@@ -63,9 +65,7 @@ def _build_mixed_repo(tmp_path: Path) -> GraphStore:
 
 def _live_file_inventory(store: GraphStore) -> tuple[int, list[str]]:
     """File count and language list straight from the File rows in SQLite."""
-    files = store._conn.execute(
-        "SELECT COUNT(*) FROM nodes WHERE kind = 'File'"
-    ).fetchone()[0]
+    files = store._conn.execute("SELECT COUNT(*) FROM nodes WHERE kind = 'File'").fetchone()[0]
     languages = [
         row[0]
         for row in store._conn.execute(
@@ -89,7 +89,8 @@ class TestStatusMatchesLiveGraph:
             store.close()
 
     def test_update_removing_language_drops_it_from_stats(
-        self, tmp_path: Path,
+        self,
+        tmp_path: Path,
     ) -> None:
         """An update that removes every Java file must drop 'java'.
 
@@ -127,7 +128,8 @@ class TestStatusMatchesLiveGraph:
             store.close()
 
     def test_stats_ignore_rows_not_backed_by_file_nodes(
-        self, tmp_path: Path,
+        self,
+        tmp_path: Path,
     ) -> None:
         """Historical/virtual rows without a File node must not leak."""
         store = _build_mixed_repo(tmp_path)
@@ -150,13 +152,19 @@ class TestStatusMatchesLiveGraph:
 
 class TestStatusCli:
     def test_status_json_reports_live_files_and_sorted_languages(
-        self, tmp_path: Path, capsys,
+        self,
+        tmp_path: Path,
+        capsys,
     ) -> None:
         store = _build_mixed_repo(tmp_path)
         store.close()
 
         argv = [
-            "code-review-graph", "status", "--repo", str(tmp_path), "--json",
+            "code-review-graph",
+            "status",
+            "--repo",
+            str(tmp_path),
+            "--json",
         ]
         with patch.object(sys, "argv", argv):
             cli.main()

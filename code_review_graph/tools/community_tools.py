@@ -34,7 +34,8 @@ _MAX_CROSS_EDGES = 200
 
 
 def _cap_members(
-    community: dict[str, Any], max_members: int,
+    community: dict[str, Any],
+    max_members: int,
 ) -> dict[str, Any]:
     """Return a copy of *community* whose member lists are bounded.
 
@@ -107,17 +108,12 @@ def list_communities_func(
             communities = [_cap_members(c, max_members) for c in communities]
         result: dict[str, object] = {
             "status": "ok",
-            "summary": (
-                f"Found {total} communities"
-                + _shown_of(len(communities), total)
-            ),
+            "summary": (f"Found {total} communities" + _shown_of(len(communities), total)),
             "communities": communities,
             "total": total,
             "truncated": truncated,
         }
-        result["_hints"] = generate_hints(
-            "list_communities", result, get_session()
-        )
+        result["_hints"] = generate_hints("list_communities", result, get_session())
         return result
     except Exception as exc:
         return {"status": "error", "error": str(exc)}
@@ -180,9 +176,7 @@ def get_community_func(
         if community is None:
             return {
                 "status": "not_found",
-                "summary": (
-                    "No community found matching the given criteria."
-                ),
+                "summary": ("No community found matching the given criteria."),
             }
 
         if include_members:
@@ -203,9 +197,7 @@ def get_community_func(
             ),
             "community": community,
         }
-        result["_hints"] = generate_hints(
-            "get_community", result, get_session()
-        )
+        result["_hints"] = generate_hints("get_community", result, get_session())
         return result
     except Exception as exc:
         return {"status": "error", "error": str(exc)}
@@ -306,43 +298,39 @@ def get_architecture_overview_func(
         else:
             overview = dict(full_overview)
             overview["communities"] = [
-                _cap_members(c, max_members)
-                for c in overview.get("communities", [])
+                _cap_members(c, max_members) for c in overview.get("communities", [])
             ]
         cross, cross_total, truncated = _bounded(
-            overview["cross_community_edges"], max_results, _MAX_CROSS_EDGES,
+            overview["cross_community_edges"],
+            max_results,
+            _MAX_CROSS_EDGES,
         )
         overview["cross_community_edges"] = cross
         # One warning per highly-coupled community pair grows quadratically
         # with the community count, so it needs the same bound.
         warnings, warn_total, warn_cut = _bounded(
-            overview["warnings"], max_results, _MAX_CROSS_EDGES,
+            overview["warnings"],
+            max_results,
+            _MAX_CROSS_EDGES,
         )
         overview["warnings"] = warnings
         truncated = truncated or warn_cut
         n_communities = len(overview["communities"])
         n_cross = len(cross)
         n_warnings = warn_total
-        cross_label = (
-            "community pairs"
-            if detail_level == "minimal"
-            else "cross-community edges"
-        )
+        cross_label = "community pairs" if detail_level == "minimal" else "cross-community edges"
         result = {
             "status": "ok",
             "summary": (
                 f"Architecture: {n_communities} communities, "
-                f"{cross_total} {cross_label}"
-                + _shown_of(n_cross, cross_total) + ", "
+                f"{cross_total} {cross_label}" + _shown_of(n_cross, cross_total) + ", "
                 f"{n_warnings} warning(s)"
             ),
             **overview,
             "cross_community_edges_total": cross_total,
             "truncated": truncated,
         }
-        result["_hints"] = generate_hints(
-            "get_architecture_overview", result, get_session()
-        )
+        result["_hints"] = generate_hints("get_architecture_overview", result, get_session())
         if detail_level == "minimal":
             attach_context_savings(result, original_context=full_overview)
         return result

@@ -142,9 +142,7 @@ def test_unicode_dotted_stem_resolves(tmp_path):
     target = tmp_path / "café.entity.ts"
     target.write_text("export const x = 1;\n", encoding="utf-8")
 
-    _path, (_nodes, edges) = _parse(
-        tmp_path, "const m = require('./café.entity');\n"
-    )
+    _path, (_nodes, edges) = _parse(tmp_path, "const m = require('./café.entity');\n")
 
     assert _import_targets(edges) == [target.resolve().as_posix()]
 

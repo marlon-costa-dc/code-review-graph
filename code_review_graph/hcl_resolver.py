@@ -23,8 +23,7 @@ def resolve_hcl_module_references(store: GraphStore) -> dict[str, int]:
     """
     conn = store._conn  # intentional: bounded post-build maintenance pass
     node_rows = conn.execute(
-        "SELECT name, qualified_name, file_path, kind "
-        "FROM nodes WHERE language = 'hcl'"
+        "SELECT name, qualified_name, file_path, kind FROM nodes WHERE language = 'hcl'"
     ).fetchall()
     if not node_rows:
         return {
@@ -33,9 +32,7 @@ def resolve_hcl_module_references(store: GraphStore) -> dict[str, int]:
             "imports_resolved": 0,
         }
 
-    hcl_files = {
-        row["file_path"] for row in node_rows if row["kind"] == "File"
-    }
+    hcl_files = {row["file_path"] for row in node_rows if row["kind"] == "File"}
     nodes_by_module_name: dict[tuple[str, str], list[str]] = {}
     known_qns: set[str] = set()
     for row in node_rows:
@@ -48,8 +45,7 @@ def resolve_hcl_module_references(store: GraphStore) -> dict[str, int]:
 
     reference_updates: list[tuple[str, int]] = []
     for row in conn.execute(
-        "SELECT id, target_qualified, file_path FROM edges "
-        "WHERE kind = 'REFERENCES'"
+        "SELECT id, target_qualified, file_path FROM edges WHERE kind = 'REFERENCES'"
     ).fetchall():
         if row["file_path"] not in hcl_files:
             continue
@@ -68,8 +64,7 @@ def resolve_hcl_module_references(store: GraphStore) -> dict[str, int]:
 
     import_updates: list[tuple[str, int]] = []
     for row in conn.execute(
-        "SELECT id, target_qualified, file_path FROM edges "
-        "WHERE kind = 'IMPORTS_FROM'"
+        "SELECT id, target_qualified, file_path FROM edges WHERE kind = 'IMPORTS_FROM'"
     ).fetchall():
         source_file = row["file_path"]
         target = row["target_qualified"]

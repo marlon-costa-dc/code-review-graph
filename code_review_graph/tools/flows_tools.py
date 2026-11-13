@@ -92,17 +92,12 @@ def list_flows(
 
         result: dict[str, object] = {
             "status": "ok",
-            "summary": (
-                f"Found {total} execution flow(s)"
-                + _shown_of(len(flows), total)
-            ),
+            "summary": (f"Found {total} execution flow(s)" + _shown_of(len(flows), total)),
             "flows": flows,
             "total": total,
             "truncated": truncated,
         }
-        result["_hints"] = generate_hints(
-            "list_flows", result, get_session()
-        )
+        result["_hints"] = generate_hints("list_flows", result, get_session())
         return result
     except Exception as exc:
         return {"status": "error", "error": str(exc)}
@@ -158,9 +153,7 @@ def get_flow(
             flow = get_flow_by_id(store, flow_id)
         elif flow_name is not None:
             # Search flows by name match
-            all_flows = get_flows(
-                store, sort_by="criticality", limit=500
-            )
+            all_flows = get_flows(store, sort_by="criticality", limit=500)
             for f in all_flows:
                 if flow_name.lower() in f["name"].lower():
                     flow = get_flow_by_id(store, f["id"])
@@ -173,7 +166,9 @@ def get_flow(
             }
 
         steps, total_steps, truncated = _bounded(
-            flow.get("steps") or [], max_steps, _MAX_FLOW_STEPS,
+            flow.get("steps") or [],
+            max_steps,
+            _MAX_FLOW_STEPS,
         )
         flow["steps"] = steps
         flow["total_steps"] = total_steps
@@ -194,20 +189,15 @@ def get_flow(
                 file_path = fp
                 if file_path and file_path.is_file():
                     try:
-                        lines = file_path.read_text(
-                            errors="replace"
-                        ).splitlines()
-                        start = max(
-                            0, (step.get("line_start") or 1) - 1
-                        )
+                        lines = file_path.read_text(errors="replace").splitlines()
+                        start = max(0, (step.get("line_start") or 1) - 1)
                         end = min(
                             len(lines),
                             step.get("line_end") or len(lines),
                             start + budget,
                         )
                         step["source"] = "\n".join(
-                            f"{i + 1}: {lines[i]}"
-                            for i in range(start, end)
+                            f"{i + 1}: {lines[i]}" for i in range(start, end)
                         )
                         budget -= max(0, end - start)
                     except (OSError, UnicodeDecodeError):
@@ -218,14 +208,11 @@ def get_flow(
             "summary": (
                 f"Flow '{flow['name']}': {flow['node_count']} nodes, "
                 f"depth {flow['depth']}, "
-                f"criticality {flow['criticality']:.4f}"
-                + _shown_of(len(steps), total_steps)
+                f"criticality {flow['criticality']:.4f}" + _shown_of(len(steps), total_steps)
             ),
             "flow": flow,
         }
-        result["_hints"] = generate_hints(
-            "get_flow", result, get_session()
-        )
+        result["_hints"] = generate_hints("get_flow", result, get_session())
         return result
     except Exception as exc:
         return {"status": "error", "error": str(exc)}

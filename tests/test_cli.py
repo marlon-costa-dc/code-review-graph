@@ -408,8 +408,18 @@ class TestDetectChangesEndToEnd:
         import subprocess
 
         subprocess.run(
-            ["git", "-C", str(repo), "-c", "user.email=t@example.com",
-             "-c", "user.name=Test", "-c", "commit.gpgsign=false", *args],
+            [
+                "git",
+                "-C",
+                str(repo),
+                "-c",
+                "user.email=t@example.com",
+                "-c",
+                "user.name=Test",
+                "-c",
+                "commit.gpgsign=false",
+                *args,
+            ],
             check=True,
             capture_output=True,
             stdin=subprocess.DEVNULL,
@@ -417,7 +427,10 @@ class TestDetectChangesEndToEnd:
         )
 
     def test_detect_changes_maps_committed_change_to_functions(
-        self, tmp_path, capsys, monkeypatch,
+        self,
+        tmp_path,
+        capsys,
+        monkeypatch,
     ):
         monkeypatch.delenv("CRG_DATA_DIR", raising=False)
         monkeypatch.delenv("CRG_REPO_ROOT", raising=False)
@@ -468,7 +481,7 @@ class TestDetectChangesEndToEnd:
             cli.main()
 
         out = capsys.readouterr().out
-        result = json.loads(out[out.index("{"):])
+        result = json.loads(out[out.index("{") :])
 
         # The diff must map to >0 functions — not silently come up empty.
         names = {f["name"] for f in result["changed_functions"]}
@@ -561,9 +574,7 @@ class TestGraphToolExplicitRepoResolution:
         repo_root = mock_run.call_args.args[1]
         assert repo_root == module.resolve()
 
-    def test_explicit_repo_without_markers_errors_cleanly(
-        self, tmp_path, capsys, monkeypatch
-    ):
+    def test_explicit_repo_without_markers_errors_cleanly(self, tmp_path, capsys, monkeypatch):
         bare = tmp_path / "not-a-project"
         bare.mkdir()
         monkeypatch.setattr(cli, "_find_explicit_repo_root", lambda _path: None)

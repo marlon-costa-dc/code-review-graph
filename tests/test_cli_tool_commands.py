@@ -88,7 +88,12 @@ from code_review_graph import cli
     ],
 )
 def test_tool_command_forwards_typed_arguments_as_json(
-    arguments, tool_name, expected, tmp_path, monkeypatch, capsys,
+    arguments,
+    tool_name,
+    expected,
+    tmp_path,
+    monkeypatch,
+    capsys,
 ):
     repo = tmp_path / "repo"
     nested = repo / "src" / "nested"

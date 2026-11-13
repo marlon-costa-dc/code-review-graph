@@ -52,10 +52,7 @@ def test_last_import_ignores_trailing_block_comment(tmp_path: Path) -> None:
 def test_last_import_ignores_trailing_line_comment(tmp_path: Path) -> None:
     source = _write_kotlin(
         tmp_path,
-        "package app\n\n"
-        "import javax.inject.Inject\n\n"
-        "// Explanatory note\n"
-        "class Main\n",
+        "package app\n\nimport javax.inject.Inject\n\n// Explanatory note\nclass Main\n",
     )
 
     targets = _import_targets(tmp_path, source)
@@ -102,10 +99,7 @@ def test_wildcard_import_with_trailing_comment_keeps_star_suffix(
 ) -> None:
     source = _write_kotlin(
         tmp_path,
-        "package app\n\n"
-        "import kotlinx.coroutines.*\n\n"
-        "/** Doc comment. */\n"
-        "class Main\n",
+        "package app\n\nimport kotlinx.coroutines.*\n\n/** Doc comment. */\nclass Main\n",
     )
 
     targets = _import_targets(tmp_path, source)
@@ -120,9 +114,7 @@ def test_long_trailing_kdoc_does_not_break_parsing(tmp_path: Path) -> None:
         tmp_path,
         "package app\n\n"
         "import javax.inject.Inject\n\n"
-        "/**\n"
-        + "".join(f" * {'detail ' * 12}\n" for _ in range(40))
-        + " */\n"
+        "/**\n" + "".join(f" * {'detail ' * 12}\n" for _ in range(40)) + " */\n"
         "class Main\n",
     )
 

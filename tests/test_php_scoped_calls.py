@@ -82,18 +82,15 @@ def test_phpunit_instance_call_creates_canonical_tested_by_edge(
 ) -> None:
     store = _build_phpunit_calculator(tmp_path)
     test_node = store._conn.execute(
-        "SELECT qualified_name, kind, is_test FROM nodes "
-        "WHERE name = 'testItAddsTwoNumbers'"
+        "SELECT qualified_name, kind, is_test FROM nodes WHERE name = 'testItAddsTwoNumbers'"
     ).fetchone()
     add_node = store._conn.execute(
-        "SELECT qualified_name FROM nodes "
-        "WHERE name = 'add' AND parent_name = 'Calculator'"
+        "SELECT qualified_name FROM nodes WHERE name = 'add' AND parent_name = 'Calculator'"
     ).fetchone()
 
     assert dict(test_node) == {
         "qualified_name": (
-            f"{tmp_path}/tests/CalculatorTest.php"
-            "::CalculatorTest.testItAddsTwoNumbers"
+            f"{tmp_path}/tests/CalculatorTest.php::CalculatorTest.testItAddsTwoNumbers"
         ),
         "kind": "Test",
         "is_test": 1,
@@ -128,8 +125,7 @@ def test_phpunit_instance_call_is_visible_through_public_tests_for(
 ) -> None:
     store = _build_phpunit_calculator(tmp_path)
     add_qn = store._conn.execute(
-        "SELECT qualified_name FROM nodes "
-        "WHERE name = 'add' AND parent_name = 'Calculator'"
+        "SELECT qualified_name FROM nodes WHERE name = 'add' AND parent_name = 'Calculator'"
     ).fetchone()["qualified_name"]
 
     method_result = query_graph("tests_for", add_qn, repo_root=str(tmp_path))
@@ -140,15 +136,13 @@ def test_phpunit_instance_call_is_visible_through_public_tests_for(
     )
 
     assert method_result["status"] == "ok"
-    assert [
-        (result["name"], result["indirect"])
-        for result in method_result["results"]
-    ] == [("testItAddsTwoNumbers", False)]
+    assert [(result["name"], result["indirect"]) for result in method_result["results"]] == [
+        ("testItAddsTwoNumbers", False)
+    ]
     assert file_result["status"] == "ok"
-    assert [
-        (result["name"], result["indirect"])
-        for result in file_result["results"]
-    ] == [("testItAddsTwoNumbers", False)]
+    assert [(result["name"], result["indirect"]) for result in file_result["results"]] == [
+        ("testItAddsTwoNumbers", False)
+    ]
 
 
 def test_php_instance_call_resolves_constructor_import_alias(
@@ -178,13 +172,11 @@ def test_php_instance_call_resolves_constructor_import_alias(
         },
     )
     target = store._conn.execute(
-        "SELECT qualified_name FROM nodes "
-        "WHERE name = 'add' AND parent_name = 'Calculator'"
+        "SELECT qualified_name FROM nodes WHERE name = 'add' AND parent_name = 'Calculator'"
     ).fetchone()["qualified_name"]
 
     call = store._conn.execute(
-        "SELECT extra FROM edges "
-        "WHERE kind = 'CALLS' AND target_qualified = ?",
+        "SELECT extra FROM edges WHERE kind = 'CALLS' AND target_qualified = ?",
         (target,),
     ).fetchone()
 
@@ -217,19 +209,22 @@ def test_php_reassignment_invalidates_constructed_receiver_type(
         },
     )
     canonical_target = store._conn.execute(
-        "SELECT qualified_name FROM nodes "
-        "WHERE name = 'add' AND parent_name = 'Calculator'"
+        "SELECT qualified_name FROM nodes WHERE name = 'add' AND parent_name = 'Calculator'"
     ).fetchone()["qualified_name"]
 
-    assert store._conn.execute(
-        "SELECT 1 FROM edges "
-        "WHERE kind = 'CALLS' AND target_qualified = ?",
-        (canonical_target,),
-    ).fetchone() is None
-    assert store._conn.execute(
-        "SELECT 1 FROM edges "
-        "WHERE kind = 'CALLS' AND target_qualified = 'add'",
-    ).fetchone() is not None
+    assert (
+        store._conn.execute(
+            "SELECT 1 FROM edges WHERE kind = 'CALLS' AND target_qualified = ?",
+            (canonical_target,),
+        ).fetchone()
+        is None
+    )
+    assert (
+        store._conn.execute(
+            "SELECT 1 FROM edges WHERE kind = 'CALLS' AND target_qualified = 'add'",
+        ).fetchone()
+        is not None
+    )
 
 
 def test_path_tokens_normalizes_windows_separators() -> None:
@@ -316,9 +311,7 @@ def test_impact_radius_of_definition_file_includes_caller(tmp_path: Path) -> Non
         },
     )
 
-    impact = get_impact_radius(
-        changed_files=["src/Mailer.php"], repo_root=str(tmp_path)
-    )
+    impact = get_impact_radius(changed_files=["src/Mailer.php"], repo_root=str(tmp_path))
     assert impact["status"] == "ok"
     impacted = {n["name"] for n in impact["impacted_nodes"]}
     assert "register" in impacted
@@ -383,7 +376,8 @@ def test_ambiguous_same_named_methods_disambiguated_by_import(tmp_path: Path) ->
     )
 
     resolved = [
-        c for c in _calls(store)
+        c
+        for c in _calls(store)
         if c["confidence_tier"] == "INFERRED" and "dispatch" in c["target_qualified"]
     ]
     assert len(resolved) == 1
@@ -434,11 +428,7 @@ def test_windows_resolved_import_path_disambiguates_same_named_methods(
 
     stats = resolve_scoped_calls(store)
     assert stats["calls_resolved"] == 1
-    resolved = [
-        call
-        for call in _calls(store)
-        if call["confidence_tier"] == "INFERRED"
-    ]
+    resolved = [call for call in _calls(store) if call["confidence_tier"] == "INFERRED"]
     assert len(resolved) == 1
     assert "Queue/Mailer.php::Mailer.dispatch" in resolved[0]["target_qualified"]
 
@@ -537,9 +527,7 @@ def test_partial_suffix_from_unrelated_namespace_does_not_resolve(
     )
 
     assert not any(c["confidence_tier"] == "INFERRED" for c in _calls(store))
-    dangling = [
-        c for c in _calls(store) if c["target_qualified"] == "Mailer::dispatch"
-    ]
+    dangling = [c for c in _calls(store) if c["target_qualified"] == "Mailer::dispatch"]
     assert len(dangling) == 1
 
 
@@ -575,7 +563,8 @@ def test_import_suffix_match_selects_correct_namespace(tmp_path: Path) -> None:
         },
     )
     resolved = [
-        c for c in _calls(store)
+        c
+        for c in _calls(store)
         if c["confidence_tier"] == "INFERRED" and "dispatch" in c["target_qualified"]
     ]
     assert len(resolved) == 1
@@ -589,10 +578,7 @@ def test_unresolved_external_scoped_call_is_left_untouched(tmp_path: Path) -> No
         tmp_path,
         {
             "src/Cache.php": (
-                "<?php\n"
-                "class Cache {\n"
-                "    public function warm($k) { return Redis::get($k); }\n"
-                "}\n"
+                "<?php\nclass Cache {\n    public function warm($k) { return Redis::get($k); }\n}\n"
             ),
         },
     )
@@ -617,22 +603,14 @@ def test_incremental_update_reresolves_scoped_call(tmp_path: Path) -> None:
                 "    public static function dispatch($to) { return true; }\n"
                 "}\n"
             ),
-            "src/Ctrl.php": (
-                "<?php\n"
-                "class Ctrl {\n"
-                "    public function reg($e) { return 0; }\n"
-                "}\n"
-            ),
+            "src/Ctrl.php": ("<?php\nclass Ctrl {\n    public function reg($e) { return 0; }\n}\n"),
         },
     )
     # Initially Ctrl does not call Mailer.
     assert query_graph("callers_of", "dispatch", repo_root=str(tmp_path))["results"] == []
 
     (tmp_path / "src/Ctrl.php").write_text(
-        "<?php\n"
-        "class Ctrl {\n"
-        "    public function reg($e) { return Mailer::dispatch($e); }\n"
-        "}\n",
+        "<?php\nclass Ctrl {\n    public function reg($e) { return Mailer::dispatch($e); }\n}\n",
         encoding="utf-8",
     )
     incremental_update(tmp_path, store, changed_files=["src/Ctrl.php"])

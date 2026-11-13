@@ -43,8 +43,7 @@ def estimate_file_tokens(repo_root: Path, files: Iterable[str]) -> int:
             if full_path.is_file():
                 total += max(
                     1,
-                    (full_path.stat().st_size + CHARS_PER_TOKEN - 1)
-                    // CHARS_PER_TOKEN,
+                    (full_path.stat().st_size + CHARS_PER_TOKEN - 1) // CHARS_PER_TOKEN,
                 )
         except OSError:
             continue
@@ -59,16 +58,8 @@ def estimate_context_savings(
     returned_tokens: int | None = None,
 ) -> dict[str, int | bool] | None:
     """Return tiny savings metadata, or None when no baseline is available."""
-    baseline = (
-        original_tokens
-        if original_tokens is not None
-        else estimate_tokens(original_context)
-    )
-    returned = (
-        returned_tokens
-        if returned_tokens is not None
-        else estimate_tokens(returned_context)
-    )
+    baseline = original_tokens if original_tokens is not None else estimate_tokens(original_context)
+    returned = returned_tokens if returned_tokens is not None else estimate_tokens(returned_context)
 
     if baseline <= 0:
         return None
@@ -183,8 +174,11 @@ def verify_with_tiktoken(
         graph_real = len(enc.encode(response))
     else:
         text = json.dumps(
-            response, default=str, ensure_ascii=True,
-            separators=(",", ":"), sort_keys=True,
+            response,
+            default=str,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
         )
         graph_real = len(enc.encode(text))
 
@@ -282,10 +276,7 @@ def format_context_savings_panel(
         vr = verified["verified_returned"]
         vs = verified["verified_saved"]
         vp = verified["verified_percent"]
-        inner_lines.append(
-            f"Verified (tiktoken):    {vs:>9,} tokens (~{vp}%)  "
-            f"[{vb:,} → {vr:,}]"
-        )
+        inner_lines.append(f"Verified (tiktoken):    {vs:>9,} tokens (~{vp}%)  [{vb:,} → {vr:,}]")
     if breakdown:
         parts = [f"{label} {_fmt_compact(tok)}" for label, tok in breakdown.items()]
         bd_line = "Breakdown: " + " · ".join(parts)

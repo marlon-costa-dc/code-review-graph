@@ -98,9 +98,7 @@ def prewarm_local_embeddings(model_name: str | None = None) -> None:
         model_name: Optional override; falls back to the ``CRG_EMBEDDING_MODEL``
             environment variable and then to ``LOCAL_DEFAULT_MODEL``.
     """
-    resolved = model_name or os.environ.get(
-        "CRG_EMBEDDING_MODEL", LOCAL_DEFAULT_MODEL
-    )
+    resolved = model_name or os.environ.get("CRG_EMBEDDING_MODEL", LOCAL_DEFAULT_MODEL)
     try:
         LocalEmbeddingProvider(resolved)._get_model()
     except ImportError:
@@ -188,7 +186,7 @@ class GoogleEmbeddingProvider(EmbeddingProvider):
         except ImportError:
             raise ImportError(
                 "google-genai not installed. "
-                "Run: pip install \"code-review-graph[google-embeddings]\""
+                'Run: pip install "code-review-graph[google-embeddings]"'
             )
 
     def embed(self, texts: list[str]) -> list[list[float]]:
@@ -232,7 +230,7 @@ class GoogleEmbeddingProvider(EmbeddingProvider):
                     )
                     raise
 
-                wait = 2 ** attempt
+                wait = 2**attempt
 
                 logger.warning(
                     "Gemini API retry %d/%d in %ds (%s): %s",
@@ -719,7 +717,9 @@ class VoyageEmbeddingProvider(EmbeddingProvider):
                 try:
                     self._wait_for_rate_limit_slot()
                     with urllib.request.urlopen(  # nosec B310
-                        req, timeout=self._timeout, context=_ssl_ctx,
+                        req,
+                        timeout=self._timeout,
+                        context=_ssl_ctx,
                     ) as resp:
                         raw = resp.read().decode("utf-8")
                 except urllib.error.HTTPError as http_err:
@@ -736,13 +736,12 @@ class VoyageEmbeddingProvider(EmbeddingProvider):
                             err_obj = parsed["error"]
                             err_msg = (
                                 err_obj.get("message", err_msg)
-                                if isinstance(err_obj, dict) else str(err_obj)
+                                if isinstance(err_obj, dict)
+                                else str(err_obj)
                             )
                     except Exception:  # nosec B110
                         pass
-                    raise RuntimeError(
-                        f"Voyage API HTTP {http_err.code}: {err_msg}"
-                    ) from http_err
+                    raise RuntimeError(f"Voyage API HTTP {http_err.code}: {err_msg}") from http_err
 
                 response = _json.loads(raw)
 
@@ -756,9 +755,7 @@ class VoyageEmbeddingProvider(EmbeddingProvider):
                     raise RuntimeError("Voyage API returned empty data")
 
                 any_has_index = any("index" in item for item in data)
-                all_int_index = all(
-                    isinstance(item.get("index"), int) for item in data
-                )
+                all_int_index = all(isinstance(item.get("index"), int) for item in data)
                 if all_int_index:
                     expected = set(range(len(texts)))
                     indices = [int(item["index"]) for item in data]
@@ -788,23 +785,29 @@ class VoyageEmbeddingProvider(EmbeddingProvider):
                 is_retryable = False
                 if isinstance(e, urllib.error.HTTPError):
                     is_retryable = e.code == 429 or 500 <= e.code < 600
-                elif isinstance(e, (
-                    urllib.error.URLError,
-                    socket.timeout,
-                    TimeoutError,
-                    ConnectionError,
-                    ssl.SSLError,
-                    http.client.IncompleteRead,
-                    http.client.BadStatusLine,
-                    http.client.RemoteDisconnected,
-                )):
+                elif isinstance(
+                    e,
+                    (
+                        urllib.error.URLError,
+                        socket.timeout,
+                        TimeoutError,
+                        ConnectionError,
+                        ssl.SSLError,
+                        http.client.IncompleteRead,
+                        http.client.BadStatusLine,
+                        http.client.RemoteDisconnected,
+                    ),
+                ):
                     is_retryable = True
                 if not is_retryable or attempt == max_retries - 1:
                     raise
-                wait = 2 ** attempt
+                wait = 2**attempt
                 logger.warning(
                     "Voyage embeddings API error (attempt %d/%d), retrying in %ds: %s",
-                    attempt + 1, max_retries, wait, e,
+                    attempt + 1,
+                    max_retries,
+                    wait,
+                    e,
                 )
                 time.sleep(wait)
 
@@ -815,7 +818,7 @@ class VoyageEmbeddingProvider(EmbeddingProvider):
             return []
         results: list[list[float]] = []
         for i in range(0, len(texts), self._batch_size):
-            results.extend(self._call_api(texts[i:i + self._batch_size], "document"))
+            results.extend(self._call_api(texts[i : i + self._batch_size], "document"))
         return results
 
     def embed_query(self, text: str) -> list[float]:
@@ -914,8 +917,7 @@ def get_provider(
     name = provider.strip().lower() if provider else ""
     if name and name not in _VALID_PROVIDERS:
         raise ValueError(
-            f"Unknown embedding provider '{name}'. "
-            "Valid: local, openai, google, minimax, voyage"
+            f"Unknown embedding provider '{name}'. Valid: local, openai, google, minimax, voyage"
         )
 
     # When no explicit provider is given but OpenAI-compatible env vars are
@@ -975,17 +977,13 @@ def get_provider(
         api_key = os.environ.get("VOYAGE_API_KEY")
         if not api_key:
             raise ValueError(
-                "VOYAGE_API_KEY environment variable is required for "
-                "the Voyage embedding provider."
+                "VOYAGE_API_KEY environment variable is required for the Voyage embedding provider."
             )
         base_url = (
-            os.environ.get("CRG_VOYAGE_BASE_URL")
-            or VoyageEmbeddingProvider._DEFAULT_BASE_URL
+            os.environ.get("CRG_VOYAGE_BASE_URL") or VoyageEmbeddingProvider._DEFAULT_BASE_URL
         )
         resolved_model = (
-            model
-            or os.environ.get("CRG_VOYAGE_MODEL")
-            or VoyageEmbeddingProvider._DEFAULT_MODEL
+            model or os.environ.get("CRG_VOYAGE_MODEL") or VoyageEmbeddingProvider._DEFAULT_MODEL
         )
         dim_env = os.environ.get("CRG_VOYAGE_OUTPUT_DIMENSION")
         output_dimension = int(dim_env) if dim_env else VoyageEmbeddingProvider._DEFAULT_DIMENSION
@@ -1038,6 +1036,7 @@ def _check_available() -> bool:
     with _MODEL_INIT_LOCK:
         try:
             import sentence_transformers  # noqa: F401
+
             return True
         except ImportError:
             return False
@@ -1243,7 +1242,7 @@ class EmbeddingStore:
 
         embedded = 0
         for i in range(0, len(to_embed), batch_size):
-            batch = to_embed[i:i + batch_size]
+            batch = to_embed[i : i + batch_size]
             texts = [t for _, t, _ in batch]
             vectors = self.provider.embed(texts)
 
@@ -1313,8 +1312,7 @@ class EmbeddingStore:
         an intentional no-op rather than an error.
         """
         has_nodes = self._conn.execute(
-            "SELECT 1 FROM sqlite_master "
-            "WHERE type = 'table' AND name = 'nodes'",
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'nodes'",
         ).fetchone()
         if has_nodes is None:
             return 0
@@ -1371,8 +1369,7 @@ def refresh_embeddings(
         )
 
     has_table = graph_store._conn.execute(
-        "SELECT 1 FROM sqlite_master "
-        "WHERE type = 'table' AND name = 'embeddings'",
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'embeddings'",
     ).fetchone()
     if has_table is None:
         return None

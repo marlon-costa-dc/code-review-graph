@@ -63,10 +63,10 @@ def test_uninstall_removes_mcp_entry_for_every_current_platform_spec(
     if spec["format"] == "toml":
         _write(
             config_path,
-            "theme = \"dark\"\n\n"
+            'theme = "dark"\n\n'
             "[mcp_servers.code-review-graph]\n"
-            "command = \"code-review-graph\"\n\n"
-            "[mcp_servers.other]\ncommand = \"other\"\n",
+            'command = "code-review-graph"\n\n'
+            '[mcp_servers.other]\ncommand = "other"\n',
         )
     elif spec["format"] == "yaml":
         _write(
@@ -333,11 +333,7 @@ def test_hook_cleanup_handles_owned_entries_and_mixed_nested_groups(
     uninstall.run(repo=fake_repo, keep_data=True)
 
     assert _read_jsonc(hooks_path) == {
-        "hooks": {
-            "sessionStart": [
-                {"matcher": "", "hooks": [{"command": "user-session-hook"}]}
-            ]
-        }
+        "hooks": {"sessionStart": [{"matcher": "", "hooks": [{"command": "user-session-hook"}]}]}
     }
 
 
@@ -441,10 +437,7 @@ def test_uninstall_cleans_current_and_legacy_copilot_instruction_paths(
 ) -> None:
     """Both Copilot paths lose only the generated CRG instruction section."""
     paths = (
-        fake_repo
-        / ".github"
-        / "instructions"
-        / "code-review-graph.instructions.md",
+        fake_repo / ".github" / "instructions" / "code-review-graph.instructions.md",
         fake_repo / ".github" / "code-review-graph.instruction.md",
     )
     for path in paths:
@@ -460,9 +453,7 @@ def test_uninstall_cleans_current_and_legacy_copilot_instruction_paths(
 def _legacy_claude_section() -> str:
     """The longest recorded pre-guardrails CLAUDE.md-shaped block."""
     return next(
-        block
-        for block in skills.LEGACY_INSTRUCTION_SECTIONS
-        if not block.startswith("---\n")
+        block for block in skills.LEGACY_INSTRUCTION_SECTIONS if not block.startswith("---\n")
     )
 
 
@@ -537,11 +528,7 @@ def test_uninstall_clears_every_duplicate_stale_block(
     fake_home: Path,
 ) -> None:
     """Repeat installs used to stack blocks (#558); removal must clear them all."""
-    older = [
-        block
-        for block in skills.LEGACY_INSTRUCTION_SECTIONS
-        if not block.startswith("---\n")
-    ]
+    older = [block for block in skills.LEGACY_INSTRUCTION_SECTIONS if not block.startswith("---\n")]
     path = fake_repo / "CLAUDE.md"
     _write(path, "user instructions\n\n" + older[0] + "\n" + older[1] + "\n" + older[0])
 
@@ -640,10 +627,7 @@ def test_dry_run_is_meaningful_and_byte_for_byte_read_only(
     data.write_bytes(b"graph")
     plugin = fake_home / ".config" / "opencode" / "plugins" / "crg-plugin.ts"
     _write(plugin, "plugin")
-    before = {
-        path: path.read_bytes()
-        for path in (config, data, plugin)
-    }
+    before = {path: path.read_bytes() for path in (config, data, plugin)}
 
     report = uninstall.run(repo=fake_repo, dry_run=True)
 
@@ -1021,8 +1005,13 @@ def test_cli_uninstall_platform_scopes_to_one_binding(
         sys,
         "argv",
         [
-            "code-review-graph", "uninstall",
-            "--platform", "claude", "--repo", str(fake_repo), "--yes",
+            "code-review-graph",
+            "uninstall",
+            "--platform",
+            "claude",
+            "--repo",
+            str(fake_repo),
+            "--yes",
         ],
     ):
         cli.main()

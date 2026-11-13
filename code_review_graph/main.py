@@ -62,6 +62,7 @@ from .tools import (
     traverse_graph_func,
     with_provenance,
 )
+from .tools._common import _paginate_response
 
 logger = logging.getLogger(__name__)
 
@@ -329,12 +330,18 @@ async def build_or_update_graph_tool(
     root = _resolve_repo_root(repo_root)
 
     def _run() -> dict:
-        return with_provenance(build_or_update_graph(
-            full_rebuild=full_rebuild, repo_root=root, base=base,
-            postprocess=postprocess, recurse_submodules=recurse_submodules,
-            embedding_provider=embedding_provider,
-            embedding_model=embedding_model,
-        ), root)
+        return with_provenance(
+            build_or_update_graph(
+                full_rebuild=full_rebuild,
+                repo_root=root,
+                base=base,
+                postprocess=postprocess,
+                recurse_submodules=recurse_submodules,
+                embedding_provider=embedding_provider,
+                embedding_model=embedding_model,
+            ),
+            root,
+        )
 
     return await asyncio.to_thread(_run)
 
@@ -370,11 +377,17 @@ async def run_postprocess_tool(
     root = _resolve_repo_root(repo_root)
 
     def _run() -> dict:
-        return with_provenance(run_postprocess(
-            flows=flows, communities=communities, fts=fts, repo_root=root,
-            embedding_provider=embedding_provider,
-            embedding_model=embedding_model,
-        ), root)
+        return with_provenance(
+            run_postprocess(
+                flows=flows,
+                communities=communities,
+                fts=fts,
+                repo_root=root,
+                embedding_provider=embedding_provider,
+                embedding_model=embedding_model,
+            ),
+            root,
+        )
 
     return await asyncio.to_thread(_run)
 
@@ -401,10 +414,15 @@ def get_minimal_context_tool(
         base: Git ref for diff comparison. Default: HEAD~1.
     """
     root = _resolve_repo_root(repo_root)
-    return with_provenance(get_minimal_context(
-        task=task, changed_files=changed_files,
-        repo_root=root, base=base,
-    ), root)
+    return with_provenance(
+        get_minimal_context(
+            task=task,
+            changed_files=changed_files,
+            repo_root=root,
+            base=base,
+        ),
+        root,
+    )
 
 
 @mcp.tool()
@@ -414,6 +432,11 @@ def get_impact_radius_tool(
     repo_root: Optional[str] = None,
     base: str = "HEAD~1",
     detail_level: str = "minimal",
+    *,
+    offset: int = 0,
+    page_size: int = 100,
+    snapshot: Optional[str] = None,
+    max_results: int = 500,
 ) -> dict:
     """Analyze the blast radius of changed files in the codebase.
 
@@ -428,11 +451,22 @@ def get_impact_radius_tool(
         detail_level: "minimal" (default) for a compact summary; "standard" for full output.
     """
     root = _resolve_repo_root(repo_root)
-    return with_provenance(get_impact_radius(
-        changed_files=changed_files, max_depth=max_depth,
-        repo_root=root, base=base,
-        detail_level=_resolve_detail_level(detail_level),
-    ), root)
+    return _paginate_response(
+        with_provenance(
+            get_impact_radius(
+                changed_files=changed_files,
+                max_depth=max_depth,
+                max_results=max_results,
+                repo_root=root,
+                base=base,
+                detail_level=_resolve_detail_level(detail_level),
+            ),
+            root,
+        ),
+        offset=offset,
+        page_size=page_size,
+        snapshot=snapshot,
+    )
 
 
 @mcp.tool()
@@ -472,10 +506,16 @@ def query_graph_tool(
             symbol cannot return an unbounded payload. Default: 100.
     """
     root = _resolve_repo_root(repo_root)
-    return with_provenance(query_graph(
-        pattern=pattern, target=target, repo_root=root,
-        detail_level=_resolve_detail_level(detail_level), max_results=max_results,
-    ), root)
+    return with_provenance(
+        query_graph(
+            pattern=pattern,
+            target=target,
+            repo_root=root,
+            detail_level=_resolve_detail_level(detail_level),
+            max_results=max_results,
+        ),
+        root,
+    )
 
 
 @mcp.tool()
@@ -487,14 +527,15 @@ def get_review_context_tool(
     repo_root: Optional[str] = None,
     base: str = "HEAD~1",
     detail_level: str = "standard",
-    max_results: int = 100,
-    max_files: int = 25,
-    max_tokens: int = 6000,
+    max_results: Optional[int] = None,
+    max_files: Optional[int] = None,
+    max_tokens: int = 0,
 ) -> dict:
-    """Generate a focused, token-efficient review context for code changes.
+    """Generate a complete review context for code changes.
 
     Combines impact analysis with source snippets and review guidance.
-    Use this for comprehensive code reviews.
+    Use this for comprehensive code reviews. Nothing is omitted unless the
+    caller passes a limit; every limit is applied exactly and reported.
 
     Args:
         changed_files: Files to review. Auto-detected from git diff if omitted.
@@ -506,21 +547,29 @@ def get_review_context_tool(
         detail_level: "standard" for full output, "minimal" for
             token-efficient summary. Default: standard.
         max_results: Maximum graph nodes per list and edges to return.
-            Default: 50. Each list reports its untruncated ``*_total``.
+            Default: all. Each list reports its untruncated ``*_total``.
         max_files: Maximum files listed and given source snippets.
-            Default: 25. Snippets share an 800-line budget.
-        max_tokens: Token budget for the response. When the full context would
+            Default: all.
+        max_tokens: Token budget for the source snippets. When they would
             exceed this, the lowest-risk source snippets are dropped first and
-            an honest ``omitted`` note is added. Default: 6000. Set 0 to disable.
+            an honest ``omitted`` note is added. Default: 0 (no budget).
     """
     root = _resolve_repo_root(repo_root)
-    return with_provenance(get_review_context(
-        changed_files=changed_files, max_depth=max_depth,
-        include_source=include_source, max_lines_per_file=max_lines_per_file,
-        repo_root=root, base=base,
-        max_results=max_results, max_files=max_files,
-        detail_level=_resolve_detail_level(detail_level), max_tokens=max_tokens,
-    ), root)
+    return with_provenance(
+        get_review_context(
+            changed_files=changed_files,
+            max_depth=max_depth,
+            include_source=include_source,
+            max_lines_per_file=max_lines_per_file,
+            repo_root=root,
+            base=base,
+            max_results=max_results,
+            max_files=max_files,
+            detail_level=_resolve_detail_level(detail_level),
+            max_tokens=max_tokens,
+        ),
+        root,
+    )
 
 
 @mcp.tool()
@@ -532,6 +581,10 @@ def semantic_search_nodes_tool(
     model: Optional[str] = None,
     provider: Optional[str] = None,
     detail_level: str = "minimal",
+    *,
+    offset: int = 0,
+    page_size: int = 100,
+    snapshot: Optional[str] = None,
 ) -> dict:
     """Search for code entities by name, keyword, or semantic similarity.
 
@@ -555,10 +608,23 @@ def semantic_search_nodes_tool(
         detail_level: "minimal" (default) for a compact summary; "standard" for full output.
     """
     root = _resolve_repo_root(repo_root)
-    return with_provenance(semantic_search_nodes(
-        query=query, kind=kind, limit=limit, repo_root=root,
-        model=model, provider=provider, detail_level=_resolve_detail_level(detail_level),
-    ), root)
+    return _paginate_response(
+        with_provenance(
+            semantic_search_nodes(
+                query=query,
+                kind=kind,
+                limit=limit,
+                repo_root=root,
+                model=model,
+                provider=provider,
+                detail_level=_resolve_detail_level(detail_level),
+            ),
+            root,
+        ),
+        offset=offset,
+        page_size=page_size,
+        snapshot=snapshot,
+    )
 
 
 @mcp.tool()
@@ -601,9 +667,14 @@ async def embed_graph_tool(
     root = _resolve_repo_root(repo_root)
 
     def _run() -> dict:
-        return with_provenance(embed_graph(
-            repo_root=root, model=model, provider=provider,
-        ), root)
+        return with_provenance(
+            embed_graph(
+                repo_root=root,
+                model=model,
+                provider=provider,
+            ),
+            root,
+        )
 
     return await asyncio.to_thread(_run)
 
@@ -654,6 +725,10 @@ def find_large_functions_tool(
     file_path_pattern: Optional[str] = None,
     limit: int = 50,
     repo_root: Optional[str] = None,
+    *,
+    offset: int = 0,
+    page_size: int = 100,
+    snapshot: Optional[str] = None,
 ) -> dict:
     """Find functions, classes, or files exceeding a line-count threshold.
 
@@ -668,10 +743,21 @@ def find_large_functions_tool(
         repo_root: Repository root path. Auto-detected if omitted.
     """
     root = _resolve_repo_root(repo_root)
-    return with_provenance(find_large_functions(
-        min_lines=min_lines, kind=kind, file_path_pattern=file_path_pattern,
-        limit=limit, repo_root=root,
-    ), root)
+    return _paginate_response(
+        with_provenance(
+            find_large_functions(
+                min_lines=min_lines,
+                kind=kind,
+                file_path_pattern=file_path_pattern,
+                limit=limit,
+                repo_root=root,
+            ),
+            root,
+        ),
+        offset=offset,
+        page_size=page_size,
+        snapshot=snapshot,
+    )
 
 
 @mcp.tool()
@@ -697,10 +783,16 @@ def list_flows_tool(
         repo_root: Repository root path. Auto-detected if omitted.
     """
     root = _resolve_repo_root(repo_root)
-    return with_provenance(list_flows(
-        repo_root=root, sort_by=sort_by, limit=limit, kind=kind,
-        detail_level=detail_level,
-    ), root)
+    return with_provenance(
+        list_flows(
+            repo_root=root,
+            sort_by=sort_by,
+            limit=limit,
+            kind=kind,
+            detail_level=detail_level,
+        ),
+        root,
+    )
 
 
 @mcp.tool()
@@ -730,11 +822,17 @@ def get_flow_tool(
             include_source is set. Default: 400.
     """
     root = _resolve_repo_root(repo_root)
-    return with_provenance(get_flow(
-        flow_id=flow_id, flow_name=flow_name,
-        include_source=include_source, repo_root=root,
-        max_steps=max_steps, max_source_lines=max_source_lines,
-    ), root)
+    return with_provenance(
+        get_flow(
+            flow_id=flow_id,
+            flow_name=flow_name,
+            include_source=include_source,
+            repo_root=root,
+            max_steps=max_steps,
+            max_source_lines=max_source_lines,
+        ),
+        root,
+    )
 
 
 @mcp.tool()
@@ -763,10 +861,16 @@ def get_affected_flows_tool(
             because a standard flow costs ~980 tokens against ~18 minimal.
     """
     root = _resolve_repo_root(repo_root)
-    return with_provenance(get_affected_flows_func(
-        changed_files=changed_files, base=base, repo_root=root,
-        detail_level=detail_level, max_flows=max_flows,
-    ), root)
+    return with_provenance(
+        get_affected_flows_func(
+            changed_files=changed_files,
+            base=base,
+            repo_root=root,
+            detail_level=detail_level,
+            max_flows=max_flows,
+        ),
+        root,
+    )
 
 
 @mcp.tool()
@@ -798,11 +902,17 @@ def list_communities_tool(
             count. Default: 10.
     """
     root = _resolve_repo_root(repo_root)
-    return with_provenance(list_communities_func(
-        repo_root=root, sort_by=sort_by, min_size=min_size,
-        detail_level=detail_level, max_results=max_results,
-        max_members=max_members,
-    ), root)
+    return with_provenance(
+        list_communities_func(
+            repo_root=root,
+            sort_by=sort_by,
+            min_size=min_size,
+            detail_level=detail_level,
+            max_results=max_results,
+            max_members=max_members,
+        ),
+        root,
+    )
 
 
 @mcp.tool()
@@ -831,11 +941,16 @@ def get_community_tool(
             members_truncated marks the cut. Default: 25.
     """
     root = _resolve_repo_root(repo_root)
-    return with_provenance(get_community_func(
-        community_name=community_name, community_id=community_id,
-        include_members=include_members, repo_root=root,
-        max_members=max_members,
-    ), root)
+    return with_provenance(
+        get_community_func(
+            community_name=community_name,
+            community_id=community_id,
+            include_members=include_members,
+            repo_root=root,
+            max_members=max_members,
+        ),
+        root,
+    )
 
 
 @mcp.tool()
@@ -863,12 +978,15 @@ def get_architecture_overview_tool(
             Default: 10.
     """
     root = _resolve_repo_root(repo_root)
-    return with_provenance(get_architecture_overview_func(
-        repo_root=root,
-        detail_level=detail_level,
-        max_results=max_results,
-        max_members=max_members,
-    ), root)
+    return with_provenance(
+        get_architecture_overview_func(
+            repo_root=root,
+            detail_level=detail_level,
+            max_results=max_results,
+            max_members=max_members,
+        ),
+        root,
+    )
 
 
 @mcp.tool()
@@ -879,9 +997,9 @@ async def detect_changes_tool(
     max_depth: int = 2,
     repo_root: Optional[str] = None,
     detail_level: str = "minimal",
-    max_results: int = 25,
-    max_flows: int = 20,
-    max_tokens: int = 6000,
+    max_results: Optional[int] = None,
+    max_flows: Optional[int] = None,
+    max_tokens: int = 0,
 ) -> dict:
     """Detect changes and produce risk-scored, priority-ordered review guidance.
 
@@ -903,25 +1021,32 @@ async def detect_changes_tool(
             token-efficient summary. Default: standard.
         max_results: Maximum changed functions, test gaps, and changed files
             to return; the matching *_total fields report the full counts.
-            Default: 25.
+            Default: all (the complete analysis).
         max_flows: Maximum affected flows to embed. Embedded flows carry
             per-flow metadata only — use get_affected_flows_tool for step
-            detail. Default: 20.
+            detail. Default: all.
         max_tokens: Token budget for the standard response. When the full
             analysis would exceed this, the lowest-risk changed functions and
             flows are dropped first and an honest ``omitted`` note is added.
-            Default: 6000. Set 0 to disable.
+            Default: 0 (no budget).
     """
     root = _resolve_repo_root(repo_root)
 
     def _run() -> dict:
-        return with_provenance(detect_changes_func(
-            base=base, changed_files=changed_files,
-            include_source=include_source, max_depth=max_depth,
-            repo_root=root, detail_level=_resolve_detail_level(detail_level),
-            max_results=max_results, max_flows=max_flows,
-            max_tokens=max_tokens,
-        ), root)
+        return with_provenance(
+            detect_changes_func(
+                base=base,
+                changed_files=changed_files,
+                include_source=include_source,
+                max_depth=max_depth,
+                repo_root=root,
+                detail_level=_resolve_detail_level(detail_level),
+                max_results=max_results,
+                max_flows=max_flows,
+                max_tokens=max_tokens,
+            ),
+            root,
+        )
 
     coro = asyncio.to_thread(_run)
     tool_timeout = int(os.environ.get("CRG_TOOL_TIMEOUT", "0"))
@@ -931,8 +1056,9 @@ async def detect_changes_tool(
         except asyncio.TimeoutError:
             message = (
                 f"detect_changes_tool timed out after {tool_timeout}s. "
-                "Reduce scope with CRG_MAX_CHANGED_FUNCS / CRG_MAX_TRANSITIVE_FRONTIER, "
-                "or increase CRG_TOOL_TIMEOUT."
+                "Increase CRG_TOOL_TIMEOUT, narrow the change set with "
+                "changed_files or a closer base, or opt into a reported bound "
+                "with CRG_MAX_CHANGED_FUNCS."
             )
             error_response = {
                 "status": "error",
@@ -982,11 +1108,19 @@ def refactor_tool(
             identifying fields only. Default: standard.
     """
     root = _resolve_repo_root(repo_root)
-    return with_provenance(refactor_func(
-        mode=mode, old_name=old_name, new_name=new_name,
-        kind=kind, file_pattern=file_pattern, repo_root=root,
-        max_results=max_results, detail_level=detail_level,
-    ), root)
+    return with_provenance(
+        refactor_func(
+            mode=mode,
+            old_name=old_name,
+            new_name=new_name,
+            kind=kind,
+            file_pattern=file_pattern,
+            repo_root=root,
+            max_results=max_results,
+            detail_level=detail_level,
+        ),
+        root,
+    )
 
 
 @mcp.tool()
@@ -1017,10 +1151,15 @@ def apply_refactor_tool(
             would_modify still lists every file. Default: 25.
     """
     root = _resolve_repo_root(repo_root)
-    return with_provenance(apply_refactor_func(
-        refactor_id=refactor_id, repo_root=root,
-        dry_run=dry_run, max_diff_files=max_diff_files,
-    ), root)
+    return with_provenance(
+        apply_refactor_func(
+            refactor_id=refactor_id,
+            repo_root=root,
+            dry_run=dry_run,
+            max_diff_files=max_diff_files,
+        ),
+        root,
+    )
 
 
 @mcp.tool()
@@ -1045,9 +1184,13 @@ async def generate_wiki_tool(
     root = _resolve_repo_root(repo_root)
 
     def _run() -> dict:
-        return with_provenance(generate_wiki_func(
-            repo_root=root, force=force,
-        ), root)
+        return with_provenance(
+            generate_wiki_func(
+                repo_root=root,
+                force=force,
+            ),
+            root,
+        )
 
     return await asyncio.to_thread(_run)
 
@@ -1070,10 +1213,14 @@ def get_wiki_page_tool(
             total_chars reports the real length. Default: 20000.
     """
     root = _resolve_repo_root(repo_root)
-    return with_provenance(get_wiki_page_func(
-        community_name=community_name, repo_root=root,
-        max_chars=max_chars,
-    ), root)
+    return with_provenance(
+        get_wiki_page_func(
+            community_name=community_name,
+            repo_root=root,
+            max_chars=max_chars,
+        ),
+        root,
+    )
 
 
 @mcp.tool()
@@ -1094,9 +1241,14 @@ def get_hub_nodes_tool(
             kind, and total_degree only. Default: standard.
     """
     root = _resolve_repo_root(repo_root)
-    return with_provenance(get_hub_nodes_func(
-        repo_root=root, top_n=top_n, detail_level=detail_level,
-    ), root)
+    return with_provenance(
+        get_hub_nodes_func(
+            repo_root=root,
+            top_n=top_n,
+            detail_level=detail_level,
+        ),
+        root,
+    )
 
 
 @mcp.tool()
@@ -1118,9 +1270,14 @@ def get_bridge_nodes_tool(
             kind, and betweenness only. Default: standard.
     """
     root = _resolve_repo_root(repo_root)
-    return with_provenance(get_bridge_nodes_func(
-        repo_root=root, top_n=top_n, detail_level=detail_level,
-    ), root)
+    return with_provenance(
+        get_bridge_nodes_func(
+            repo_root=root,
+            top_n=top_n,
+            detail_level=detail_level,
+        ),
+        root,
+    )
 
 
 @mcp.tool()
@@ -1143,10 +1300,14 @@ def get_knowledge_gaps_tool(
             file paths. Default: standard.
     """
     root = _resolve_repo_root(repo_root)
-    return with_provenance(get_knowledge_gaps_func(
-        repo_root=root, max_per_category=max_per_category,
-        detail_level=detail_level,
-    ), root)
+    return with_provenance(
+        get_knowledge_gaps_func(
+            repo_root=root,
+            max_per_category=max_per_category,
+            detail_level=detail_level,
+        ),
+        root,
+    )
 
 
 @mcp.tool()
@@ -1168,9 +1329,14 @@ def get_surprising_connections_tool(
             source, target, kind, and score only. Default: standard.
     """
     root = _resolve_repo_root(repo_root)
-    return with_provenance(get_surprising_connections_func(
-        repo_root=root, top_n=top_n, detail_level=detail_level,
-    ), root)
+    return with_provenance(
+        get_surprising_connections_func(
+            repo_root=root,
+            top_n=top_n,
+            detail_level=detail_level,
+        ),
+        root,
+    )
 
 
 @mcp.tool()
@@ -1187,9 +1353,12 @@ def get_suggested_questions_tool(
         repo_root: Repository root path. Auto-detected if omitted.
     """
     root = _resolve_repo_root(repo_root)
-    return with_provenance(get_suggested_questions_func(
-        repo_root=root,
-    ), root)
+    return with_provenance(
+        get_suggested_questions_func(
+            repo_root=root,
+        ),
+        root,
+    )
 
 
 @mcp.tool()
@@ -1199,6 +1368,10 @@ def traverse_graph_tool(
     depth: int = 3,
     token_budget: int = 2000,
     repo_root: Optional[str] = None,
+    *,
+    offset: int = 0,
+    page_size: int = 100,
+    snapshot: Optional[str] = None,
 ) -> dict:
     """BFS/DFS traversal from best-matching node with token budget.
 
@@ -1216,11 +1389,21 @@ def traverse_graph_tool(
         repo_root: Repository root path. Auto-detected if omitted.
     """
     root = _resolve_repo_root(repo_root)
-    return with_provenance(traverse_graph_func(
-        query=query, mode=mode, depth=depth,
-        token_budget=token_budget,
-        repo_root=root or "",
-    ), root)
+    return _paginate_response(
+        with_provenance(
+            traverse_graph_func(
+                query=query,
+                mode=mode,
+                depth=depth,
+                token_budget=token_budget,
+                repo_root=root or "",
+            ),
+            root,
+        ),
+        offset=offset,
+        page_size=page_size,
+        snapshot=snapshot,
+    )
 
 
 @mcp.tool()

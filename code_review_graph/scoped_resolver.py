@@ -122,16 +122,13 @@ def _path_key(file_path: str) -> str:
     return file_path.replace("\\", "/")
 
 
-def _path_ends_with(
-    path_tokens: list[str], suffix: list[str], language: str
-) -> bool:
+def _path_ends_with(path_tokens: list[str], suffix: list[str], language: str) -> bool:
     """Whether a complete import/module suffix matches a defining file path."""
     if not suffix or len(suffix) > len(path_tokens):
         return False
     path_tail = path_tokens[-len(suffix) :]
     return all(
-        _fold(left, language) == _fold(right, language)
-        for left, right in zip(path_tail, suffix)
+        _fold(left, language) == _fold(right, language) for left, right in zip(path_tail, suffix)
     )
 
 
@@ -192,9 +189,7 @@ def _enclosing_class(source_qualified: str) -> Optional[str]:
     return tail.rsplit(".", 1)[0]
 
 
-def _scope_and_method(
-    target: str, language: str
-) -> Optional[tuple[Optional[str], str, bool]]:
+def _scope_and_method(target: str, language: str) -> Optional[tuple[Optional[str], str, bool]]:
     """Parse a raw scoped target into ``(class, method, needs_enclosing)``.
 
     ``class`` is ``None`` when ``needs_enclosing`` is set (``self`` / ``Self`` /
@@ -300,9 +295,7 @@ def resolve_scoped_calls(store: GraphStore) -> dict:
     for row in conn.execute(
         "SELECT file_path, target_qualified FROM edges WHERE kind = 'IMPORTS_FROM'"
     ).fetchall():
-        imports_by_file.setdefault(row["file_path"], set()).add(
-            row["target_qualified"]
-        )
+        imports_by_file.setdefault(row["file_path"], set()).add(row["target_qualified"])
 
     # ------------------------------------------------------------------
     # csharp_namespaces_by_file: .cs file → namespaces it declares. C#
@@ -313,8 +306,7 @@ def resolve_scoped_calls(store: GraphStore) -> dict:
     csharp_namespaces_by_file: dict[str, set[str]] = {}
     if "csharp" in file_language.values():
         for row in conn.execute(
-            "SELECT file_path, extra FROM nodes "
-            "WHERE kind = 'File' AND language = 'csharp'"
+            "SELECT file_path, extra FROM nodes WHERE kind = 'File' AND language = 'csharp'"
         ).fetchall():
             try:
                 node_extra = json.loads(row["extra"] or "{}")
@@ -338,11 +330,7 @@ def resolve_scoped_calls(store: GraphStore) -> dict:
         the caller (via a ``using`` directive or the caller's own declared
         namespaces).
         """
-        same_file = [
-            candidate
-            for candidate in candidates
-            if file_of.get(candidate) == caller_file
-        ]
+        same_file = [candidate for candidate in candidates if file_of.get(candidate) == caller_file]
         if len(same_file) == 1:
             return same_file[0], "same_file"
         visible_ns = {
@@ -354,8 +342,7 @@ def resolve_scoped_calls(store: GraphStore) -> dict:
         visible = [
             candidate
             for candidate in candidates
-            if csharp_namespaces_by_file.get(file_of.get(candidate, ""), set())
-            & visible_ns
+            if csharp_namespaces_by_file.get(file_of.get(candidate, ""), set()) & visible_ns
         ]
         if len(visible) == 1:
             return visible[0], "namespace"
@@ -371,9 +358,7 @@ def resolve_scoped_calls(store: GraphStore) -> dict:
         # #574's PHP import resolver rewrites resolvable ``use`` targets to the
         # absolute path of the class file, so a direct path match is exact.
         imported_paths = {
-            _path_key(target)
-            for target in imported
-            if "/" in target or "\\" in target
+            _path_key(target) for target in imported if "/" in target or "\\" in target
         }
         matched = [
             candidate
@@ -398,10 +383,7 @@ def resolve_scoped_calls(store: GraphStore) -> dict:
                 if _fold(segments[-1], language) != _fold(class_name, language):
                     continue
                 suffixes = _safe_import_suffixes(segments, language)
-                if any(
-                    _path_ends_with(tokens, suffix, language)
-                    for suffix in suffixes
-                ):
+                if any(_path_ends_with(tokens, suffix, language) for suffix in suffixes):
                     matched_by_suffix.add(candidate)
                     break
         if len(matched_by_suffix) == 1:
@@ -464,9 +446,7 @@ def resolve_scoped_calls(store: GraphStore) -> dict:
             if new_target is None:
                 continue
         else:
-            new_target = disambiguate(
-                candidates, row["file_path"], class_name, language
-            )
+            new_target = disambiguate(candidates, row["file_path"], class_name, language)
             if new_target is None:
                 continue
             via = "import"
@@ -501,7 +481,9 @@ def resolve_scoped_calls(store: GraphStore) -> dict:
         resolved += 1
         logger.debug(
             "Scoped resolver: %s → %s (via %s)",
-            resolution_target, new_target, via,
+            resolution_target,
+            new_target,
+            via,
         )
 
     if resolved:
@@ -509,6 +491,7 @@ def resolve_scoped_calls(store: GraphStore) -> dict:
 
     logger.info(
         "Scoped resolver: resolved %d CALLS edges across %d files",
-        resolved, len(file_language),
+        resolved,
+        len(file_language),
     )
     return {"files_indexed": len(file_language), "calls_resolved": resolved}

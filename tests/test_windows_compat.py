@@ -64,9 +64,7 @@ def test_delete_false_named_tempfiles_close_before_graphstore_reopens_them():
                     else [assignment.target]
                 )
                 targets = [
-                    name
-                    for target in raw_targets
-                    if (name := _qualified_name(target)) is not None
+                    name for target in raw_targets if (name := _qualified_name(target)) is not None
                 ]
                 for target in targets:
                     close_lines = [
@@ -84,9 +82,7 @@ def test_delete_false_named_tempfiles_close_before_graphstore_reopens_them():
                         and (_qualified_name(node.func) or "").split(".")[-1] == "GraphStore"
                         and _references_temp_name(node, target)
                     ]
-                    if not close_lines or (
-                        reopen_lines and min(close_lines) >= min(reopen_lines)
-                    ):
+                    if not close_lines or (reopen_lines and min(close_lines) >= min(reopen_lines)):
                         failures.append(f"{path.name}:{assignment.lineno} ({target})")
 
     assert not failures, "Close temporary handles before GraphStore reopens them:\n" + "\n".join(

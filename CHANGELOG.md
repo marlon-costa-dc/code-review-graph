@@ -16,6 +16,34 @@
 
 - `prune` imports `tomllib` behind a Python version check, clearing the
   mypy `no-redef` error from 98065a3.
+### Changed
+
+- **Change analysis is never silently truncated.** `detect_changes_tool`,
+  `get_review_context_tool`, and CLI `detect-changes` return the complete
+  analysis by default: the MCP defaults are now `max_results=None`,
+  `max_flows=None`, `max_files=None`, and `max_tokens=0`. Caller limits are
+  applied exactly — the hidden ceilings (200 files, 100 changed functions,
+  200 flows, 100 nodes / 150 edges, the 800- and 600-line shared source
+  budgets, and the 500-line `max_lines_per_file` clamp) are gone. Every cut
+  keeps its `*_total` count, sets `truncated`, and is stated in the summary;
+  `max_tokens` trims still report `omitted`.
+- `CRG_MAX_CHANGED_FUNCS` is now an opt-in bound with no default (was `500`).
+  When set, `analyze_changes` reports `changed_functions_total`,
+  `functions_truncated`, and a summary line naming the cut; a non-positive or
+  non-integer value raises.
+- `get_review_context` now surfaces `impact_truncated` and the real
+  `impacted_nodes_total` when the impact radius stops at
+  `CRG_MAX_IMPACT_NODES`, instead of reporting the kept count as the total.
+- The `detect_changes_tool` timeout message no longer points at the removed
+  `CRG_MAX_TRANSITIVE_FRONTIER`.
+
+### Removed
+
+- `CRG_MAX_TRANSITIVE_FRONTIER` and the `max_frontier` argument of
+  `GraphStore.get_transitive_tests`. The frontier silently dropped callees
+  past 50 (in arbitrary set order); every callee is now followed, and each
+  hop resolves its edges with batched `IN (...)` queries so a hub function
+  costs a constant number of statements.
 
 ## dc-use fork releases
 
@@ -23,7 +51,10 @@ Fork deltas and release history are documented in [FORK.md](FORK.md). Fork
 versions are PEP 440 local versions of the current upstream release (`2.3.8`);
 they are never invented ahead of an upstream release:
 
-- `2.3.8+dc.3` — current: deployment hardening batch (serve startup fix,
+- `2.3.8+dc.4` — current: one process watches every repository a manifest
+  names (`watch --manifest`); notebook cells without a final newline keep
+  their cell index; vendored D3 restored to its pinned bytes
+- `2.3.8+dc.3` — deployment hardening batch (serve startup fix,
   atomic indexing, VCS inventory, fallback removal, batched writes)
 - `2.3.8+dc.2` — PEP 440 local version publishing repair
 - `2.3.8+dc.1` — initial fork local version

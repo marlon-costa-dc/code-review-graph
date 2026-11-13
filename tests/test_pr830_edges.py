@@ -19,7 +19,8 @@ def _parse(source: str):
 
 def _receiver_calls(edges, method_suffix: str, receiver: str = "a"):
     return [
-        edge for edge in edges
+        edge
+        for edge in edges
         if edge.kind == "CALLS"
         and edge.source.endswith(method_suffix)
         and edge.extra.get("receiver") == receiver
@@ -83,7 +84,10 @@ class TestScopeBoundaries:
             "}\n"
         )
         assert _resolution(edges, "::A.M", "::A.Save") == [
-            False, False, False, True,
+            False,
+            False,
+            False,
+            True,
         ]
 
     def test_sibling_switch_cases_do_not_leak_shadow(self):
@@ -181,10 +185,7 @@ class TestFalseEdgeGuards:
         # The parser sees one file at a time, so the call must stay bare
         # rather than bind to the free function.
         _, edges = _parse(
-            "package edge\n"
-            "type A struct{}\n"
-            "func Missing() {}\n"
-            "func (a *A) M() { a.Missing() }\n"
+            "package edge\ntype A struct{}\nfunc Missing() {}\nfunc (a *A) M() { a.Missing() }\n"
         )
         calls = _receiver_calls(edges, "::A.M")
         assert len(calls) == 1
@@ -201,10 +202,7 @@ class TestFalseEdgeGuards:
             '\tfmt.Println("x")\n'
             "}\n"
         )
-        calls = [
-            edge for edge in edges
-            if edge.kind == "CALLS" and edge.source.endswith("::A.M")
-        ]
+        calls = [edge for edge in edges if edge.kind == "CALLS" and edge.source.endswith("::A.M")]
         assert len(calls) == 1
         assert calls[0].target == "Println"
         assert "go_method_receiver" not in calls[0].extra
@@ -233,8 +231,7 @@ class TestFalseEdgeGuards:
             "}\n"
         )
         targets = [
-            edge.target for edge in edges
-            if edge.kind == "CALLS" and edge.source.endswith("::A.M")
+            edge.target for edge in edges if edge.kind == "CALLS" and edge.source.endswith("::A.M")
         ]
         assert all(not target.endswith("::A.Save") for target in targets)
 
@@ -242,10 +239,7 @@ class TestFalseEdgeGuards:
 class TestReceiverForms:
     def test_value_receiver_resolves(self):
         _, edges = _parse(
-            "package edge\n"
-            "type A struct{}\n"
-            "func (a A) Save() {}\n"
-            "func (a A) M() { a.Save() }\n"
+            "package edge\ntype A struct{}\nfunc (a A) Save() {}\nfunc (a A) M() { a.Save() }\n"
         )
         assert _resolution(edges, "::A.M", "::A.Save") == [True]
 
@@ -295,7 +289,10 @@ class TestReceiverForms:
             "}\n"
         )
         assert _resolution(
-            edges, "::Alpha.Μέθοδος", "::Alpha.Σ", receiver="α",
+            edges,
+            "::Alpha.Μέθοδος",
+            "::Alpha.Σ",
+            receiver="α",
         ) == [True, False, True]
 
 

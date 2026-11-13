@@ -26,22 +26,34 @@ class TestGraphStore:
 
     def _make_file_node(self, path="/test/file.py"):
         return NodeInfo(
-            kind="File", name=path, file_path=path,
-            line_start=1, line_end=100, language="python",
+            kind="File",
+            name=path,
+            file_path=path,
+            line_start=1,
+            line_end=100,
+            language="python",
         )
 
     def _make_func_node(self, name="my_func", path="/test/file.py", parent=None, is_test=False):
         return NodeInfo(
             kind="Test" if is_test else "Function",
-            name=name, file_path=path,
-            line_start=10, line_end=20, language="python",
-            parent_name=parent, is_test=is_test,
+            name=name,
+            file_path=path,
+            line_start=10,
+            line_end=20,
+            language="python",
+            parent_name=parent,
+            is_test=is_test,
         )
 
     def _make_class_node(self, name="MyClass", path="/test/file.py"):
         return NodeInfo(
-            kind="Class", name=name, file_path=path,
-            line_start=5, line_end=50, language="python",
+            kind="Class",
+            name=name,
+            file_path=path,
+            line_start=5,
+            line_end=50,
+            language="python",
         )
 
     def test_upsert_and_get_node(self):
@@ -96,8 +108,12 @@ class TestGraphStore:
     def test_get_node_bridge_keeps_php_backslashes_in_symbol_part(self):
         """Only the path component is normalized; PHP FQN symbols keep ``\\``."""
         node = NodeInfo(
-            kind="Class", name="App\\Domain\\Job", file_path="src/App.php",
-            line_start=1, line_end=10, language="php",
+            kind="Class",
+            name="App\\Domain\\Job",
+            file_path="src/App.php",
+            line_start=1,
+            line_end=10,
+            language="php",
         )
         self.store.upsert_node(node)
         self.store.commit()
@@ -352,8 +368,10 @@ class TestGraphStore:
         nodes = [self._make_file_node(), self._make_func_node()]
         edges = [
             EdgeInfo(
-                kind="CONTAINS", source="/test/file.py",
-                target="/test/file.py::my_func", file_path="/test/file.py",
+                kind="CONTAINS",
+                source="/test/file.py",
+                target="/test/file.py::my_func",
+                file_path="/test/file.py",
             )
         ]
         self.store.store_file_nodes_edges("/test/file.py", nodes, edges)
@@ -390,7 +408,9 @@ class TestGraphStore:
         for i in range(5):
             path = f"/test/file_{i}.py"
             self.store.store_file_nodes_edges(
-                path, [self._make_file_node(path)], [],
+                path,
+                [self._make_file_node(path)],
+                [],
             )
 
         # Simulates full_build's stale-file purge: multiple deletes in a
@@ -425,7 +445,7 @@ class TestGraphStore:
         # Re-open the transaction and verify the batch path is guarded too.
         self.store._conn.execute("BEGIN")
         assert self.store._conn.in_transaction
-        self.store.store_file_batch([("/test/b.py", [node_b], [], "")])
+        self.store.apply_file_changes_atomic([("/test/b.py", [node_b], [], "")])
         assert self.store.get_node("/test/b.py") is not None
 
     def test_search_nodes(self):
@@ -444,10 +464,14 @@ class TestGraphStore:
         self.store.upsert_node(self._make_file_node())
         self.store.upsert_node(self._make_func_node())
         self.store.upsert_node(self._make_class_node())
-        self.store.upsert_edge(EdgeInfo(
-            kind="CONTAINS", source="/test/file.py",
-            target="/test/file.py::my_func", file_path="/test/file.py",
-        ))
+        self.store.upsert_edge(
+            EdgeInfo(
+                kind="CONTAINS",
+                source="/test/file.py",
+                target="/test/file.py::my_func",
+                file_path="/test/file.py",
+            )
+        )
         self.store.commit()
 
         stats = self.store.get_stats()
@@ -471,10 +495,15 @@ class TestGraphStore:
         self.store.upsert_node(self._make_func_node("func_a", "/a.py"))
         self.store.upsert_node(self._make_file_node("/b.py"))
         self.store.upsert_node(self._make_func_node("func_b", "/b.py"))
-        self.store.upsert_edge(EdgeInfo(
-            kind="CALLS", source="/b.py::func_b",
-            target="/a.py::func_a", file_path="/b.py", line=10,
-        ))
+        self.store.upsert_edge(
+            EdgeInfo(
+                kind="CALLS",
+                source="/b.py::func_b",
+                target="/a.py::func_a",
+                file_path="/b.py",
+                line=10,
+            )
+        )
         self.store.commit()
 
         result = self.store.get_impact_radius(["/a.py"], max_depth=2)
@@ -486,12 +515,18 @@ class TestGraphStore:
     def test_upsert_edge_preserves_multiple_call_sites(self):
         """Multiple CALLS edges to the same target from the same source on different lines."""
         edge1 = EdgeInfo(
-            kind="CALLS", source="/test/file.py::caller",
-            target="/test/file.py::helper", file_path="/test/file.py", line=10,
+            kind="CALLS",
+            source="/test/file.py::caller",
+            target="/test/file.py::helper",
+            file_path="/test/file.py",
+            line=10,
         )
         edge2 = EdgeInfo(
-            kind="CALLS", source="/test/file.py::caller",
-            target="/test/file.py::helper", file_path="/test/file.py", line=20,
+            kind="CALLS",
+            source="/test/file.py::caller",
+            target="/test/file.py::helper",
+            file_path="/test/file.py",
+            line=20,
         )
         self.store.upsert_edge(edge1)
         self.store.upsert_edge(edge2)
@@ -516,15 +551,22 @@ class TestGraphStore:
         self.store.upsert_node(self._make_file_node("/src/calc.py"))
         self.store.upsert_node(self._make_func_node("add", "/src/calc.py"))
         self.store.upsert_node(self._make_file_node("/tests/check.py"))
-        self.store.upsert_node(self._make_func_node(
-            "verify_addition", "/tests/check.py", is_test=True,
-        ))
-        self.store.upsert_edge(EdgeInfo(
-            kind="TESTED_BY",
-            source="/src/calc.py::add",
-            target="/tests/check.py::verify_addition",
-            file_path="/tests/check.py", line=1,
-        ))
+        self.store.upsert_node(
+            self._make_func_node(
+                "verify_addition",
+                "/tests/check.py",
+                is_test=True,
+            )
+        )
+        self.store.upsert_edge(
+            EdgeInfo(
+                kind="TESTED_BY",
+                source="/src/calc.py::add",
+                target="/tests/check.py::verify_addition",
+                file_path="/tests/check.py",
+                line=1,
+            )
+        )
         self.store.commit()
 
         results = self.store.get_transitive_tests("/src/calc.py::add")
@@ -541,30 +583,40 @@ class TestGraphStore:
         self.store.upsert_node(self._make_func_node("orchestrate", "/src/svc.py"))
         self.store.upsert_node(self._make_func_node("compute", "/src/svc.py"))
         self.store.upsert_node(self._make_file_node("/tests/check.py"))
-        self.store.upsert_node(self._make_func_node(
-            "verify_compute", "/tests/check.py", is_test=True,
-        ))
-        self.store.upsert_edge(EdgeInfo(
-            kind="CALLS", source="/src/svc.py::orchestrate",
-            target="/src/svc.py::compute", file_path="/src/svc.py", line=2,
-        ))
-        self.store.upsert_edge(EdgeInfo(
-            kind="TESTED_BY",
-            source="/src/svc.py::compute",
-            target="/tests/check.py::verify_compute",
-            file_path="/tests/check.py", line=1,
-        ))
+        self.store.upsert_node(
+            self._make_func_node(
+                "verify_compute",
+                "/tests/check.py",
+                is_test=True,
+            )
+        )
+        self.store.upsert_edge(
+            EdgeInfo(
+                kind="CALLS",
+                source="/src/svc.py::orchestrate",
+                target="/src/svc.py::compute",
+                file_path="/src/svc.py",
+                line=2,
+            )
+        )
+        self.store.upsert_edge(
+            EdgeInfo(
+                kind="TESTED_BY",
+                source="/src/svc.py::compute",
+                target="/tests/check.py::verify_compute",
+                file_path="/tests/check.py",
+                line=1,
+            )
+        )
         self.store.commit()
 
         results = self.store.get_transitive_tests(
-            "/src/svc.py::orchestrate", max_depth=2,
+            "/src/svc.py::orchestrate",
+            max_depth=2,
         )
         qns = {r["qualified_name"] for r in results}
         assert "/tests/check.py::verify_compute" in qns
-        match = next(
-            r for r in results
-            if r["qualified_name"] == "/tests/check.py::verify_compute"
-        )
+        match = next(r for r in results if r["qualified_name"] == "/tests/check.py::verify_compute")
         assert match["indirect"] is True
 
     def test_parse_store_get_transitive_tests_end_to_end(self):
@@ -623,9 +675,7 @@ class TestGraphStore:
     def test_get_all_community_ids_logs_when_column_missing(self, caplog):
         conn = sqlite3.connect(":memory:")
         conn.row_factory = sqlite3.Row
-        conn.execute(
-            "CREATE TABLE nodes (qualified_name TEXT PRIMARY KEY)"
-        )
+        conn.execute("CREATE TABLE nodes (qualified_name TEXT PRIMARY KEY)")
         store = GraphStore.__new__(GraphStore)
         store._conn = conn
 
@@ -666,29 +716,58 @@ class TestImpactRadiusSql:
     def _build_chain(self):
         """Build D -> C -> B -> A dependency chain for testing."""
         for name, path in [
-            ("func_a", "/a.py"), ("func_b", "/b.py"),
-            ("func_c", "/c.py"), ("func_d", "/d.py"),
+            ("func_a", "/a.py"),
+            ("func_b", "/b.py"),
+            ("func_c", "/c.py"),
+            ("func_d", "/d.py"),
         ]:
-            self.store.upsert_node(NodeInfo(
-                kind="File", name=path, file_path=path,
-                line_start=1, line_end=50, language="python",
-            ))
-            self.store.upsert_node(NodeInfo(
-                kind="Function", name=name, file_path=path,
-                line_start=5, line_end=20, language="python",
-            ))
-        self.store.upsert_edge(EdgeInfo(
-            kind="CALLS", source="/b.py::func_b",
-            target="/a.py::func_a", file_path="/b.py", line=10,
-        ))
-        self.store.upsert_edge(EdgeInfo(
-            kind="CALLS", source="/c.py::func_c",
-            target="/b.py::func_b", file_path="/c.py", line=10,
-        ))
-        self.store.upsert_edge(EdgeInfo(
-            kind="CALLS", source="/d.py::func_d",
-            target="/c.py::func_c", file_path="/d.py", line=10,
-        ))
+            self.store.upsert_node(
+                NodeInfo(
+                    kind="File",
+                    name=path,
+                    file_path=path,
+                    line_start=1,
+                    line_end=50,
+                    language="python",
+                )
+            )
+            self.store.upsert_node(
+                NodeInfo(
+                    kind="Function",
+                    name=name,
+                    file_path=path,
+                    line_start=5,
+                    line_end=20,
+                    language="python",
+                )
+            )
+        self.store.upsert_edge(
+            EdgeInfo(
+                kind="CALLS",
+                source="/b.py::func_b",
+                target="/a.py::func_a",
+                file_path="/b.py",
+                line=10,
+            )
+        )
+        self.store.upsert_edge(
+            EdgeInfo(
+                kind="CALLS",
+                source="/c.py::func_c",
+                target="/b.py::func_b",
+                file_path="/c.py",
+                line=10,
+            )
+        )
+        self.store.upsert_edge(
+            EdgeInfo(
+                kind="CALLS",
+                source="/d.py::func_d",
+                target="/c.py::func_c",
+                file_path="/d.py",
+                line=10,
+            )
+        )
         self.store.commit()
 
     def test_sql_matches_networkx(self):
@@ -704,7 +783,9 @@ class TestImpactRadiusSql:
     def test_max_nodes_truncation(self):
         """Setting max_nodes=2 should truncate results."""
         result = self.store.get_impact_radius_sql(
-            ["/a.py"], max_depth=3, max_nodes=2,
+            ["/a.py"],
+            max_depth=3,
+            max_nodes=2,
         )
         assert result["truncated"] is True
         assert result["total_impacted"] == 3
@@ -728,15 +809,11 @@ def test_impact_radius_real_build_includes_importer_not_imported_dependency(
     importer = tmp_path / "importer.py"
     dependency.write_text("VALUE = 1\n", encoding="utf-8")
     changed.write_text(
-        "from dependency import VALUE\n\n"
-        "def changed_value():\n"
-        "    return VALUE\n",
+        "from dependency import VALUE\n\ndef changed_value():\n    return VALUE\n",
         encoding="utf-8",
     )
     importer.write_text(
-        "from changed import changed_value\n\n"
-        "def consume():\n"
-        "    return changed_value()\n",
+        "from changed import changed_value\n\ndef consume():\n    return changed_value()\n",
         encoding="utf-8",
     )
 
@@ -772,11 +849,16 @@ def test_impact_radius_real_build_includes_importer_not_imported_dependency(
     ],
 )
 def test_impact_float_configuration_is_finite_and_bounded(
-    monkeypatch, raw, expected,
+    monkeypatch,
+    raw,
+    expected,
 ):
     monkeypatch.setenv("CRG_TEST_IMPACT_FLOAT", raw)
     assert constants_module._bounded_float_env(
-        "CRG_TEST_IMPACT_FLOAT", 0.6, lower=0.0, upper=1.0,
+        "CRG_TEST_IMPACT_FLOAT",
+        0.6,
+        lower=0.0,
+        upper=1.0,
     ) == pytest.approx(expected)
 
 
@@ -793,19 +875,34 @@ class TestWeightedImpactScoring:
         Path(self.tmp.name).unlink(missing_ok=True)
 
     def _add_func(self, name: str, path: str) -> str:
-        self.store.upsert_node(NodeInfo(
-            kind="Function", name=name, file_path=path,
-            line_start=1, line_end=10, language="python",
-        ))
+        self.store.upsert_node(
+            NodeInfo(
+                kind="Function",
+                name=name,
+                file_path=path,
+                line_start=1,
+                line_end=10,
+                language="python",
+            )
+        )
         return f"{path}::{name}"
 
     def _add_edge(
-        self, kind: str, source: str, target: str, line: int = 1,
+        self,
+        kind: str,
+        source: str,
+        target: str,
+        line: int = 1,
     ) -> None:
-        self.store.upsert_edge(EdgeInfo(
-            kind=kind, source=source, target=target,
-            file_path="/seed.py", line=line,
-        ))
+        self.store.upsert_edge(
+            EdgeInfo(
+                kind=kind,
+                source=source,
+                target=target,
+                file_path="/seed.py",
+                line=line,
+            )
+        )
 
     @staticmethod
     def _ordered_qns(result) -> list[str]:
@@ -833,7 +930,8 @@ class TestWeightedImpactScoring:
 
         sql = self.store.get_impact_radius_sql(["/seed.py"], max_depth=1)
         nx_result = self.store._get_impact_radius_networkx(
-            ["/seed.py"], max_depth=1,
+            ["/seed.py"],
+            max_depth=1,
         )
 
         assert self._ordered_qns(sql) == [dependent]
@@ -844,7 +942,8 @@ class TestWeightedImpactScoring:
         seed = self._add_func("seed", "/seed.py")
         test = self._add_func("test_seed", "/test_seed.py")
         unrelated_production = self._add_func(
-            "unrelated_production", "/unrelated.py",
+            "unrelated_production",
+            "/unrelated.py",
         )
         self._add_edge("TESTED_BY", seed, test)
         self._add_edge("TESTED_BY", unrelated_production, seed, line=2)
@@ -852,7 +951,8 @@ class TestWeightedImpactScoring:
 
         sql = self.store.get_impact_radius_sql(["/seed.py"], max_depth=1)
         nx_result = self.store._get_impact_radius_networkx(
-            ["/seed.py"], max_depth=1,
+            ["/seed.py"],
+            max_depth=1,
         )
 
         assert self._ordered_qns(sql) == [test]
@@ -869,7 +969,8 @@ class TestWeightedImpactScoring:
 
         sql = self.store.get_impact_radius_sql(["/seed.py"], max_depth=2)
         nx_result = self.store._get_impact_radius_networkx(
-            ["/seed.py"], max_depth=2,
+            ["/seed.py"],
+            max_depth=2,
         )
 
         assert self._ordered_qns(sql) == []
@@ -886,7 +987,8 @@ class TestWeightedImpactScoring:
 
         sql = self.store.get_impact_radius_sql(["/seed.py"], max_depth=1)
         nx_result = self.store._get_impact_radius_networkx(
-            ["/seed.py"], max_depth=1,
+            ["/seed.py"],
+            max_depth=1,
         )
 
         assert self._ordered_qns(sql) == [dependent]
@@ -899,7 +1001,8 @@ class TestWeightedImpactScoring:
         caller = self._add_func("caller", "/caller.py")
         importer = self._add_func("importer", "/importer.py")
         indirect_caller = self._add_func(
-            "indirect_caller", "/indirect_caller.py",
+            "indirect_caller",
+            "/indirect_caller.py",
         )
         self._add_edge("CALLS", caller, seed)
         self._add_edge("IMPORTS_FROM", importer, seed)
@@ -908,14 +1011,17 @@ class TestWeightedImpactScoring:
 
         sql = self.store.get_impact_radius_sql(["/seed.py"], max_depth=2)
         nx_result = self.store._get_impact_radius_networkx(
-            ["/seed.py"], max_depth=2,
+            ["/seed.py"],
+            max_depth=2,
         )
 
         assert sql["impact_scores"][caller] == pytest.approx(0.6)
         assert sql["impact_scores"][indirect_caller] == pytest.approx(0.36)
         assert sql["impact_scores"][importer] == pytest.approx(0.3)
         assert self._ordered_qns(sql) == [
-            caller, indirect_caller, importer,
+            caller,
+            indirect_caller,
+            importer,
         ]
         assert sql["impact_scores"] == nx_result["impact_scores"]
         assert self._ordered_qns(sql) == self._ordered_qns(nx_result)
@@ -931,26 +1037,26 @@ class TestWeightedImpactScoring:
 
         sql = self.store.get_impact_radius_sql(["/seed.py"], max_depth=2)
         nx_result = self.store._get_impact_radius_networkx(
-            ["/seed.py"], max_depth=2,
+            ["/seed.py"],
+            max_depth=2,
         )
 
         assert sql["impact_scores"][target] == pytest.approx(0.36)
         assert sql["impact_scores"] == nx_result["impact_scores"]
 
     def test_score_floor_stops_expansion_in_both_engines(self):
-        qns = [
-            self._add_func(f"node_{index}", f"/node_{index}.py")
-            for index in range(8)
-        ]
+        qns = [self._add_func(f"node_{index}", f"/node_{index}.py") for index in range(8)]
         for index, (source, target) in enumerate(zip(qns[1:], qns)):
             self._add_edge("CALLS", source, target, line=index + 1)
         self.store.commit()
 
         sql = self.store.get_impact_radius_sql(
-            ["/node_0.py"], max_depth=8,
+            ["/node_0.py"],
+            max_depth=8,
         )
         nx_result = self.store._get_impact_radius_networkx(
-            ["/node_0.py"], max_depth=8,
+            ["/node_0.py"],
+            max_depth=8,
         )
 
         assert qns[5] in sql["impact_scores"]
@@ -965,7 +1071,8 @@ class TestWeightedImpactScoring:
 
         sql = self.store.get_impact_radius_sql(["/seed.py"], max_depth=1)
         nx_result = self.store._get_impact_radius_networkx(
-            ["/seed.py"], max_depth=1,
+            ["/seed.py"],
+            max_depth=1,
         )
 
         assert sql["impact_scores"][target] == pytest.approx(0.3)
@@ -973,19 +1080,20 @@ class TestWeightedImpactScoring:
 
     def test_truncation_is_exact_at_boundary_and_uses_sentinel(self):
         seed = self._add_func("seed", "/seed.py")
-        targets = [
-            self._add_func(f"target_{index}", f"/target_{index}.py")
-            for index in range(3)
-        ]
+        targets = [self._add_func(f"target_{index}", f"/target_{index}.py") for index in range(3)]
         for index, target in enumerate(targets):
             self._add_edge("CALLS", target, seed, line=index + 1)
         self.store.commit()
 
         exact = self.store.get_impact_radius_sql(
-            ["/seed.py"], max_depth=1, max_nodes=3,
+            ["/seed.py"],
+            max_depth=1,
+            max_nodes=3,
         )
         capped = self.store.get_impact_radius_sql(
-            ["/seed.py"], max_depth=1, max_nodes=2,
+            ["/seed.py"],
+            max_depth=1,
+            max_nodes=2,
         )
 
         assert exact["truncated"] is False
@@ -1003,7 +1111,9 @@ class TestWeightedImpactScoring:
         self.store.commit()
 
         result = self.store.get_impact_radius_sql(
-            ["/seed.py"], max_depth=2, max_nodes=1,
+            ["/seed.py"],
+            max_depth=2,
+            max_nodes=1,
         )
 
         assert self._ordered_qns(result) == [target]
@@ -1019,7 +1129,8 @@ class TestWeightedImpactScoring:
 
         sql = self.store.get_impact_radius_sql(["/seed.py"], max_depth=1)
         nx_result = self.store._get_impact_radius_networkx(
-            ["/seed.py"], max_depth=1,
+            ["/seed.py"],
+            max_depth=1,
         )
         assert sql["impact_scores"][target] == pytest.approx(0.6)
         assert sql["impact_scores"] == nx_result["impact_scores"]
@@ -1037,7 +1148,8 @@ class TestWeightedImpactScoring:
         ):
             sql = self.store.get_impact_radius_sql([path], max_depth=1)
             nx_result = self.store._get_impact_radius_networkx(
-                [path], max_depth=1,
+                [path],
+                max_depth=1,
             )
 
             assert self._ordered_qns(sql) == [expected_qn]
@@ -1060,7 +1172,9 @@ class TestWeightedImpactScoring:
 
         started = time.monotonic()
         result = self.store.get_impact_radius_sql(
-            ["/node_0.py"], max_depth=25, max_nodes=20,
+            ["/node_0.py"],
+            max_depth=25,
+            max_nodes=20,
         )
         elapsed = time.monotonic() - started
 
@@ -1069,8 +1183,8 @@ class TestWeightedImpactScoring:
         assert elapsed < 5.0
 
 
-class TestGetTransitiveTestsFrontierCap:
-    """Regression tests for O(N*M) query explosion in get_transitive_tests."""
+class TestGetTransitiveTestsFrontier:
+    """get_transitive_tests follows the whole frontier with batched queries."""
 
     def setup_method(self):
         self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
@@ -1083,22 +1197,33 @@ class TestGetTransitiveTestsFrontierCap:
 
     def _add_func(self, name: str, path: str) -> str:
         node = NodeInfo(
-            kind="Function", name=name, file_path=path,
-            line_start=1, line_end=5, language="python",
+            kind="Function",
+            name=name,
+            file_path=path,
+            line_start=1,
+            line_end=5,
+            language="python",
         )
         self.store.upsert_node(node)
         return f"{path}::{name}"
 
     def _add_calls_edge(self, source_qn: str, target_qn: str) -> None:
-        self.store.upsert_edge(EdgeInfo(
-            kind="CALLS", source=source_qn, target=target_qn,
-            file_path=source_qn.split("::")[0], line=1,
-        ))
+        self.store.upsert_edge(
+            EdgeInfo(
+                kind="CALLS",
+                source=source_qn,
+                target=target_qn,
+                file_path=source_qn.split("::")[0],
+                line=1,
+            )
+        )
 
-    def test_frontier_capped_limits_sql_queries(self):
-        """Hub function with 200 callees must not issue 200 TESTED_BY queries."""
+    def test_hub_fan_out_uses_constant_queries(self, monkeypatch):
+        """Hub function with 1000 callees must not issue one query per callee."""
+        # The former env default (50) must not bring the cap back.
+        monkeypatch.setenv("CRG_MAX_TRANSITIVE_FRONTIER", "50")
         hub_qn = self._add_func("hub", "/t/hub.py")
-        for i in range(200):
+        for i in range(1000):
             callee_qn = self._add_func(f"callee_{i}", "/t/callee.py")
             self._add_calls_edge(hub_qn, callee_qn)
         self.store.commit()
@@ -1110,38 +1235,38 @@ class TestGetTransitiveTestsFrontierCap:
             query_count += 1
 
         self.store._conn.set_trace_callback(_trace)
-        self.store.get_transitive_tests(hub_qn, max_frontier=50)
+        self.store.get_transitive_tests(hub_qn)
         self.store._conn.set_trace_callback(None)
 
-        # Without cap: 200 callee TESTED_BY queries + overhead = ~204
-        # With cap of 50: ~54 queries max
-        assert query_count <= 60, (
-            f"Expected <=60 queries with frontier cap, got {query_count}"
-        )
+        # One CALLS batch plus three TESTED_BY batches of at most 450 callees,
+        # on top of the fixed direct-coverage lookups.
+        assert query_count <= 12, f"Expected batched frontier queries, got {query_count}"
 
-    def test_uncapped_small_frontier_unchanged(self):
-        """Small fan-out (< cap) returns same results regardless of cap."""
+    def test_every_callee_on_a_wide_frontier_is_followed(self, monkeypatch):
+        """Coverage of all 120 callees survives; nothing past 50 is dropped."""
+        monkeypatch.setenv("CRG_MAX_TRANSITIVE_FRONTIER", "50")
         hub_qn = self._add_func("hub", "/t/hub.py")
-        test_qn = self._add_func("test_hub", "/t/test_hub.py")
-        for i in range(5):
+        for i in range(120):
             callee_qn = self._add_func(f"callee_{i}", "/t/callee.py")
+            test_qn = self._add_func(f"test_callee_{i}", "/t/test_callee.py")
             self._add_calls_edge(hub_qn, callee_qn)
-            # Only callee_2 has a test
-            if i == 2:
-                self.store.upsert_edge(EdgeInfo(
-                    kind="TESTED_BY", source=callee_qn, target=test_qn,
-                    file_path="/t/test_hub.py", line=1,
-                ))
+            self.store.upsert_edge(
+                EdgeInfo(
+                    kind="TESTED_BY",
+                    source=callee_qn,
+                    target=test_qn,
+                    file_path="/t/test_callee.py",
+                    line=1,
+                )
+            )
         self.store.commit()
 
-        results_default = self.store.get_transitive_tests(hub_qn)
-        results_capped = self.store.get_transitive_tests(hub_qn, max_frontier=50)
+        results = self.store.get_transitive_tests(hub_qn)
 
-        indirect_default = [r for r in results_default if r["indirect"]]
-        indirect_capped = [r for r in results_capped if r["indirect"]]
-        assert len(indirect_default) == 1
-        assert len(indirect_capped) == 1
-        assert indirect_default[0]["name"] == indirect_capped[0]["name"]
+        indirect = sorted(r["name"] for r in results if r["indirect"])
+        assert indirect == sorted(f"test_callee_{i}" for i in range(120))
+        # Stable order: the same graph always yields the same sequence.
+        assert results == self.store.get_transitive_tests(hub_qn)
 
 
 class TestResolveBareEndpoints:
@@ -1157,44 +1282,50 @@ class TestResolveBareEndpoints:
         Path(self.tmp.name).unlink(missing_ok=True)
 
     def _func(self, name: str, path: str, *, is_test: bool = False) -> str:
-        self.store.upsert_node(NodeInfo(
-            kind="Test" if is_test else "Function",
-            name=name,
-            file_path=path,
-            line_start=1,
-            line_end=5,
-            language="python",
-            is_test=is_test,
-        ))
+        self.store.upsert_node(
+            NodeInfo(
+                kind="Test" if is_test else "Function",
+                name=name,
+                file_path=path,
+                line_start=1,
+                line_end=5,
+                language="python",
+                is_test=is_test,
+            )
+        )
         return f"{path}::{name}"
 
     def _edge(
-        self, kind: str, source: str, target: str, file_path: str,
+        self,
+        kind: str,
+        source: str,
+        target: str,
+        file_path: str,
     ) -> None:
-        self.store.upsert_edge(EdgeInfo(
-            kind=kind,
-            source=source,
-            target=target,
-            file_path=file_path,
-            line=1,
-        ))
+        self.store.upsert_edge(
+            EdgeInfo(
+                kind=kind,
+                source=source,
+                target=target,
+                file_path=file_path,
+                line=1,
+            )
+        )
 
     def _endpoints(self, kind: str) -> list[tuple[str, str]]:
         rows = self.store._conn.execute(
-            "SELECT source_qualified, target_qualified FROM edges "
-            "WHERE kind = ? ORDER BY id",
+            "SELECT source_qualified, target_qualified FROM edges WHERE kind = ? ORDER BY id",
             (kind,),
         ).fetchall()
-        return [
-            (row["source_qualified"], row["target_qualified"])
-            for row in rows
-        ]
+        return [(row["source_qualified"], row["target_qualified"]) for row in rows]
 
     def test_unique_tested_by_source_without_evidence_stays_bare(self):
         """A globally unique name in an unrelated file is still not evidence."""
         self._func("parse", "/repo/src/app.py")
         test_qn = self._func(
-            "test_parse", "/repo/tests/test_other.py", is_test=True,
+            "test_parse",
+            "/repo/tests/test_other.py",
+            is_test=True,
         )
         self._edge("TESTED_BY", "parse", test_qn, "/repo/tests/test_other.py")
         self.store.commit()
@@ -1298,32 +1429,55 @@ class TestResolveBareTargets:
     def setup_method(self):
         self.store = GraphStore(":memory:")
         for f in ("/r/base.py", "/r/impl.py", "/r/app.py"):
-            self.store.upsert_node(NodeInfo(
-                kind="File", name=f, file_path=f,
-                line_start=1, line_end=50, language="python",
-            ))
+            self.store.upsert_node(
+                NodeInfo(
+                    kind="File",
+                    name=f,
+                    file_path=f,
+                    line_start=1,
+                    line_end=50,
+                    language="python",
+                )
+            )
 
     def teardown_method(self):
         self.store.close()
 
     def _node(self, kind, name, file_path, parent=None):
-        self.store.upsert_node(NodeInfo(
-            kind=kind, name=name, file_path=file_path,
-            line_start=1, line_end=5, language="python", parent_name=parent,
-        ))
+        self.store.upsert_node(
+            NodeInfo(
+                kind=kind,
+                name=name,
+                file_path=file_path,
+                line_start=1,
+                line_end=5,
+                language="python",
+                parent_name=parent,
+            )
+        )
 
     def test_call_resolver_does_not_rewrite_inheritance_edges(self):
         self._node("Class", "BaseHandler", "/r/base.py")
         self._node("Class", "JsonHandler", "/r/impl.py")
         # Cross-file INHERITS stored with a bare base name (parser behavior).
-        self.store.upsert_edge(EdgeInfo(
-            kind="INHERITS", source="/r/impl.py::JsonHandler",
-            target="BaseHandler", file_path="/r/impl.py", line=1,
-        ))
-        self.store.upsert_edge(EdgeInfo(
-            kind="IMPORTS_FROM", source="/r/impl.py",
-            target="/r/base.py", file_path="/r/impl.py", line=1,
-        ))
+        self.store.upsert_edge(
+            EdgeInfo(
+                kind="INHERITS",
+                source="/r/impl.py::JsonHandler",
+                target="BaseHandler",
+                file_path="/r/impl.py",
+                line=1,
+            )
+        )
+        self.store.upsert_edge(
+            EdgeInfo(
+                kind="IMPORTS_FROM",
+                source="/r/impl.py",
+                target="/r/base.py",
+                file_path="/r/impl.py",
+                line=1,
+            )
+        )
         self.store.commit()
         self.store.resolve_bare_call_targets()
         targets = [
@@ -1336,10 +1490,15 @@ class TestResolveBareTargets:
     def test_does_not_resolve_cross_file_call_without_import_evidence(self):
         self._node("Function", "handle", "/r/base.py", parent="BaseHandler")
         self._node("Function", "run", "/r/app.py")
-        self.store.upsert_edge(EdgeInfo(
-            kind="CALLS", source="/r/app.py::run",
-            target="handle", file_path="/r/app.py", line=2,
-        ))
+        self.store.upsert_edge(
+            EdgeInfo(
+                kind="CALLS",
+                source="/r/app.py::run",
+                target="handle",
+                file_path="/r/app.py",
+                line=2,
+            )
+        )
         self.store.commit()
         self.store.resolve_bare_call_targets()
         targets = [
@@ -1354,10 +1513,15 @@ class TestResolveBareTargets:
         self._node("Class", "Base", "/r/base.py")
         self._node("Class", "Base", "/r/app.py")
         self._node("Class", "Child", "/r/impl.py")
-        self.store.upsert_edge(EdgeInfo(
-            kind="INHERITS", source="/r/impl.py::Child",
-            target="Base", file_path="/r/impl.py", line=1,
-        ))
+        self.store.upsert_edge(
+            EdgeInfo(
+                kind="INHERITS",
+                source="/r/impl.py::Child",
+                target="Base",
+                file_path="/r/impl.py",
+                line=1,
+            )
+        )
         self.store.commit()
         self.store.resolve_bare_call_targets()
         targets = [

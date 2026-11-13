@@ -34,7 +34,9 @@ class TestDottedStemEdges:
         _touch(tmp_path, "a.ts")
         importer = tmp_path / "main.ts"
         resolved = parser._resolve_module_to_file(
-            "./a.b.c", str(importer), "typescript",
+            "./a.b.c",
+            str(importer),
+            "typescript",
         )
         assert resolved == str(want.resolve())
 
@@ -44,7 +46,9 @@ class TestDottedStemEdges:
         _touch(tmp_path, "x.entity.js")
         importer = tmp_path / "main.ts"
         resolved = parser._resolve_module_to_file(
-            "./x.entity", str(importer), "typescript",
+            "./x.entity",
+            str(importer),
+            "typescript",
         )
         assert resolved == str(want.resolve())
 
@@ -54,7 +58,9 @@ class TestDottedStemEdges:
         _touch(tmp_path, "outlet.entity/index.ts")
         importer = tmp_path / "main.ts"
         resolved = parser._resolve_module_to_file(
-            "./outlet.entity", str(importer), "typescript",
+            "./outlet.entity",
+            str(importer),
+            "typescript",
         )
         assert resolved == str(want.resolve())
 
@@ -67,7 +73,9 @@ class TestDottedStemEdges:
         want = _touch(tmp_path, "styles.module/index.ts")
         importer = tmp_path / "main.ts"
         resolved = parser._resolve_module_to_file(
-            "./styles.module", str(importer), "typescript",
+            "./styles.module",
+            str(importer),
+            "typescript",
         )
         assert resolved == str(want.resolve())
 
@@ -75,7 +83,9 @@ class TestDottedStemEdges:
         want = _touch(tmp_path, "café.entité.ts")
         importer = tmp_path / "main.ts"
         resolved = parser._resolve_module_to_file(
-            "./café.entité", str(importer), "typescript",
+            "./café.entité",
+            str(importer),
+            "typescript",
         )
         assert resolved == str(want.resolve())
 
@@ -83,7 +93,9 @@ class TestDottedStemEdges:
         want = _touch(tmp_path, "a.b.c.d.e.f.g.spec.ts")
         importer = tmp_path / "main.ts"
         resolved = parser._resolve_module_to_file(
-            "./a.b.c.d.e.f.g.spec", str(importer), "typescript",
+            "./a.b.c.d.e.f.g.spec",
+            str(importer),
+            "typescript",
         )
         assert resolved == str(want.resolve())
 
@@ -91,12 +103,16 @@ class TestDottedStemEdges:
         want = _touch(tmp_path, "modal.confirm.vue", "<template><div/></template>\n")
         importer = tmp_path / "app.vue"
         resolved = parser._resolve_module_to_file(
-            "./modal.confirm", str(importer), "vue",
+            "./modal.confirm",
+            str(importer),
+            "vue",
         )
         assert resolved == str(want.resolve())
 
     def test_unresolvable_dotted_stem_returns_none_not_truncated_decoy(
-        self, tmp_path, parser,
+        self,
+        tmp_path,
+        parser,
     ):
         """`./gone.entity` with only a truncated decoy present must be None,
         never the decoy: a missing edge is recoverable, a wrong edge is not.
@@ -104,7 +120,9 @@ class TestDottedStemEdges:
         _touch(tmp_path, "gone.ts")
         importer = tmp_path / "main.ts"
         resolved = parser._resolve_module_to_file(
-            "./gone.entity", str(importer), "typescript",
+            "./gone.entity",
+            str(importer),
+            "typescript",
         )
         assert resolved is None
 
@@ -116,7 +134,9 @@ class TestSpecifierShapes:
         importer = tmp_path / "sub" / "main.ts"
         importer.parent.mkdir()
         resolved = parser._resolve_module_to_file(
-            "..", str(importer), "typescript",
+            "..",
+            str(importer),
+            "typescript",
         )
         assert resolved == str(want.resolve())
 
@@ -124,7 +144,9 @@ class TestSpecifierShapes:
         want = _touch(tmp_path, "index.ts")
         importer = tmp_path / "main.ts"
         resolved = parser._resolve_module_to_file(
-            ".", str(importer), "typescript",
+            ".",
+            str(importer),
+            "typescript",
         )
         assert resolved == str(want.resolve())
 
@@ -132,7 +154,9 @@ class TestSpecifierShapes:
         want = _touch(tmp_path, "utils/index.ts")
         importer = tmp_path / "main.ts"
         resolved = parser._resolve_module_to_file(
-            "./utils/", str(importer), "typescript",
+            "./utils/",
+            str(importer),
+            "typescript",
         )
         assert resolved == str(want.resolve())
 
@@ -143,7 +167,9 @@ class TestSpecifierShapes:
         _touch(tmp_path, "foo.ts.ts", "export const trap = 1;\n")
         importer = tmp_path / "main.ts"
         resolved = parser._resolve_module_to_file(
-            "./foo.ts", str(importer), "typescript",
+            "./foo.ts",
+            str(importer),
+            "typescript",
         )
         assert resolved == str(want.resolve())
 
@@ -153,7 +179,9 @@ class TestNodeNextFallback:
         want = _touch(tmp_path, "comp.tsx", "export const C = () => null;\n")
         importer = tmp_path / "main.tsx"
         resolved = parser._resolve_module_to_file(
-            "./comp.jsx", str(importer), "tsx",
+            "./comp.jsx",
+            str(importer),
+            "tsx",
         )
         assert resolved == str(want.resolve())
 
@@ -161,7 +189,9 @@ class TestNodeNextFallback:
         want = _touch(tmp_path, "legacy.ts")
         importer = tmp_path / "main.ts"
         resolved = parser._resolve_module_to_file(
-            "./legacy.cjs", str(importer), "typescript",
+            "./legacy.cjs",
+            str(importer),
+            "typescript",
         )
         assert resolved == str(want.resolve())
 
@@ -172,7 +202,9 @@ class TestNodeNextFallback:
         _touch(tmp_path, "foo.ts")
         importer = tmp_path / "main.ts"
         resolved = parser._resolve_module_to_file(
-            "./foo.js", str(importer), "typescript",
+            "./foo.js",
+            str(importer),
+            "typescript",
         )
         assert resolved == str(want.resolve())
 
@@ -184,7 +216,9 @@ class TestNodeNextFallback:
         want = _touch(tmp_path, "user.service.ts")
         importer = tmp_path / "main.ts"
         resolved = parser._resolve_module_to_file(
-            "./user.service.js", str(importer), "typescript",
+            "./user.service.js",
+            str(importer),
+            "typescript",
         )
         assert resolved == str(want.resolve())
 
@@ -195,7 +229,9 @@ class TestNodeNextFallback:
         want = _touch(tmp_path, "foo.js.ts")
         importer = tmp_path / "main.ts"
         resolved = parser._resolve_module_to_file(
-            "./foo.js", str(importer), "typescript",
+            "./foo.js",
+            str(importer),
+            "typescript",
         )
         assert resolved == str(want.resolve())
 
@@ -207,7 +243,9 @@ class TestDartEdges:
         _touch(tmp_path, "thing.dart", "class Decoy2 {}\n")
         importer = tmp_path / "consumer.dart"
         resolved = parser._resolve_module_to_file(
-            "./thing.model.g", str(importer), "dart",
+            "./thing.model.g",
+            str(importer),
+            "dart",
         )
         assert resolved == str(want.resolve())
 
@@ -215,7 +253,9 @@ class TestDartEdges:
         want = _touch(tmp_path, "thing.model.dart", "class T {}\n")
         importer = tmp_path / "consumer.dart"
         resolved = parser._resolve_module_to_file(
-            "./thing.model.dart", str(importer), "dart",
+            "./thing.model.dart",
+            str(importer),
+            "dart",
         )
         assert resolved == str(want.resolve())
 
@@ -223,7 +263,9 @@ class TestDartEdges:
         _touch(tmp_path, "thing.dart", "class Decoy {}\n")
         importer = tmp_path / "consumer.dart"
         resolved = parser._resolve_module_to_file(
-            "./thing.model", str(importer), "dart",
+            "./thing.model",
+            str(importer),
+            "dart",
         )
         assert resolved is None
 
@@ -233,12 +275,14 @@ class TestEndToEnd:
         """Full parse: the IMPORTS_FROM edge target must be the resolved
         dotted-stem file, not the truncated decoy and not the bare module."""
         _touch(
-            tmp_path, "outlet.entity.ts",
+            tmp_path,
+            "outlet.entity.ts",
             "export class Outlet {}\n",
         )
         _touch(tmp_path, "outlet.ts", "export const decoy = 1;\n")
         svc = _touch(
-            tmp_path, "outlet.service.ts",
+            tmp_path,
+            "outlet.service.ts",
             'import { Outlet } from "./outlet.entity";\n'
             "export class OutletService { o = new Outlet(); }\n",
         )

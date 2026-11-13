@@ -33,74 +33,93 @@ class TestCodeParser:
 
     def test_detect_shebang_bin_bash(self, tmp_path):
         p = self._write_shebang_file(
-            tmp_path, "deploy", "#!/bin/bash\nfoo() { echo hi; }\n",
+            tmp_path,
+            "deploy",
+            "#!/bin/bash\nfoo() { echo hi; }\n",
         )
         assert self.parser.detect_language(p) == "bash"
 
     def test_detect_shebang_bin_sh_routed_to_bash(self, tmp_path):
         """/bin/sh scripts are parsed through the bash grammar."""
         p = self._write_shebang_file(
-            tmp_path, "install-hook", "#!/bin/sh\necho hello\n",
+            tmp_path,
+            "install-hook",
+            "#!/bin/sh\necho hello\n",
         )
         assert self.parser.detect_language(p) == "bash"
 
     def test_detect_shebang_env_bash(self, tmp_path):
         p = self._write_shebang_file(
-            tmp_path, "runner", "#!/usr/bin/env bash\nfoo() { echo hi; }\n",
+            tmp_path,
+            "runner",
+            "#!/usr/bin/env bash\nfoo() { echo hi; }\n",
         )
         assert self.parser.detect_language(p) == "bash"
 
     def test_detect_shebang_env_python3(self, tmp_path):
         p = self._write_shebang_file(
-            tmp_path, "myapp",
+            tmp_path,
+            "myapp",
             "#!/usr/bin/env python3\ndef main():\n    pass\n",
         )
         assert self.parser.detect_language(p) == "python"
 
     def test_detect_shebang_direct_python(self, tmp_path):
         p = self._write_shebang_file(
-            tmp_path, "tool", "#!/usr/bin/python3\nprint('hi')\n",
+            tmp_path,
+            "tool",
+            "#!/usr/bin/python3\nprint('hi')\n",
         )
         assert self.parser.detect_language(p) == "python"
 
     def test_detect_shebang_node(self, tmp_path):
         p = self._write_shebang_file(
-            tmp_path, "cli", "#!/usr/bin/env node\nconsole.log(1);\n",
+            tmp_path,
+            "cli",
+            "#!/usr/bin/env node\nconsole.log(1);\n",
         )
         assert self.parser.detect_language(p) == "javascript"
 
     def test_detect_shebang_env_dash_s_flag(self, tmp_path):
         """``#!/usr/bin/env -S node --flag`` (Linux -S) resolves to the interpreter."""
         p = self._write_shebang_file(
-            tmp_path, "esm-tool",
-            "#!/usr/bin/env -S node --experimental-vm-modules\n"
-            "console.log('esm');\n",
+            tmp_path,
+            "esm-tool",
+            "#!/usr/bin/env -S node --experimental-vm-modules\nconsole.log('esm');\n",
         )
         assert self.parser.detect_language(p) == "javascript"
 
     def test_detect_shebang_ruby(self, tmp_path):
         p = self._write_shebang_file(
-            tmp_path, "rake-task", "#!/usr/bin/env ruby\nputs 1\n",
+            tmp_path,
+            "rake-task",
+            "#!/usr/bin/env ruby\nputs 1\n",
         )
         assert self.parser.detect_language(p) == "ruby"
 
     def test_detect_shebang_perl(self, tmp_path):
         p = self._write_shebang_file(
-            tmp_path, "cgi-script", "#!/usr/bin/env perl\nprint 1;\n",
+            tmp_path,
+            "cgi-script",
+            "#!/usr/bin/env perl\nprint 1;\n",
         )
         assert self.parser.detect_language(p) == "perl"
 
     def test_detect_shebang_with_trailing_flags(self, tmp_path):
         """``#!/bin/bash -e`` still maps to bash (flags ignored)."""
         p = self._write_shebang_file(
-            tmp_path, "strict", "#!/bin/bash -e\nfoo() { echo hi; }\n",
+            tmp_path,
+            "strict",
+            "#!/bin/bash -e\nfoo() { echo hi; }\n",
         )
         assert self.parser.detect_language(p) == "bash"
 
     def test_detect_shebang_missing_returns_none(self, tmp_path):
         """Extension-less text files without a shebang return None, not bash."""
         p = self._write_shebang_file(
-            tmp_path, "README", "# just a readme, no shebang\nsome content\n",
+            tmp_path,
+            "README",
+            "# just a readme, no shebang\nsome content\n",
         )
         assert self.parser.detect_language(p) is None
 
@@ -120,7 +139,9 @@ class TestCodeParser:
         """A valid shebang to an interpreter we don't route is treated as
         'unknown language' — same as an unmapped extension."""
         p = self._write_shebang_file(
-            tmp_path, "ocaml-script", "#!/usr/bin/env ocaml\nlet x = 1\n",
+            tmp_path,
+            "ocaml-script",
+            "#!/usr/bin/env ocaml\nlet x = 1\n",
         )
         assert self.parser.detect_language(p) is None
 
@@ -171,7 +192,8 @@ class TestCodeParser:
         to zero nodes — stored under the snapshot's (final) file hash.
         """
         p = self._write_shebang_file(
-            tmp_path, "tool",
+            tmp_path,
+            "tool",
             "#!/usr/bin/env python3\n\ndef damaged():\n    return 1\n",
         )
         snapshot = p.read_bytes()
@@ -194,7 +216,9 @@ class TestCodeParser:
     def test_detect_language_without_source_still_probes_disk(self, tmp_path):
         """Path-only callers (file filters) keep the on-disk shebang probe."""
         p = self._write_shebang_file(
-            tmp_path, "runner", "#!/usr/bin/env bash\necho hi\n",
+            tmp_path,
+            "runner",
+            "#!/usr/bin/env bash\necho hi\n",
         )
         assert self.parser.detect_language(p) == "bash"
 
@@ -236,7 +260,7 @@ class Plain:
         widget = next(node for node in nodes if node.name == "Widget")
         plain = next(node for node in nodes if node.name == "Plain")
 
-        expected = ["Component(\"widget-card\")", "dataclass(frozen=True)"]
+        expected = ['Component("widget-card")', "dataclass(frozen=True)"]
         assert widget.kind == "Class"
         assert widget.modifiers == ",".join(expected)
         assert widget.extra["decorators"] == expected
@@ -300,9 +324,7 @@ class Plain:
         file_path = (FIXTURES / "sample_python.py").as_posix()
 
         # create_auth_service() calls AuthService() — a class defined in the same file
-        auth_service_calls = [
-            e for e in calls if e.target == f"{file_path}::AuthService"
-        ]
+        auth_service_calls = [e for e in calls if e.target == f"{file_path}::AuthService"]
         assert len(auth_service_calls) >= 1
 
     def test_calls_edge_cross_file_resolution(self):
@@ -312,9 +334,7 @@ class Plain:
 
         sample_path = (FIXTURES / "sample_python.py").resolve().as_posix()
         # setup_and_run() calls create_auth_service(), imported from sample_python
-        resolved_calls = [
-            e for e in calls if e.target == f"{sample_path}::create_auth_service"
-        ]
+        resolved_calls = [e for e in calls if e.target == f"{sample_path}::create_auth_service"]
         assert len(resolved_calls) == 1
 
     def test_same_file_calls_resolved(self):
@@ -333,8 +353,11 @@ class Plain:
 
         # guarded_process() calls process_request() — both in the same file,
         # but guarded_process is wrapped in a decorated_definition node
-        resolved = [e for e in calls if e.target == f"{file_path}::process_request"
-                    and "guarded_process" in e.source]
+        resolved = [
+            e
+            for e in calls
+            if e.target == f"{file_path}::process_request" and "guarded_process" in e.source
+        ]
         assert len(resolved) == 1
 
     def test_multiple_calls_to_same_function(self):
@@ -368,9 +391,9 @@ class Plain:
             _, edges = self.parser.parse_file(tmp)
             calls = [e for e in edges if e.kind == "CALLS"]
             module_scope_calls = [e for e in calls if e.source == tmp.as_posix()]
-            assert any(
-                "helper" in e.target for e in module_scope_calls
-            ), f"Expected module-scope CALLS edge to helper(); got: {[(e.source, e.target) for e in calls]}"
+            assert any("helper" in e.target for e in module_scope_calls), (
+                f"Expected module-scope CALLS edge to helper(); got: {[(e.source, e.target) for e in calls]}"
+            )
         finally:
             tmp.unlink()
 
@@ -400,9 +423,9 @@ class Plain:
         try:
             _, edges = self.parser.parse_file(tmp)
             calls = [e for e in edges if e.kind == "CALLS"]
-            assert any(
-                "do_work" in e.target and e.source == tmp.as_posix() for e in calls
-            ), f"Expected notebook CALLS edge to do_work(); got: {[(e.source, e.target) for e in calls]}"
+            assert any("do_work" in e.target and e.source == tmp.as_posix() for e in calls), (
+                f"Expected notebook CALLS edge to do_work(); got: {[(e.source, e.target) for e in calls]}"
+            )
         finally:
             tmp.unlink()
 
@@ -438,9 +461,7 @@ class Plain:
         assert len(tested_by) >= 1, "fixture should yield at least one TESTED_BY edge"
 
         test_file = (FIXTURES / "test_sample.py").as_posix()
-        test_qualified = {
-            f"{test_file}::{n.name}" for n in nodes if n.kind == "Test"
-        }
+        test_qualified = {f"{test_file}::{n.name}" for n in nodes if n.kind == "Test"}
         assert test_qualified, "fixture should yield at least one Test node"
 
         for edge in tested_by:
@@ -451,8 +472,7 @@ class Plain:
                 f"Edge: kind={edge.kind} source={edge.source} target={edge.target}"
             )
             assert edge.source not in test_qualified, (
-                f"TESTED_BY edge points test -> test: "
-                f"{edge.source} -> {edge.target}"
+                f"TESTED_BY edge points test -> test: {edge.source} -> {edge.target}"
             )
 
     def test_recursion_depth_guard(self):
@@ -467,6 +487,7 @@ class Plain:
         source = "\n".join(lines).encode("utf-8")
 
         import tempfile
+
         with tempfile.NamedTemporaryFile(suffix=".py", delete=False) as f:
             f.write(source)
             f.flush()
@@ -523,8 +544,10 @@ class Plain:
         nodes, edges = self.parser.parse_file(FIXTURES / "sample_vue.vue")
         calls = [e for e in edges if e.kind == "CALLS"]
         call_targets = {e.target for e in calls}
-        assert "log" in call_targets or "console.log" in call_targets or any(
-            "log" in t for t in call_targets
+        assert (
+            "log" in call_targets
+            or "console.log" in call_targets
+            or any("log" in t for t in call_targets)
         )
 
     def test_parse_vue_contains_edges(self):
@@ -630,7 +653,8 @@ class Plain:
         funcs = [n for n in nodes if n.kind == "Function"]
         # Both Animal and Dog define speak(); check Dog's specifically
         dog_speak = next(
-            (f for f in funcs if f.name == "speak" and f.parent_name == "Dog"), None,
+            (f for f in funcs if f.name == "speak" and f.parent_name == "Dog"),
+            None,
         )
         assert dog_speak is not None
 
@@ -709,17 +733,21 @@ class Plain:
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)
             (root / "outlet.entity.ts").write_text(
-                "export class Outlet {}\n", encoding="utf-8",
+                "export class Outlet {}\n",
+                encoding="utf-8",
             )
             # A decoy at the truncated name: proves a wrong resolution
             # lands here instead of raising or returning None.
             (root / "outlet.ts").write_text(
-                "export const wrongFile = true;\n", encoding="utf-8",
+                "export const wrongFile = true;\n",
+                encoding="utf-8",
             )
             importer = root / "outlet.service.ts"
 
             resolved = self.parser._resolve_module_to_file(
-                "./outlet.entity", str(importer), "typescript",
+                "./outlet.entity",
+                str(importer),
+                "typescript",
             )
 
             assert resolved == str((root / "outlet.entity.ts").resolve()), (
@@ -739,7 +767,9 @@ class Plain:
             importer = root / "bar.ts"
 
             resolved = self.parser._resolve_module_to_file(
-                "./foo.js", str(importer), "typescript",
+                "./foo.js",
+                str(importer),
+                "typescript",
             )
 
             assert resolved == str((root / "foo.ts").resolve())
@@ -754,15 +784,19 @@ class Plain:
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)
             (root / "thing.model.dart").write_text(
-                "class Thing {}\n", encoding="utf-8",
+                "class Thing {}\n",
+                encoding="utf-8",
             )
             (root / "thing.dart").write_text(
-                "class WrongFile {}\n", encoding="utf-8",
+                "class WrongFile {}\n",
+                encoding="utf-8",
             )
             importer = root / "consumer.dart"
 
             resolved = self.parser._resolve_module_to_file(
-                "./thing.model", str(importer), "dart",
+                "./thing.model",
+                str(importer),
+                "dart",
             )
 
             assert resolved == str((root / "thing.model.dart").resolve()), (
@@ -787,13 +821,15 @@ class Plain:
         """describe Test nodes should CONTAIN it/test Test nodes."""
         nodes, edges = self.parser.parse_file(FIXTURES / "sample_vitest.test.ts")
         describe_nodes = [
-            n for n in nodes
+            n
+            for n in nodes
             if n.kind == "Test"
             and (n.name.startswith("describe") or n.name.startswith("describe:"))
         ]
         assert len(describe_nodes) >= 1
         it_tests = [
-            n for n in nodes
+            n
+            for n in nodes
             if n.kind == "Test" and (n.name.startswith("it:") or n.name.startswith("test:"))
         ]
         assert len(it_tests) >= 2
@@ -838,8 +874,7 @@ class Plain:
         ref_target_names = {e.target.rsplit("::", 1)[-1] for e in refs}
         for callback in ("executor_callback", "filter_callback", "map_callback"):
             assert callback in ref_target_names, (
-                f"Expected REFERENCES edge to {callback}, got targets: "
-                f"{ref_target_names}"
+                f"Expected REFERENCES edge to {callback}, got targets: {ref_target_names}"
             )
 
     def test_python_keyword_callback_reference_emitted(self):
@@ -859,12 +894,12 @@ class Plain:
             db_path = Path(tmp_dir) / "graph.db"
             store = GraphStore(db_path)
             try:
-                nodes, edges = self.parser.parse_file(
-                    FIXTURES / "sample_callback_refs.py"
-                )
+                nodes, edges = self.parser.parse_file(FIXTURES / "sample_callback_refs.py")
                 store.store_file_nodes_edges(
                     str(FIXTURES / "sample_callback_refs.py"),
-                    nodes, edges, "",
+                    nodes,
+                    edges,
+                    "",
                 )
                 dead = find_dead_code(store)
                 dead_names = {d["name"] for d in dead}
@@ -912,6 +947,7 @@ class Plain:
         """A file under __tests__/ should be classified as a test file even
         when the filename itself has no .test./.spec. marker."""
         from code_review_graph.parser import _is_test_file
+
         assert _is_test_file("src/__tests__/UserService.ts")
         assert _is_test_file("src\\__tests__\\UserService.ts")
         # Negative: __tests__ as a substring without path separators must not match
@@ -960,12 +996,12 @@ class Plain:
             f"Edges: {[(e.kind, e.source, e.target) for e in edges]}"
         )
 
-
     def test_non_test_file_describe_not_special(self):
         """describe() in a non-test file should NOT create Test nodes."""
         import tempfile
+
         code = (
-            b'function describe(name, fn) { fn(); }\n'
+            b"function describe(name, fn) { fn(); }\n"
             b'describe("test", () => { console.log("hello"); });\n'
         )
         with tempfile.NamedTemporaryFile(suffix=".ts", delete=False, prefix="regular_") as f:
@@ -996,16 +1032,15 @@ class Plain:
         calls = [e for e in edges if e.kind == "CALLS"]
         expected_target = f"{(FIXTURES / 'MarkdownMsg.tsx').resolve().as_posix()}::MarkdownMsg"
         jsx_calls = [
-            e for e in calls
+            e
+            for e in calls
             if e.source == f"{path.as_posix()}::BookWorkspace" and e.target == expected_target
         ]
         assert len(jsx_calls) == 1
 
     def test_tsx_intrinsic_dom_elements_do_not_create_call_edges(self):
         source = (
-            b"export function BookWorkspace() {\n"
-            b"  return <section><div /><span /></section>;\n"
-            b"}\n"
+            b"export function BookWorkspace() {\n  return <section><div /><span /></section>;\n}\n"
         )
         path = FIXTURES / "BookWorkspace.tsx"
 
@@ -1016,9 +1051,7 @@ class Plain:
 
     def test_tsx_member_component_invocation_creates_unqualified_call_edge(self):
         source = (
-            b"export function BookWorkspace() {\n"
-            b"  return <UI.MarkdownMsg text={value} />;\n"
-            b"}\n"
+            b"export function BookWorkspace() {\n  return <UI.MarkdownMsg text={value} />;\n}\n"
         )
         path = FIXTURES / "BookWorkspace.tsx"
 
@@ -1026,7 +1059,8 @@ class Plain:
 
         calls = [e for e in edges if e.kind == "CALLS"]
         jsx_calls = [
-            e for e in calls
+            e
+            for e in calls
             if e.source == f"{path.as_posix()}::BookWorkspace" and e.target == "MarkdownMsg"
         ]
         assert len(jsx_calls) == 1
@@ -1045,7 +1079,8 @@ class Plain:
         calls = [e for e in edges if e.kind == "CALLS"]
         expected_target = f"{(FIXTURES / 'MarkdownMsg.tsx').resolve().as_posix()}::MarkdownMsg"
         jsx_calls = [
-            e for e in calls
+            e
+            for e in calls
             if e.source == f"{path.as_posix()}::BookWorkspace" and e.target == expected_target
         ]
         assert len(jsx_calls) == 1
@@ -1064,7 +1099,8 @@ class Plain:
         calls = [e for e in edges if e.kind == "CALLS"]
         expected_target = f"{(FIXTURES / 'MarkdownMsg.tsx').resolve().as_posix()}::MarkdownMsg"
         jsx_calls = [
-            e for e in calls
+            e
+            for e in calls
             if e.source == f"{path.as_posix()}::BookWorkspace" and e.target == expected_target
         ]
         assert len(jsx_calls) == 1
@@ -1093,11 +1129,11 @@ class Plain:
 
             calls = [e for e in edges if e.kind == "CALLS"]
             expected_target = (
-                f"{(root / 'components' / 'MarkdownMsg.tsx').resolve().as_posix()}"
-                "::MarkdownMsg"
+                f"{(root / 'components' / 'MarkdownMsg.tsx').resolve().as_posix()}::MarkdownMsg"
             )
             jsx_calls = [
-                e for e in calls
+                e
+                for e in calls
                 if e.source == f"{consumer.as_posix()}::BookWorkspace"
                 and e.target == expected_target
             ]
@@ -1127,11 +1163,11 @@ class Plain:
 
             calls = [e for e in edges if e.kind == "CALLS"]
             expected_target = (
-                f"{(root / 'components' / 'MarkdownMsg.tsx').resolve().as_posix()}"
-                "::MarkdownMsg"
+                f"{(root / 'components' / 'MarkdownMsg.tsx').resolve().as_posix()}::MarkdownMsg"
             )
             jsx_calls = [
-                e for e in calls
+                e
+                for e in calls
                 if e.source == f"{consumer.as_posix()}::BookWorkspace"
                 and e.target == expected_target
             ]
@@ -1161,11 +1197,11 @@ class Plain:
 
             calls = [e for e in edges if e.kind == "CALLS"]
             expected_target = (
-                f"{(root / 'components' / 'MarkdownMsg.tsx').resolve().as_posix()}"
-                "::MarkdownMsg"
+                f"{(root / 'components' / 'MarkdownMsg.tsx').resolve().as_posix()}::MarkdownMsg"
             )
             jsx_calls = [
-                e for e in calls
+                e
+                for e in calls
                 if e.source == f"{consumer.as_posix()}::BookWorkspace"
                 and e.target == expected_target
             ]
@@ -1212,10 +1248,7 @@ class Plain:
             expected_target = (
                 f"{(components / 'MarkdownMsg.jsx').resolve().as_posix()}::MarkdownMsg"
             )
-            jsx_calls = [
-                e for e in edges
-                if e.kind == "CALLS" and e.target == expected_target
-            ]
+            jsx_calls = [e for e in edges if e.kind == "CALLS" and e.target == expected_target]
             by_source = {}
             for edge in jsx_calls:
                 by_source[edge.source] = by_source.get(edge.source, 0) + 1
@@ -1252,11 +1285,10 @@ class Plain:
 
             _, edges = self.parser.parse_file(consumer)
 
-            expected_target = (
-                f"{(messages / 'MarkdownMsg.jsx').resolve().as_posix()}::MarkdownMsg"
-            )
+            expected_target = f"{(messages / 'MarkdownMsg.jsx').resolve().as_posix()}::MarkdownMsg"
             jsx_calls = [
-                e for e in edges
+                e
+                for e in edges
                 if e.kind == "CALLS"
                 and e.source == f"{consumer.as_posix()}::BookDashboard"
                 and e.target == expected_target
@@ -1267,11 +1299,7 @@ class Plain:
         """Java @Test annotation should mark functions as tests."""
         nodes, _ = self.parser.parse_bytes(
             Path("/src/MyTest.java"),
-            b"class MyTest {\n"
-            b"  @Test\n"
-            b"  void verifyBehavior() { }\n"
-            b"  void helperMethod() { }\n"
-            b"}\n",
+            b"class MyTest {\n  @Test\n  void verifyBehavior() { }\n  void helperMethod() { }\n}\n",
         )
         test_nodes = [n for n in nodes if n.is_test]
         test_names = {n.name for n in test_nodes}
@@ -1282,10 +1310,7 @@ class Plain:
         """Kotlin @Test annotation should mark functions as tests."""
         nodes, _ = self.parser.parse_bytes(
             Path("/src/SampleTest.kt"),
-            b"class SampleTest {\n"
-            b"  @Test fun checkResult() { }\n"
-            b"  fun setup() { }\n"
-            b"}\n",
+            b"class SampleTest {\n  @Test fun checkResult() { }\n  fun setup() { }\n}\n",
         )
         test_nodes = [n for n in nodes if n.is_test]
         test_names = {n.name for n in test_nodes}
@@ -1296,8 +1321,7 @@ class Plain:
         """Functions with test-like names should be marked is_test=True."""
         nodes, _ = self.parser.parse_bytes(
             Path("/src/test_example.py"),
-            b"def test_something(): pass\n"
-            b"def helper(): pass\n",
+            b"def test_something(): pass\ndef helper(): pass\n",
         )
         test_nodes = [n for n in nodes if n.is_test]
         test_names = {n.name for n in test_nodes}
@@ -1426,10 +1450,7 @@ class Plain:
                 encoding="utf-8",
             )
             _nodes, edges = self.parser.parse_file(src)
-        targets = {
-            e.target.split("::")[-1]
-            for e in edges if e.kind == "CALLS"
-        }
+        targets = {e.target.split("::")[-1] for e in edges if e.kind == "CALLS"}
         # Dead: declared inside the never-evaluated branch.
         assert "dead_in_fn" not in targets
         assert "dead_in_class" not in targets
@@ -1445,10 +1466,8 @@ class Plain:
         cases = [
             (
                 "sample_dead_guard.c",
-                {"dead_in_if0", "dead_in_wrapped", "dead_in_elif0",
-                 "dead_in_elifblock"},
-                {"live_helper", "live_in_else", "live_in_elif",
-                 "live_in_if1"},
+                {"dead_in_if0", "dead_in_wrapped", "dead_in_elif0", "dead_in_elifblock"},
+                {"live_helper", "live_in_else", "live_in_elif", "live_in_if1"},
             ),
             (
                 "sample_dead_guard.go",
@@ -1464,7 +1483,8 @@ class Plain:
         for fixture, dead, live in cases:
             nodes, edges = self.parser.parse_file(FIXTURES / fixture)
             with tempfile.NamedTemporaryFile(
-                suffix=".db", delete=False,
+                suffix=".db",
+                delete=False,
             ) as handle:
                 db_path = handle.name
             try:
@@ -1474,20 +1494,13 @@ class Plain:
                     for edge in edges:
                         store.upsert_edge(edge)
                     store.commit()
-                    targets = {
-                        t.split("::")[-1]
-                        for t in store.get_all_call_targets()
-                    }
+                    targets = {t.split("::")[-1] for t in store.get_all_call_targets()}
             finally:
                 Path(db_path).unlink(missing_ok=True)
             for name in dead:
-                assert name not in targets, (
-                    f"{fixture}: dead target {name} leaked into the store"
-                )
+                assert name not in targets, f"{fixture}: dead target {name} leaked into the store"
             for name in live:
-                assert name in targets, (
-                    f"{fixture}: live target {name} missing from the store"
-                )
+                assert name in targets, f"{fixture}: live target {name} missing from the store"
 
 
 class TestDeadGuardHelpers:
@@ -1674,9 +1687,7 @@ class TestDeadGuardHelpers:
     def test_c_else_live(self):
         from code_review_graph.parser import _is_in_static_dead_guard
 
-        root, _ = self._parse(
-            "c", b"void f() {\n#if 0\na();\n#else\nb();\n#endif\n}\n"
-        )
+        root, _ = self._parse("c", b"void f() {\n#if 0\na();\n#else\nb();\n#endif\n}\n")
         call_b = self._find_call(root, b"b")
         assert _is_in_static_dead_guard(call_b) is False
 
@@ -1703,8 +1714,7 @@ class TestDeadGuardHelpers:
             FIXTURES / "sample_dead_guard.go",
         )
         dead = [
-            e for e in edges
-            if e.kind == "CALLS" and e.target.split("::")[-1] == "dead_false_call"
+            e for e in edges if e.kind == "CALLS" and e.target.split("::")[-1] == "dead_false_call"
         ]
         assert dead == []
 
@@ -1715,8 +1725,7 @@ class TestDeadGuardHelpers:
             FIXTURES / "sample_dead_guard.ts",
         )
         dead = [
-            e for e in edges
-            if e.kind == "CALLS" and e.target.split("::")[-1] == "dead_false_call"
+            e for e in edges if e.kind == "CALLS" and e.target.split("::")[-1] == "dead_false_call"
         ]
         assert dead == []
 
@@ -1726,10 +1735,7 @@ class TestDeadGuardHelpers:
         nodes, edges = self.parser.parse_file(
             FIXTURES / "sample_dead_guard.c",
         )
-        dead = [
-            e for e in edges
-            if e.kind == "CALLS" and e.target.split("::")[-1] == "dead_in_if0"
-        ]
+        dead = [e for e in edges if e.kind == "CALLS" and e.target.split("::")[-1] == "dead_in_if0"]
         assert dead == []
 
     def test_extract_calls_keeps_live(self):
@@ -1738,10 +1744,7 @@ class TestDeadGuardHelpers:
         nodes, edges = self.parser.parse_file(
             FIXTURES / "sample_dead_guard.go",
         )
-        live = [
-            e for e in edges
-            if e.kind == "CALLS" and e.target.split("::")[-1] == "live_helper"
-        ]
+        live = [e for e in edges if e.kind == "CALLS" and e.target.split("::")[-1] == "live_helper"]
         assert len(live) == 1
 
 
@@ -1817,19 +1820,14 @@ class TestValueReferences:
         nodes, edges = self.parser.parse_file(FIXTURES / "sample_map_dispatch.ts")
         refs = [e for e in edges if e.kind == "REFERENCES"]
         # The register(handleCreate) call is inside 'dispatch'
-        dispatch_refs = [
-            e for e in refs
-            if "dispatch" in e.source and "handleCreate" in e.target
-        ]
+        dispatch_refs = [e for e in refs if "dispatch" in e.source and "handleCreate" in e.target]
         assert len(dispatch_refs) >= 1
 
     def test_no_references_for_unknown_identifiers(self):
         """Identifiers not in defined_names or import_map should NOT emit REFERENCES."""
         nodes, edges = self.parser.parse_bytes(
             Path("/test/example.ts"),
-            b"function outer() {\n"
-            b"  const map = { key: unknownFunc };\n"
-            b"}\n",
+            b"function outer() {\n  const map = { key: unknownFunc };\n}\n",
         )
         refs = [e for e in edges if e.kind == "REFERENCES"]
         ref_targets = {e.target for e in refs}
@@ -1839,10 +1837,7 @@ class TestValueReferences:
         """All-uppercase identifiers should NOT emit REFERENCES (likely constants)."""
         nodes, edges = self.parser.parse_bytes(
             Path("/test/example.ts"),
-            b"const MAX_SIZE = 100;\n"
-            b"function outer() {\n"
-            b"  const arr = [MAX_SIZE];\n"
-            b"}\n",
+            b"const MAX_SIZE = 100;\nfunction outer() {\n  const arr = [MAX_SIZE];\n}\n",
         )
         refs = [e for e in edges if e.kind == "REFERENCES"]
         ref_targets = {e.target for e in refs}
@@ -1871,39 +1866,26 @@ class TestModuleScopeCalls:
         self.parser = CodeParser()
 
     def test_python_top_level_call_attributes_to_file(self):
-        source = (
-            b"def worker():\n"
-            b"    return 1\n"
-            b"\n"
-            b"worker()\n"
-        )
+        source = b"def worker():\n    return 1\n\nworker()\n"
         path = FIXTURES / "module_scope_py.py"
         _, edges = self.parser.parse_bytes(path, source)
 
         calls = [e for e in edges if e.kind == "CALLS"]
         top_level = [
-            e for e in calls
-            if e.source == path.as_posix() and e.target.endswith("worker")
+            e for e in calls if e.source == path.as_posix() and e.target.endswith("worker")
         ]
         assert len(top_level) == 1
         # Edge originates at the call site (line 4), not the def (line 1).
         assert top_level[0].line == 4
 
     def test_python_if_main_block_call_attributes_to_file(self):
-        source = (
-            b"def run_job():\n"
-            b"    return 1\n"
-            b"\n"
-            b"if __name__ == '__main__':\n"
-            b"    run_job()\n"
-        )
+        source = b"def run_job():\n    return 1\n\nif __name__ == '__main__':\n    run_job()\n"
         path = FIXTURES / "module_scope_cli.py"
         _, edges = self.parser.parse_bytes(path, source)
 
         calls = [e for e in edges if e.kind == "CALLS"]
         top_level = [
-            e for e in calls
-            if e.source == path.as_posix() and e.target.endswith("run_job")
+            e for e in calls if e.source == path.as_posix() and e.target.endswith("run_job")
         ]
         assert len(top_level) == 1
         # Edge originates inside the `if __name__` block (line 5).
@@ -1913,19 +1895,12 @@ class TestModuleScopeCalls:
         # Bare top-level JSX expression statement exercises the
         # _extract_jsx_child path specifically (not a value-reference
         # fallback from the `const element = ...` assignment).
-        source = (
-            b"import App from './App';\n"
-            b"\n"
-            b"<App />;\n"
-        )
+        source = b"import App from './App';\n\n<App />;\n"
         path = FIXTURES / "module_scope_entry.tsx"
         _, edges = self.parser.parse_bytes(path, source)
 
         calls = [e for e in edges if e.kind == "CALLS"]
-        top_level = [
-            e for e in calls
-            if e.source == path.as_posix() and e.target.endswith("App")
-        ]
+        top_level = [e for e in calls if e.source == path.as_posix() and e.target.endswith("App")]
         assert len(top_level) == 1
         # Edge originates at the JSX site (line 3), not the import (line 1).
         assert top_level[0].line == 3
@@ -1933,21 +1908,14 @@ class TestModuleScopeCalls:
     def test_r_top_level_call_attributes_to_file(self):
         # R scripts are overwhelmingly module-scope by convention; this is
         # the highest-leverage language for the fix after Python.
-        source = (
-            b"worker <- function() {\n"
-            b"  1\n"
-            b"}\n"
-            b"\n"
-            b"worker()\n"
-        )
+        source = b"worker <- function() {\n  1\n}\n\nworker()\n"
         path = FIXTURES / "module_scope_sample.R"
         _, edges = self.parser.parse_bytes(path, source)
 
         top_level = [
-            e for e in edges
-            if e.kind == "CALLS"
-            and e.source == path.as_posix()
-            and e.target.endswith("worker")
+            e
+            for e in edges
+            if e.kind == "CALLS" and e.source == path.as_posix() and e.target.endswith("worker")
         ]
         assert len(top_level) == 1
 
@@ -1959,10 +1927,9 @@ class TestModuleScopeCalls:
         _, edges = self.parser.parse_bytes(path, source)
 
         top_level = [
-            e for e in edges
-            if e.kind == "CALLS"
-            and e.source == path.as_posix()
-            and e.target.endswith("puts")
+            e
+            for e in edges
+            if e.kind == "CALLS" and e.source == path.as_posix() and e.target.endswith("puts")
         ]
         assert len(top_level) == 1
 
@@ -2008,8 +1975,6 @@ ExtensionID PlaybackExtension::ID() const { return {}; }
         ]
 
 
-
-
 class TestCppScopedFunctionName:
     """Regression tests for C++ scoped function name extraction.
 
@@ -2020,10 +1985,7 @@ class TestCppScopedFunctionName:
         """bufferlist OSDService::get_inc_map(...) should extract 'get_inc_map'."""
         src = tmp_path / "osd_service.cpp"
         src.write_text(
-            "bufferlist OSDService::get_inc_map(epoch_t e) {\n"
-            "  bufferlist bl;\n"
-            "  return bl;\n"
-            "}\n"
+            "bufferlist OSDService::get_inc_map(epoch_t e) {\n  bufferlist bl;\n  return bl;\n}\n"
         )
         p = CodeParser()
         nodes, _ = p.parse_file(src)
@@ -2035,9 +1997,7 @@ class TestCppScopedFunctionName:
         """std::string OSDMap::get_pool_name(...) should extract 'get_pool_name'."""
         src = tmp_path / "osd_map.cpp"
         src.write_text(
-            "std::string OSDMap::get_pool_name(int64_t pool_id) const {\n"
-            '  return "";\n'
-            "}\n"
+            'std::string OSDMap::get_pool_name(int64_t pool_id) const {\n  return "";\n}\n'
         )
         p = CodeParser()
         nodes, _ = p.parse_file(src)
@@ -2048,11 +2008,7 @@ class TestCppScopedFunctionName:
     def test_scoped_function_with_primitive_return_still_works(self, tmp_path):
         """int OSD::handle_osd_map(...) was already correct; verify no regression."""
         src = tmp_path / "osd.cpp"
-        src.write_text(
-            "int OSD::handle_osd_map(MOSDMap *m) {\n"
-            "  return 0;\n"
-            "}\n"
-        )
+        src.write_text("int OSD::handle_osd_map(MOSDMap *m) {\n  return 0;\n}\n")
         p = CodeParser()
         nodes, _ = p.parse_file(src)
         fns = [n for n in nodes if n.kind == "Function"]
@@ -2063,9 +2019,7 @@ class TestCppScopedFunctionName:
         """static std::string _make_key(...) should extract '_make_key'."""
         src = tmp_path / "util.cpp"
         src.write_text(
-            "static std::string _make_key(const std::string& prefix) {\n"
-            "  return prefix;\n"
-            "}\n"
+            "static std::string _make_key(const std::string& prefix) {\n  return prefix;\n}\n"
         )
         p = CodeParser()
         nodes, _ = p.parse_file(src)
@@ -2077,9 +2031,7 @@ class TestCppScopedFunctionName:
         """string RGWDedupProcessor::get_obj_fingerprint(...) should extract the method name."""
         src = tmp_path / "rgw_dedup.cpp"
         src.write_text(
-            "string RGWDedupProcessor::get_obj_fingerprint(const rgw_obj& obj) {\n"
-            '  return "";\n'
-            "}\n"
+            'string RGWDedupProcessor::get_obj_fingerprint(const rgw_obj& obj) {\n  return "";\n}\n'
         )
         p = CodeParser()
         nodes, _ = p.parse_file(src)
@@ -2104,9 +2056,7 @@ class TestJsMemberAssignedFunctions:
     def test_js_object_method_assignment_captured(self):
         nodes, _ = self.parser.parse_bytes(
             Path("/test/application.js"),
-            b"app.handle = function handle(req, res, next) {\n"
-            b"  next();\n"
-            b"};\n",
+            b"app.handle = function handle(req, res, next) {\n  next();\n};\n",
         )
         fns = {n.name for n in nodes if n.kind == "Function"}
         assert "app.handle" in fns
@@ -2114,9 +2064,7 @@ class TestJsMemberAssignedFunctions:
     def test_js_arrow_member_assignment_captured(self):
         nodes, _ = self.parser.parse_bytes(
             Path("/test/router.js"),
-            b"router.dispatch = (req, res) => {\n"
-            b"  return res;\n"
-            b"};\n",
+            b"router.dispatch = (req, res) => {\n  return res;\n};\n",
         )
         fns = {n.name for n in nodes if n.kind == "Function"}
         assert "router.dispatch" in fns
@@ -2139,7 +2087,8 @@ class TestJsMemberAssignedFunctions:
             b"app.handle = function handle(req, res) {};\n",
         )
         contains = [
-            e for e in edges
+            e
+            for e in edges
             if e.kind == "CONTAINS" and e.target == f"{path.as_posix()}::app.handle"
         ]
         assert len(contains) == 1
@@ -2149,8 +2098,7 @@ class TestJsMemberAssignedFunctions:
         """``obj.prop = <non-function>`` must not create a Function node."""
         nodes, _ = self.parser.parse_bytes(
             Path("/test/config.js"),
-            b"app.settings = { trust_proxy: false };\n"
-            b"app.locals = {};\n",
+            b"app.settings = { trust_proxy: false };\napp.locals = {};\n",
         )
         fns = {n.name for n in nodes if n.kind == "Function"}
         assert "app.settings" not in fns
@@ -2161,15 +2109,13 @@ class TestJsMemberAssignedFunctions:
         path = Path("/test/local_assignments.js")
         nodes, edges = self.parser.parse_bytes(
             path,
-            b"function a() { x.run = function () {}; }\n"
-            b"function b() { x.run = function () {}; }\n",
+            b"function a() { x.run = function () {}; }\nfunction b() { x.run = function () {}; }\n",
         )
         functions = [n for n in nodes if n.kind == "Function"]
         assert {n.name for n in functions} == {"a", "b"}
         assert all(n.name != "x.run" for n in functions)
         assert all(
-            not (e.kind == "CONTAINS" and e.target == f"{path.as_posix()}::x.run")
-            for e in edges
+            not (e.kind == "CONTAINS" and e.target == f"{path.as_posix()}::x.run") for e in edges
         )
 
     def test_sibling_top_level_blocks_do_not_share_member_identity(self):
@@ -2183,8 +2129,7 @@ class TestJsMemberAssignedFunctions:
         functions = [n for n in nodes if n.kind == "Function"]
         assert all(n.name != "x.run" for n in functions)
         assert all(
-            not (e.kind == "CONTAINS" and e.target == f"{path.as_posix()}::x.run")
-            for e in edges
+            not (e.kind == "CONTAINS" and e.target == f"{path.as_posix()}::x.run") for e in edges
         )
 
     def test_dynamic_receiver_assignment_is_not_a_stable_definition(self):
@@ -2197,10 +2142,7 @@ class TestJsMemberAssignedFunctions:
         functions = [n for n in nodes if n.kind == "Function"]
         assert all(n.name != "factory().handle" for n in functions)
         assert all(
-            not (
-                e.kind == "CONTAINS"
-                and e.target == f"{path.as_posix()}::factory().handle"
-            )
+            not (e.kind == "CONTAINS" and e.target == f"{path.as_posix()}::factory().handle")
             for e in edges
         )
 
@@ -2209,13 +2151,9 @@ class TestJsMemberAssignedFunctions:
         path = Path("/test/dynamic_call.js")
         _, edges = self.parser.parse_bytes(
             path,
-            b"factory().handle = function () {};\n"
-            b"function start() { factory().handle(); }\n",
+            b"factory().handle = function () {};\nfunction start() { factory().handle(); }\n",
         )
-        calls = [
-            e for e in edges
-            if e.kind == "CALLS" and e.source == f"{path.as_posix()}::start"
-        ]
+        calls = [e for e in edges if e.kind == "CALLS" and e.source == f"{path.as_posix()}::start"]
         assert len(calls) == 2
         handle_call = next(e for e in calls if e.target == "handle")
         assert "member_call" not in handle_call.extra
@@ -2225,13 +2163,11 @@ class TestJsMemberAssignedFunctions:
         path = Path("/test/application.js")
         _, edges = self.parser.parse_bytes(
             path,
-            b"function helper() { return 1; }\n"
-            b"app.handle = function handle() {\n"
-            b"  helper();\n"
-            b"};\n",
+            b"function helper() { return 1; }\napp.handle = function handle() {\n  helper();\n};\n",
         )
         calls = [
-            e for e in edges
+            e
+            for e in edges
             if e.kind == "CALLS"
             and e.source == f"{path.as_posix()}::app.handle"
             and e.target.endswith("helper")
@@ -2243,13 +2179,9 @@ class TestJsMemberAssignedFunctions:
         path = Path("/test/application.js")
         _, edges = self.parser.parse_bytes(
             path,
-            b"app.handle = function () {};\n"
-            b"function start() { app.handle(); }\n",
+            b"app.handle = function () {};\nfunction start() { app.handle(); }\n",
         )
-        calls = [
-            e for e in edges
-            if e.kind == "CALLS" and e.source == f"{path.as_posix()}::start"
-        ]
+        calls = [e for e in edges if e.kind == "CALLS" and e.source == f"{path.as_posix()}::start"]
         assert len(calls) == 1
         assert calls[0].target == f"{path.as_posix()}::app.handle"
 
@@ -2258,13 +2190,9 @@ class TestJsMemberAssignedFunctions:
         path = Path("/test/application.js")
         _, edges = self.parser.parse_bytes(
             path,
-            b"app.handle = function () {};\n"
-            b"function start() { app?.handle(); }\n",
+            b"app.handle = function () {};\nfunction start() { app?.handle(); }\n",
         )
-        calls = [
-            e for e in edges
-            if e.kind == "CALLS" and e.source == f"{path.as_posix()}::start"
-        ]
+        calls = [e for e in edges if e.kind == "CALLS" and e.source == f"{path.as_posix()}::start"]
         assert len(calls) == 1
         assert calls[0].target == f"{path.as_posix()}::app.handle"
 
@@ -2277,8 +2205,7 @@ class TestJsMemberAssignedFunctions:
         monkeypatch.setenv("CRG_SERIAL_PARSE", "1")
         source = tmp_path / "application.js"
         source.write_text(
-            "app.handle = function () { return 1; };\n"
-            "function start() { return app.handle(); }\n",
+            "app.handle = function () { return 1; };\nfunction start() { return app.handle(); }\n",
             encoding="utf-8",
         )
         member_qn = f"{source.as_posix()}::app.handle"
@@ -2290,9 +2217,7 @@ class TestJsMemberAssignedFunctions:
 
             member = store.get_node(member_qn)
             callers = [
-                edge
-                for edge in store.get_edges_by_target(member_qn)
-                if edge.kind == "CALLS"
+                edge for edge in store.get_edges_by_target(member_qn) if edge.kind == "CALLS"
             ]
 
         assert member is not None
@@ -2300,6 +2225,8 @@ class TestJsMemberAssignedFunctions:
         assert member.name == "app.handle"
         assert len(callers) == 1
         assert callers[0].source_qualified == caller_qn
+
+
 class TestTypeScriptTypeDeclarations:
     """TS interfaces / type aliases / enums are graph nodes, and type positions
     are dependencies.
@@ -2362,11 +2289,7 @@ class TestTypeScriptTypeDeclarations:
 
             _, edges = self.parser.parse_file(use)
 
-            refs = {
-                (e.source, e.target)
-                for e in edges
-                if e.kind == "REFERENCES"
-            }
+            refs = {(e.source, e.target) for e in edges if e.kind == "REFERENCES"}
             summarize = f"{use.as_posix()}::summarize"
             assert (summarize, f"{types.resolve().as_posix()}::Finding") in refs
             assert (summarize, f"{types.resolve().as_posix()}::Verdict") in refs
@@ -2386,18 +2309,13 @@ class TestTypeScriptTypeDeclarations:
 
             _, edges = self.parser.parse_file(use)
 
-            refs = {
-                (edge.source, edge.target)
-                for edge in edges
-                if edge.kind == "REFERENCES"
-            }
+            refs = {(edge.source, edge.target) for edge in edges if edge.kind == "REFERENCES"}
             assert (
                 f"{use.as_posix()}::summarize",
                 f"{types.resolve().as_posix()}::Finding",
             ) in refs
             assert not any(
-                target == f"{types.resolve().as_posix()}::ImportedFinding"
-                for _, target in refs
+                target == f"{types.resolve().as_posix()}::ImportedFinding" for _, target in refs
             )
 
     def test_type_argument_inside_a_generic_is_a_reference(self):
@@ -2457,8 +2375,7 @@ class TestTypeScriptTypeDeclarations:
             root = Path(tmp_dir)
             base = root / "base.ts"
             base.write_text(
-                "export class Base {}\n"
-                "export interface Findable { id: string }\n",
+                "export class Base {}\nexport interface Findable { id: string }\n",
                 encoding="utf-8",
             )
             impl = root / "impl.ts"
@@ -2472,9 +2389,7 @@ class TestTypeScriptTypeDeclarations:
 
             _, edges = self.parser.parse_file(impl)
 
-            inherits = {
-                (e.source, e.target) for e in edges if e.kind == "INHERITS"
-            }
+            inherits = {(e.source, e.target) for e in edges if e.kind == "INHERITS"}
             assert (f"{impl.as_posix()}::Impl", "Base") in inherits
             assert (f"{impl.as_posix()}::Impl", "Findable") in inherits
 
@@ -2538,20 +2453,16 @@ class TestTypeScriptTypeDeclarations:
 
             _, edges = self.parser.parse_file(wrapper)
 
-            inherits = [
-                edge for edge in edges
-                if edge.kind == "INHERITS" and edge.target == "Box"
-            ]
+            inherits = [edge for edge in edges if edge.kind == "INHERITS" and edge.target == "Box"]
             references = [
-                edge for edge in edges
-                if edge.kind == "REFERENCES"
-                and edge.target == f"{base.resolve().as_posix()}::Box"
+                edge
+                for edge in edges
+                if edge.kind == "REFERENCES" and edge.target == f"{base.resolve().as_posix()}::Box"
             ]
             assert len(inherits) == 2
             assert references == []
             assert any(
-                edge.kind == "REFERENCES"
-                and edge.target == f"{base.resolve().as_posix()}::Payload"
+                edge.kind == "REFERENCES" and edge.target == f"{base.resolve().as_posix()}::Payload"
                 for edge in edges
             )
 

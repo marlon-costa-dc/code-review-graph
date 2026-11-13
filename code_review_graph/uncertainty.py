@@ -73,9 +73,14 @@ _JS_FAMILY = frozenset({"javascript", "typescript", "tsx"})
 # Patterns answered from CALLS edges, where an unresolved dynamic call site
 # can hide a real answer. ``references_to`` is deliberately excluded: it reads
 # REFERENCES edges, which is exactly where an unresolved handoff does land.
-_CALL_PATTERNS = frozenset({
-    "callers_of", "callees_of", "tests_for", IMPACT_PATTERN,
-})
+_CALL_PATTERNS = frozenset(
+    {
+        "callers_of",
+        "callees_of",
+        "tests_for",
+        IMPACT_PATTERN,
+    }
+)
 # Patterns answered from IMPORTS_FROM edges.
 _IMPORT_PATTERNS = frozenset({"imports_of", "importers_of", IMPACT_PATTERN})
 
@@ -267,11 +272,13 @@ def _confirmed_note(target: str, current: bool) -> str:
     """
     if current:
         return _interpolated_target(
-            "'", target,
+            "'",
+            target,
             "' is indexed and the graph is current, so this 0 is a real absence",
         )
     return _interpolated_target(
-        "'", target,
+        "'",
+        target,
         "' is indexed and no such edge is recorded; graph currency unverified",
     )
 
@@ -290,7 +297,9 @@ def _live_git_head(root: Path) -> str | None:
 
 
 def _staleness(
-    store: GraphStore, root: Path, file_path: str | None,
+    store: GraphStore,
+    root: Path,
+    file_path: str | None,
 ) -> tuple[str | None, bool]:
     """Return ``(stale_note, currency_verified)`` for the graph.
 
@@ -405,12 +414,10 @@ def empty_impact_confidence(
 
         if current:
             return _bounded(
-                "changed files are indexed and the graph is current, so this "
-                "0 is a real absence"
+                "changed files are indexed and the graph is current, so this 0 is a real absence"
             )
         return _bounded(
-            "changed files are indexed and nothing depends on them; graph "
-            "currency unverified"
+            "changed files are indexed and nothing depends on them; graph currency unverified"
         )
     except Exception:
         logger.debug("Could not compute empty-impact confidence", exc_info=True)
@@ -434,11 +441,13 @@ def empty_search_confidence(
         if stale:
             return _bounded(stale)
 
-        return _bounded(_interpolated(
-            "no indexed node matches '",
-            query,
-            "'; search covers names, paths and signatures, not source text",
-        ))
+        return _bounded(
+            _interpolated(
+                "no indexed node matches '",
+                query,
+                "'; search covers names, paths and signatures, not source text",
+            )
+        )
     except Exception:
         logger.debug("Could not compute empty-search confidence", exc_info=True)
         return None

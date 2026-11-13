@@ -20,6 +20,7 @@ try:
     import yaml as _yaml  # noqa: F401
 
     from code_review_graph.eval.runner import load_all_configs, load_config, write_csv
+
     _HAS_YAML = True
 except ImportError:
     _HAS_YAML = False
@@ -123,9 +124,7 @@ def test_load_config():
     """Load a temp YAML config and verify structure."""
     import yaml
 
-    with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".yaml", delete=False
-    ) as f:
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
         yaml.dump(
             {
                 "name": "test-repo",
@@ -135,9 +134,7 @@ def test_load_config():
                 "size_category": "small",
                 "test_commits": [{"sha": "abc123", "description": "test"}],
                 "entry_points": ["main.py::main"],
-                "search_queries": [
-                    {"query": "hello", "expected": "main.py::greet"}
-                ],
+                "search_queries": [{"query": "hello", "expected": "main.py::greet"}],
             },
             f,
         )
@@ -177,14 +174,16 @@ def test_load_config_rejects_a_pin_before_the_latest_test_commit(
 
     config_path = tmp_path / "bad.yaml"
     config_path.write_text(
-        yaml.safe_dump({
-            "name": "bad",
-            "commit": "older",
-            "test_commits": [
-                {"sha": "older", "changed_files": 10},
-                {"sha": "newer", "changed_files": 12},
-            ],
-        }),
+        yaml.safe_dump(
+            {
+                "name": "bad",
+                "commit": "older",
+                "test_commits": [
+                    {"sha": "older", "changed_files": 10},
+                    {"sha": "newer", "changed_files": 12},
+                ],
+            }
+        ),
         encoding="utf-8",
     )
     monkeypatch.setattr("code_review_graph.eval.runner.CONFIGS_DIR", tmp_path)
@@ -234,19 +233,31 @@ def test_generate_readme_tables():
             w = csv.DictWriter(
                 f,
                 fieldnames=[
-                    "repo", "commit", "description", "changed_files",
-                    "naive_tokens", "standard_tokens", "graph_tokens",
-                    "naive_to_graph_ratio", "standard_to_graph_ratio",
+                    "repo",
+                    "commit",
+                    "description",
+                    "changed_files",
+                    "naive_tokens",
+                    "standard_tokens",
+                    "graph_tokens",
+                    "naive_to_graph_ratio",
+                    "standard_to_graph_ratio",
                 ],
             )
             w.writeheader()
-            w.writerow({
-                "repo": "myrepo", "commit": "abc", "description": "test",
-                "changed_files": "3", "naive_tokens": "1000",
-                "standard_tokens": "500", "graph_tokens": "200",
-                "naive_to_graph_ratio": "5.0",
-                "standard_to_graph_ratio": "2.5",
-            })
+            w.writerow(
+                {
+                    "repo": "myrepo",
+                    "commit": "abc",
+                    "description": "test",
+                    "changed_files": "3",
+                    "naive_tokens": "1000",
+                    "standard_tokens": "500",
+                    "graph_tokens": "200",
+                    "naive_to_graph_ratio": "5.0",
+                    "standard_to_graph_ratio": "2.5",
+                }
+            )
 
         tables = generate_readme_tables(results_dir)
         assert "### Token Efficiency" in tables
@@ -257,9 +268,16 @@ def test_generate_readme_tables():
 def _write_agent_baseline_csv(results_dir: Path, rows: list[dict]) -> None:
     path = results_dir / "test_agent_baseline_2026-01-01.csv"
     fieldnames = [
-        "repo", "question", "terms", "files_matched", "top_files",
-        "baseline_tokens", "graph_tokens", "baseline_to_graph_ratio",
-        "status", "error",
+        "repo",
+        "question",
+        "terms",
+        "files_matched",
+        "top_files",
+        "baseline_tokens",
+        "graph_tokens",
+        "baseline_to_graph_ratio",
+        "status",
+        "error",
     ]
     with open(path, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fieldnames)
@@ -273,14 +291,32 @@ def test_median_token_reduction_from_agent_baseline():
     with tempfile.TemporaryDirectory() as tmpdir:
         results_dir = Path(tmpdir)
         # Three OK rows: reductions 90%, 80%, 50% -> median 80%.
-        _write_agent_baseline_csv(results_dir, [
-            {"repo": "r", "question": "q1", "baseline_tokens": "1000",
-             "graph_tokens": "100", "status": "ok"},
-            {"repo": "r", "question": "q2", "baseline_tokens": "1000",
-             "graph_tokens": "200", "status": "ok"},
-            {"repo": "r", "question": "q3", "baseline_tokens": "1000",
-             "graph_tokens": "500", "status": "ok"},
-        ])
+        _write_agent_baseline_csv(
+            results_dir,
+            [
+                {
+                    "repo": "r",
+                    "question": "q1",
+                    "baseline_tokens": "1000",
+                    "graph_tokens": "100",
+                    "status": "ok",
+                },
+                {
+                    "repo": "r",
+                    "question": "q2",
+                    "baseline_tokens": "1000",
+                    "graph_tokens": "200",
+                    "status": "ok",
+                },
+                {
+                    "repo": "r",
+                    "question": "q3",
+                    "baseline_tokens": "1000",
+                    "graph_tokens": "500",
+                    "status": "ok",
+                },
+            ],
+        )
         stats = median_token_reduction(results_dir)
         assert stats["source"] == "agent_baseline"
         assert stats["n"] == 3
@@ -293,14 +329,32 @@ def test_median_token_reduction_excludes_failed_rows():
     """Rows with status != ok must not contribute to the median."""
     with tempfile.TemporaryDirectory() as tmpdir:
         results_dir = Path(tmpdir)
-        _write_agent_baseline_csv(results_dir, [
-            {"repo": "r", "question": "q1", "baseline_tokens": "1000",
-             "graph_tokens": "100", "status": "ok"},
-            {"repo": "r", "question": "q2", "baseline_tokens": "1000",
-             "graph_tokens": "0", "status": "no_graph_results"},
-            {"repo": "r", "question": "q3", "baseline_tokens": "0",
-             "graph_tokens": "0", "status": "error"},
-        ])
+        _write_agent_baseline_csv(
+            results_dir,
+            [
+                {
+                    "repo": "r",
+                    "question": "q1",
+                    "baseline_tokens": "1000",
+                    "graph_tokens": "100",
+                    "status": "ok",
+                },
+                {
+                    "repo": "r",
+                    "question": "q2",
+                    "baseline_tokens": "1000",
+                    "graph_tokens": "0",
+                    "status": "no_graph_results",
+                },
+                {
+                    "repo": "r",
+                    "question": "q3",
+                    "baseline_tokens": "0",
+                    "graph_tokens": "0",
+                    "status": "error",
+                },
+            ],
+        )
         stats = median_token_reduction(results_dir)
         assert stats["n"] == 1
         assert stats["median_percent"] == 90.0
@@ -315,17 +369,29 @@ def test_median_token_reduction_falls_back_to_token_efficiency():
             w = csv.DictWriter(
                 f,
                 fieldnames=[
-                    "repo", "commit", "description", "changed_files",
-                    "naive_tokens", "standard_tokens", "graph_tokens",
-                    "naive_to_graph_ratio", "standard_to_graph_ratio",
-                    "status", "error",
+                    "repo",
+                    "commit",
+                    "description",
+                    "changed_files",
+                    "naive_tokens",
+                    "standard_tokens",
+                    "graph_tokens",
+                    "naive_to_graph_ratio",
+                    "standard_to_graph_ratio",
+                    "status",
+                    "error",
                 ],
             )
             w.writeheader()
-            w.writerow({
-                "repo": "r", "commit": "abc", "naive_tokens": "1000",
-                "graph_tokens": "250", "status": "ok",
-            })
+            w.writerow(
+                {
+                    "repo": "r",
+                    "commit": "abc",
+                    "naive_tokens": "1000",
+                    "graph_tokens": "250",
+                    "status": "ok",
+                }
+            )
         stats = median_token_reduction(results_dir)
         assert stats["source"] == "token_efficiency"
         assert stats["median_percent"] == 75.0
@@ -345,10 +411,18 @@ def test_median_token_reduction_empty_dir_is_honest():
 def test_median_token_reduction_table_renders_percent():
     with tempfile.TemporaryDirectory() as tmpdir:
         results_dir = Path(tmpdir)
-        _write_agent_baseline_csv(results_dir, [
-            {"repo": "r", "question": "q1", "baseline_tokens": "1000",
-             "graph_tokens": "100", "status": "ok"},
-        ])
+        _write_agent_baseline_csv(
+            results_dir,
+            [
+                {
+                    "repo": "r",
+                    "question": "q1",
+                    "baseline_tokens": "1000",
+                    "graph_tokens": "100",
+                    "status": "ok",
+                },
+            ],
+        )
         table = median_token_reduction_table(results_dir)
         assert "90.0%" in table
         assert "`agent_baseline`" in table
@@ -365,18 +439,29 @@ def test_generate_full_report():
             w = csv.DictWriter(
                 f,
                 fieldnames=[
-                    "repo", "file_count", "node_count", "edge_count",
-                    "flow_detection_seconds", "community_detection_seconds",
-                    "search_avg_ms", "nodes_per_second",
+                    "repo",
+                    "file_count",
+                    "node_count",
+                    "edge_count",
+                    "flow_detection_seconds",
+                    "community_detection_seconds",
+                    "search_avg_ms",
+                    "nodes_per_second",
                 ],
             )
             w.writeheader()
-            w.writerow({
-                "repo": "testrepo", "file_count": "10", "node_count": "50",
-                "edge_count": "30", "flow_detection_seconds": "0.1",
-                "community_detection_seconds": "0.2",
-                "search_avg_ms": "5.0", "nodes_per_second": "500",
-            })
+            w.writerow(
+                {
+                    "repo": "testrepo",
+                    "file_count": "10",
+                    "node_count": "50",
+                    "edge_count": "30",
+                    "flow_detection_seconds": "0.1",
+                    "community_detection_seconds": "0.2",
+                    "search_avg_ms": "5.0",
+                    "nodes_per_second": "500",
+                }
+            )
 
         report = generate_full_report(results_dir)
         assert "# Evaluation Report" in report
@@ -393,16 +478,16 @@ def test_runner_with_mock_repo():
         repo_path.mkdir()
 
         # Init git repo
-        subprocess.run(
-            ["git", "init"], cwd=str(repo_path), capture_output=True
-        )
+        subprocess.run(["git", "init"], cwd=str(repo_path), capture_output=True)
         subprocess.run(
             ["git", "config", "user.email", "test@test.com"],
-            cwd=str(repo_path), capture_output=True,
+            cwd=str(repo_path),
+            capture_output=True,
         )
         subprocess.run(
             ["git", "config", "user.name", "Test"],
-            cwd=str(repo_path), capture_output=True,
+            cwd=str(repo_path),
+            capture_output=True,
         )
 
         # Create two Python files
@@ -415,12 +500,11 @@ def test_runner_with_mock_repo():
             encoding="utf-8",
         )
 
-        subprocess.run(
-            ["git", "add", "."], cwd=str(repo_path), capture_output=True
-        )
+        subprocess.run(["git", "add", "."], cwd=str(repo_path), capture_output=True)
         subprocess.run(
             ["git", "commit", "-m", "initial"],
-            cwd=str(repo_path), capture_output=True,
+            cwd=str(repo_path),
+            capture_output=True,
         )
 
         # Second commit: modify helper.py
@@ -428,12 +512,11 @@ def test_runner_with_mock_repo():
             'def greet(name):\n    print(f"Hi {name}!")\n',
             encoding="utf-8",
         )
-        subprocess.run(
-            ["git", "add", "."], cwd=str(repo_path), capture_output=True
-        )
+        subprocess.run(["git", "add", "."], cwd=str(repo_path), capture_output=True)
         subprocess.run(
             ["git", "commit", "-m", "update greeting"],
-            cwd=str(repo_path), capture_output=True,
+            cwd=str(repo_path),
+            capture_output=True,
         )
 
         # Build graph
@@ -458,6 +541,7 @@ def test_runner_with_mock_repo():
 
         # Run token_efficiency
         from code_review_graph.eval.benchmarks import token_efficiency
+
         te_results = token_efficiency.run(repo_path, store, config)
         assert len(te_results) >= 1
         assert "naive_tokens" in te_results[0]
@@ -465,6 +549,7 @@ def test_runner_with_mock_repo():
 
         # Run impact_accuracy
         from code_review_graph.eval.benchmarks import impact_accuracy
+
         ia_results = impact_accuracy.run(repo_path, store, config)
         assert len(ia_results) >= 1
         assert "precision" in ia_results[0]
@@ -472,12 +557,14 @@ def test_runner_with_mock_repo():
 
         # Run search_quality
         from code_review_graph.eval.benchmarks import search_quality
+
         sq_results = search_quality.run(repo_path, store, config)
         assert len(sq_results) == 1
         assert "reciprocal_rank" in sq_results[0]
 
         # Run build_performance
         from code_review_graph.eval.benchmarks import build_performance
+
         bp_results = build_performance.run(repo_path, store, config)
         assert len(bp_results) == 1
         assert "node_count" in bp_results[0]
@@ -537,15 +624,19 @@ def test_benchmark_review_workflow():
 
         # Init git repo with two commits
         subprocess.run(
-            ["git", "init"], cwd=str(repo_path), capture_output=True,
+            ["git", "init"],
+            cwd=str(repo_path),
+            capture_output=True,
         )
         subprocess.run(
             ["git", "config", "user.email", "test@test.com"],
-            cwd=str(repo_path), capture_output=True,
+            cwd=str(repo_path),
+            capture_output=True,
         )
         subprocess.run(
             ["git", "config", "user.name", "Test"],
-            cwd=str(repo_path), capture_output=True,
+            cwd=str(repo_path),
+            capture_output=True,
         )
 
         (repo_path / "main.py").write_text(
@@ -558,11 +649,14 @@ def test_benchmark_review_workflow():
         )
 
         subprocess.run(
-            ["git", "add", "."], cwd=str(repo_path), capture_output=True,
+            ["git", "add", "."],
+            cwd=str(repo_path),
+            capture_output=True,
         )
         subprocess.run(
             ["git", "commit", "-m", "initial"],
-            cwd=str(repo_path), capture_output=True,
+            cwd=str(repo_path),
+            capture_output=True,
         )
 
         # Second commit
@@ -571,11 +665,14 @@ def test_benchmark_review_workflow():
             encoding="utf-8",
         )
         subprocess.run(
-            ["git", "add", "."], cwd=str(repo_path), capture_output=True,
+            ["git", "add", "."],
+            cwd=str(repo_path),
+            capture_output=True,
         )
         subprocess.run(
             ["git", "commit", "-m", "update greeting"],
-            cwd=str(repo_path), capture_output=True,
+            cwd=str(repo_path),
+            capture_output=True,
         )
 
         # Build graph
@@ -589,7 +686,8 @@ def test_benchmark_review_workflow():
 
         # Run the review benchmark
         result = benchmark_review_workflow(
-            repo_root=str(repo_path), base="HEAD~1",
+            repo_root=str(repo_path),
+            base="HEAD~1",
         )
 
         assert result["workflow"] == "review"
@@ -611,15 +709,19 @@ def test_run_all_benchmarks():
         repo_path.mkdir()
 
         subprocess.run(
-            ["git", "init"], cwd=str(repo_path), capture_output=True,
+            ["git", "init"],
+            cwd=str(repo_path),
+            capture_output=True,
         )
         subprocess.run(
             ["git", "config", "user.email", "test@test.com"],
-            cwd=str(repo_path), capture_output=True,
+            cwd=str(repo_path),
+            capture_output=True,
         )
         subprocess.run(
             ["git", "config", "user.name", "Test"],
-            cwd=str(repo_path), capture_output=True,
+            cwd=str(repo_path),
+            capture_output=True,
         )
 
         (repo_path / "app.py").write_text(
@@ -628,11 +730,14 @@ def test_run_all_benchmarks():
         )
 
         subprocess.run(
-            ["git", "add", "."], cwd=str(repo_path), capture_output=True,
+            ["git", "add", "."],
+            cwd=str(repo_path),
+            capture_output=True,
         )
         subprocess.run(
             ["git", "commit", "-m", "initial"],
-            cwd=str(repo_path), capture_output=True,
+            cwd=str(repo_path),
+            capture_output=True,
         )
 
         (repo_path / "app.py").write_text(
@@ -640,11 +745,14 @@ def test_run_all_benchmarks():
             encoding="utf-8",
         )
         subprocess.run(
-            ["git", "add", "."], cwd=str(repo_path), capture_output=True,
+            ["git", "add", "."],
+            cwd=str(repo_path),
+            capture_output=True,
         )
         subprocess.run(
             ["git", "commit", "-m", "update"],
-            cwd=str(repo_path), capture_output=True,
+            cwd=str(repo_path),
+            capture_output=True,
         )
 
         from code_review_graph.graph import GraphStore
@@ -662,7 +770,11 @@ def test_run_all_benchmarks():
 
         workflow_names = {r["workflow"] for r in results}
         assert workflow_names == {
-            "review", "architecture", "debug", "onboard", "pre_merge",
+            "review",
+            "architecture",
+            "debug",
+            "onboard",
+            "pre_merge",
         }
 
         # Each successful result should have total_tokens
@@ -837,13 +949,9 @@ def test_impact_accuracy_emits_both_ground_truth_modes():
     assert impact_accuracy.MODE_CO_CHANGE in modes
 
     graph_rows = [
-        r for r in results
-        if r["ground_truth_mode"] == impact_accuracy.MODE_GRAPH_DERIVED
+        r for r in results if r["ground_truth_mode"] == impact_accuracy.MODE_GRAPH_DERIVED
     ]
-    co_rows = [
-        r for r in results
-        if r["ground_truth_mode"] == impact_accuracy.MODE_CO_CHANGE
-    ]
+    co_rows = [r for r in results if r["ground_truth_mode"] == impact_accuracy.MODE_CO_CHANGE]
 
     for row in graph_rows:
         assert row["status"] == "ok"
@@ -872,10 +980,7 @@ def test_impact_accuracy_co_change_skipped_for_single_file_commit():
         finally:
             store.close()
 
-    co_rows = [
-        r for r in results
-        if r["ground_truth_mode"] == impact_accuracy.MODE_CO_CHANGE
-    ]
+    co_rows = [r for r in results if r["ground_truth_mode"] == impact_accuracy.MODE_CO_CHANGE]
     assert len(co_rows) == 1
     assert co_rows[0]["status"] == "skipped"
     assert "co-changed" in co_rows[0]["error"]
@@ -1030,34 +1135,70 @@ def test_reporter_impact_f1_skips_error_and_co_change_rows():
         results_dir = Path(tmpdir)
         ia_path = results_dir / "mock_impact_accuracy_2026-01-01.csv"
         fieldnames = [
-            "repo", "commit", "ground_truth_mode", "seed_file",
-            "predicted_files", "actual_files", "true_positives",
-            "precision", "recall", "f1", "status", "error",
+            "repo",
+            "commit",
+            "ground_truth_mode",
+            "seed_file",
+            "predicted_files",
+            "actual_files",
+            "true_positives",
+            "precision",
+            "recall",
+            "f1",
+            "status",
+            "error",
         ]
         with open(ia_path, "w", newline="") as f:
             w = csv.DictWriter(f, fieldnames=fieldnames)
             w.writeheader()
-            w.writerow({
-                "repo": "mock", "commit": "abc",
-                "ground_truth_mode": "graph-derived (circular — upper bound)",
-                "seed_file": "", "predicted_files": "2", "actual_files": "2",
-                "true_positives": "1", "precision": "0.5", "recall": "0.5",
-                "f1": "0.5", "status": "ok", "error": "",
-            })
-            w.writerow({
-                "repo": "mock", "commit": "def",
-                "ground_truth_mode": "graph-derived (circular — upper bound)",
-                "seed_file": "", "predicted_files": "", "actual_files": "",
-                "true_positives": "", "precision": "", "recall": "",
-                "f1": "", "status": "error", "error": "boom",
-            })
-            w.writerow({
-                "repo": "mock", "commit": "abc",
-                "ground_truth_mode": "co-change (same commit, seed excluded)",
-                "seed_file": "a.py", "predicted_files": "1", "actual_files": "1",
-                "true_positives": "1", "precision": "1.0", "recall": "1.0",
-                "f1": "0.9", "status": "ok", "error": "",
-            })
+            w.writerow(
+                {
+                    "repo": "mock",
+                    "commit": "abc",
+                    "ground_truth_mode": "graph-derived (circular — upper bound)",
+                    "seed_file": "",
+                    "predicted_files": "2",
+                    "actual_files": "2",
+                    "true_positives": "1",
+                    "precision": "0.5",
+                    "recall": "0.5",
+                    "f1": "0.5",
+                    "status": "ok",
+                    "error": "",
+                }
+            )
+            w.writerow(
+                {
+                    "repo": "mock",
+                    "commit": "def",
+                    "ground_truth_mode": "graph-derived (circular — upper bound)",
+                    "seed_file": "",
+                    "predicted_files": "",
+                    "actual_files": "",
+                    "true_positives": "",
+                    "precision": "",
+                    "recall": "",
+                    "f1": "",
+                    "status": "error",
+                    "error": "boom",
+                }
+            )
+            w.writerow(
+                {
+                    "repo": "mock",
+                    "commit": "abc",
+                    "ground_truth_mode": "co-change (same commit, seed excluded)",
+                    "seed_file": "a.py",
+                    "predicted_files": "1",
+                    "actual_files": "1",
+                    "true_positives": "1",
+                    "precision": "1.0",
+                    "recall": "1.0",
+                    "f1": "0.9",
+                    "status": "ok",
+                    "error": "",
+                }
+            )
 
         tables = generate_readme_tables(results_dir)
 
@@ -1277,10 +1418,12 @@ def test_agent_baseline_aggregate_reports_excluded_rows():
 def test_agent_baseline_aggregate_counts_zero_on_a_healthy_run():
     from code_review_graph.eval.benchmarks import agent_baseline
 
-    agg = agent_baseline.aggregate([
-        {"status": "ok", "baseline_to_graph_ratio": "10.0"},
-        {"status": "ok", "baseline_to_graph_ratio": "20.0"},
-    ])
+    agg = agent_baseline.aggregate(
+        [
+            {"status": "ok", "baseline_to_graph_ratio": "10.0"},
+            {"status": "ok", "baseline_to_graph_ratio": "20.0"},
+        ]
+    )
 
     assert agg["ok_rows"] == 2
     assert agg["no_graph_results_rows"] == 0

@@ -25,11 +25,21 @@ logger = logging.getLogger(__name__)
 # that touches their class, so listing them as test gaps is noise that
 # inflates the gap count and the Untested summary (#850). Names cover
 # PHPUnit/xUnit and Python unittest conventions.
-_TEST_GAP_EXEMPT_NAMES = frozenset({
-    "setUp", "tearDown", "setUpBeforeClass", "tearDownAfterClass",
-    "setup_method", "teardown_method", "setUpClass", "tearDownClass",
-    "__construct", "__init__", "__destruct",
-})
+_TEST_GAP_EXEMPT_NAMES = frozenset(
+    {
+        "setUp",
+        "tearDown",
+        "setUpBeforeClass",
+        "tearDownAfterClass",
+        "setup_method",
+        "teardown_method",
+        "setUpClass",
+        "tearDownClass",
+        "__construct",
+        "__init__",
+        "__destruct",
+    }
+)
 
 _GIT_TIMEOUT = int(os.environ.get("CRG_GIT_TIMEOUT", "30"))  # seconds, configurable
 
@@ -414,7 +424,11 @@ def analyze_changes(
 
     Returns:
         Dict with ``summary``, ``risk_score``, ``changed_functions``,
-        ``affected_flows``, ``test_gaps``, and ``review_priorities``.
+        ``changed_functions_total``, ``affected_flows``, ``test_gaps``,
+        ``review_priorities``, and ``functions_truncated``. Every changed
+        function is analysed unless the opt-in ``CRG_MAX_CHANGED_FUNCS``
+        bound is set; ``functions_truncated`` and the summary report when it
+        cut the analysis.
     """
     # Compute changed ranges if not provided.
     if changed_ranges is None and repo_root is not None:
@@ -440,9 +454,7 @@ def analyze_changes(
     # already-absolute inputs (MCP) pass through pathlib joining unchanged.
     if repo_root is not None:
         _root = Path(repo_root)
-        changed_files = [
-            normalize_file_path(_root / fp) for fp in changed_files
-        ]
+        changed_files = [normalize_file_path(_root / fp) for fp in changed_files]
 
     # Map changes to nodes.
     if changed_ranges:
@@ -456,14 +468,17 @@ def analyze_changes(
     # RTL declarations are stored as Function nodes for compatibility but
     # are not callable/testable functions.
     changed_funcs = [
-        n for n in changed_nodes
-        if n.kind in ("Function", "Test", "Class")
-        and not n.extra.get("verilog_kind")
+        n
+        for n in changed_nodes
+        if n.kind in ("Function", "Test", "Class") and not n.extra.get("verilog_kind")
     ]
 
-    # Cap to prevent O(N*M) query explosion on large PRs.
-    _max_funcs = int(os.environ.get("CRG_MAX_CHANGED_FUNCS", "500"))
-    funcs_truncated = len(changed_funcs) > _max_funcs
+    # The analysis is complete by default. ``CRG_MAX_CHANGED_FUNCS`` is an
+    # explicit opt-in safety bound for pathological change sets; when it
+    # cuts the list, the result reports the untruncated total and says so.
+    changed_functions_total = len(changed_funcs)
+    _max_funcs = _changed_funcs_bound()
+    funcs_truncated = _max_funcs is not None and changed_functions_total > _max_funcs
     if funcs_truncated:
         changed_funcs = changed_funcs[:_max_funcs]
 
@@ -479,10 +494,12 @@ def analyze_changes(
     node_risks: list[dict[str, Any]] = []
     for node in changed_funcs:
         risk = compute_risk_score(store, node, churn_counts)
-        node_risks.append({
-            **node_to_dict(node),
-            "risk_score": risk,
-        })
+        node_risks.append(
+            {
+                **node_to_dict(node),
+                "risk_score": risk,
+            }
+        )
 
     # Overall risk score: max of individual risks, or 0.
     overall_risk = max((nr["risk_score"] for nr in node_risks), default=0.0)
@@ -502,13 +519,15 @@ def analyze_changes(
         # See: #515
         tested = store.get_edges_by_source(node.qualified_name)
         if not any(e.kind == "TESTED_BY" for e in tested):
-            test_gaps.append({
-                "name": _sanitize_name(node.name),
-                "qualified_name": _sanitize_name(node.qualified_name),
-                "file": node.file_path,
-                "line_start": node.line_start,
-                "line_end": node.line_end,
-            })
+            test_gaps.append(
+                {
+                    "name": _sanitize_name(node.name),
+                    "qualified_name": _sanitize_name(node.qualified_name),
+                    "file": node.file_path,
+                    "line_start": node.line_start,
+                    "line_end": node.line_end,
+                }
+            )
 
     # Review priorities: top 10 by risk score.
     review_priorities = sorted(node_risks, key=lambda x: x["risk_score"], reverse=True)[:10]
@@ -542,16 +561,34 @@ def analyze_changes(
         summary_parts.append(f"  - Untested: {', '.join(gap_names)}")
     if funcs_truncated:
         summary_parts.append(
-            f"  - Warning: analysis capped at {_max_funcs} functions "
-            f"(set CRG_MAX_CHANGED_FUNCS to adjust)"
+            f"  - Warning: analysis limited to {_max_funcs} of "
+            f"{changed_functions_total} changed functions by "
+            f"CRG_MAX_CHANGED_FUNCS; unset it for the complete analysis"
         )
 
     return {
         "summary": "\n".join(summary_parts),
         "risk_score": overall_risk,
         "changed_functions": node_risks,
+        "changed_functions_total": changed_functions_total,
         "affected_flows": affected["affected_flows"],
         "test_gaps": test_gaps,
         "review_priorities": review_priorities,
         "functions_truncated": funcs_truncated,
     }
+
+
+def _changed_funcs_bound() -> int | None:
+    """Return the opt-in ``CRG_MAX_CHANGED_FUNCS`` bound, or ``None``.
+
+    Unset means no bound: the change analysis covers every changed
+    function. A set value must be a positive integer; anything else raises
+    instead of silently selecting a different bound.
+    """
+    raw = os.environ.get("CRG_MAX_CHANGED_FUNCS")
+    if raw is None:
+        return None
+    bound = int(raw)
+    if bound < 1:
+        raise ValueError(f"CRG_MAX_CHANGED_FUNCS must be a positive integer, got {raw!r}")
+    return bound

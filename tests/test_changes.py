@@ -117,28 +117,19 @@ class TestChanges:
         result = _parse_unified_diff(diff)
         assert "bar.py" in result
         assert len(result["bar.py"]) == 2
-        assert result["bar.py"][0] == (5, 7)   # 5 + 3 - 1
+        assert result["bar.py"][0] == (5, 7)  # 5 + 3 - 1
         assert result["bar.py"][1] == (21, 24)  # 21 + 4 - 1
 
     def test_parse_unified_diff_single_line(self):
         """Parses a diff where count is omitted (single line change)."""
-        diff = (
-            "--- a/x.py\n"
-            "+++ b/x.py\n"
-            "@@ -1 +1 @@\n"
-            "+changed\n"
-        )
+        diff = "--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n+changed\n"
         result = _parse_unified_diff(diff)
         assert "x.py" in result
         assert result["x.py"][0] == (1, 1)
 
     def test_parse_unified_diff_deletion_only(self):
         """Handles pure deletion hunks (+start,0)."""
-        diff = (
-            "--- a/del.py\n"
-            "+++ b/del.py\n"
-            "@@ -10,3 +10,0 @@ some context\n"
-        )
+        diff = "--- a/del.py\n+++ b/del.py\n@@ -10,3 +10,0 @@ some context\n"
         result = _parse_unified_diff(diff)
         assert "del.py" in result
         # Count=0 means deletion, start=end
@@ -317,14 +308,8 @@ class TestChanges:
         store_flows(self.store, flows)
 
         # Manually set different criticality values
-        self.store._conn.execute(
-            "UPDATE flows SET criticality = 0.9 "
-            "WHERE name = 'hi_entry'"
-        )
-        self.store._conn.execute(
-            "UPDATE flows SET criticality = 0.1 "
-            "WHERE name = 'lo_entry'"
-        )
+        self.store._conn.execute("UPDATE flows SET criticality = 0.9 WHERE name = 'hi_entry'")
+        self.store._conn.execute("UPDATE flows SET criticality = 0.1 WHERE name = 'lo_entry'")
         self.store.commit()
 
         hi = self.store.get_node("hi.py::hi_func")
@@ -405,14 +390,10 @@ class TestChanges:
 
     def test_analyze_changes_lifecycle_methods_not_test_gaps(self):
         """Lifecycle and construction methods are exempt from gaps (#850)."""
-        self._add_func("setUp", path="thing_test_helper.py",
-                       line_start=1, line_end=5)
-        self._add_func("tearDown", path="thing_test_helper.py",
-                       line_start=6, line_end=10)
-        self._add_func("__construct", path="thing.php",
-                       line_start=1, line_end=5)
-        self._add_func("realMethod", path="thing.php",
-                       line_start=6, line_end=20)
+        self._add_func("setUp", path="thing_test_helper.py", line_start=1, line_end=5)
+        self._add_func("tearDown", path="thing_test_helper.py", line_start=6, line_end=10)
+        self._add_func("__construct", path="thing.php", line_start=1, line_end=5)
+        self._add_func("realMethod", path="thing.php", line_start=6, line_end=20)
 
         result = analyze_changes(
             self.store,
@@ -539,8 +520,8 @@ class TestChanges:
         assert getattr(self.store.close, "__func__", None) is GraphStore.close
 
 
-class TestAnalyzeChangesFunctionCap:
-    """Regression tests for O(N) slowdown when PR touches many functions."""
+class TestAnalyzeChangesFunctionBound:
+    """The change analysis is complete unless CRG_MAX_CHANGED_FUNCS opts in."""
 
     def setup_method(self):
         self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
@@ -554,32 +535,60 @@ class TestAnalyzeChangesFunctionCap:
     def _add_funcs(self, count: int, path: str = "app.py") -> None:
         for i in range(count):
             node = NodeInfo(
-                kind="Function", name=f"func_{i}", file_path=path,
-                line_start=i * 10 + 1, line_end=i * 10 + 9, language="python",
+                kind="Function",
+                name=f"func_{i}",
+                file_path=path,
+                line_start=i * 10 + 1,
+                line_end=i * 10 + 9,
+                language="python",
             )
             self.store.upsert_node(node, file_hash="abc")
         self.store.commit()
 
-    def test_changed_funcs_capped(self, monkeypatch):
-        """analyze_changes processes at most CRG_MAX_CHANGED_FUNCS functions."""
+    def test_every_changed_function_is_analysed_by_default(self, monkeypatch):
+        """More changed functions than the former 500 default are all kept."""
+        monkeypatch.delenv("CRG_MAX_CHANGED_FUNCS", raising=False)
+        self._add_funcs(620)
+
+        result = analyze_changes(self.store, changed_files=["app.py"])
+
+        assert len(result["changed_functions"]) == 620
+        assert result["changed_functions_total"] == 620
+        assert len(result["test_gaps"]) == 620
+        assert result["functions_truncated"] is False
+        assert "CRG_MAX_CHANGED_FUNCS" not in result["summary"]
+
+    def test_opt_in_bound_is_reported_with_total(self, monkeypatch):
+        """An explicit CRG_MAX_CHANGED_FUNCS cut states what it omitted."""
         monkeypatch.setenv("CRG_MAX_CHANGED_FUNCS", "10")
         self._add_funcs(20)
 
         result = analyze_changes(self.store, changed_files=["app.py"])
 
         assert len(result["changed_functions"]) == 10
+        assert result["changed_functions_total"] == 20
         assert result["functions_truncated"] is True
+        assert "limited to 10 of 20 changed functions" in result["summary"]
         assert "CRG_MAX_CHANGED_FUNCS" in result["summary"]
 
-    def test_no_truncation_below_cap(self, monkeypatch):
-        """analyze_changes processes all functions when count is below cap."""
+    def test_opt_in_bound_above_count_cuts_nothing(self, monkeypatch):
         monkeypatch.setenv("CRG_MAX_CHANGED_FUNCS", "50")
         self._add_funcs(5)
 
         result = analyze_changes(self.store, changed_files=["app.py"])
 
         assert len(result["changed_functions"]) == 5
+        assert result["changed_functions_total"] == 5
         assert result["functions_truncated"] is False
+
+    @pytest.mark.parametrize("raw", ["0", "-3", "many"])
+    def test_invalid_opt_in_bound_raises(self, monkeypatch, raw):
+        """A malformed bound fails loudly instead of selecting another bound."""
+        monkeypatch.setenv("CRG_MAX_CHANGED_FUNCS", raw)
+        self._add_funcs(3)
+
+        with pytest.raises(ValueError):
+            analyze_changes(self.store, changed_files=["app.py"])
 
 
 class TestAnalyzeChangesInternalParseRemap:
@@ -604,17 +613,23 @@ class TestAnalyzeChangesInternalParseRemap:
 
     def _add_func_at(self, abs_path: str) -> None:
         node = NodeInfo(
-            kind="Function", name="greet", file_path=abs_path,
-            line_start=1, line_end=10, language="python",
+            kind="Function",
+            name="greet",
+            file_path=abs_path,
+            line_start=1,
+            line_end=10,
+            language="python",
         )
         self.store.upsert_node(node, file_hash="abc")
         self.store.commit()
 
     def _spy_map_changes(self, captured: dict):
         """Wrap the real map_changes_to_nodes, capturing changed_ranges."""
+
         def _spy(store, changed_ranges):
             captured["ranges"] = changed_ranges
             return map_changes_to_nodes(store, changed_ranges)
+
         return _spy
 
     def test_internal_parse_remaps_relative_keys_to_absolute(self, tmp_path):
@@ -673,8 +688,12 @@ class TestAnalyzeChangesInternalParseRemap:
     def test_explicit_changed_ranges_not_remapped(self, tmp_path):
         """The explicit changed_ranges path (MCP) must stay untouched."""
         node = NodeInfo(
-            kind="Function", name="rel_func", file_path="app.py",
-            line_start=1, line_end=10, language="python",
+            kind="Function",
+            name="rel_func",
+            file_path="app.py",
+            line_start=1,
+            line_end=10,
+            language="python",
         )
         self.store.upsert_node(node, file_hash="abc")
         self.store.commit()
@@ -761,7 +780,10 @@ class TestFileChurn:
 
     def test_git_log_uses_nul_terminated_paths(self):
         completed = subprocess.CompletedProcess(
-            args=[], returncode=0, stdout="1\t0\tapp.py\0", stderr="",
+            args=[],
+            returncode=0,
+            stdout="1\t0\tapp.py\0",
+            stderr="",
         )
         with patch(
             "code_review_graph.changes.subprocess.run",
@@ -779,14 +801,16 @@ class TestRiskScoreChurn:
         self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
         self.tmp.close()
         self.store = GraphStore(self.tmp.name)
-        self.store.upsert_node(NodeInfo(
-            kind="Function",
-            name="hot_func",
-            file_path="app.py",
-            line_start=1,
-            line_end=10,
-            language="python",
-        ))
+        self.store.upsert_node(
+            NodeInfo(
+                kind="Function",
+                name="hot_func",
+                file_path="app.py",
+                line_start=1,
+                line_end=10,
+                language="python",
+            )
+        )
         self.store.commit()
 
     def teardown_method(self):
@@ -800,10 +824,14 @@ class TestRiskScoreChurn:
         baseline = compute_risk_score(self.store, node)
         assert compute_risk_score(self.store, node, churn_counts=None) == baseline
         saturated = compute_risk_score(
-            self.store, node, churn_counts={"app.py": 10},
+            self.store,
+            node,
+            churn_counts={"app.py": 10},
         )
         extreme = compute_risk_score(
-            self.store, node, churn_counts={"app.py": 10_000},
+            self.store,
+            node,
+            churn_counts={"app.py": 10_000},
         )
 
         assert saturated - baseline == pytest.approx(0.15)
@@ -811,14 +839,16 @@ class TestRiskScoreChurn:
 
     def test_analyze_changes_matches_absolute_graph_paths(self, tmp_path):
         absolute = str(tmp_path / "app.py")
-        self.store.upsert_node(NodeInfo(
-            kind="Function",
-            name="absolute_hot_func",
-            file_path=absolute,
-            line_start=1,
-            line_end=10,
-            language="python",
-        ))
+        self.store.upsert_node(
+            NodeInfo(
+                kind="Function",
+                name="absolute_hot_func",
+                file_path=absolute,
+                line_start=1,
+                line_end=10,
+                language="python",
+            )
+        )
         self.store.commit()
         kwargs = {
             "changed_files": [absolute],

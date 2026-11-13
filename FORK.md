@@ -6,7 +6,7 @@ kept current with upstream `main` and carrying deployment-driven deltas. The
 fork is distributed through the ai-hub host-tools pin (branch `dc-use`, exact
 SHA recorded in the host-tools manifest). Fork releases use PEP 440 local
 versions derived from the current upstream release: upstream is at `2.3.8`
-and the fork is at `2.3.8+dc.3`. The next fork release is `2.3.8+dc.4` while
+and the fork is at `2.3.8+dc.4`. The next fork release is `2.3.8+dc.5` while
 upstream stays at `2.3.8`; when upstream releases a new version, the fork
 rebases onto it and restarts the local suffix at `+dc.1`. Fork version
 numbers are never invented ahead of an upstream release.
@@ -40,7 +40,9 @@ this list at the next sync.
   improvements; graph-backed refactor previews.
 - **MCP surface**: lean curated tool set (`--tools lean` / `CRG_TOOLS=lean`);
   token-budgeted review output; bounded query results; graph-not-built guard
-  for read tools.
+  for read tools; complete change analysis by default (`detect_changes`,
+  `get_review_context`) with caller limits applied exactly and every cut
+  reported (ai-hub ADR-0026 D6).
 - **Runtime**: `doctor` health checklist; FastMCP 4 / MCP 2 migration;
   one-line uv installer; Beads integration for this repository's own
   development; VSCode reader schema alignment.
@@ -54,6 +56,7 @@ this list at the next sync.
 | Embeddings | `CRG_EMBEDDING_MODEL` selects the local model; cloud providers require explicit acceptance env |
 | Serving | `CRG_TOOLS=lean`, `CRG_DETAIL_LEVEL`, `CRG_TOOL_TIMEOUT` bound the MCP surface |
 | Watch daemon | `crg-daemon` start/stop/status with health records, restart backoff, hot config reload |
+| One-process watch | `watch --manifest PATH` watches every `{repo, data_dir}` the JSON manifest names from one process (one thread and observer per repo), reloads the manifest when it is replaced, builds one repo at a time, and exits non-zero on the first watcher failure |
 | Index reuse store | `vstore put/get/list`: index bundles content-addressed by the repo tree hash (`git rev-parse HEAD^{tree}`, gitlinks included) with sha256 receipts and reflink copies (`cp --reflink=auto`, byte-copy fallback); store root is `$CRG_VSTORE`, `$CRG_HOME/vstore`, or `~/.code-review-graph/vstore` |
 
 Known gaps scheduled under the autopilot epic (ai-hub beads `aihub-3t7yh.3`):

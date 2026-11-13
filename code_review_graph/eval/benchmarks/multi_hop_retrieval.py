@@ -82,18 +82,20 @@ def run(repo_path: Path, store, config: dict) -> list[dict]:
                 break
 
         if anchor is None:
-            results.append({
-                "repo": config["name"],
-                "task_id": task_id,
-                "nl_query": nl_query,
-                "anchor_found": False,
-                "anchor_rank": -1,
-                "neighbor_count": 0,
-                "expected_count": len(expected),
-                "matched_count": 0,
-                "neighbor_recall": 0.0,
-                "score": 0.0,
-            })
+            results.append(
+                {
+                    "repo": config["name"],
+                    "task_id": task_id,
+                    "nl_query": nl_query,
+                    "anchor_found": False,
+                    "anchor_rank": -1,
+                    "neighbor_count": 0,
+                    "expected_count": len(expected),
+                    "matched_count": 0,
+                    "neighbor_recall": 0.0,
+                    "score": 0.0,
+                }
+            )
             continue
 
         # Step 2 — single-hop graph traversal from the anchor
@@ -106,7 +108,10 @@ def run(repo_path: Path, store, config: dict) -> list[dict]:
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning(
-                "query_graph(%s) failed on %s: %s", traversal, task_id, exc,
+                "query_graph(%s) failed on %s: %s",
+                traversal,
+                task_id,
+                exc,
             )
             trav = {}
 
@@ -115,17 +120,19 @@ def run(repo_path: Path, store, config: dict) -> list[dict]:
         matched = sum(1 for e in expected if e in names)
         recall = matched / len(expected) if expected else 0.0
 
-        results.append({
-            "repo": config["name"],
-            "task_id": task_id,
-            "nl_query": nl_query,
-            "anchor_found": True,
-            "anchor_rank": anchor_rank,
-            "neighbor_count": len(rows),
-            "expected_count": len(expected),
-            "matched_count": matched,
-            "neighbor_recall": round(recall, 3),
-            "score": round(recall, 3),
-        })
+        results.append(
+            {
+                "repo": config["name"],
+                "task_id": task_id,
+                "nl_query": nl_query,
+                "anchor_found": True,
+                "anchor_rank": anchor_rank,
+                "neighbor_count": len(rows),
+                "expected_count": len(expected),
+                "matched_count": matched,
+                "neighbor_recall": round(recall, 3),
+                "score": round(recall, 3),
+            }
+        )
 
     return results

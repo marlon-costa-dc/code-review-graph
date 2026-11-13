@@ -14,8 +14,18 @@ from code_review_graph import doctor
 
 def _git(repo: Path, *args: str) -> None:
     subprocess.run(
-        ["git", "-C", str(repo), "-c", "user.email=t@example.com",
-         "-c", "user.name=Test", "-c", "commit.gpgsign=false", *args],
+        [
+            "git",
+            "-C",
+            str(repo),
+            "-c",
+            "user.email=t@example.com",
+            "-c",
+            "user.name=Test",
+            "-c",
+            "commit.gpgsign=false",
+            *args,
+        ],
         check=True,
         capture_output=True,
         stdin=subprocess.DEVNULL,
@@ -234,6 +244,7 @@ class TestDoctorCliWiring:
                     0,
                 )
                 from code_review_graph import cli
+
                 with pytest.raises(SystemExit) as exc:
                     cli.main()
                 assert exc.value.code == 0
@@ -246,13 +257,19 @@ class TestDoctorCliWiring:
         with patch.object(sys, "argv", argv):
             with patch("code_review_graph.doctor.run_doctor") as mock_run:
                 mock_run.return_value = (
-                    [doctor.CheckResult(
-                        name="graph", ok=False, critical=True,
-                        message="missing", hint="run build",
-                    )],
+                    [
+                        doctor.CheckResult(
+                            name="graph",
+                            ok=False,
+                            critical=True,
+                            message="missing",
+                            hint="run build",
+                        )
+                    ],
                     1,
                 )
                 from code_review_graph import cli
+
                 with pytest.raises(SystemExit) as exc:
                     cli.main()
                 assert exc.value.code == 1
@@ -263,8 +280,11 @@ class TestPrintReport:
         results = [
             doctor.CheckResult(name="graph", ok=True, message="42 nodes"),
             doctor.CheckResult(
-                name="freshness", ok=False, critical=False,
-                message="stale", hint="run update",
+                name="freshness",
+                ok=False,
+                critical=False,
+                message="stale",
+                hint="run update",
             ),
         ]
         doctor.print_report(results, repo_root=Path("/tmp/x"))
