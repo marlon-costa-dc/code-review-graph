@@ -131,7 +131,10 @@ def watch_set(
                 startup_lock=startup_lock,
             )
         except BaseException as failure:  # recorded for the main loop to raise
-            watcher.failure = failure
+            # A stop requested while queued behind another repository's
+            # initial build unwinds as KeyboardInterrupt; that is a clean stop.
+            if not (isinstance(failure, KeyboardInterrupt) and watcher.stop.is_set()):
+                watcher.failure = failure
         finally:
             store.close()
 

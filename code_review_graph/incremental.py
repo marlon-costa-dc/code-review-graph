@@ -7,7 +7,6 @@ and updates the graph accordingly. Also supports CLI invocation for hooks.
 from __future__ import annotations
 
 import concurrent.futures
-import contextlib
 import fnmatch
 import hashlib
 import json
@@ -2584,7 +2583,8 @@ def watch(
         stop_event: Optional event that ends the loop cleanly, for callers
             that run ``watch`` on a thread they need to shut down.
         startup_lock: Optional lock held around the initial full build, so a
-            process watching several repositories builds them one at a time.
+            process watching several repositories builds them one at a time;
+            while waiting for it the health record reports ``phase=queued``.
 
     Raises:
         RuntimeError: if a watch update fails, or if the filesystem observer
@@ -2650,8 +2650,22 @@ def watch(
         # the repository as it exists now; the pre-watch heartbeat published
         # above exists to cover this build's duration, and the "watching"
         # readiness below is only published once the graph has converged.
-        with startup_lock if startup_lock is not None else contextlib.nullcontext():
+        if startup_lock is None:
             initial = full_build(repo_root, store)
+        else:
+            # Waiting for another repository's build is not a stall: the
+            # heartbeat keeps saying so until this repository's turn comes.
+            while not startup_lock.acquire(timeout=_WATCH_TICK_SECONDS):
+                if stop_event is not None and stop_event.is_set():
+                    raise KeyboardInterrupt
+                supervisor.report_health(observer_alive=True, phase="queued")
+            try:
+                supervisor.report_health(
+                    observer_alive=True, phase="initial-build", force=True
+                )
+                initial = full_build(repo_root, store)
+            finally:
+                startup_lock.release()
         _raise_watch_update_errors(initial, "initial watch build")
         # A full build rewrites the graph wholesale, so post-processing runs for
         # any non-empty convergence — parsed files, or a now-empty repo whose
