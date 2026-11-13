@@ -3741,7 +3741,9 @@ class CodeParser:
                     )
                 )
                 code_chunks.append(cell.source)
-                current_line += cell_line_count + 1
+                # "\n".join only terminates a cell whose source lacks a final
+                # newline; a cell that already ends in one gains a blank line.
+                current_line += cell_line_count + (1 if cell.source.endswith("\n") else 0)
 
             concatenated = "\n".join(code_chunks)
             concat_bytes = concatenated.encode("utf-8")

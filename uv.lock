@@ -576,7 +576,7 @@ wheels = [
 
 [[package]]
 name = "code-review-graph"
-version = "2.3.8+dc.3"
+version = "2.3.8+dc.4"
 source = { editable = "." }
 dependencies = [
     { name = "fastmcp" },
