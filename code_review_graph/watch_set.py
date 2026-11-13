@@ -196,7 +196,9 @@ def watch_set(
                 stop(repo)
             except BaseException as failure:
                 if active is not None:
-                    active.add_note(f"stopping the watcher for {repo} also failed: {failure!r}")
+                    # The original failure stays the one raised; this one is
+                    # logged with its traceback so it is not lost.
+                    logger.exception("Stopping the watcher for %s also failed", repo)
                 elif cleanup_failure is None:
                     cleanup_failure = failure
         if previous_handler is not None:
