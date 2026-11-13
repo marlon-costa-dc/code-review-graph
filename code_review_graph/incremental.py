@@ -1287,7 +1287,9 @@ def _repository_relative_path(repo_root: Path, path: Path) -> str:
         path.resolve().relative_to(repo_root)
     except ValueError as exc:
         raise RuntimeError(f"index path escapes repository root: {path}") from exc
-    return str(relative)
+    # Relative paths are reported to consumers; keep them POSIX like every
+    # other graph identity (#774), not backslashed on Windows.
+    return relative.as_posix()
 
 
 def _parse_single_file(
