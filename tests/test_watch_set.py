@@ -162,3 +162,42 @@ class TestWatchManifestCli:
             cli_main_argv(["watch", "--manifest", str(manifest)])
         assert exited.value.code == 1
         assert f"watch for {repo} failed" in capsys.readouterr().err
+
+
+class TestQueuedWatcherLiveness:
+    def test_dead_observer_while_queued_fails_the_watcher(self, tmp_path):
+        """A watcher waiting for another repository's build still dies loudly."""
+        from watchdog.observers import Observer
+
+        from code_review_graph.incremental import watch
+
+        repo, data_dir = _repo(tmp_path, "queued")
+        startup_lock = threading.Lock()
+        observer = Observer()
+        failures: list[BaseException] = []
+
+        def run() -> None:
+            with GraphStore(data_dir / "graph.db") as store:
+                try:
+                    watch(repo, store, observer=observer, startup_lock=startup_lock)
+                except BaseException as failure:  # surfaced to the test thread
+                    failures.append(failure)
+
+        startup_lock.acquire()
+        thread = threading.Thread(target=run, daemon=True)
+        try:
+            thread.start()
+            _until(
+                lambda: (read_watch_health(repo) or {}).get("phase") == "queued",
+                "the watcher to queue",
+            )
+            _until(lambda: bool(observer.emitters), "the observer to schedule")
+            # The dispatcher thread dying is a death no reschedule repairs.
+            observer.stop()
+            thread.join(timeout=_DEADLINE_SECONDS)
+        finally:
+            startup_lock.release()
+        assert not thread.is_alive()
+        assert len(failures) == 1
+        assert isinstance(failures[0], RuntimeError)
+        assert "stopped while queued" in str(failures[0])

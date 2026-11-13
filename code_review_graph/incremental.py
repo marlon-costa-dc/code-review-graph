@@ -2658,6 +2658,8 @@ def watch(
             while not startup_lock.acquire(timeout=_WATCH_TICK_SECONDS):
                 if stop_event is not None and stop_event.is_set():
                     raise KeyboardInterrupt
+                # A repaired emitter needs no replay here: the initial build
+                # that follows this wait reads the whole tree anyway.
                 queued_dead, _ = supervisor.check_liveness()
                 if queued_dead:
                     names = ", ".join(queued_dead)

@@ -180,16 +180,29 @@ def watch_set(
             if repo not in watchers and repo not in unwinding:
                 start(target)
 
-    def stop_all() -> None:
-        for watcher in [*watchers.values(), *retiring]:
+    def stop_all(*, report_failures: bool) -> BaseException | None:
+        """Stop and join every watcher; return the first problem found.
+
+        Every watcher is joined even when one is stuck, so one slow build
+        never leaves the others running.  Watcher failures are reported only
+        when no failure is already propagating (it is that same failure).
+        """
+        everyone = [*watchers.values(), *retiring]
+        for watcher in everyone:
             watcher.stop.set()
-        for watcher in [*watchers.values(), *retiring]:
+        first: BaseException | None = None
+        for watcher in everyone:
             if watcher.thread is not None:
                 watcher.thread.join(timeout=_WATCH_STOP_TIMEOUT * 2)
-                if watcher.thread.is_alive():
-                    raise TimeoutError(f"watcher for {watcher.target.repo} did not stop")
-        for watcher in [*watchers.values(), *retiring]:
-            raise_failure(watcher)
+                if watcher.thread.is_alive() and first is None:
+                    first = TimeoutError(f"watcher for {watcher.target.repo} did not stop")
+        if report_failures and first is None:
+            for watcher in everyone:
+                if watcher.failure is not None:
+                    first = RuntimeError(f"watch for {watcher.target.repo} failed")
+                    first.__cause__ = watcher.failure
+                    break
+        return first
 
     previous_handler = None
     if threading.current_thread() is threading.main_thread():
@@ -213,13 +226,13 @@ def watch_set(
     finally:
         active = sys.exc_info()[1]
         try:
-            stop_all()
-        except BaseException:
-            if active is None:
-                raise
-            # The original failure stays the one raised; this one is logged
-            # with its traceback so it is not lost.
-            logger.exception("Stopping the watchers also failed")
+            problem = stop_all(report_failures=active is None)
+            if problem is not None:
+                if active is None:
+                    raise problem
+                # The original failure stays the one raised; this one is
+                # logged so it is not lost.
+                logger.error("Stopping the watchers also failed: %s", problem)
         finally:
             if previous_handler is not None:
                 signal.signal(signal.SIGTERM, previous_handler)
