@@ -8,7 +8,6 @@ from unittest.mock import patch
 
 import pytest
 
-import code_review_graph.tools  # noqa: F401 - exposes lazy patch targets
 from code_review_graph import cli
 
 

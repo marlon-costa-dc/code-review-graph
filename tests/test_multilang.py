@@ -1,6 +1,7 @@
 """Tests for Go, Rust, Java, C, C++, C#, Ruby, PHP, Kotlin, Swift, Solidity, and Vue parsing."""
 
 import subprocess
+from importlib import import_module
 from pathlib import Path
 
 import pytest
@@ -4167,7 +4168,7 @@ class TestHCLParsing:
 # ---------------------------------------------------------------------------
 
 try:
-    import yaml as _yaml_check  # noqa: F401
+    import_module("yaml")
 
     _YAML_AVAILABLE = True
 except ImportError:

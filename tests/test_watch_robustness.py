@@ -674,6 +674,82 @@ class TestObserverLiveness:
 
 
 class TestWatchLoop:
+    def test_native_batch_observer_stop_joins_its_real_streams(self, tmp_path):
+        from watchdog.events import FileSystemEventHandler
+
+        from code_review_graph._watchfiles import WatchfilesObserver
+
+        original = set(threading.enumerate())
+        observer = WatchfilesObserver(timeout=5, max_streams=2)
+        observer.schedule(FileSystemEventHandler(), str(tmp_path), recursive=False)
+        observer.start()
+        observer.stop()
+        observer.join(timeout=5)
+        assert not observer.is_alive()
+        assert not (set(threading.enumerate()) - original)
+
+    def test_native_batch_observer_join_preserves_a_callback_failure(self, tmp_path):
+        from watchdog.events import FileSystemEventHandler
+
+        from code_review_graph._watchfiles import WatchfilesObserver
+
+        called = threading.Event()
+
+        class FailingHandler(FileSystemEventHandler):
+            def on_created(self, event):
+                called.set()
+                raise RuntimeError("native callback failed")
+
+        original = set(threading.enumerate())
+        observer = WatchfilesObserver(timeout=5, max_streams=2)
+        observer.schedule(FailingHandler(), str(tmp_path), recursive=False)
+        observer.start()
+        (tmp_path / "source.py").write_text("value = 1\n", encoding="utf-8")
+        assert called.wait(5)
+        observer.stop()
+        with pytest.raises(RuntimeError, match="native callback failed"):
+            observer.join(timeout=5)
+        assert not observer.is_alive()
+        assert not (set(threading.enumerate()) - original)
+
+    def test_default_observer_bounds_threads_across_many_ignored_subtrees(
+        self, tmp_path, watch_repository
+    ):
+        """Many real schedules retain coverage without one thread pair per path."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / ".gitignore").write_text("**/target/\n", encoding="utf-8")
+        (repo / ".code-review-graphignore").write_text("**/target/\n", encoding="utf-8")
+        for index in range(32):
+            module = repo / f"module{index}"
+            (module / "target").mkdir(parents=True)
+            (module / "source.py").write_text("def value():\n    return 1\n", encoding="utf-8")
+        subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+        subprocess.run(["git", "add", "."], cwd=repo, check=True)
+        original_threads = set(threading.enumerate())
+        wait_for = TestRealObserver()._wait_for
+        with watch_repository(repo) as (reader, thread):
+            assert wait_for(
+                lambda: (read_watch_health(repo) or {}).get("phase") == "watching"
+            ), "the native multi-path observer did not become ready"
+            health = read_watch_health(repo)
+            assert health is not None and health["watched_paths"] >= 32
+            assert len(set(threading.enumerate()) - original_threads) <= 8
+            changed = repo / "module31" / "source.py"
+            changed.write_text("def changed():\n    return 2\n", encoding="utf-8")
+            assert wait_for(
+                lambda: any(
+                    node.name == "changed" for node in reader.get_nodes_by_file(str(changed))
+                )
+            ), "the last scheduled module stopped receiving events"
+            ignored = repo / "module31" / "target" / "ignored.py"
+            ignored.write_text("def excluded():\n    return 3\n", encoding="utf-8")
+            assert ignored.as_posix() not in reader.get_all_files()
+            assert thread.is_alive()
+        assert not (set(threading.enumerate()) - original_threads), "observer threads leaked"
+        with GraphStore(repo / "graph.db") as stopped:
+            assert ignored.as_posix() not in stopped.get_all_files()
+
     def _watch_with(self, tmp_path, store, observer, sleeper, health_interval=0.0, **kwargs):
         with (
             patch("watchdog.observers.Observer", return_value=observer),
@@ -1346,6 +1422,70 @@ def _write_health(repo_root: Path, **fields) -> None:
 
 
 class TestStatusSurfacesStalls:
+    def test_concurrent_health_reads_allow_atomic_replacement(self, tmp_path):
+        from concurrent.futures import ThreadPoolExecutor
+
+        path = watch_health_path(tmp_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        padding = "heartbeat" * 8192
+
+        def payload(generation):
+            return json.dumps(
+                {"updated_at": time.time(), "generation": generation, "data": padding}
+            )
+
+        path.write_text(payload(0), encoding="utf-8")
+        ready = threading.Barrier(5)
+        stop = threading.Event()
+
+        def read_continuously():
+            ready.wait(timeout=10)
+            reads = 0
+            while not stop.is_set():
+                health = read_watch_health(tmp_path)
+                assert health is not None
+                assert health["data"] == padding
+                assert isinstance(health["generation"], int)
+                reads += 1
+            return reads
+
+        with ThreadPoolExecutor(max_workers=4) as readers:
+            futures = [readers.submit(read_continuously) for _ in range(4)]
+            try:
+                ready.wait(timeout=10)
+                temporary = path.with_suffix(".tmp")
+                for generation in range(1, 201):
+                    temporary.write_text(payload(generation), encoding="utf-8")
+                    temporary.replace(path)
+            finally:
+                stop.set()
+            assert all(future.result(timeout=10) > 0 for future in futures)
+
+        final = read_watch_health(tmp_path)
+        assert final is not None and final["generation"] == 200
+        if sys.platform == "win32":
+            import ctypes
+            from ctypes import wintypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.GetProcessHandleCount.argtypes = (
+                wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)
+            )
+            kernel32.GetProcessHandleCount.restype = wintypes.BOOL
+
+            def handle_count():
+                count = wintypes.DWORD()
+                if not kernel32.GetProcessHandleCount(wintypes.HANDLE(-1), ctypes.byref(count)):
+                    raise ctypes.WinError(ctypes.get_last_error())
+                return count.value
+
+            before = handle_count()
+            for _ in range(100):
+                assert read_watch_health(tmp_path) is not None
+            assert handle_count() == before, "heartbeat readers leaked native Windows handles"
+        path.unlink()
+        assert read_watch_health(tmp_path) is None
+
     def test_missing_health_reads_as_unknown(self, tmp_path):
         assert read_watch_health(tmp_path) is None
         assert watcher_status(True, None) == "unknown"

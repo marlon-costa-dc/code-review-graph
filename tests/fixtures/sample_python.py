@@ -1,7 +1,7 @@
 """Sample Python file for testing the parser."""
 
 import os
-from pathlib import Path  # noqa: F401 — used by parser tests
+from pathlib import Path as Path
 
 
 class BaseService:

@@ -1035,7 +1035,7 @@ def _check_available() -> bool:
     """Check whether local embedding support is available."""
     with _MODEL_INIT_LOCK:
         try:
-            import sentence_transformers  # noqa: F401
+            __import__("sentence_transformers")
 
             return True
         except ImportError:
@@ -1202,7 +1202,7 @@ class EmbeddingStore:
     def __enter__(self) -> "EmbeddingStore":
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb) -> None:  # type: ignore[no-untyped-def]
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
         self.close()
 
     def close(self) -> None:

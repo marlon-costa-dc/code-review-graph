@@ -21,11 +21,14 @@ import sys
 import threading
 import time
 import uuid
+from bisect import bisect_left
+from collections.abc import Collection, Sequence
+from importlib import import_module
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, NamedTuple, Optional, Protocol, runtime_checkable
 
 from watchdog.events import FileSystemEventHandler
-from watchdog.observers.api import BaseObserver, EventEmitter, ObservedWatch
+from watchdog.observers.api import BaseObserver, ObservedWatch
 
 from code_review_graph.daemon import watch_health_path
 
@@ -99,7 +102,7 @@ def _run_python_resolver(store: GraphStore) -> Optional[dict]:
         from .python_resolver import resolve_python_imports
 
         return resolve_python_imports(store)
-    except Exception as exc:  # noqa: BLE001 - best-effort post-pass
+    except Exception as exc:
         logger.warning("Python import resolver failed: %s", exc)
         return None
 
@@ -144,7 +147,7 @@ def _run_spring_event_resolver(store: GraphStore) -> Optional[dict]:
         from .event_resolver import resolve_spring_events
 
         return resolve_spring_events(store)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.warning("Spring event resolver failed: %s", exc)
         return None
 
@@ -172,7 +175,7 @@ def _run_hcl_resolver(store: GraphStore) -> Optional[dict]:
         from .hcl_resolver import resolve_hcl_module_references
 
         return resolve_hcl_module_references(store)
-    except Exception as exc:  # noqa: BLE001 - best-effort post-pass
+    except Exception as exc:
         logger.warning("Terraform/HCL resolver failed: %s", exc)
         return None
 
@@ -183,7 +186,7 @@ def _run_scoped_resolver(store: GraphStore) -> Optional[dict]:
         from .scoped_resolver import resolve_scoped_calls
 
         return resolve_scoped_calls(store)
-    except Exception as exc:  # noqa: BLE001 - best-effort post-pass
+    except Exception as exc:
         logger.warning("Scoped call resolver failed: %s", exc)
         return None
 
@@ -1811,7 +1814,7 @@ def _plan_watch_subtree(
     repo_root: Path,
     ignore_patterns: list[str],
     depth: int,
-    max_depth: int,
+    max_depth: int | None,
     cache: dict[Path, list[Path]],
     split_threshold: int = _WATCH_SPLIT_MIN_DIRS,
 ) -> tuple[bool, list[tuple[Path, bool]]]:
@@ -1832,7 +1835,7 @@ def _plan_watch_subtree(
         else:
             kept.append(child)
     clean = ignored_weight < split_threshold
-    if depth >= max_depth:
+    if max_depth is not None and depth >= max_depth:
         if clean:
             return True, [(directory, True)]
         return False, [(directory, False)] + [(child, True) for child in kept]
@@ -1852,7 +1855,7 @@ def _plan_watch_paths(
     repo_root: Path,
     ignore_patterns: list[str],
     max_depth: int = _WATCH_PLAN_DEPTH,
-    max_schedules: int = _MAX_WATCH_SCHEDULES,
+    max_schedules: int | None = _MAX_WATCH_SCHEDULES,
     split_threshold: int = _WATCH_SPLIT_MIN_DIRS,
 ) -> list[tuple[Path, bool]]:
     """Return the ``(path, recursive)`` watches that cover the repo.
@@ -1862,6 +1865,12 @@ def _plan_watch_paths(
     to the single recursive root watch.
     """
     cache: dict[Path, list[Path]] = {}
+    if max_schedules is None:
+        # Multi-path streams do not spend two threads per scheduled directory.
+        # Select the complete ignore-aware topology instead of a thread-budget proxy.
+        return _plan_watch_subtree(
+            repo_root, repo_root, ignore_patterns, 0, None, cache, 1
+        )[1]
     for depth in range(max(1, max_depth), 0, -1):
         _, plan = _plan_watch_subtree(
             repo_root, repo_root, ignore_patterns, 0, depth, cache, split_threshold
@@ -1942,7 +1951,7 @@ class _WatchSupervisor:
         repo_root: Path,
         ignore_patterns: list[str],
         health_path: Path | None = None,
-        max_schedules: int = _MAX_WATCH_SCHEDULES,
+        max_schedules: int | None = _MAX_WATCH_SCHEDULES,
     ) -> None:
         self._observer = observer
         # One boundary resolves the path.  ``--repo .`` stays relative all the
@@ -1951,7 +1960,7 @@ class _WatchSupervisor:
         self._repo_root = Path(os.path.abspath(repo_root))
         self._ignore_patterns = ignore_patterns
         self._health_path = health_path
-        self._max_schedules = max(1, max_schedules)
+        self._max_schedules = None if max_schedules is None else max(1, max_schedules)
         self._handler: Any = None
         self._watches: dict[str, _WatchEntry] = {}
         self._shallow: set[str] = set()
@@ -2096,6 +2105,10 @@ class _WatchSupervisor:
         promoting the parent.
         """
         cache: dict[Path, list[Path]] = {}
+        if self._max_schedules is None:
+            return _plan_watch_subtree(
+                directory, self._repo_root, self._ignore_patterns, 0, None, cache, 1
+            )[1]
         available = self._max_schedules - len(self._watches)
         if available <= 0:
             return None
@@ -2340,13 +2353,16 @@ def _create_watch_handler(
                 return None
             return str(relative)
 
-        def _stored_descendants(self, relative_directory: str) -> set[str]:
+        def _stored_descendants(
+            self, relative_directory: str, files: Sequence[str]
+        ) -> set[str]:
             # Stored file paths use POSIX separators (#774).
             directory = normalize_file_path(repo_root / relative_directory) + "/"
+            lower = bisect_left(files, directory)
+            upper = bisect_left(files, directory[:-1] + "0")
             return {
                 str(Path(file_path).relative_to(repo_root))
-                for file_path in store.get_all_files()
-                if file_path.startswith(directory)
+                for file_path in files[lower:upper]
             }
 
         def _parseable_file(self, relative_path: str) -> bool:
@@ -2382,7 +2398,7 @@ def _create_watch_handler(
                 and not _should_ignore(str(path.relative_to(repo_root)), ignore_patterns)
             }
 
-        def _event_paths(self, event: FileSystemEvent) -> set[str]:
+        def _event_paths(self, event: FileSystemEvent, files: Sequence[str]) -> set[str]:
             paths: set[str] = set()
             source = self._relative_path(os.fsdecode(event.src_path))
             destination_path = getattr(event, "dest_path", "")
@@ -2391,7 +2407,7 @@ def _create_watch_handler(
             )
             if event.is_directory:
                 if source is not None and event.event_type in {"deleted", "moved"}:
-                    paths.update(self._stored_descendants(source))
+                    paths.update(self._stored_descendants(source, files))
                 if destination is not None:
                     paths.update(self._parseable_descendants(destination))
                 elif source is not None and event.event_type == "created":
@@ -2399,6 +2415,8 @@ def _create_watch_handler(
             else:
                 if source is not None and event.event_type in {"deleted", "moved"}:
                     paths.add(source)
+                    # Native multi-path notifications do not retain a deleted path's kind.
+                    paths.update(self._stored_descendants(source, files))
                 elif source is not None and self._parseable_file(source):
                     paths.add(source)
                 if destination is not None and self._parseable_file(destination):
@@ -2411,8 +2429,14 @@ def _create_watch_handler(
             self.last_event_at = time.time()
             self.events_seen += len(events)
             try:
+                # One sorted native inventory serves every deletion in this batch.
+                files = (
+                    store.get_all_files()
+                    if any(event.event_type in {"deleted", "moved"} for event in events)
+                    else []
+                )
                 changed_files = sorted(
-                    {path for event in events for path in self._event_paths(event)}
+                    {path for event in events for path in self._event_paths(event, files)}
                 )
                 if not changed_files:
                     return
@@ -2542,7 +2566,7 @@ class ObserverProtocol(Protocol):
     def ident(self) -> int | None: ...
 
     @property
-    def emitters(self) -> set[EventEmitter]: ...
+    def emitters(self) -> Collection[threading.Thread]: ...
 
     def schedule(
         self, event_handler: FileSystemEventHandler, path: str, *, recursive: bool = False
@@ -2593,7 +2617,8 @@ def watch(
             stops running.
     """
     from watchdog.events import DirCreatedEvent, DirDeletedEvent
-    from watchdog.observers import Observer
+
+    from code_review_graph._watchfiles import WatchfilesObserver
 
     # One boundary, once: ``--repo .`` reaches here relative, and every path
     # comparison below — stored file paths, watch keys, event paths — assumes
@@ -2613,26 +2638,31 @@ def watch(
         repo_root,
         _load_ignore_patterns(repo_root),
         health_path=watch_health_path(repo_root),
+        max_schedules=None if observer is None else _MAX_WATCH_SCHEDULES,
     )
     # The first build of a large repository takes minutes.  Without a
     # heartbeat up front, ``crg-daemon status`` calls that healthy watcher
     # stalled for the whole build.
     supervisor.report_health(observer_alive=True, phase="initial-build", force=True)
-    observer = Observer() if observer is None else observer
+    observer = (
+        WatchfilesObserver(timeout=_WATCH_STOP_TIMEOUT, max_streams=_MAX_WATCH_SCHEDULES)
+        if observer is None
+        else observer
+    )
     supervisor.attach(observer)
     handler = _create_watch_handler(repo_root, store, on_files_updated)
     restore_sigterm = _install_sigterm_interrupt()
 
     def stop_observer() -> None:
         _run_time_boxed(observer.stop, "observer stop", timeout=_WATCH_STOP_TIMEOUT)
-        if observer.is_alive():
+        if observer.ident is not None:
             observer.join(timeout=_WATCH_STOP_TIMEOUT)
         if observer.is_alive():
             raise TimeoutError(f"watch observer did not stop in {_WATCH_STOP_TIMEOUT:g}s")
 
     try:
-        observer.start()
         supervisor.schedule_initial(handler)
+        observer.start()
         # Capture the observer threads before publishing readiness.  Otherwise a
         # watched directory can disappear after the health file is visible but
         # before the first tick records its emitter as live; that dead emitter is
@@ -2775,7 +2805,7 @@ def start_watch_thread(
     Returns the started thread, or None if watchdog is unavailable.
     """
     try:
-        import watchdog  # noqa: F401
+        import_module("watchdog")
     except ImportError:
         logger.warning("watchdog not installed; auto-watch disabled")
         return None

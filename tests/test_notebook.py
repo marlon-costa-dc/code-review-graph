@@ -3,6 +3,8 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from code_review_graph.parser import _SQL_TABLE_RE, CodeParser
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -48,6 +50,31 @@ class TestNotebookParsing:
         assert funcs["multiply"].extra.get("cell_index") == 2
         # DataProcessor.__init__ is in cell index 3
         assert funcs["__init__"].extra.get("cell_index") == 3
+
+    @pytest.mark.parametrize("first_ending", ["", "\n", "\n\n"])
+    @pytest.mark.parametrize("second_ending", ["", "\n", "\n\n"])
+    def test_cell_indices_follow_concatenated_source(self, first_ending, second_ending):
+        sources = [
+            "def first():\n    return 'olá'" + first_ending,
+            "def second():\n    return first()" + second_ending,
+            "class Third:\n    def method(self):\n        return second()",
+        ]
+        notebook = {
+            "cells": [{"cell_type": "code", "source": source} for source in sources],
+            "metadata": {"kernelspec": {"language": "python"}},
+            "nbformat": 4,
+        }
+        nodes, edges = self.parser.parse_bytes(
+            Path("line_endings.ipynb"), json.dumps(notebook).encode("utf-8")
+        )
+        definitions = {node.name: node for node in nodes if node.kind != "File"}
+        assert definitions["first"].extra["cell_index"] == 0
+        assert definitions["second"].extra["cell_index"] == 1
+        assert definitions["Third"].extra["cell_index"] == 2
+        assert definitions["method"].extra["cell_index"] == 2
+        assert definitions["second"].line_start == sources[0].count("\n") + 2
+        assert definitions["Third"].line_start == sum(s.count("\n") + 1 for s in sources[:2]) + 1
+        assert any(edge.kind == "CALLS" and edge.target.endswith("::first") for edge in edges)
 
     def test_cross_cell_calls(self):
         calls = [e for e in self.edges if e.kind == "CALLS"]

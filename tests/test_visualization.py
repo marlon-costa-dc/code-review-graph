@@ -229,7 +229,7 @@ def test_generate_html(store_with_data, tmp_path):
 # must load D3 from a same-origin vendored file so `visualize --serve` works
 # on offline/filtered networks, while keeping SRI integrity verification.
 _D3_FILENAME = "d3.v7.min.js"
-_D3_CDN_URL = "https://d3js.org/d3.v7.min.js"
+_D3_CDN_URL = "https://cdn.jsdelivr.net/npm/d3@7.9.0/dist/d3.min.js"
 _D3_SRI_HASH = "sha384-CjloA8y00+1SDAUkjs099PVfnY2KmDC2BZnws9kh8D/lX1s46w6EPhpXdqMfjK6i"
 
 
@@ -259,7 +259,7 @@ def test_generated_html_loads_d3_same_origin_with_sri(store_with_data, tmp_path,
     assert f'integrity="{_D3_SRI_HASH}"' in local_tag.group(0)
 
     # CDN fallback (only used when the local asset is missing) keeps the
-    # security invariant: SRI hash AND crossorigin on the d3js.org tag.
+    # security invariant: SRI hash AND crossorigin on the versioned CDN tag.
     fallback = [s for s in inline_scripts if _D3_CDN_URL in s]
     assert len(fallback) == 1
     assert f'integrity="{_D3_SRI_HASH}"' in fallback[0]

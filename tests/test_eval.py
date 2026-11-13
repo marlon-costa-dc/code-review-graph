@@ -4,6 +4,7 @@ import csv
 import os
 import subprocess
 import tempfile
+from importlib import import_module
 from pathlib import Path
 
 import pytest
@@ -17,16 +18,16 @@ from code_review_graph.eval.reporter import (
 )
 
 try:
-    import yaml as _yaml  # noqa: F401
+    import_module("yaml")
 
     from code_review_graph.eval.runner import load_all_configs, load_config, write_csv
 
     _HAS_YAML = True
 except ImportError:
     _HAS_YAML = False
-    load_all_configs = None  # type: ignore[assignment]
-    load_config = None  # type: ignore[assignment]
-    write_csv = None  # type: ignore[assignment]
+    load_all_configs = None
+    load_config = None
+    write_csv = None
 from code_review_graph.eval.scorer import (
     compute_mrr,
     compute_precision_recall,

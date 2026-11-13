@@ -5,12 +5,21 @@ from __future__ import annotations
 import logging
 import sqlite3
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict
 
 from .graph import GraphStore
 from .search import hybrid_search
 
 logger = logging.getLogger(__name__)
+
+
+class QuestionTokenResult(TypedDict):
+    """Numeric benchmark evidence for one question, before JSON reporting."""
+
+    question: str
+    naive_tokens: int
+    graph_tokens: int
+    reduction_ratio: float
 
 # Sample questions for benchmarking
 _SAMPLE_QUESTIONS = [
@@ -118,7 +127,14 @@ def run_token_benchmark(
             }
         )
 
-    avg_ratio = sum(ratios) / len(ratios) if ratios else 0.0
+    if results:
+        total = sum(
+            r["reduction_ratio"]
+            for r in results
+        )
+        avg_ratio = total / len(results)
+    else:
+        avg_ratio = 0.0
 
     return {
         "naive_corpus_tokens": naive_total,

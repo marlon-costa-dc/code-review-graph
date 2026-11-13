@@ -175,13 +175,19 @@ def get_knowledge_gaps_func(
         return not_built if not_built is not None else _not_built_response()
     try:
         raw = find_knowledge_gaps(store)
+        categories = (
+            ("isolated_nodes", raw["isolated_nodes"]),
+            ("thin_communities", raw["thin_communities"]),
+            ("untested_hotspots", raw["untested_hotspots"]),
+            ("single_file_communities", raw["single_file_communities"]),
+        )
         # Totals must come from the untruncated lists: the summary counts are
         # the whole point of the tool, and capping them would hide the gap.
-        totals = {category: len(rows) for category, rows in raw.items()}
+        totals = {category: len(rows) for category, rows in categories}
 
         gaps: dict[str, list[dict[str, Any]]] = {}
         truncated = False
-        for category, rows in raw.items():
+        for category, rows in categories:
             visible, _total, cut = _bounded(
                 rows,
                 max_per_category,

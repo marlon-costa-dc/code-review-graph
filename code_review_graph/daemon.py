@@ -547,7 +547,7 @@ def load_state(path: Path | None = None) -> dict[str, Any]:
     if not state_path.exists():
         return {}
     try:
-        return json.loads(state_path.read_text(encoding="utf-8"))  # type: ignore[no-any-return]
+        return json.loads(state_path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
         return {}
 
@@ -585,6 +585,38 @@ def watch_health_path(repo_root: str | Path) -> Path:
     return watch_health_dir() / f"{digest}.json"
 
 
+def _read_health_text(path: Path) -> str:
+    """Read a heartbeat without preventing the publisher's atomic replacement."""
+    if sys.platform != "win32":
+        return path.read_text(encoding="utf-8")
+
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.argtypes = (
+        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+        wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+    )
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    # GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+    # OPEN_EXISTING and FILE_ATTRIBUTE_NORMAL. CRT open omits delete sharing.
+    handle = kernel32.CreateFileW(str(path), 0x80000000, 0x7, None, 3, 0x80, None)
+    if handle == wintypes.HANDLE(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        descriptor = msvcrt.open_osfhandle(handle, os.O_RDONLY | os.O_BINARY)
+    except BaseException:
+        kernel32.CloseHandle(handle)
+        raise
+    # open_osfhandle transfers ownership; closing the stream closes the HANDLE.
+    with os.fdopen(descriptor, "r", encoding="utf-8") as stream:
+        return stream.read()
+
+
 def read_watch_health(
     repo_root: str | Path,
     *,
@@ -596,7 +628,7 @@ def read_watch_health(
     ``stalled`` (observer reported dead, or heartbeat too old).
     """
     try:
-        raw = watch_health_path(repo_root).read_text(encoding="utf-8")
+        raw = _read_health_text(watch_health_path(repo_root))
         data = json.loads(raw)
     except (OSError, json.JSONDecodeError, ValueError):
         return None
@@ -682,7 +714,7 @@ class ConfigWatcher:
 
             watcher = self
 
-            class _Handler(FileSystemEventHandler):  # type: ignore[misc]
+            class _Handler(FileSystemEventHandler):
                 def on_modified(self, event: Any) -> None:
                     if Path(event.src_path).resolve() == watcher._config_path.resolve():
                         watcher._on_config_changed()
@@ -827,7 +859,7 @@ class WatchDaemon:
 
         msg = f"Daemon started — watching {len(self._config.repos)} repo(s)"
         logger.info(msg)
-        print(msg)  # noqa: T201
+        print(msg)
 
     def stop(self) -> None:
         """Tear down the daemon: stop watchers, terminate children."""
@@ -1248,7 +1280,7 @@ class WatchDaemon:
                 repo.path,
             ]
 
-        log_fd = open(log_path, "ab")  # noqa: SIM115
+        log_fd = open(log_path, "ab")
         try:
             proc = subprocess.Popen(
                 cmd,

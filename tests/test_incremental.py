@@ -7,7 +7,7 @@ import subprocess
 import threading
 import time
 from pathlib import Path
-from unittest.mock import MagicMock, call, patch  # noqa: F401 – used in tests
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 
@@ -1444,7 +1444,7 @@ class TestMultiHopDependents:
             original = member.read_bytes()
             (repo / "c.ts").write_text("export function c() { return 2; }", encoding="utf-8")
             result = incremental_update(repo, store, changed_files=["c.ts"])
-            assert result["dependent_files"] == ["modules/member/member.ts"]
+            assert result["dependent_files"] == [str(Path("modules") / "member" / "member.ts")]
             assert store.get_nodes_by_file(str(member))
             assert member.read_bytes() == original
 

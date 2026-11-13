@@ -137,6 +137,8 @@ Build the code review graph for this project
 ```
 
 The initial build takes ~10 seconds for a 500-file project. After that, watch mode and supported hooks can keep the graph updated automatically.
+Watch mode batches its ignore-aware paths into native multi-path streams, separating recursive and non-recursive paths. Observer threads stay bounded per repository; adding a watched directory preserves the previous streams until their replacements are ready.
+For this default observer, `CRG_MAX_WATCH_SCHEDULES` bounds native streams rather than directory paths. The complete ignore-aware topology is retained; an insufficient stream budget fails before startup instead of registering ignored subtrees.
 
 
 ## How It Works
