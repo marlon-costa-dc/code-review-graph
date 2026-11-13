@@ -968,6 +968,14 @@ def main() -> None:
         default=None,
         help="External directory to store graph database (useful for network shares)",
     )
+    watch_cmd.add_argument(
+        "--manifest",
+        default=None,
+        help=(
+            "JSON manifest of {repo, data_dir} entries: one process watches every "
+            "listed repository and reloads the manifest when it is replaced"
+        ),
+    )
     _add_embedding_refresh_args(watch_cmd)
 
     # status
@@ -1864,6 +1872,26 @@ def main() -> None:
             logging.error(result.get("error", "embed_graph failed"))
             sys.exit(1)
         print(result.get("summary", "Embedding done."))
+        return
+
+    if args.command == "watch" and args.manifest:
+        if args.repo or args.data_dir:
+            ap.error("watch --manifest names every repository; drop --repo and --data-dir")
+        from .postprocessing import run_post_processing
+        from .watch_set import watch_set
+
+        try:
+            watch_set(
+                Path(args.manifest).expanduser(),
+                on_files_updated=(
+                    partial(run_post_processing, **embedding_refresh_kwargs)
+                    if embedding_refresh_kwargs
+                    else run_post_processing
+                ),
+            )
+        except RuntimeError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            sys.exit(1)
         return
 
     if args.command in ("update", "detect-changes"):

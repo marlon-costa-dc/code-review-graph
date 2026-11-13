@@ -91,6 +91,7 @@ def run_token_benchmark(
     naive_total = compute_naive_tokens(repo_root)
 
     results = []
+    ratios: list[float] = []
     for q in questions:
         search_results = hybrid_search(store, q, limit=5)
         # Simulate graph context: search results + neighbors
@@ -107,23 +108,17 @@ def run_token_benchmark(
             ratio = naive_total / graph_tokens
         else:
             ratio = 0
+        ratios.append(round(ratio, 1))
         results.append(
             {
                 "question": q,
                 "naive_tokens": naive_total,
                 "graph_tokens": graph_tokens,
-                "reduction_ratio": round(ratio, 1),
+                "reduction_ratio": ratios[-1],
             }
         )
 
-    if results:
-        total = sum(
-            r["reduction_ratio"]
-            for r in results  # type: ignore[misc]
-        )
-        avg_ratio = float(total) / len(results)  # type: ignore[arg-type]
-    else:
-        avg_ratio = 0.0
+    avg_ratio = sum(ratios) / len(ratios) if ratios else 0.0
 
     return {
         "naive_corpus_tokens": naive_total,

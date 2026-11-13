@@ -7,6 +7,7 @@ and updates the graph accordingly. Also supports CLI invocation for hooks.
 from __future__ import annotations
 
 import concurrent.futures
+import contextlib
 import fnmatch
 import hashlib
 import json
@@ -2560,6 +2561,7 @@ def watch(
     stop_event: threading.Event | None = None,
     *,
     observer: ObserverProtocol | None = None,
+    startup_lock: threading.Lock | None = None,
 ) -> None:
     """Watch for file changes and auto-update the graph.
 
@@ -2581,6 +2583,8 @@ def watch(
             owns its scheduling and complete lifecycle.
         stop_event: Optional event that ends the loop cleanly, for callers
             that run ``watch`` on a thread they need to shut down.
+        startup_lock: Optional lock held around the initial full build, so a
+            process watching several repositories builds them one at a time.
 
     Raises:
         RuntimeError: if a watch update fails, or if the filesystem observer
@@ -2646,7 +2650,8 @@ def watch(
         # the repository as it exists now; the pre-watch heartbeat published
         # above exists to cover this build's duration, and the "watching"
         # readiness below is only published once the graph has converged.
-        initial = full_build(repo_root, store)
+        with startup_lock if startup_lock is not None else contextlib.nullcontext():
+            initial = full_build(repo_root, store)
         _raise_watch_update_errors(initial, "initial watch build")
         # A full build rewrites the graph wholesale, so post-processing runs for
         # any non-empty convergence — parsed files, or a now-empty repo whose
