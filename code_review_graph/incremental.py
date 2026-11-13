@@ -2658,6 +2658,16 @@ def watch(
             while not startup_lock.acquire(timeout=_WATCH_TICK_SECONDS):
                 if stop_event is not None and stop_event.is_set():
                     raise KeyboardInterrupt
+                queued_dead, _ = supervisor.check_liveness()
+                if queued_dead:
+                    names = ", ".join(queued_dead)
+                    supervisor.report_health(
+                        observer_alive=False,
+                        dead_threads=tuple(queued_dead),
+                        phase="queued",
+                        force=True,
+                    )
+                    raise RuntimeError(f"watch observer stopped while queued: {names}")
                 supervisor.report_health(observer_alive=True, phase="queued")
             try:
                 supervisor.report_health(

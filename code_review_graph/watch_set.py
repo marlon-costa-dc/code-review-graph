@@ -119,10 +119,16 @@ def watch_set(
     stopping = stop_event if stop_event is not None else threading.Event()
     startup_lock = threading.Lock()
     watchers: dict[Path, _Watcher] = {}
+    # Removed from the manifest but still unwinding (a running initial build
+    # does not look at its stop event); reaped on a later tick, never joined
+    # inline, so one slow build cannot stall or tear down the others.
+    retiring: list[_Watcher] = []
+    desired: dict[Path, WatchTarget] = {}
 
     def run(watcher: _Watcher) -> None:
-        store = GraphStore(watcher.target.data_dir / _DATABASE_NAME)
+        store: GraphStore | None = None
         try:
+            store = GraphStore(watcher.target.data_dir / _DATABASE_NAME)
             watch(
                 watcher.target.repo,
                 store,
@@ -136,7 +142,8 @@ def watch_set(
             if not (isinstance(failure, KeyboardInterrupt) and watcher.stop.is_set()):
                 watcher.failure = failure
         finally:
-            store.close()
+            if store is not None:
+                store.close()
 
     def start(target: WatchTarget) -> None:
         watcher = _Watcher(target=target)
@@ -150,58 +157,69 @@ def watch_set(
         watcher.thread.start()
         logger.info("Watching %s (graph %s)", target.repo, target.data_dir)
 
-    def stop(repo: Path) -> None:
-        watcher = watchers.pop(repo)
-        watcher.stop.set()
-        if watcher.thread is not None:
-            watcher.thread.join(timeout=_WATCH_STOP_TIMEOUT * 2)
-            if watcher.thread.is_alive():
-                raise TimeoutError(f"watcher for {repo} did not stop")
+    def raise_failure(watcher: _Watcher) -> None:
         if watcher.failure is not None:
-            raise RuntimeError(f"watch for {repo} failed") from watcher.failure
-        logger.info("Stopped watching %s", repo)
+            raise RuntimeError(f"watch for {watcher.target.repo} failed") from watcher.failure
 
-    def reconcile(targets: tuple[WatchTarget, ...]) -> None:
-        desired = {target.repo: target for target in targets}
+    def reap() -> None:
+        for watcher in [item for item in retiring if not item.thread or not item.thread.is_alive()]:
+            retiring.remove(watcher)
+            raise_failure(watcher)
+            logger.info("Stopped watching %s", watcher.target.repo)
+
+    def reconcile() -> None:
         for repo in [repo for repo in watchers if desired.get(repo) != watchers[repo].target]:
-            stop(repo)
+            watcher = watchers.pop(repo)
+            watcher.stop.set()
+            retiring.append(watcher)
+        reap()
+        unwinding = {watcher.target.repo for watcher in retiring}
         for repo, target in desired.items():
-            if repo not in watchers:
+            # A repository still unwinding keeps its graph until it is reaped;
+            # starting a second writer on that graph would race it.
+            if repo not in watchers and repo not in unwinding:
                 start(target)
+
+    def stop_all() -> None:
+        for watcher in [*watchers.values(), *retiring]:
+            watcher.stop.set()
+        for watcher in [*watchers.values(), *retiring]:
+            if watcher.thread is not None:
+                watcher.thread.join(timeout=_WATCH_STOP_TIMEOUT * 2)
+                if watcher.thread.is_alive():
+                    raise TimeoutError(f"watcher for {watcher.target.repo} did not stop")
+        for watcher in [*watchers.values(), *retiring]:
+            raise_failure(watcher)
 
     previous_handler = None
     if threading.current_thread() is threading.main_thread():
         previous_handler = signal.signal(signal.SIGTERM, lambda *_: stopping.set())
     try:
         version = _manifest_version(manifest)
-        reconcile(load_manifest(manifest))
+        desired = {target.repo: target for target in load_manifest(manifest)}
+        reconcile()
         logger.info("Watching %d repositories from one process", len(watchers))
         while not stopping.wait(_WATCH_TICK_SECONDS):
-            failed = [watcher for watcher in watchers.values() if watcher.failure is not None]
-            if failed:
-                first = failed[0]
-                raise RuntimeError(f"watch for {first.target.repo} failed") from first.failure
+            for watcher in watchers.values():
+                raise_failure(watcher)
             current = _manifest_version(manifest)
             if current != version:
                 version = current
-                reconcile(load_manifest(manifest))
-                logger.info("Manifest reloaded: %d repositories", len(watchers))
+                desired = {target.repo: target for target in load_manifest(manifest)}
+                logger.info("Manifest reloaded: %d repositories", len(desired))
+            reconcile()
     except KeyboardInterrupt:
         stopping.set()
     finally:
         active = sys.exc_info()[1]
-        cleanup_failure: BaseException | None = None
-        for repo in list(watchers):
-            try:
-                stop(repo)
-            except BaseException as failure:
-                if active is not None:
-                    # The original failure stays the one raised; this one is
-                    # logged with its traceback so it is not lost.
-                    logger.exception("Stopping the watcher for %s also failed", repo)
-                elif cleanup_failure is None:
-                    cleanup_failure = failure
-        if previous_handler is not None:
-            signal.signal(signal.SIGTERM, previous_handler)
-        if cleanup_failure is not None:
-            raise cleanup_failure
+        try:
+            stop_all()
+        except BaseException:
+            if active is None:
+                raise
+            # The original failure stays the one raised; this one is logged
+            # with its traceback so it is not lost.
+            logger.exception("Stopping the watchers also failed")
+        finally:
+            if previous_handler is not None:
+                signal.signal(signal.SIGTERM, previous_handler)

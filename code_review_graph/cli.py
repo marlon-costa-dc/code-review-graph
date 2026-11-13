@@ -1874,8 +1874,8 @@ def main() -> None:
         print(result.get("summary", "Embedding done."))
         return
 
-    if args.command == "watch" and args.manifest:
-        if args.repo or args.data_dir:
+    if args.command == "watch" and args.manifest is not None:
+        if args.repo is not None or args.data_dir is not None:
             ap.error("watch --manifest names every repository; drop --repo and --data-dir")
         from .postprocessing import run_post_processing
         from .watch_set import watch_set

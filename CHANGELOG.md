@@ -37,7 +37,10 @@ Fork deltas and release history are documented in [FORK.md](FORK.md). Fork
 versions are PEP 440 local versions of the current upstream release (`2.3.8`);
 they are never invented ahead of an upstream release:
 
-- `2.3.8+dc.3` — current: deployment hardening batch (serve startup fix,
+- `2.3.8+dc.4` — current: one process watches every repository a manifest
+  names (`watch --manifest`); notebook cells without a final newline keep
+  their cell index; vendored D3 restored to its pinned bytes
+- `2.3.8+dc.3` — deployment hardening batch (serve startup fix,
   atomic indexing, VCS inventory, fallback removal, batched writes)
 - `2.3.8+dc.2` — PEP 440 local version publishing repair
 - `2.3.8+dc.1` — initial fork local version

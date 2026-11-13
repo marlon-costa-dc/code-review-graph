@@ -21,6 +21,17 @@ from code_review_graph.graph import GraphStore
 from code_review_graph.incremental import full_build
 from code_review_graph.watch_set import load_manifest, watch_set
 
+
+def cli_main_argv(argv: list[str]) -> None:
+    """Run the real console entry point with ``argv``."""
+    import sys
+    from unittest.mock import patch
+
+    from code_review_graph.cli import main
+
+    with patch.object(sys, "argv", ["code-review-graph", *argv]):
+        main()
+
 _DEADLINE_SECONDS = 60.0
 
 
@@ -83,7 +94,7 @@ class TestWatchSet:
             except BaseException as failure:  # surfaced to the test thread
                 failures.append(failure)
 
-        thread = threading.Thread(target=run)
+        thread = threading.Thread(target=run, daemon=True)
         thread.start()
         try:
             _until(lambda: _watching(first) and _watching(second), "both watchers")
@@ -97,6 +108,10 @@ class TestWatchSet:
             _write_manifest(manifest, [(first, first_data)])
             _until(lambda: not watch_health_path(second).exists(), "second to stop")
             assert _watching(first)
+
+            _write_manifest(manifest, [(first, first_data), (second, second_data)])
+            _until(lambda: _watching(second), "second to start again")
+            assert read_watch_health(second)["pid"] == os.getpid()
         finally:
             stop.set()
             thread.join(timeout=_DEADLINE_SECONDS)
@@ -113,7 +128,8 @@ class TestWatchSet:
         _write_manifest(manifest, [(repo, empty)])
 
         with pytest.raises(ValueError, match="build it before watching"):
-            load_manifest(manifest)
+            watch_set(manifest, stop_event=threading.Event())
+        assert not watch_health_path(repo).exists()
 
     def test_duplicate_repository_is_refused(self, tmp_path):
         repo, data_dir = _repo(tmp_path, "dup")
@@ -125,3 +141,24 @@ class TestWatchSet:
 
         with pytest.raises(ValueError, match="duplicate repository"):
             load_manifest(manifest)
+
+
+class TestWatchManifestCli:
+    def test_manifest_rejects_repo_and_data_dir(self, tmp_path, capsys):
+        manifest = tmp_path / "watch.json"
+        _write_manifest(manifest, [])
+        with pytest.raises(SystemExit) as exited:
+            cli_main_argv(["watch", "--manifest", str(manifest), "--repo", str(tmp_path)])
+        assert exited.value.code == 2
+        assert "drop --repo and --data-dir" in capsys.readouterr().err
+
+    def test_failing_watcher_exits_one(self, tmp_path, capsys):
+        repo, data_dir = _repo(tmp_path, "broken")
+        # A graph whose file is not a database fails when the watcher opens it.
+        (data_dir / "graph.db").write_bytes(b"not a sqlite database")
+        manifest = tmp_path / "watch.json"
+        _write_manifest(manifest, [(repo, data_dir)])
+        with pytest.raises(SystemExit) as exited:
+            cli_main_argv(["watch", "--manifest", str(manifest)])
+        assert exited.value.code == 1
+        assert f"watch for {repo} failed" in capsys.readouterr().err
