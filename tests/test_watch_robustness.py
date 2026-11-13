@@ -1200,10 +1200,9 @@ class TestRealObserver:
 
         def write_sources():
             version = 1
-            staged = source.with_suffix(".writing")
+            # In place: Windows denies replacing a file the watcher has open.
             while not stop_writer.is_set():
-                staged.write_text(f"def version():\n    return {version}\n", encoding="utf-8")
-                staged.replace(source)
+                source.write_text(f"def version():\n    return {version}\n", encoding="utf-8")
                 version += 1
                 stop_writer.wait(0.02)
 
@@ -1297,9 +1296,10 @@ class TestRealObserver:
                     for emitter in observer.emitters
                 )
             ), "the new directory did not receive a recursive watch"
-            assert self._wait_for(
-                lambda: (created / "svc.py").as_posix() in reader.get_all_files()
-            ), "the new directory was not indexed"
+            indexed = (created / "svc.py").as_posix()
+            assert self._wait_for(lambda: indexed in reader.get_all_files()), (
+                "the new directory was not indexed"
+            )
             assert all(emitter.watch.path != str(ignored) for emitter in observer.emitters)
             assert ignored_file.as_posix() not in reader.get_all_files()
             nested = repo / "src" / "nested"

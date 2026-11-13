@@ -22,6 +22,10 @@ Use the code-review-graph MCP tools to explore and understand the codebase.
 - Use `children_of` on a file to see all its functions and classes.
 - Use `find_large_functions_tool` to identify complex code.
 
+## Graph Freshness
+
+- If `get_minimal_context_tool` returns `status: not_ready`, or `code-review-graph status` reports a commit other than `HEAD`, refresh the graph with the build-graph skill before trusting any result.
+
 ## Token Efficiency Rules
 - Start with `get_minimal_context_tool(task="<your task>")` before other graph tools.
 - Use `detail_level="minimal"` on all calls. Only escalate to "standard" when minimal is insufficient.
