@@ -18,9 +18,14 @@ Use the knowledge graph to plan and execute refactoring with confidence.
 ### Safety Checks
 
 - Always preview before applying (rename mode gives you an edit list).
+- Map the cascade before a rename or move: `query_graph_tool` with `callers_of`, `importers_of` and `tests_for` on the target.
 - Check `get_impact_radius_tool` before major refactors.
 - Use `get_affected_flows_tool` to ensure no critical paths are broken.
 - Run `find_large_functions_tool` to identify decomposition targets.
+
+## Graph Freshness
+
+- If `get_minimal_context_tool` returns `status: not_ready`, or `code-review-graph status` reports a commit other than `HEAD`, refresh the graph with the build-graph skill before trusting any result.
 
 ## Token Efficiency Rules
 - Start with `get_minimal_context_tool(task="<your task>")` before other graph tools.
