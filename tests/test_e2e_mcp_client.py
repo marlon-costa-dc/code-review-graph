@@ -378,6 +378,13 @@ def test_shared_postprocess_invalidates_previous_refresh(tmp_path):
         )
 
     run("build")
+    mixed = subprocess.run(
+        [sys.executable, "-m", "code_review_graph", "status",
+         "--repo", str(repo), "--data-dir", str(tmp_path / "other")],
+        env=env, capture_output=True, text=True, timeout=30, check=False,
+    )
+    assert mixed.returncode == 2
+    assert "Select either CRG_SHARED_DB or --data-dir" in mixed.stderr
     run("update")
     assert "Reused the completed refresh" in run("update")
     run("postprocess")

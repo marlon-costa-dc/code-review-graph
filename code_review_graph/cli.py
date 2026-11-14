@@ -3407,6 +3407,11 @@ def _dispatch() -> None:
         "watch",
     })
     explicit_data_dir = bool(getattr(args, "data_dir", None))
+    if explicit_data_dir:
+        from .shared_sqlite import shared_database
+
+        if shared_database() is not None:
+            ap.error("Select either CRG_SHARED_DB or --data-dir")
     read_only_explicit_data_dir = (
         args.command in _read_only_db_cmds and explicit_data_dir
     )
