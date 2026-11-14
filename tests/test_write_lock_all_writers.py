@@ -403,18 +403,33 @@ def test_full_refresh_completes_a_minimal_build_without_source_edits(repo):
     assert "flows_detected" not in repeated
 
 
-def test_watch_batch_retried_behind_a_writer_is_counted_once(repo, held):
+def test_watch_coalesces_edits_after_deferring_a_batch(repo, held, monkeypatch):
+    deferred = threading.Event()
+    requeue = incremental._WatchDebouncer.requeue
+
+    def signal_requeue(debouncer, events):
+        requeue(debouncer, events)
+        deferred.set()
+
+    monkeypatch.setattr(incremental._WatchDebouncer, "requeue", signal_requeue)
+    postprocessed = []
     with GraphStore(incremental.get_db_path(repo)) as store:
-        handler = incremental._create_watch_handler(repo, store, None)
+        handler = incremental._create_watch_handler(repo, store, postprocessed.append)
         handler.start()
         try:
-            handler.dispatch(_edit(repo, "countedOnce"))
-            time.sleep(0.5)
+            handler.dispatch(_edit(repo, "supersededEdit"))
+            assert deferred.wait(_BOUND), "the observer did not defer its batch"
+            for _ in range(20):
+                handler.dispatch(_edit(repo, "finalEdit"))
             held.release()
-            assert _wait_for(lambda: "countedOnce" in _names(repo, repo / "keep.py"))
-            assert handler.events_seen == 1
+            assert _wait_for(lambda: "finalEdit" in _names(repo, repo / "keep.py"))
         finally:
             handler.stop()
+        handler.raise_if_failed()
+
+    assert "supersededEdit" not in _names(repo, repo / "keep.py")
+    assert handler.events_seen == 1
+    assert len(postprocessed) == 1
 
 
 def test_watch_can_stop_while_a_batch_waits_for_the_lock(repo, held):
