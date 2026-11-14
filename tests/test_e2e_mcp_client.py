@@ -386,6 +386,40 @@ def test_shared_postprocess_invalidates_previous_refresh(tmp_path):
 
 
 @pytest.mark.e2e
+def test_shared_cli_reuses_watcher_reconciliation(tmp_path):
+    repo = _make_fixture_repo(tmp_path)
+    env = {**_server_env(tmp_path / "home"), "CRG_SHARED_DB": str(tmp_path / "shared.db")}
+
+    def cli(*args):
+        return [sys.executable, "-m", "code_review_graph", *args, "--repo", str(repo)]
+
+    subprocess.check_call(cli("build"), env=env, timeout=30)
+    relative = "pkg/view.py"
+    (repo / relative).write_text("def reconciled_by_watch(): return 1\n", encoding="utf-8")
+    log = tmp_path / "watch.log"
+    with log.open("wb") as output, subprocess.Popen(
+        cli("watch"), env={**env, "CRG_WATCH_HEALTH_INTERVAL": "1"},
+        stdout=output, stderr=subprocess.STDOUT,
+    ) as watcher:
+        try:
+            deadline = time.monotonic() + 30
+            while "Watching " not in log.read_text(encoding="utf-8"):
+                assert watcher.poll() is None, log.read_text(encoding="utf-8")
+                assert time.monotonic() < deadline, log.read_text(encoding="utf-8")
+                time.sleep(0.1)
+            assert "Reused the completed refresh" in subprocess.check_output(
+                cli("update"), env=env, text=True, timeout=30,
+            )
+            query = json.loads(subprocess.check_output(
+                cli("query", "file_summary", relative), env=env, text=True, timeout=30,
+            ))
+            assert "reconciled_by_watch" in {row["name"] for row in query["results"]}
+        finally:
+            watcher.terminate()
+            watcher.wait(timeout=15)
+
+
+@pytest.mark.e2e
 def test_shared_cli_crash_rolls_back_written_rows(tmp_path):
     repo = _make_fixture_repo(tmp_path)
     env = {**_server_env(tmp_path / "home"), "CRG_SERIAL_PARSE": "1",

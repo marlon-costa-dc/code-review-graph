@@ -59,6 +59,8 @@ def _refresh_profile(
                      if key.startswith("CRG_") and key not in {
                          "CRG_REPO_ROOT", "CRG_PARSE_EXECUTOR", "CRG_SERIAL_PARSE",
                          "CRG_PARSE_WORKERS", "CRG_FOLLOW_SYMLINKS",
+                         "CRG_DATA_DIR", "CRG_HOME", "CRG_WATCH_HEALTH_INTERVAL",
+                         "CRG_WATCH_HEALTH_STALE",
                      })),
     )
 

@@ -13,7 +13,8 @@ A refresh owns the native writer lock for that file and publishes its changes
 together in one transaction. An interrupted writer loses the kernel lock and
 its uncommitted changes. A caller may reuse a completion only for its own
 checkout, matching inputs and graph profile. The watcher and tool callers use
-the same writer and completion records.
+the same writer and completion records. Data directory routing and watcher
+health reporting do not change the refresh profile for a shared file.
 
 A parser worker may reuse a syntax tree for identical preprocessed bytes
 and the same loaded grammar. It still extracts nodes and resolves names for
