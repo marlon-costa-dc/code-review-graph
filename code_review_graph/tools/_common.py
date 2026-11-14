@@ -501,15 +501,17 @@ def _resolve_graph_file_paths_with_unmatched(
     for file_path in file_paths:
         matched = False
         raw = file_path.replace("\\", "/")
-        candidates = [raw]
-        path = Path(file_path)
-        if path.is_absolute():
-            try:
-                candidates.append(str(path.resolve().relative_to(root)).replace("\\", "/"))
-            except ValueError:
-                pass
-        else:
-            candidates.append(normalize_file_path(root / path))
+        candidates = []
+        if raw:
+            candidates.append(raw)
+            path = Path(raw)
+            if path.is_absolute():
+                try:
+                    candidates.append(path.resolve().relative_to(root).as_posix())
+                except ValueError:
+                    pass
+            else:
+                candidates.append(normalize_file_path(root / path))
 
         for candidate in candidates:
             if store.get_nodes_by_file(candidate):

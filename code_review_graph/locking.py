@@ -97,32 +97,32 @@ def _flock_supported() -> bool:
     return sys.platform != "win32"
 
 
-def _flock(handle: Any, blocking: bool) -> bool:
-    """Take an exclusive lock on *handle*. Returns False when it is held."""
-    import fcntl
+if sys.platform == "win32":
+    def _lock_file(handle: Any, blocking: bool) -> bool:
+        """Lock the first byte until the descriptor closes, even for an empty file."""
+        import msvcrt
 
-    flags = fcntl.LOCK_EX if blocking else fcntl.LOCK_EX | fcntl.LOCK_NB
-    try:
-        fcntl.flock(handle.fileno(), flags)
-    except OSError as exc:
-        if exc.errno in (errno.EACCES, errno.EAGAIN):
-            return False
-        raise
-    return True
+        handle.seek(0)
+        try:
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK if blocking else msvcrt.LK_NBLCK, 1)
+        except OSError as exc:
+            if exc.errno in (errno.EACCES, errno.EAGAIN, errno.EDEADLK):
+                return False
+            raise
+        return True
+else:
+    def _lock_file(handle: Any, blocking: bool) -> bool:
+        """Take an exclusive lock on the open file description."""
+        import fcntl
 
-
-def _windows_owner_lock(handle: Any, blocking: bool) -> bool:
-    """Lock the first byte until the descriptor closes, even for an empty file."""
-    import msvcrt
-
-    handle.seek(0)
-    try:
-        msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK if blocking else msvcrt.LK_NBLCK, 1)
-    except OSError as exc:
-        if exc.errno in (errno.EACCES, errno.EAGAIN, errno.EDEADLK):
-            return False
-        raise
-    return True
+        flags = fcntl.LOCK_EX if blocking else fcntl.LOCK_EX | fcntl.LOCK_NB
+        try:
+            fcntl.flock(handle.fileno(), flags)
+        except OSError as exc:
+            if exc.errno in (errno.EACCES, errno.EAGAIN):
+                return False
+            raise
+        return True
 
 
 def read_write_lock_holder(db_path: Path) -> int | None:
@@ -187,8 +187,7 @@ class WriteLock:
         _open_locks.add(self)
         acquired = False
         try:
-            acquire = _flock if use_flock else _windows_owner_lock
-            acquired = acquire(handle, blocking)
+            acquired = _lock_file(handle, blocking)
         except OSError as exc:
             if self._strict:
                 raise

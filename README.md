@@ -700,9 +700,9 @@ the shared registry records their locations. It is not a second graph store.
 | `CRG_MAX_IMPACT_NODES` | Maximum nodes in impact analysis | `500` |
 | `CRG_MAX_IMPACT_DEPTH` | Search depth for blast-radius analysis | `2` |
 | `CRG_MAX_BFS_DEPTH` | Maximum depth for graph traversal | `15` |
-| `CRG_MAX_CHANGED_FUNCS` | Maximum changed functions analysed in one change report | `500` |
+| `CRG_MAX_CHANGED_FUNCS` | Maximum changed functions analysed in one change report | - |
 | `CRG_MAX_DELETION_FILES` | Maximum files whose old version is read in one change report, to name the functions and classes a diff deleted | `100` |
-| `CRG_MAX_CHANGED_YAML_PATHS` | Maximum changed YAML paths analysed in one change report, and separately the same number of JSON paths | `200` |
+| `CRG_MAX_CHANGED_YAML_PATHS` | Maximum changed paths shown per format (YAML and JSON separately); totals stay complete | - |
 | `CRG_MAX_TRANSITIVE_FRONTIER` | Maximum callees followed per hop when `tests_for` and `detect-changes` look for tests. The first by name are kept, so one graph always gives one answer | `50` |
 | `CRG_CALLER_TEST_ROUTE_DEPTH` | Hops to walk up incoming `CALLS` when looking for a tested caller of an untested changed symbol. Reported as a note, never as coverage | `2` |
 | `CRG_CALLER_TEST_ROUTE_MAX_CALLERS` | Maximum callers examined while looking for that tested caller | `500` |
