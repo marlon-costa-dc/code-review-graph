@@ -213,7 +213,7 @@ def test_store_file_batch_normalizes_file_key(tmp_path):
         )
         store.store_file_nodes_edges("C:/repo/src/app.py", [node], [], "old")
         # Re-storing under the native-Windows spelling must replace, not duplicate.
-        store.apply_file_changes_atomic([("C:\\repo\\src\\app.py", [node], [], "new")])
+        store.store_file_batch([("C:\\repo\\src\\app.py", [node], [], "new")])
         assert len(store.get_nodes_by_file("C:/repo/src/app.py")) == 1
     finally:
         store.close()
