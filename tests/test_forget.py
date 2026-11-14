@@ -50,7 +50,9 @@ class TestMatchFilesToForget:
         assert cli._match_files_to_forget(self.stored, ["missing.py"], Path("/repo")) == []
 
     def test_multiple_patterns_are_unioned_and_deduplicated(self):
-        matched = cli._match_files_to_forget(self.stored, ["pkg/auth.py", "pkg"], Path("/repo"))
+        matched = cli._match_files_to_forget(
+            self.stored, ["pkg/auth.py", "pkg"], Path("/repo")
+        )
         assert matched == ["/repo/pkg/auth.py", "/repo/pkg/views.py"]
 
     def test_blank_pattern_is_ignored(self):
@@ -63,20 +65,12 @@ def _seed_file(store: GraphStore, abs_path: str, symbol: str) -> None:
         abs_path,
         [
             NodeInfo(
-                kind="File",
-                name=abs_path,
-                file_path=abs_path,
-                line_start=1,
-                line_end=40,
-                language="python",
+                kind="File", name=abs_path, file_path=abs_path,
+                line_start=1, line_end=40, language="python",
             ),
             NodeInfo(
-                kind="Function",
-                name=symbol,
-                file_path=abs_path,
-                line_start=5,
-                line_end=20,
-                language="python",
+                kind="Function", name=symbol, file_path=abs_path,
+                line_start=5, line_end=20, language="python",
             ),
         ],
         [],

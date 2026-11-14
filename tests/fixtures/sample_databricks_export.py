@@ -6,7 +6,6 @@ from pathlib import Path
 def load_config():
     return {"env": os.getenv("ENV", "dev")}
 
-
 # COMMAND ----------
 
 # MAGIC %sql
@@ -28,11 +27,9 @@ def load_config():
 
 # COMMAND ----------
 
-
 def process_events(config):
     path = Path(config["env"])
     return load_config()
-
 
 # COMMAND ----------
 

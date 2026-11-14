@@ -26,7 +26,9 @@ locals {
     assert any(node.name == "local.selected" for node in nodes)
     local_qn = "infra/locals.tf::local.selected"
     targets = {
-        edge.target for edge in edges if edge.kind == "REFERENCES" and edge.source == local_qn
+        edge.target
+        for edge in edges
+        if edge.kind == "REFERENCES" and edge.source == local_qn
     }
     assert targets == {
         "infra/locals.tf::var.items",

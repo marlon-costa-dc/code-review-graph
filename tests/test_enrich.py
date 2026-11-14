@@ -53,7 +53,9 @@ class TestExtractPattern:
         assert extract_pattern("Write", {"content": "hello"}) is None
 
     def test_bash_rg_with_glob_flag(self):
-        result = extract_pattern("Bash", {"command": "rg --glob '*.py' parse_file"})
+        result = extract_pattern(
+            "Bash", {"command": "rg --glob '*.py' parse_file"}
+        )
         assert result == "parse_file"
 
 
@@ -74,30 +76,18 @@ class TestEnrichSearch:
         posix_dir = Path(self.tmpdir).as_posix()
         nodes = [
             NodeInfo(
-                kind="Function",
-                name="parse_file",
-                file_path=f"{posix_dir}/parser.py",
-                line_start=10,
-                line_end=50,
-                language="python",
-                params="(path: str)",
-                return_type="list[Node]",
+                kind="Function", name="parse_file", file_path=f"{posix_dir}/parser.py",
+                line_start=10, line_end=50, language="python",
+                params="(path: str)", return_type="list[Node]",
             ),
             NodeInfo(
-                kind="Function",
-                name="full_build",
-                file_path=f"{posix_dir}/build.py",
-                line_start=1,
-                line_end=30,
-                language="python",
+                kind="Function", name="full_build", file_path=f"{posix_dir}/build.py",
+                line_start=1, line_end=30, language="python",
             ),
             NodeInfo(
-                kind="Test",
-                name="test_parse_file",
+                kind="Test", name="test_parse_file",
                 file_path=f"{posix_dir}/test_parser.py",
-                line_start=1,
-                line_end=20,
-                language="python",
+                line_start=1, line_end=20, language="python",
                 is_test=True,
             ),
         ]
@@ -108,8 +98,7 @@ class TestEnrichSearch:
                 kind="CALLS",
                 source=f"{posix_dir}/build.py::full_build",
                 target=f"{posix_dir}/parser.py::parse_file",
-                file_path=f"{posix_dir}/build.py",
-                line=15,
+                file_path=f"{posix_dir}/build.py", line=15,
             ),
             EdgeInfo(
                 # TESTED_BY edges are stored as source=production, target=test
@@ -117,8 +106,7 @@ class TestEnrichSearch:
                 kind="TESTED_BY",
                 source=f"{posix_dir}/parser.py::parse_file",
                 target=f"{posix_dir}/test_parser.py::test_parse_file",
-                file_path=f"{posix_dir}/test_parser.py",
-                line=1,
+                file_path=f"{posix_dir}/test_parser.py", line=1,
             ),
         ]
         for e in edges:
@@ -171,28 +159,16 @@ class TestEnrichFileRead:
         self.file_path = (Path(self.tmpdir) / "parser.py").as_posix()
         nodes = [
             NodeInfo(
-                kind="File",
-                name="parser.py",
-                file_path=self.file_path,
-                line_start=1,
-                line_end=100,
-                language="python",
+                kind="File", name="parser.py", file_path=self.file_path,
+                line_start=1, line_end=100, language="python",
             ),
             NodeInfo(
-                kind="Function",
-                name="parse_file",
-                file_path=self.file_path,
-                line_start=10,
-                line_end=50,
-                language="python",
+                kind="Function", name="parse_file", file_path=self.file_path,
+                line_start=10, line_end=50, language="python",
             ),
             NodeInfo(
-                kind="Function",
-                name="parse_imports",
-                file_path=self.file_path,
-                line_start=55,
-                line_end=80,
-                language="python",
+                kind="Function", name="parse_imports", file_path=self.file_path,
+                line_start=55, line_end=80, language="python",
             ),
         ]
         for n in nodes:
@@ -202,8 +178,7 @@ class TestEnrichFileRead:
                 kind="CALLS",
                 source=f"{self.file_path}::parse_file",
                 target=f"{self.file_path}::parse_imports",
-                file_path=self.file_path,
-                line=30,
+                file_path=self.file_path, line=30,
             ),
         ]
         for e in edges:
@@ -221,7 +196,8 @@ class TestEnrichFileRead:
         # File node "parser.py" should not appear as a symbol entry
         lines = result.split("\n")
         symbol_lines = [
-            ln for ln in lines if ln and not ln.startswith(" ") and not ln.startswith("[")
+            ln for ln in lines
+            if ln and not ln.startswith(" ") and not ln.startswith("[")
         ]
         for line in symbol_lines:
             assert "parser.py (" not in line or "parse_" in line
@@ -253,12 +229,9 @@ class TestRunHookOutput:
         store = GraphStore(db_dir / "graph.db")
         store.upsert_node(
             NodeInfo(
-                kind="Function",
-                name="my_function",
+                kind="Function", name="my_function",
                 file_path=f"{tmpdir}/mod.py",
-                line_start=1,
-                line_end=10,
-                language="python",
+                line_start=1, line_end=10, language="python",
             ),
         )
         rebuild_fts_index(store)

@@ -12,6 +12,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from code_review_graph.graph import GraphStore
 from code_review_graph.incremental import full_build
 from code_review_graph.tools.query import get_impact_radius, query_graph
@@ -26,7 +28,20 @@ def _build(tmp_path: Path, files: dict[str, str]) -> GraphStore:
     graph_dir.mkdir(exist_ok=True)
     store = GraphStore(graph_dir / "graph.db")
     full_build(tmp_path, store)
+    _BUILT.append(store)
     return store
+
+
+# Stores the helper above built for the running test. The helper hands its
+# store to the test, so the module closes it once the test is done.
+_BUILT: list[GraphStore] = []
+
+
+@pytest.fixture(autouse=True)
+def _close_built_stores():
+    yield
+    while _BUILT:
+        _BUILT.pop().close()
 
 
 def _calls(store: GraphStore) -> list[dict]:
@@ -81,7 +96,10 @@ def test_scoped_call_edge_is_tagged_inferred(tmp_path: Path) -> None:
             ),
         },
     )
-    resolved = [c for c in _calls(store) if c["target_qualified"].endswith("Mailer.dispatch")]
+    resolved = [
+        c for c in _calls(store)
+        if c["target_qualified"].endswith("Mailer.dispatch")
+    ]
     assert len(resolved) == 1
     assert resolved[0]["confidence_tier"] == "INFERRED"
 
@@ -92,10 +110,16 @@ def test_constructor_new_call_resolves(tmp_path: Path) -> None:
         tmp_path,
         {
             "src/mailer.rs": (
-                "pub struct Mailer;\nimpl Mailer {\n    pub fn build() -> Mailer { Mailer }\n}\n"
+                "pub struct Mailer;\n"
+                "impl Mailer {\n"
+                "    pub fn build() -> Mailer { Mailer }\n"
+                "}\n"
             ),
             "src/app.rs": (
-                "use crate::mailer::Mailer;\npub fn boot() -> Mailer {\n    Mailer::build()\n}\n"
+                "use crate::mailer::Mailer;\n"
+                "pub fn boot() -> Mailer {\n"
+                "    Mailer::build()\n"
+                "}\n"
             ),
         },
     )
@@ -121,7 +145,10 @@ def test_self_scoped_call_resolves_to_enclosing_type(tmp_path: Path) -> None:
             ),
         },
     )
-    resolved = [c for c in _calls(store) if c["target_qualified"].endswith("Worker.helper")]
+    resolved = [
+        c for c in _calls(store)
+        if c["target_qualified"].endswith("Worker.helper")
+    ]
     assert len(resolved) == 1
     assert resolved[0]["source_qualified"].endswith("Worker.run")
     # The dangling ``Self::helper`` / ``Worker::helper`` form must not survive.
@@ -151,7 +178,9 @@ def test_impact_radius_of_definition_file_includes_caller(tmp_path: Path) -> Non
             ),
         },
     )
-    impact = get_impact_radius(changed_files=["src/mailer.rs"], repo_root=str(tmp_path))
+    impact = get_impact_radius(
+        changed_files=["src/mailer.rs"], repo_root=str(tmp_path)
+    )
     assert impact["status"] == "ok"
     impacted = {n["name"] for n in impact["impacted_nodes"]}
     assert "register" in impacted
@@ -159,27 +188,34 @@ def test_impact_radius_of_definition_file_includes_caller(tmp_path: Path) -> Non
 
 def test_unresolved_external_scoped_call_is_left_untouched(tmp_path: Path) -> None:
     # ``Vec::new`` / ``String::from`` are stdlib types with no in-graph node —
-    # the edge must stay a raw, directly-extracted target.
+    # the edge must stay a raw target that says it names no node.
     store = _build(
         tmp_path,
         {
-            "src/app.rs": ("pub fn make() -> Vec<u8> {\n    Vec::new()\n}\n"),
+            "src/app.rs": (
+                "pub fn make() -> Vec<u8> {\n"
+                "    Vec::new()\n"
+                "}\n"
+            ),
         },
     )
     external = [c for c in _calls(store) if c["target_qualified"] == "Vec::new"]
     assert len(external) == 1
-    assert external[0]["confidence_tier"] == "EXTRACTED"
+    assert external[0]["confidence_tier"] == "UNRESOLVED"
 
 
 def test_case_sensitive_identifiers_are_not_conflated(tmp_path: Path) -> None:
     # Rust is case-sensitive: a call to ``Mailer::send`` must NOT resolve to a
     # differently-cased definition ``Mailer::Send``. The edge must stay a raw,
-    # directly-extracted target rather than a bogus resolved caller.
+    # target that says it names no node, rather than a bogus resolved caller.
     store = _build(
         tmp_path,
         {
             "src/mailer.rs": (
-                "pub struct Mailer;\nimpl Mailer {\n    pub fn Send(to: &str) -> bool { true }\n}\n"
+                "pub struct Mailer;\n"
+                "impl Mailer {\n"
+                "    pub fn Send(to: &str) -> bool { true }\n"
+                "}\n"
             ),
             "src/signup.rs": (
                 "use crate::mailer::Mailer;\n"
@@ -191,10 +227,11 @@ def test_case_sensitive_identifiers_are_not_conflated(tmp_path: Path) -> None:
     )
     dangling = [c for c in _calls(store) if c["target_qualified"] == "Mailer::send"]
     assert len(dangling) == 1
-    assert dangling[0]["confidence_tier"] == "EXTRACTED"
+    assert dangling[0]["confidence_tier"] == "UNRESOLVED"
     # And nothing falsely resolved onto the capital-S ``Send`` definition.
     assert not any(
-        c["target_qualified"].endswith("Mailer.Send") and c["confidence_tier"] == "INFERRED"
+        c["target_qualified"].endswith("Mailer.Send")
+        and c["confidence_tier"] == "INFERRED"
         for c in _calls(store)
     )
 
@@ -205,7 +242,10 @@ def test_case_sensitive_matching_definition_resolves(tmp_path: Path) -> None:
         tmp_path,
         {
             "src/mailer.rs": (
-                "pub struct Mailer;\nimpl Mailer {\n    pub fn Send(to: &str) -> bool { true }\n}\n"
+                "pub struct Mailer;\n"
+                "impl Mailer {\n"
+                "    pub fn Send(to: &str) -> bool { true }\n"
+                "}\n"
             ),
             "src/signup.rs": (
                 "use crate::mailer::Mailer;\n"
@@ -228,23 +268,30 @@ def test_import_suffix_match_selects_correct_module(tmp_path: Path) -> None:
         tmp_path,
         {
             "src/billing/mailer.rs": (
-                "pub struct Mailer;\nimpl Mailer {\n    pub fn go(to: &str) -> bool { true }\n}\n"
+                "pub struct Mailer;\n"
+                "impl Mailer {\n"
+                "    pub fn go(to: &str) -> bool { true }\n"
+                "}\n"
             ),
             "src/shipping/mailer.rs": (
-                "pub struct Mailer;\nimpl Mailer {\n    pub fn go(to: &str) -> bool { true }\n}\n"
+                "pub struct Mailer;\n"
+                "impl Mailer {\n"
+                "    pub fn go(to: &str) -> bool { true }\n"
+                "}\n"
             ),
             "src/app.rs": (
                 "use crate::shipping::mailer::Mailer;\n"
                 "pub fn run() -> bool {\n"
-                '    Mailer::go("x")\n'
+                "    Mailer::go(\"x\")\n"
                 "}\n"
             ),
         },
     )
     resolved = [
-        c
-        for c in _calls(store)
-        if c["confidence_tier"] == "INFERRED" and c["target_qualified"].endswith("Mailer.go")
+        c for c in _calls(store)
+        if c["confidence_tier"] == "INFERRED" and c["target_qualified"].endswith(
+            "Mailer.go"
+        )
     ]
     assert len(resolved) == 1
     assert "shipping/mailer.rs" in resolved[0]["target_qualified"]
@@ -258,15 +305,21 @@ def test_unrelated_import_path_does_not_resolve(tmp_path: Path) -> None:
         tmp_path,
         {
             "src/billing/mailer.rs": (
-                "pub struct Mailer;\nimpl Mailer {\n    pub fn go(to: &str) -> bool { true }\n}\n"
+                "pub struct Mailer;\n"
+                "impl Mailer {\n"
+                "    pub fn go(to: &str) -> bool { true }\n"
+                "}\n"
             ),
             "src/shipping/mailer.rs": (
-                "pub struct Mailer;\nimpl Mailer {\n    pub fn go(to: &str) -> bool { true }\n}\n"
+                "pub struct Mailer;\n"
+                "impl Mailer {\n"
+                "    pub fn go(to: &str) -> bool { true }\n"
+                "}\n"
             ),
             "src/app.rs": (
                 "use crate::warehouse::mailer::Mailer;\n"
                 "pub fn run() -> bool {\n"
-                '    Mailer::go("x")\n'
+                "    Mailer::go(\"x\")\n"
                 "}\n"
             ),
         },
@@ -284,15 +337,21 @@ def test_partial_suffix_from_unrelated_module_does_not_resolve(
         tmp_path,
         {
             "src/order/queue/mailer.rs": (
-                "pub struct Mailer;\nimpl Mailer {\n    pub fn go(to: &str) -> bool { true }\n}\n"
+                "pub struct Mailer;\n"
+                "impl Mailer {\n"
+                "    pub fn go(to: &str) -> bool { true }\n"
+                "}\n"
             ),
             "src/billing/legacy/mailer.rs": (
-                "pub struct Mailer;\nimpl Mailer {\n    pub fn go(to: &str) -> bool { true }\n}\n"
+                "pub struct Mailer;\n"
+                "impl Mailer {\n"
+                "    pub fn go(to: &str) -> bool { true }\n"
+                "}\n"
             ),
             "src/app.rs": (
                 "use crate::warehouse::queue::mailer::Mailer;\n"
                 "pub fn run() -> bool {\n"
-                '    Mailer::go("x")\n'
+                "    Mailer::go(\"x\")\n"
                 "}\n"
             ),
         },
@@ -316,9 +375,16 @@ def test_multi_segment_module_path_is_left_untouched(tmp_path: Path) -> None:
                 "    pub fn dispatch(to: &str) -> bool { true }\n"
                 "}\n"
             ),
-            "src/app.rs": ('pub fn run() -> bool {\n    crate::mailer::Mailer::dispatch("x")\n}\n'),
+            "src/app.rs": (
+                "pub fn run() -> bool {\n"
+                "    crate::mailer::Mailer::dispatch(\"x\")\n"
+                "}\n"
+            ),
         },
     )
-    multi = [c for c in _calls(store) if c["target_qualified"] == "crate::mailer::Mailer::dispatch"]
+    multi = [
+        c for c in _calls(store)
+        if c["target_qualified"] == "crate::mailer::Mailer::dispatch"
+    ]
     assert len(multi) == 1
-    assert multi[0]["confidence_tier"] == "EXTRACTED"
+    assert multi[0]["confidence_tier"] == "UNRESOLVED"

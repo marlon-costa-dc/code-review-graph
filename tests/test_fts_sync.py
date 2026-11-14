@@ -1,6 +1,5 @@
 """Tests for FTS5 content sync robustness."""
 
-import sqlite3
 import tempfile
 from pathlib import Path
 
@@ -21,26 +20,17 @@ def store():
     store.close()
     Path(db_path).unlink(missing_ok=True)
 
-
 class TestFTSSync:
     def test_fts_rebuild_syncs_with_nodes(self, store):
         """Test that rebuild_fts_index properly populates from nodes table."""
         # 1. Add some nodes
         node1 = NodeInfo(
-            kind="Function",
-            name="calculate_total",
-            file_path="app.py",
-            line_start=1,
-            line_end=5,
-            language="python",
+            kind="Function", name="calculate_total", file_path="app.py",
+            line_start=1, line_end=5, language="python"
         )
         node2 = NodeInfo(
-            kind="Class",
-            name="OrderProcessor",
-            file_path="app.py",
-            line_start=10,
-            line_end=50,
-            language="python",
+            kind="Class", name="OrderProcessor", file_path="app.py",
+            line_start=10, line_end=50, language="python"
         )
         store.store_file_nodes_edges("app.py", [node1, node2], [])
 
@@ -60,12 +50,8 @@ class TestFTSSync:
         """Test that rebuild_fts_index clears existing FTS data before repopulating."""
         # 1. Add and index one node
         node1 = NodeInfo(
-            kind="Function",
-            name="old_func",
-            file_path="old.py",
-            line_start=1,
-            line_end=5,
-            language="python",
+            kind="Function", name="old_func", file_path="old.py",
+            line_start=1, line_end=5, language="python"
         )
         store.store_file_nodes_edges("old.py", [node1], [])
         rebuild_fts_index(store)
@@ -76,12 +62,8 @@ class TestFTSSync:
 
         # 3. Add a new node
         node2 = NodeInfo(
-            kind="Function",
-            name="new_func",
-            file_path="new.py",
-            line_start=1,
-            line_end=5,
-            language="python",
+            kind="Function", name="new_func", file_path="new.py",
+            line_start=1, line_end=5, language="python"
         )
         store.store_file_nodes_edges("new.py", [node2], [])
 
