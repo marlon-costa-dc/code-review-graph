@@ -110,3 +110,6 @@ scratch/
 
 # Maintainer-only local agent rules
 CLAUDE.local.md
+
+# Native refactoring reports and staged candidates
+.reports/

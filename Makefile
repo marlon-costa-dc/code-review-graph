@@ -6,9 +6,12 @@ setup:
 
 tools-lock:
 	uv lock --project .tools
+	mise trust .mise.toml
+	mise lock --jobs 2
 
 tools-setup:
 	uv sync --project .tools --frozen
+	mise install --locked --yes aqua:ast-grep/ast-grep
 
 check:
 	uv run --frozen ruff check code_review_graph/
