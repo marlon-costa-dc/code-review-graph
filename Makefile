@@ -119,5 +119,6 @@ test-parser-reuse:
 
 .PHONY: test-vscode
 test-vscode:
+	npm --prefix code-review-graph-vscode run compile
 	npm --prefix code-review-graph-vscode run lint
 	uv run --locked --extra dev env CRG_TEST_CLI="$(CURDIR)/.venv/bin/code-review-graph" npm --prefix code-review-graph-vscode test

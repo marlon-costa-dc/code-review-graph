@@ -68,7 +68,7 @@ function getWorkspaceRoot(): string | undefined {
 async function navigateToNode(node: GraphNode): Promise<void> {
   const workspaceRoot = getWorkspaceRoot();
   const filePath = workspaceRoot
-    ? path.join(workspaceRoot, node.filePath)
+    ? path.resolve(workspaceRoot, node.filePath)
     : node.filePath;
 
   const doc = await vscode.workspace.openTextDocument(filePath);
@@ -829,6 +829,11 @@ function watchGraphDb(context: vscode.ExtensionContext): void {
   });
 
   watcher.onDidCreate(async () => {
+    if (shared && sqliteReader) {
+      // SQLite can recreate the WAL before the first update is checkpointed.
+      await vscode.commands.executeCommand("codeReviewGraph.codeGraph.refresh");
+      return;
+    }
     const wsRoot = getWorkspaceRoot();
     if (wsRoot && !sqliteReader) {
       const dbPath = findGraphDb(wsRoot);
