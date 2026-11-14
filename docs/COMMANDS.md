@@ -412,6 +412,7 @@ poll_interval = 2            # seconds between config file polls
 path = "/home/user/project-a"
 alias = "project-a"
 discover_worktrees = true    # include live linked Git worktrees (default: false)
+activity_ttl_seconds = 600  # opt-in idle expiry for discovered watchers (default: 0)
 
 [[repos]]
 path = "/home/user/project-b"
@@ -428,6 +429,10 @@ live linked checkouts found by Git. Explicitly configured checkouts keep their
 own options. Discovered checkouts do not inherit the parent graph directory;
 a process-wide `CRG_DATA_DIR` override is incompatible with this option.
 Worktree membership changes are picked up without editing `watch.toml`.
+An optional `activity_ttl_seconds` retires discovered watchers after inactivity.
+File events and branch or HEAD changes renew activity; health heartbeats do
+not. A branch or HEAD change reactivates an expired checkout. Explicitly
+configured watchers do not expire, and expiry leaves the graph on disk.
 
 Watcher entry points sharing a `CRG_HOME` claim the canonical
 checkout before installing filesystem observers. A competing watcher exits

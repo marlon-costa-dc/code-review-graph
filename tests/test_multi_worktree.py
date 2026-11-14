@@ -108,6 +108,40 @@ def test_daemon_reconciles_linked_worktree_membership(tmp_path: Path) -> None:
         assert daemon._current_repos == {configured.alias: configured}
 
 
+def test_daemon_expires_idle_worktree_and_readmits_new_revision(tmp_path: Path) -> None:
+    from code_review_graph.daemon import DaemonConfig, WatchDaemon, WatchRepo
+
+    repo = _repository(tmp_path)
+    linked = tmp_path / "linked"
+    _git(repo, "worktree", "add", "-q", "-b", "review", str(linked))
+    parent = WatchRepo(path=str(repo), alias="repo", discover_worktrees=True,
+                       activity_ttl_seconds=10)
+    daemon = WatchDaemon(config=DaemonConfig(repos=[parent]))
+    clock = [100.0]
+    health = {"last_event_at": None, "updated_at": 100.0}
+    with (
+        patch("code_review_graph.daemon.time.time", side_effect=lambda: clock[0]),
+        patch("code_review_graph.daemon.read_watch_health", return_value=health),
+        patch.object(daemon, "_initial_build"),
+        patch.object(daemon, "_start_watcher") as start,
+        patch.object(daemon, "_save_state"),
+    ):
+        daemon.reconcile()
+        assert start.call_count == 2
+        clock[0] = 109.0
+        health["last_event_at"] = 108.0
+        daemon.reconcile()
+        clock[0] = health["updated_at"] = 118.0
+        daemon.reconcile()
+        assert set(daemon._current_repos) == {parent.alias}
+        daemon.reconcile()
+        assert start.call_count == 2
+        _git(linked, "commit", "--allow-empty", "-m", "reactivate")
+        daemon.reconcile()
+        assert start.call_count == 3
+        assert start.call_args.args[0].path == str(linked.resolve())
+
+
 def test_authorizer_accepts_linked_worktree_and_rejects_other_repo(tmp_path: Path) -> None:
     repo = _repository(tmp_path)
     worktree = tmp_path / "worktree"

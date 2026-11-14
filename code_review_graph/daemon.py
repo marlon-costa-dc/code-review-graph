@@ -220,13 +220,28 @@ class WatchRepo:
     discover_worktrees: bool = False
     """Include live linked Git worktrees in the daemon's desired watchers."""
 
+    activity_ttl_seconds: int = 0
+    """Retire idle discovered watchers; zero keeps them running."""
 
-def _watch_targets(repos: list[WatchRepo]) -> dict[str, WatchRepo]:
+
+@dataclass(frozen=True)
+class _CheckoutActivity:
+    head: str
+    branch_ref: str | None
+    last_active: float
+    last_event: float
+
+
+def _watch_targets(
+    repos: list[WatchRepo], activity: dict[str, _CheckoutActivity],
+) -> dict[str, WatchRepo]:
     """Expand opted-in roots without inheriting a parent's database directory."""
     from .multi_worktree import discover_worktrees
 
     targets = {repo.alias: repo for repo in repos}
     roots = {Path(repo.path).resolve() for repo in repos}
+    discovered: dict[str, _CheckoutActivity] = {}
+    now = time.time()
     for repo in repos:
         if not repo.discover_worktrees:
             continue
@@ -239,10 +254,33 @@ def _watch_targets(repos: list[WatchRepo]) -> dict[str, WatchRepo]:
             alias = f"{repo.alias}-wt-{hashlib.sha256(os.fsencode(path)).hexdigest()[:16]}"
             if alias in targets:
                 raise ValueError(f"Discovered worktree alias conflicts: {alias}")
+            roots.add(checkout.root)
+            if repo.activity_ttl_seconds:
+                previous = activity.get(alias)
+                health = read_watch_health(path) or {}
+                raw_event = health.get("last_event_at")
+                event = float(raw_event) if isinstance(raw_event, (int, float)) else 0.0
+                if not 0 < event <= now:
+                    event = 0.0
+                if previous is None or (previous.head, previous.branch_ref) != (
+                    checkout.head, checkout.branch_ref,
+                ):
+                    current = _CheckoutActivity(checkout.head, checkout.branch_ref, now, event)
+                elif event > previous.last_event:
+                    current = replace(
+                        previous, last_active=max(previous.last_active, event), last_event=event,
+                    )
+                else:
+                    current = previous
+                discovered[alias] = current
+                if now - current.last_active >= repo.activity_ttl_seconds:
+                    continue
             targets[alias] = replace(
                 repo, path=path, alias=alias, data_dir="", discover_worktrees=False,
+                activity_ttl_seconds=0,
             )
-            roots.add(checkout.root)
+    activity.clear()
+    activity.update(discovered)
     return targets
 
 
@@ -348,6 +386,9 @@ def load_config(path: Path | None = None) -> DaemonConfig:
             continue
 
         seen_aliases.add(alias)
+        ttl = entry.get("activity_ttl_seconds", 0)
+        if type(ttl) is not int or ttl < 0:
+            raise ValueError(f"Invalid activity_ttl_seconds for {alias}: expected non-negative int")
         repos.append(
             WatchRepo(
                 path=str(repo_path),
@@ -356,6 +397,7 @@ def load_config(path: Path | None = None) -> DaemonConfig:
                 recurse_submodules=entry.get("recurse_submodules", False),
                 embedding=entry.get("embedding", ""),
                 discover_worktrees=entry.get("discover_worktrees", False),
+                activity_ttl_seconds=ttl,
             )
         )
 
@@ -430,6 +472,8 @@ def _serialize_toml(config: DaemonConfig) -> str:
             lines.append(f"embedding = {_toml_str(repo.embedding)}")
         if repo.discover_worktrees:
             lines.append("discover_worktrees = true")
+        if repo.activity_ttl_seconds:
+            lines.append(f"activity_ttl_seconds = {repo.activity_ttl_seconds}")
     lines.append("")  # trailing newline
     return "\n".join(lines)
 
@@ -1257,6 +1301,7 @@ class WatchDaemon:
         self._state_path: Path = default_state_path()
         self._children: dict[str, subprocess.Popen[bytes]] = {}
         self._current_repos: dict[str, WatchRepo] = {}
+        self._checkout_activity: dict[str, _CheckoutActivity] = {}
         self._config_watcher: ConfigWatcher | None = None
         self._health_thread: threading.Thread | None = None
         self._health_stop: threading.Event = threading.Event()
@@ -1280,7 +1325,7 @@ class WatchDaemon:
         from .registry import Registry
 
         registry = Registry()
-        targets = _watch_targets(self._config.repos)
+        targets = _watch_targets(self._config.repos, self._checkout_activity)
         for repo in targets.values():
             registry.register(repo.path, alias=repo.alias, data_dir=repo.data_dir or None)
 
@@ -1346,7 +1391,7 @@ class WatchDaemon:
         if new_config is not None:
             self._config = new_config
 
-        desired = _watch_targets(self._config.repos)
+        desired = _watch_targets(self._config.repos, self._checkout_activity)
         current: set[str] = set(self._current_repos.keys())
 
         to_add: set[str] = desired.keys() - current
