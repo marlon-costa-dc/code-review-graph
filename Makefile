@@ -47,7 +47,7 @@ test-daemon:
 
 .PHONY: test-worktrees
 test-worktrees:
-	uv run --locked --extra dev pytest tests/test_multi_worktree.py -q --tb=short
+	uv run --locked --extra dev pytest tests/test_multi_worktree.py tests/test_repo_root_identity.py -q --tb=short
 
 .PHONY: test-watch-locks
 test-watch-locks:

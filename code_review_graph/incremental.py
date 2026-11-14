@@ -3002,6 +3002,7 @@ def full_build(
             ``CRG_FOLLOW_SYMLINKS`` env var. Default: off.
     """
     repo_root = _canonical_repo_root(repo_root)
+    _assert_graph_matches_root(repo_root, store)
     parser = _get_code_parser_cls()(repo_root)
     files, followed, followed_dirs = _collect_files(
         repo_root, recurse_submodules, follow_symlinks,
