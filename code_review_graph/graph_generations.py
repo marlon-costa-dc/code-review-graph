@@ -11,7 +11,11 @@ import hashlib
 import os
 import sqlite3
 from collections.abc import Mapping
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .graph import GraphStore
 
 
 def content_identity(files: Mapping[str, str]) -> str:
@@ -34,6 +38,15 @@ def content_identity(files: Mapping[str, str]) -> str:
         digest.update(os.fsencode(path) + b"\0")
         digest.update(raw_digest)
     return digest.hexdigest()
+
+
+def indexed_content_identity(repo_root: Path, store: GraphStore) -> str:
+    """Identify the indexed bytes without rereading or hashing the checkout."""
+    root = repo_root.resolve()
+    return content_identity({
+        (root / path).relative_to(root).as_posix(): digest
+        for path, digest in store.get_file_hashes().items()
+    })
 
 
 def initialize_bindings(conn: sqlite3.Connection) -> None:
