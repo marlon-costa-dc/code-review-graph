@@ -64,3 +64,7 @@ test-install:
 .PHONY: test-read-guard
 test-read-guard:
 	uv run --locked --extra dev pytest tests/test_not_built_guard.py tests/test_uncertainty.py -q --tb=short
+
+.PHONY: test-review-budget
+test-review-budget:
+	uv run --locked --extra dev pytest tests/test_complete_change_analysis.py::TestCallerLimitsAreExact::test_detect_changes_token_budget_reports_omissions tests/test_complete_change_analysis.py::TestCallerLimitsAreExact::test_detect_changes_limits_above_former_ceilings -q --tb=short

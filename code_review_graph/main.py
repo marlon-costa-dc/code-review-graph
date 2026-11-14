@@ -1097,6 +1097,7 @@ async def detect_changes_tool(
     detail_level: str = "standard",
     max_results: int | None = None,
     max_flows: int | None = None,
+    max_tokens: int = 0,
 ) -> dict:
     """Detect changes and produce risk-scored, priority-ordered review guidance.
 
@@ -1128,7 +1129,7 @@ async def detect_changes_tool(
             base=base, changed_files=changed_files,
             include_source=include_source, max_depth=max_depth,
             repo_root=root, detail_level=detail_level,
-            max_results=max_results, max_flows=max_flows,
+            max_results=max_results, max_flows=max_flows, max_tokens=max_tokens,
         ),
         root,
         timeout_hint=_DETECT_CHANGES_TIMEOUT_HINT,

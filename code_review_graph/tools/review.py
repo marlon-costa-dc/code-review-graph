@@ -16,7 +16,7 @@ from ..changes import (  # noqa: F401
     parse_git_diff_ranges,
 )
 from ..context_history import CallInfo
-from ..context_savings import attach_context_savings, estimate_file_tokens
+from ..context_savings import attach_context_savings, estimate_file_tokens, estimate_tokens
 from ..errors import ChangeDiscoveryError
 from ..flows import get_affected_flows as _get_affected_flows
 from ..graph import GraphNode, GraphStore, edge_to_dict, node_to_dict
@@ -971,6 +971,86 @@ def get_affected_flows_func(
 # ---------------------------------------------------------------------------
 
 
+def _budget_detect_changes(result: dict[str, Any], max_tokens: int) -> dict[str, Any] | None:
+    """Trim a standard detect_changes result to fit ``max_tokens``.
+
+    The big-list fields are trimmed lowest-signal first, in this order:
+
+    1. ``affected_flows``   (kept in upstream criticality order)
+    2. ``changed_functions`` (re-ranked highest-risk first)
+    3. ``test_gaps``        (a flat list that balloons on large PRs)
+    4. ``review_priorities`` (the curated top-N; trimmed last, kept longest)
+
+    The summary scaffold and risk score always survive.  Returns an
+    ``omitted`` summary dict, or ``None`` when nothing was dropped.  Mutates
+    ``result`` in place.
+    """
+    if estimate_tokens(result) <= max_tokens:
+        return None
+
+    funcs = result.get("changed_functions") or []
+    flows = result.get("affected_flows") or []
+    gaps = result.get("test_gaps") or []
+    prios = result.get("review_priorities") or []
+    orig = {
+        "changed_functions": len(funcs),
+        "affected_flows": len(flows),
+        "test_gaps": len(gaps),
+        "review_priorities": len(prios),
+    }
+
+    # Highest-risk functions first; the other lists keep their upstream order.
+    ranked_funcs = sorted(funcs, key=lambda f: f.get("risk_score", 0.0), reverse=True)
+
+    # Counts kept per field; start with everything, shrink as needed.
+    keep = dict(orig)
+    sources = {
+        "changed_functions": ranked_funcs,
+        "affected_flows": flows,
+        "test_gaps": gaps,
+        "review_priorities": prios,
+    }
+
+    def _apply() -> None:
+        for f, src in sources.items():
+            result[f] = src[: keep[f]]
+
+    def _fits() -> bool:
+        _apply()
+        return estimate_tokens(result) <= max_tokens
+
+    # Trim each field down to zero in priority order until the payload fits.
+    # Binary-search the largest count that still fits to keep this O(log N)
+    # per field rather than O(N) decrements on large PRs.
+    for field in ("affected_flows", "changed_functions", "test_gaps", "review_priorities"):
+        if _fits():
+            break
+        lo, hi = 0, keep[field]  # hi currently overflows
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            keep[field] = mid
+            if _fits():
+                lo = mid
+            else:
+                hi = mid - 1
+        keep[field] = lo
+    _apply()
+
+    dropped = {f: orig[f] - keep[f] for f in orig}
+    if not any(dropped.values()):
+        return None
+
+    note = (
+        f"Token budget ({max_tokens}) reached: omitted "
+        f"{dropped['changed_functions']} function(s), "
+        f"{dropped['affected_flows']} flow(s), "
+        f"{dropped['test_gaps']} test gap(s), and "
+        f"{dropped['review_priorities']} review priority(ies). "
+        f"Re-run with a higher max_tokens to see them."
+    )
+    return {**dropped, "max_tokens": max_tokens, "note": note}
+
+
 def detect_changes_func(
     base: str = "HEAD~1",
     changed_files: list[str] | None = None,
@@ -980,6 +1060,7 @@ def detect_changes_func(
     detail_level: str = "standard",
     max_results: int | None = None,
     max_flows: int | None = None,
+    max_tokens: int = 0,
 ) -> dict[str, Any]:
     """Detect changes and produce risk-scored review guidance.
 
@@ -1012,6 +1093,9 @@ def detect_changes_func(
         _validate_positive_int(max_results, "max_results")
     if max_flows is not None:
         _validate_positive_int(max_flows, "max_flows")
+
+    if type(max_tokens) is not int or max_tokens < 0:
+        raise ValueError("max_tokens must be a non-negative integer")
 
     store, root = _get_store(repo_root)
     notes: list[str] = []
@@ -1201,6 +1285,12 @@ def detect_changes_func(
                 "affected_flows_total": flows_total,
                 "truncated": any_cut,
             }
+        if max_tokens and detail_level != "minimal":
+            budget_note = _budget_detect_changes(result, max_tokens)
+            if budget_note:
+                result["omitted"] = budget_note
+                result["truncated"] = True
+                result["summary"] += "\n  - " + budget_note["note"]
         if notes:
             # Said once, first: the review covers different files than the
             # base the caller asked for would have.
