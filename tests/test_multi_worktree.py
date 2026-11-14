@@ -149,6 +149,17 @@ def test_daemon_expires_idle_worktree_and_readmits_new_revision(tmp_path: Path) 
         daemon.reconcile()
         assert start.call_count == 4
         assert start.call_args.args[0].path == str(linked.resolve())
+        # A staged-only edit has a clean index-to-worktree comparison.
+        _git(linked, "checkout", "--", "README.md")
+        clock[0] = 140.0
+        daemon.reconcile()
+        assert set(daemon._current_repos) == {parent.alias}
+        dirty.write_text("staged while idle\n", encoding="utf-8")
+        _git(linked, "add", "README.md")
+        _git(linked, "diff", "--exit-code")
+        daemon.reconcile()
+        assert start.call_count == 5
+
 
 
 def test_authorizer_accepts_linked_worktree_and_rejects_other_repo(tmp_path: Path) -> None:
