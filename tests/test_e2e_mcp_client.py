@@ -367,6 +367,25 @@ async def test_mcp_client_full_review_journey(tmp_path: Path) -> None:
 
 
 @pytest.mark.e2e
+def test_shared_postprocess_invalidates_previous_refresh(tmp_path):
+    repo = _make_fixture_repo(tmp_path)
+    env = {**_server_env(tmp_path / "home"), "CRG_SHARED_DB": str(tmp_path / "shared.db")}
+
+    def run(*args):
+        return subprocess.check_output(
+            [sys.executable, "-m", "code_review_graph", *args, "--repo", str(repo)],
+            env=env, text=True, timeout=30,
+        )
+
+    run("build")
+    run("update")
+    assert "Reused the completed refresh" in run("update")
+    run("postprocess")
+    assert "Reused the completed refresh" not in run("update")
+    assert "Reused the completed refresh" in run("update")
+
+
+@pytest.mark.e2e
 def test_shared_cli_crash_rolls_back_written_rows(tmp_path):
     repo = _make_fixture_repo(tmp_path)
     env = {**_server_env(tmp_path / "home"), "CRG_SERIAL_PARSE": "1",
