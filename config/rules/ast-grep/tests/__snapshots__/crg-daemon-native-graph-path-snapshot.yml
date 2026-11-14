@@ -1,0 +1,9 @@
+id: crg-daemon-native-graph-path
+snapshots:
+  Path(repo.path) / ".code-review-graph" / "graph.db":
+    fixed: get_db_path(Path(repo.path), read_only=True)
+    labels:
+    - source: Path(repo.path) / ".code-review-graph" / "graph.db"
+      style: primary
+      start: 0
+      end: 51

@@ -1,0 +1,5 @@
+scope: runtime
+ruleDirs:
+  - rules
+testConfigs:
+  - testDir: tests

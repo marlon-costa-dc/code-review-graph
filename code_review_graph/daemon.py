@@ -1208,6 +1208,7 @@ class WatchDaemon:
         logger.info("Starting daemon '%s'", self._config.session_name)
 
         # Auto-register repos in the central registry
+        from .incremental import get_db_path
         from .registry import Registry
 
         registry = Registry()
@@ -1284,6 +1285,7 @@ class WatchDaemon:
         # Register new/updated repos and build graphs *before* acquiring
         # the lock so that long-running builds don't block health checks.
         if to_add or to_update:
+            from .incremental import get_db_path
             from .registry import Registry
 
             registry = Registry()

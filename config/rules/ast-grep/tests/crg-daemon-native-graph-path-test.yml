@@ -1,0 +1,5 @@
+id: crg-daemon-native-graph-path
+valid:
+  - get_db_path(Path(repo.path), read_only=True)
+invalid:
+  - Path(repo.path) / ".code-review-graph" / "graph.db"

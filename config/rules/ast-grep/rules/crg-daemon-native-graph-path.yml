@@ -1,0 +1,9 @@
+id: crg-daemon-native-graph-path
+language: python
+severity: error
+message: Resolve daemon graphs through the native registry-aware path owner.
+files:
+  - code_review_graph/daemon.py
+rule:
+  pattern: Path($REPO.path) / ".code-review-graph" / "graph.db"
+fix: get_db_path(Path($REPO.path), read_only=True)
