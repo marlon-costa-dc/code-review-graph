@@ -12,6 +12,7 @@ import json
 import os
 import sqlite3
 from collections.abc import Mapping
+from contextlib import closing
 from dataclasses import asdict
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING
@@ -263,3 +264,38 @@ def publish_binding(
             (generation, checkout, expected_revision),
         )
     return cursor.rowcount == 1
+
+
+def publish_indexed_checkout(
+    database: Path, repo_root: Path, store: GraphStore, *, profile_digest: str,
+) -> int:
+    """Publish an experimental read projection from a successful native write."""
+    from .locking import WriteLock
+    from .multi_worktree import _canonical_git_identity
+
+    root, repository = _canonical_git_identity(repo_root)
+    database = database.resolve()
+    if database.parent == store.db_path.resolve().parent:
+        raise ValueError("Shared projection requires a separate graph data directory")
+    lock = WriteLock(database)
+    if not lock.acquire(blocking=True):
+        raise RuntimeError("Shared projection writer is contended")
+    try:
+        with closing(sqlite3.connect(database, isolation_level=None)) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
+            initialize_bindings(conn)
+            conn.execute("BEGIN IMMEDIATE")
+            current = read_binding(conn, str(root))
+            generation = ensure_indexed_generation(
+                conn, repository=str(repository), profile_digest=profile_digest,
+                repo_root=root, store=store,
+            )
+            if current is None or current[0] != generation:
+                if not publish_binding(
+                    conn, str(root), generation, expected_revision=current[1] if current else 0,
+                ):
+                    raise RuntimeError("Shared checkout binding changed during publication")
+            conn.commit()
+            return generation
+    finally:
+        lock.release()

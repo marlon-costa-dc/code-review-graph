@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import sqlite3
 import time
 from pathlib import Path
@@ -570,6 +571,23 @@ def build_or_update_graph(
         store, root = _get_store(
             str(root), db_path=db_path, recover_corrupt=full_rebuild and recover_corrupt
         )
+        def publish(result: dict[str, Any]) -> dict[str, Any]:
+            shared = os.environ.get("CRG_SHARED_FILE_SUMMARY_DB")
+            if shared and result["status"] == "ok" and not result.get("warnings"):
+                from ..graph_generations import publish_indexed_checkout
+
+                profile = repr((
+                    postprocess, recurse_submodules, enrich, follow_symlinks,
+                    tuple(os.environ.get(key, "") for key in (
+                        "CRG_RECURSE_SUBMODULES", "CRG_ENABLE_ENRICHMENT",
+                        "CRG_DISABLE_ENRICHMENT", "CRG_FOLLOW_SYMLINKS",
+                    )),
+                ))
+                result["shared_generation"] = publish_indexed_checkout(
+                    Path(shared), root, store, profile_digest=profile,
+                )
+            return result
+
         if not full_rebuild and not store.has_nodes() and not store.get_metadata("last_build_type"):
             raise RuntimeError(_UPDATE_REQUIRES_GRAPH)
 
@@ -682,7 +700,7 @@ def build_or_update_graph(
                             noop_warnings: list[str] = []
                             _report_refresh_skipped(noop_result, noop_warnings)
                             noop_result["warnings"] = noop_warnings
-                    return noop_result
+                    return publish(noop_result)
 
                 # Older builds could leave FTS drift behind a complete marker.
                 # Reconcile it even when Git has no source changes, while
@@ -734,7 +752,7 @@ def build_or_update_graph(
                         _report_refresh_skipped(build_result, embedding_warnings)
                         build_result.setdefault("warnings", []).extend(embedding_warnings)
                 build_result["postprocess_level"] = postprocess_level
-                return build_result
+                return publish(build_result)
             summary = (
                 f"Incremental update: {result['files_updated']} files re-parsed, "
                 f"{result['total_nodes']} nodes and "
@@ -814,7 +832,7 @@ def build_or_update_graph(
                 POSTPROCESS_PENDING if rows_changed else (previous_state or ""),
             )
         build_result["repaired_interrupted_build"] = interrupted
-        return build_result
+        return publish(build_result)
     finally:
         try:
             if store is not None:
