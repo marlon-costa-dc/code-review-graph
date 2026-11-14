@@ -142,6 +142,18 @@ class TestConfigParsing:
         assert len(cfg.repos) == 1
         assert cfg.repos[0].path == str(repo_a.resolve())
 
+    def test_load_config_rejects_two_aliases_for_one_checkout(self, tmp_path):
+        repo = tmp_path / "repo"
+        (repo / ".git").mkdir(parents=True)
+        config_file = tmp_path / "watch.toml"
+        config_file.write_text(
+            f'[[repos]]\npath = "{repo.as_posix()}"\nalias = "first"\n'
+            f'[[repos]]\npath = "{repo.as_posix()}/."\nalias = "second"\n',
+            encoding="utf-8",
+        )
+        with pytest.raises(ValueError, match="configured twice: first and second"):
+            load_config(config_file)
+
     def test_load_config_no_git_dir(self, tmp_path):
         """Repos without .git or .code-review-graph are skipped."""
         bare = tmp_path / "bare-dir"

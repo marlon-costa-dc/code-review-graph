@@ -360,6 +360,7 @@ def load_config(path: Path | None = None) -> DaemonConfig:
     # -- [[repos]] array ----------------------------------------------------
     repos: list[WatchRepo] = []
     seen_aliases: set[str] = set()
+    seen_paths: dict[Path, str] = {}
 
     for entry in raw.get("repos", []):
         repo_path_str: str = entry.get("path", "")
@@ -391,7 +392,12 @@ def load_config(path: Path | None = None) -> DaemonConfig:
             logger.warning("Skipping duplicate alias '%s' for repo %s", alias, repo_path)
             continue
 
+        if repo_path in seen_paths:
+            raise ValueError(
+                f"Checkout {repo_path} is configured twice: {seen_paths[repo_path]} and {alias}"
+            )
         seen_aliases.add(alias)
+        seen_paths[repo_path] = alias
         ttl = entry.get("activity_ttl_seconds", 0)
         if type(ttl) is not int or ttl < 0:
             raise ValueError(f"Invalid activity_ttl_seconds for {alias}: expected non-negative int")
