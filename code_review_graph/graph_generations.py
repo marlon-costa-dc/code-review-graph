@@ -171,6 +171,7 @@ def ensure_indexed_generation(
                  json.dumps({
                      **asdict(node),
                      "file_path": path,
+                     "name": path if node.kind == "File" else node.name,
                      "qualified_name": node.qualified_name.removeprefix(prefix),
                      "parent_name": (node.parent_name.removeprefix(prefix)
                                      if node.parent_name else node.parent_name),
@@ -233,6 +234,8 @@ def read_checkout_nodes(
     for (payload,) in rows:
         fields = json.loads(payload)
         fields["file_path"] = (root / fields["file_path"]).as_posix()
+        if fields["kind"] == "File":
+            fields["name"] = fields["file_path"]
         fields["qualified_name"] = prefix + fields["qualified_name"]
         if fields.pop("qualified_parent"):
             fields["parent_name"] = prefix + fields["parent_name"]

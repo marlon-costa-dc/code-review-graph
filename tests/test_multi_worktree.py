@@ -97,6 +97,10 @@ def test_shared_generations_reuse_sibling_content_and_isolate_wip(tmp_path: Path
         assert publish_binding(shared, str(repo.resolve()), generation, expected_revision=0)
         assert publish_binding(shared, str(linked.resolve()), generation, expected_revision=0)
         shared.commit()
+        linked_file = next(
+            node for node in read_checkout_nodes(shared, linked, "app.py") if node.kind == "File"
+        )
+        assert linked_file.name == linked_file.file_path == (linked / "app.py").as_posix()
         original = read_checkout_manifest(shared, str(repo.resolve()))
         assert "app.py" in original
         assert read_checkout_manifest(shared, str(linked.resolve())) == original
