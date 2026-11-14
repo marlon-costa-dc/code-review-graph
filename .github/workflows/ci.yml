@@ -259,6 +259,7 @@ jobs:
           python -m pytest --tb=short -q
           tests/test_windows_compat.py
           tests/test_daemon.py
+          tests/test_daemon_external_graph.py
           tests/test_changes.py
           tests/test_communities.py
           tests/test_flows.py

@@ -429,7 +429,7 @@ own options. Discovered checkouts do not inherit the parent graph directory;
 a process-wide `CRG_DATA_DIR` override is incompatible with this option.
 Worktree membership changes are picked up without editing `watch.toml`.
 
-On POSIX, watcher entry points sharing a `CRG_HOME` claim the canonical
+Watcher entry points sharing a `CRG_HOME` claim the canonical
 checkout before installing filesystem observers. A competing watcher exits
 with a contention error. This ownership lock is separate from the graph
 write lock, so an active watcher does not prevent manual updates.

@@ -111,6 +111,20 @@ def _flock(handle: Any, blocking: bool) -> bool:
     return True
 
 
+def _windows_owner_lock(handle: Any, blocking: bool) -> bool:
+    """Lock the first byte until the descriptor closes, even for an empty file."""
+    import msvcrt
+
+    handle.seek(0)
+    try:
+        msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK if blocking else msvcrt.LK_NBLCK, 1)
+    except OSError as exc:
+        if exc.errno in (errno.EACCES, errno.EAGAIN, errno.EDEADLK):
+            return False
+        raise
+    return True
+
+
 def read_write_lock_holder(db_path: Path) -> int | None:
     """Return the PID that recorded itself as the lock holder, if any.
 
@@ -149,13 +163,14 @@ class WriteLock:
     def acquire(self, *, blocking: bool = False) -> bool:
         """Claim the lock, or report that somebody else holds it.
 
-        Returns True when this instance owns the lock afterwards. On platforms
-        without ``flock`` this is a no-op that reports success, so behaviour
-        there is exactly what it was before this module existed.
+        Returns True when this instance owns the lock afterwards. On Windows,
+        checkout ownership uses a byte-range lock; ordinary write locks keep
+        their existing behavior.
         """
         if self._handle is not None:
             return True
-        if not _flock_supported():  # pragma: no cover - POSIX in CI
+        use_flock = _flock_supported()
+        if not use_flock and not self._strict:
             return True
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -172,7 +187,8 @@ class WriteLock:
         _open_locks.add(self)
         acquired = False
         try:
-            acquired = _flock(handle, blocking)
+            acquire = _flock if use_flock else _windows_owner_lock
+            acquired = acquire(handle, blocking)
         except OSError as exc:
             if self._strict:
                 raise
@@ -187,7 +203,8 @@ class WriteLock:
                 handle.close()
         if not acquired:
             return False
-        self._record_holder(handle)
+        if not self._strict:
+            self._record_holder(handle)
         return True
 
     def _record_holder(self, handle: Any) -> None:
@@ -211,12 +228,13 @@ class WriteLock:
         _open_locks.discard(self)
         if handle is None:
             return
-        try:
-            handle.seek(0)
-            handle.truncate()
-            handle.flush()
-        except OSError:  # pragma: no cover - best-effort cleanup
-            pass
+        if not self._strict:
+            try:
+                handle.seek(0)
+                handle.truncate()
+                handle.flush()
+            except OSError:  # pragma: no cover - best-effort cleanup
+                pass
         try:
             handle.close()  # closing the description releases the flock
         except OSError:  # pragma: no cover - best-effort cleanup

@@ -5182,7 +5182,7 @@ def watch(
     follow_symlinks: bool | None = None,
     startup_lock: threading.Lock | None = None,
 ) -> None:
-    """Run a filesystem observer, with exclusive checkout ownership on POSIX."""
+    """Run a filesystem observer with exclusive checkout ownership."""
     from .daemon import watch_health_path
 
     repo_root = _canonical_repo_root(repo_root)

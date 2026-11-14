@@ -1,12 +1,35 @@
 """The daemon must reuse the same external graph its child will open."""
 
+import subprocess
+import sys
 from unittest.mock import patch
 
 import pytest
 
 from code_review_graph.daemon import DaemonConfig, WatchDaemon, WatchRepo
 from code_review_graph.graph import GraphStore
+from code_review_graph.locking import WriteLock
 from code_review_graph.registry import Registry
+
+
+def test_watcher_ownership_excludes_other_processes_until_release(tmp_path):
+    db = tmp_path / "graph.db"
+    path = tmp_path / "watch.lock"
+    owner = WriteLock(db, owner_path=path)
+    probe = [
+        sys.executable, "-c",
+        "from pathlib import Path; from sys import argv; "
+        "from code_review_graph.locking import WriteLock; "
+        "lock = WriteLock(Path(argv[1]), owner_path=Path(argv[2])); "
+        "print(lock.acquire())",
+        str(db), str(path),
+    ]
+    assert owner.acquire()
+    try:
+        assert subprocess.check_output(probe, text=True, timeout=10).strip() == "False"
+    finally:
+        owner.release()
+    assert subprocess.check_output(probe, text=True, timeout=10).strip() == "True"
 
 
 @pytest.mark.parametrize("operation", ["start", "reconcile"])
