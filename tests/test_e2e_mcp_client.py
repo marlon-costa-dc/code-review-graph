@@ -658,6 +658,19 @@ async def test_mcp_shared_sqlite_isolates_sibling_worktrees(tmp_path, monkeypatc
             await query(repo, "left_symbol", "right_wip")
             assert list(tmp_path.rglob("*.db")) == [db]
 
+            await asyncio.to_thread(
+                subprocess.check_call,
+                [sys.executable, "-m", "code_review_graph", "forget", relative_path,
+                 "--repo", str(sibling)],
+                env=_server_env(crg_home), timeout=30,
+            )
+            forgotten = _payload(await _call(session, "semantic_search_nodes_tool", {
+                "query": "right_wip", "repo_root": str(sibling),
+            }))
+            assert "right_wip" not in {row["name"] for row in forgotten["results"]}, forgotten
+            await query(repo, "left_symbol", "right_wip")
+            assert list(tmp_path.rglob("*.db")) == [db]
+
 
 async def test_mcp_multi_worktree_routes_parallel_graphs(tmp_path: Path) -> None:
     """One stdio session can build and query separate linked-worktree graphs."""
