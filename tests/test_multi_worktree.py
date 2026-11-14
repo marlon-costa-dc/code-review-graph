@@ -64,7 +64,9 @@ def _repository(tmp_path: Path) -> Path:
     return repo
 
 
-def test_indexed_content_identity_reuses_sibling_content_and_tracks_wip(tmp_path: Path):
+def test_shared_generations_reuse_sibling_content_and_isolate_wip(tmp_path: Path, monkeypatch):
+    from code_review_graph.tools.query import query_graph
+
     repo = _repository(tmp_path)
     linked = tmp_path / "linked"
     (repo / "app.py").write_text("def original(): return first_target()\n", encoding="utf-8")
@@ -125,6 +127,17 @@ def test_indexed_content_identity_reuses_sibling_content_and_tracks_wip(tmp_path
             assert any(expected in target for _, target in calls)
             assert all(excluded not in target and str(checkout) not in source
                        for source, target in calls)
+        monkeypatch.setenv("CRG_SHARED_FILE_SUMMARY_DB", str(tmp_path / "shared.db"))
+        for checkout, generation_id, name in (
+            (repo, generation, "original"), (linked, edited, "edited"),
+        ):
+            result = query_graph("file_summary", "app.py", str(checkout), "minimal")
+            assert result["generation"] == generation_id
+            assert [row["name"] for row in result["results"] if row["kind"] == "Function"] == [name]
+            assert all(row["file_path"] == (checkout / "app.py").as_posix()
+                       for row in result["results"])
+        unbound = _repository(tmp_path / "unbound")
+        assert query_graph("file_summary", "app.py", str(unbound))["status"] == "not_built"
         (shared_files,) = shared.execute(
             "SELECT COUNT(*) FROM generation_files AS original "
             "JOIN generation_files AS edited USING (file_version) "

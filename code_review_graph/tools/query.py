@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
+import sqlite3
 from collections import defaultdict, deque
+from contextlib import closing
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +37,7 @@ from ..graph import (
     import_scope_ancestors,
     node_to_dict,
 )
+from ..graph_generations import read_binding, read_checkout_nodes
 from ..hints import generate_hints, get_session
 from ..incremental import (
     discover_review_changes,
@@ -55,6 +59,7 @@ from ._common import (
     _get_store_for_read,
     _resolve_graph_file_paths,
     _resolve_graph_file_paths_with_unmatched,
+    _resolve_root,
     _shown_of,
     _unmatched_file_warning,
     _validate_positive_int,
@@ -1017,6 +1022,34 @@ def get_impact_radius(
 # ---------------------------------------------------------------------------
 
 
+def _shared_file_summary(
+    database: Path, root: Path, target: str, *, minimal: bool, limit: int,
+) -> dict[str, Any]:
+    candidate = root / target
+    if not path_within_repo(root, candidate):
+        raise ValueError("file_summary target is outside the requested checkout")
+    relative = candidate.resolve().relative_to(root).as_posix()
+    with closing(sqlite3.connect(database.resolve().as_uri() + "?mode=ro", uri=True)) as conn:
+        conn.execute("BEGIN")
+        binding = read_binding(conn, str(root))
+        if binding is None:
+            return {"status": "not_built", "error": "No shared generation for this checkout"}
+        nodes = read_checkout_nodes(conn, root, relative)
+    results = [node_to_dict(node) for node in nodes[:min(limit, 5) if minimal else limit]]
+    if minimal:
+        results = [{k: row[k] for k in ("name", "kind", "file_path")} for row in results]
+    response = {
+        "status": "ok", "pattern": "file_summary", "target": target,
+        "description": _QUERY_PATTERNS["file_summary"],
+        "summary": f"Found {len(nodes)} result(s) for file_summary('{target}')",
+        "result_count": len(nodes), "results_omitted": len(nodes) - len(results),
+        "results": results, "generation": binding[0],
+    }
+    if not minimal:
+        response["edges"] = []
+    return response
+
+
 def query_graph(
     pattern: str,
     target: str,
@@ -1058,6 +1091,13 @@ def query_graph(
     if resolution not in QUERY_RESOLUTIONS:
         raise ValueError(
             f"resolution must be one of {list(QUERY_RESOLUTIONS)}, got {resolution!r}"
+        )
+
+    shared = os.environ.get("CRG_SHARED_FILE_SUMMARY_DB")
+    if shared and pattern == "file_summary":
+        return _shared_file_summary(
+            Path(shared), _resolve_root(repo_root), target,
+            minimal=detail_level == "minimal", limit=max_results,
         )
 
     store, root, not_built = _get_store_for_read(repo_root)
