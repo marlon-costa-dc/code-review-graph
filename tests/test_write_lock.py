@@ -139,11 +139,15 @@ def test_initialization_failure_releases_the_write_lock(tmp_path, call):
 
 
 @pytest.mark.parametrize("command", ["build", "update", "postprocess"])
-def test_writers_still_accept_a_plain_directory(tmp_path, monkeypatch, capsys, command):
-    """They reach tool validation first now, so they must set up the marker it wants."""
+def test_writers_still_accept_a_plain_directory(tmp_path, monkeypatch, command):
+    """A plain directory supports writes, with a prior build for update."""
     repo = tmp_path / "plain"
     repo.mkdir()
     (repo / "app.py").write_text("def app():\n    return 1\n", encoding="utf-8")
+    if command == "update":
+        monkeypatch.setattr(sys, "argv", ["crg", "build", "--repo", str(repo)])
+        cli.main()
+        (repo / ".code-review-graph" / "write.lock").unlink()
     monkeypatch.setattr(sys, "argv", ["crg", command, "--repo", str(repo)])
 
     cli.main()
