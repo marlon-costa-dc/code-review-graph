@@ -119,6 +119,46 @@ class TestWatchSet:
         assert failures == []
         assert not watch_health_path(first).exists()
 
+    def test_shared_manifest_routes_edits_to_the_selected_checkout(self, tmp_path, monkeypatch):
+        database = tmp_path / "shared.db"
+        monkeypatch.setenv("CRG_SHARED_DB", str(database))
+        entries = [(tmp_path / name, tmp_path / "unused") for name in ("left", "right")]
+        for repo, _ in entries:
+            repo.mkdir()
+            (repo / "app.py").write_text("def initial(): return 1\n", encoding="utf-8")
+            cli_main_argv(["build", "--repo", str(repo)])
+        manifest = tmp_path / "shared.json"
+        _write_manifest(manifest, entries)
+        stop = threading.Event()
+        failures: list[BaseException] = []
+
+        def run() -> None:
+            from code_review_graph.postprocessing import run_post_processing
+
+            try:
+                watch_set(manifest, stop_event=stop, on_files_updated=run_post_processing)
+            except BaseException as failure:
+                failures.append(failure)
+
+        def names(repo: Path) -> set[str]:
+            with GraphStore(database, checkout=repo, read_only=True) as store:
+                return {node.name for node in store.get_all_nodes() if node.kind == "Function"}
+
+        left, right = (repo for repo, _ in entries)
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        try:
+            _until(lambda: _watching(left) and _watching(right), "shared manifest watchers")
+            (left / "app.py").write_text("def changed_on_left(): return 2\n", encoding="utf-8")
+            _until(lambda: names(left) == {"changed_on_left"}, "left checkout edit")
+            assert names(right) == {"initial"}
+            assert list(tmp_path.rglob("*.db")) == [database]
+        finally:
+            stop.set()
+            thread.join(timeout=_DEADLINE_SECONDS)
+        assert not thread.is_alive()
+        assert failures == []
+
     def test_unbuilt_graph_is_refused_before_watching(self, tmp_path):
         repo = tmp_path / "unbuilt"
         repo.mkdir()
