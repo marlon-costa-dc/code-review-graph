@@ -131,14 +131,18 @@ class TestCompleteByDefault:
         assert result["changed_files"] == big_change["files"]
         assert result["changed_file_count"] == len(big_change["files"])
 
-    def test_detect_changes_include_source_covers_every_function(self, big_change):
+    def test_detect_changes_reports_source_cut_without_losing_functions(self, big_change):
         result = _detect(big_change, include_source=True)
 
-        assert result["truncated"] is False
-        assert all("source" in func for func in result["changed_functions"])
+        assert result["truncated"] is True
+        assert result["source_truncated"] is True
+        assert len(result["changed_functions"]) == result["changed_functions_total"]
+        assert 0 < sum("source" in func for func in result["changed_functions"]) < len(
+            result["changed_functions"]
+        )
 
     def test_review_context_returns_the_complete_context(self, big_change):
-        result = _review(big_change)
+        result = _review(big_change, include_source=False)
 
         context = result["context"]
         graph = context["graph"]
@@ -146,13 +150,14 @@ class TestCompleteByDefault:
         assert "omitted" not in result
         assert context["truncated"] is False
         assert context["impact_truncated"] is False
-        assert context["changed_files"] == big_change["files"]
+        assert set(context["changed_files"]) == set(big_change["files"])
+        scores = [context["file_risk"][path] for path in context["changed_files"]]
+        assert scores == sorted(scores, reverse=True)
         assert context["changed_files_total"] == len(big_change["files"])
         assert len(graph["changed_nodes"]) == graph["changed_nodes_total"]
         assert len(graph["changed_nodes"]) > 500
         assert len(graph["impacted_nodes"]) == graph["impacted_nodes_total"]
         assert len(graph["edges"]) == graph["edges_total"]
-        assert set(context["source_snippets"]) == set(big_change["files"])
         assert "showing" not in result["summary"]
 
 
@@ -233,7 +238,8 @@ class TestCallerLimitsAreExact:
 
         context = result["context"]
         assert len(context["changed_files"]) == 220
-        assert len(context["source_snippets"]) == 220
+        assert 0 < len(context["source_snippets"]) < 220
+        assert context["source_regions"]["shown"] < context["source_regions"]["total"]
         assert len(context["graph"]["changed_nodes"]) == 600
         assert context["truncated"] is True
 

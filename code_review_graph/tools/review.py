@@ -610,8 +610,10 @@ def get_review_context(
         edges, edges_total, edges_cut = _bounded(
             impact["edges"], max_results, None,
         )
+        impact_truncated = bool(impact.get("truncated"))
         truncated = (
-            files_cut or impacted_cut or cn_cut or in_cut or edges_cut or unmatched_cut
+            impact_truncated or files_cut or impacted_cut or cn_cut or in_cut or edges_cut
+            or unmatched_cut
         )
 
         context: dict[str, Any] = {
@@ -631,6 +633,7 @@ def get_review_context(
                 "edges_total": edges_total,
             },
             "truncated": truncated,
+            "impact_truncated": impact_truncated,
         }
 
         # Add source snippets for the bounded file list, spending a shared
@@ -1190,7 +1193,8 @@ def detect_changes_func(
         # Optionally include source snippets for changed functions, spending a
         # shared line budget. Inlining every changed function body turned a
         # whole-repo diff into a 30k-token ``changed_functions`` list.
-        if include_source:
+        source_clipped = False
+        if include_source and detail_level != "minimal":
             budget = _MAX_DETECT_SOURCE_LINES
             followed = followed_files(store)
             for func in analysis.get("changed_functions", []):
@@ -1208,6 +1212,7 @@ def detect_changes_func(
                             ).splitlines()
                             start = max(0, ls - 1)
                             end = min(len(lines), le, start + budget)
+                            func["source_truncated"] = end < min(len(lines), le)
                             func["source"] = "\n".join(
                                 f"{i + 1}: {lines[i]}"
                                 for i in range(start, end)
@@ -1269,6 +1274,10 @@ def detect_changes_func(
             removed_total = analysis.get("removed_symbols_total", len(removed))
             removed_cut = removed_cut or removed_total > len(removed)
             funcs_total = analysis["changed_functions_total"]
+            if include_source:
+                source_clipped = any(
+                    "source" not in func or func.get("source_truncated", False) for func in funcs
+                )
             any_cut = (
                 bool(analysis["functions_truncated"]) or
                 funcs_cut or gaps_cut or flows_cut or files_cut or yaml_paths_cut
@@ -1276,6 +1285,7 @@ def detect_changes_func(
                 or removed_cut
                 or bool(analysis.get("yaml_paths_truncated"))
                 or bool(analysis.get("json_paths_truncated"))
+                or source_clipped
             )
             summary = analysis.get("summary", "")
             if any_cut:
@@ -1288,6 +1298,7 @@ def detect_changes_func(
                         if json_paths_total else ""
                     )
                     + f"{len(gaps)} of {gaps_total} test gap(s), "
+                    f"{len(files)} of {files_total} changed file(s) shown, "
                     f"{len(flows)} of {flows_total} flow(s)"
                     + (
                         f", {len(removed)} of {removed_total} removed symbol(s)"
@@ -1315,6 +1326,8 @@ def detect_changes_func(
                 "affected_flows_total": flows_total,
                 "truncated": any_cut,
             }
+            if source_clipped:
+                result["source_truncated"] = True
         if max_tokens and detail_level != "minimal":
             budget_note = _budget_detect_changes(result, max_tokens)
             if budget_note:

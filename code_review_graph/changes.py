@@ -1829,7 +1829,8 @@ def analyze_changes(
         )
     if funcs_truncated:
         summary_parts.append(
-            f"  - Warning: analysis capped at {_max_funcs} functions "
+            f"  - Warning: analysis limited to {_max_funcs} of "
+            f"{changed_functions_total} changed functions "
             f"(set CRG_MAX_CHANGED_FUNCS to adjust)"
         )
     if ranges_unavailable:
