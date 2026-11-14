@@ -478,12 +478,14 @@ main()
     assert list(tmp_path.rglob("*.db")) == [tmp_path / "shared.db"]
 
 
-@pytest.mark.parametrize("outcome", ["reused", "crash", "different-profile"])
+@pytest.mark.parametrize("outcome", ["reused", "crash", "different-profile", "new-edit"])
 async def test_cli_and_mcp_complete_a_contended_refresh(tmp_path, outcome):
     repo = _make_fixture_repo(tmp_path)
     crg_home = tmp_path / "refresh-home"
     crg_home.mkdir()
     env = {**_server_env(crg_home), "CRG_SERIAL_PARSE": "1"}
+    if outcome == "new-edit":
+        env["CRG_SHARED_DB"] = str(tmp_path / "shared.db")
     # Keep the production parser and writer; pause the CLI process after
     # it has taken the kernel lock and started parsing.
     producer = """
@@ -495,15 +497,16 @@ from code_review_graph.parser import CodeParser
 entered, resume = map(Path, sys.argv[1:3])
 del sys.argv[1:3]
 real_parse = CodeParser.parse_bytes
-def pause(self, *args, **kwargs):
-    if not entered.exists():
+def pause(self, path, source):
+    result = real_parse(self, path, source)
+    if Path(path).name == "core.py" and not entered.exists():
         entered.touch()
         until = time.monotonic() + 15
         while not resume.exists() and time.monotonic() < until:
             time.sleep(0.02)
         if not resume.exists():
             raise TimeoutError("fixture never resumed the parser")
-    return real_parse(self, *args, **kwargs)
+    return result
 CodeParser.parse_bytes = pause
 main()
 """
@@ -537,6 +540,11 @@ main()
                     if outcome == "crash":
                         child.kill()
                     else:
+                        if outcome == "new-edit":
+                            (repo / "pkg" / "core.py").write_text(
+                                CORE_PY + "\ndef arrived_during_refresh(): return 1\n",
+                                encoding="utf-8",
+                            )
                         resume.touch()
                     result = _payload(await join)
                     assert result["status"] == "ok", result
@@ -549,7 +557,10 @@ main()
                     query = _payload(await _call(session, "query_graph_tool", {
                         "pattern": "file_summary", "target": "pkg/core.py",
                     }))
-                    assert {node["name"] for node in query["results"]} >= {"compute_total"}
+                    names = {node["name"] for node in query["results"]}
+                    assert "compute_total" in names
+                    if outcome == "new-edit":
+                        assert "arrived_during_refresh" in names
         finally:
             resume.touch()
             stdout, stderr = child.communicate(timeout=20)
