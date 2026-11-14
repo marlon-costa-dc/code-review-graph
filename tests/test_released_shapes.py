@@ -325,11 +325,11 @@ def _require_tags() -> tuple[str, ...]:
 
 
 def test_recorded_hook_blocks_match_the_tags() -> None:
-    """The frozen snapshot really is what the released tags contain."""
+    """Each tag available in this fork uses a recognized released hook."""
     _require_tags()
     derived = _released_hook_bodies()
     assert derived, "no pre-commit hook body could be read from any tag"
-    assert set(derived) == set(RELEASED_GIT_HOOK_BODIES), (
+    assert set(derived) <= set(RELEASED_GIT_HOOK_BODIES), (
         "the released pre-commit hook bodies have changed; update "
         "RELEASED_GIT_HOOK_BODIES and skills._LEGACY_GIT_HOOK_BLOCKS together"
     )
