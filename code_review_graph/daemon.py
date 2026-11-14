@@ -21,7 +21,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -217,6 +217,34 @@ class WatchRepo:
     embedding: str = ""
     """Per-repo embedding model (rendered as ``CRG_EMBEDDING_MODEL``)."""
 
+    discover_worktrees: bool = False
+    """Include live linked Git worktrees in the daemon's desired watchers."""
+
+
+def _watch_targets(repos: list[WatchRepo]) -> dict[str, WatchRepo]:
+    """Expand opted-in roots without inheriting a parent's database directory."""
+    from .multi_worktree import discover_worktrees
+
+    targets = {repo.alias: repo for repo in repos}
+    roots = {Path(repo.path).resolve() for repo in repos}
+    for repo in repos:
+        if not repo.discover_worktrees:
+            continue
+        if os.environ.get("CRG_DATA_DIR", "").strip():
+            raise ValueError("discover_worktrees cannot use a shared CRG_DATA_DIR override")
+        for checkout in discover_worktrees(Path(repo.path)):
+            if checkout.root in roots:
+                continue
+            path = str(checkout.root)
+            alias = f"{repo.alias}-wt-{hashlib.sha256(os.fsencode(path)).hexdigest()[:16]}"
+            if alias in targets:
+                raise ValueError(f"Discovered worktree alias conflicts: {alias}")
+            targets[alias] = replace(
+                repo, path=path, alias=alias, data_dir="", discover_worktrees=False,
+            )
+            roots.add(checkout.root)
+    return targets
+
 
 def watcher_env(repo: WatchRepo) -> dict[str, str]:
     """Build the child environment honoring per-repo overrides."""
@@ -327,6 +355,7 @@ def load_config(path: Path | None = None) -> DaemonConfig:
                 data_dir=entry.get("data_dir", ""),
                 recurse_submodules=entry.get("recurse_submodules", False),
                 embedding=entry.get("embedding", ""),
+                discover_worktrees=entry.get("discover_worktrees", False),
             )
         )
 
@@ -399,6 +428,8 @@ def _serialize_toml(config: DaemonConfig) -> str:
             lines.append("recurse_submodules = true")
         if repo.embedding:
             lines.append(f"embedding = {_toml_str(repo.embedding)}")
+        if repo.discover_worktrees:
+            lines.append("discover_worktrees = true")
     lines.append("")  # trailing newline
     return "\n".join(lines)
 
@@ -1248,21 +1279,22 @@ class WatchDaemon:
         from .registry import Registry
 
         registry = Registry()
-        for repo in self._config.repos:
+        targets = _watch_targets(self._config.repos)
+        for repo in targets.values():
             registry.register(repo.path, alias=repo.alias, data_dir=repo.data_dir or None)
 
         # Build initial graph for repos that lack a database
-        for repo in self._config.repos:
+        for repo in targets.values():
             db_path = get_db_path(Path(repo.path), read_only=True)
             if not db_path.exists():
                 self._initial_build(repo)
 
         # Spawn a watcher child for every repo
-        for repo in self._config.repos:
+        for repo in targets.values():
             self._start_watcher(repo)
 
         # Track current state
-        self._current_repos = {r.alias: r for r in self._config.repos}
+        self._current_repos = targets
 
         # Persist child PIDs to disk for cross-process status queries
         self._save_state()
@@ -1273,7 +1305,7 @@ class WatchDaemon:
         # Start health checker to auto-restart dead watchers
         self.start_health_checker()
 
-        msg = f"Daemon started — watching {len(self._config.repos)} repo(s)"
+        msg = f"Daemon started — watching {len(targets)} repo(s)"
         logger.info(msg)
         print(msg)  # noqa: T201
 
@@ -1307,7 +1339,7 @@ class WatchDaemon:
         if new_config is not None:
             self._config = new_config
 
-        desired: dict[str, WatchRepo] = {r.alias: r for r in self._config.repos}
+        desired = _watch_targets(self._config.repos)
         current: set[str] = set(self._current_repos.keys())
 
         to_add: set[str] = desired.keys() - current

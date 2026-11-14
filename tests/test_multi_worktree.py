@@ -69,6 +69,37 @@ def test_discovery_tracks_moved_and_detached_checkouts(tmp_path: Path) -> None:
     assert second[moved.resolve()].head == first[linked.resolve()].head
 
 
+def test_daemon_reconciles_linked_worktree_membership(tmp_path: Path) -> None:
+    from code_review_graph.daemon import DaemonConfig, WatchDaemon, WatchRepo
+
+    repo = _repository(tmp_path)
+    linked = tmp_path / "linked checkout"
+    configured = WatchRepo(
+        path=str(repo.resolve()), alias="repo", data_dir=str(tmp_path / "external"),
+        discover_worktrees=True,
+    )
+    config = DaemonConfig(repos=[configured])
+    daemon = WatchDaemon(config=config)
+
+    with (
+        patch.object(daemon, "_initial_build"),
+        patch.object(daemon, "_start_watcher") as start,
+        patch.object(daemon, "_save_state"),
+    ):
+        daemon.reconcile(config)
+        _git(repo, "worktree", "add", "-q", "-b", "review", str(linked))
+        daemon.reconcile(config)
+        discovered = start.call_args.args[0]
+        assert discovered.path == str(linked.resolve())
+        assert discovered.data_dir == ""
+
+        daemon.reconcile(config)
+        assert start.call_count == 2
+        _git(repo, "worktree", "remove", str(linked))
+        daemon.reconcile(config)
+        assert daemon._current_repos == {configured.alias: configured}
+
+
 def test_authorizer_accepts_linked_worktree_and_rejects_other_repo(tmp_path: Path) -> None:
     repo = _repository(tmp_path)
     worktree = tmp_path / "worktree"
