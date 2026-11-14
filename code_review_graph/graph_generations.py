@@ -7,7 +7,33 @@ input. Readers resolve the binding in the same read transaction as the rows.
 
 from __future__ import annotations
 
+import hashlib
+import os
 import sqlite3
+from collections.abc import Mapping
+from pathlib import PurePosixPath
+
+
+def content_identity(files: Mapping[str, str]) -> str:
+    """Digest a manifest of canonical relative paths and parsed byte hashes.
+
+    Input paths and hashes must describe the bytes consumed by the indexer.
+    Commit IDs and checkout paths are deliberately outside this identity.
+    """
+    digest = hashlib.sha256()
+    for path, file_digest in sorted(files.items()):
+        relative = PurePosixPath(path)
+        if (
+            relative.is_absolute() or not relative.parts or ".." in relative.parts
+            or relative.as_posix() != path or "\\" in path or "\0" in path
+        ):
+            raise ValueError(f"Invalid graph manifest path: {path!r}")
+        raw_digest = bytes.fromhex(file_digest)
+        if len(raw_digest) != digest.digest_size:
+            raise ValueError(f"Invalid SHA-256 for graph manifest path: {path!r}")
+        digest.update(os.fsencode(path) + b"\0")
+        digest.update(raw_digest)
+    return digest.hexdigest()
 
 
 def initialize_bindings(conn: sqlite3.Connection) -> None:

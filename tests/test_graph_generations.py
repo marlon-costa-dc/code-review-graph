@@ -4,6 +4,7 @@ from contextlib import closing
 import pytest
 
 from code_review_graph.graph_generations import (
+    content_identity,
     ensure_generation,
     initialize_bindings,
     publish_binding,
@@ -50,3 +51,15 @@ def test_shared_generation_binding_is_atomic_and_rejects_stale_publication(tmp_p
         assert publish_binding(writer, "right", candidate, expected_revision=3)
         writer.rollback()
         assert read_binding(reader, "right") == (1, 3)
+
+def test_content_identity_distinguishes_edits_and_renames_without_checkout_paths():
+    original = {"pkg/app.py": "01" * 32, "test_app.py": "02" * 32}
+    clean = content_identity(original)
+    assert clean == content_identity(dict(reversed(list(original.items()))))
+    assert clean != content_identity(original | {"pkg/app.py": "03" * 32})
+    assert clean != content_identity(original | {"untracked.py": "01" * 32})
+    assert clean != content_identity({"pkg/other.py": "01" * 32, "test_app.py": "02" * 32})
+    assert clean != content_identity({"pkg/app.py": "01" * 32})
+    for invalid in ("/checkout/pkg/app.py", "../app.py", "pkg//app.py"):
+        with pytest.raises(ValueError, match="Invalid graph manifest path"):
+            content_identity({invalid: "01" * 32})
