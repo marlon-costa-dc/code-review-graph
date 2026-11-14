@@ -214,15 +214,16 @@ def run_update_hook(existing_only: bool = False) -> None:
     repo_root = _update_target(_read_payload(), existing_only)
     if repo_root is None:
         return
-    _update_repo(repo_root)
+    _update_repo(repo_root, existing_only=existing_only)
 
 
-def _update_repo(repo_root: Path) -> None:
+def _update_repo(repo_root: Path, *, existing_only: bool = False) -> None:
     from .tools.build import build_or_update_graph
 
     try:
         result = build_or_update_graph(
-            full_rebuild=False, repo_root=str(repo_root), postprocess="minimal"
+            full_rebuild=not existing_only and not _has_graph(repo_root),
+            repo_root=str(repo_root), postprocess="minimal",
         )
     except RuntimeError as exc:
         print(f"Error: {exc}", file=sys.stderr)

@@ -33,6 +33,8 @@ from ..incremental import (
 from ..locking import WriteLock, write_lock_path
 from ._common import _get_store, _resolve_root
 
+_UPDATE_REQUIRES_GRAPH = "incremental update requires an existing graph; run build explicitly"
+
 logger = logging.getLogger(__name__)
 
 _PARTIAL_GRAPH_MIN_FILES = 8
@@ -562,12 +564,14 @@ def build_or_update_graph(
     store = None
     try:
         recovery_reason: str | None = None
+        if not full_rebuild and not db_path.is_file():
+            raise RuntimeError(_UPDATE_REQUIRES_GRAPH)
         _prepare_db_path(root, db_path)
         store, root = _get_store(
             str(root), db_path=db_path, recover_corrupt=full_rebuild and recover_corrupt
         )
-        if not full_rebuild and not store.has_nodes():
-            full_rebuild = True
+        if not full_rebuild and not store.has_nodes() and not store.get_metadata("last_build_type"):
+            raise RuntimeError(_UPDATE_REQUIRES_GRAPH)
 
         # A previous run that died before post-processing left a current anchor
         # over a half-derived graph. Preserve the visible incomplete marker,
@@ -580,14 +584,15 @@ def build_or_update_graph(
             full_rebuild = True
 
         # An automatic (base is None) incremental update resolves its diff base
-        # to the last-synced commit. When no usable anchor exists, fall back to
-        # a full rebuild rather than a wrong HEAD~1 diff that could report the
-        # graph as up to date while it is actually stale.
+        # to the last-synced commit. A missing anchor requires an explicit
+        # build rather than diffing against an unrelated revision.
         base_resolved: str | None = base
         if not full_rebuild and base is None:
             base_resolved = resolve_incremental_base(root, store)
             if base_resolved is None:
-                full_rebuild = True
+                raise RuntimeError(
+                    "incremental update has no usable Git base; run build explicitly"
+                )
 
         if (
             not full_rebuild

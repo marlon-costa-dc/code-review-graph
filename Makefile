@@ -68,3 +68,7 @@ test-read-guard:
 .PHONY: test-review-budget
 test-review-budget:
 	uv run --locked --extra dev pytest tests/test_complete_change_analysis.py -q --tb=short
+
+.PHONY: test-update-contract
+test-update-contract:
+	uv run --locked --extra dev pytest tests/test_integration_git.py tests/test_update_in_a_graph_only_project.py tests/test_hook_update.py tests/test_codex_hook_never_builds_a_new_graph.py -q --tb=short
