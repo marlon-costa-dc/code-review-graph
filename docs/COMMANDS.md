@@ -419,10 +419,11 @@ path = "/home/user/project-b"
 alias = "project-b"
 ```
 
-The daemon spawns one `code-review-graph watch` child process per repo with
-`subprocess.Popen`. It polls the config file and starts or stops children as
-repos are added or removed. A health check every 30 seconds restarts dead
-watchers. No tmux or screen is needed.
+The daemon starts one `code-review-graph watch` child per repository. It
+reloads `watch.toml` when the file changes or is replaced atomically and
+starts or stops children as repositories are added or removed. At startup and
+reload, it reuses an existing graph in the registered data directory. A
+health check every 30 seconds restarts dead watchers.
 
 With `discover_worktrees`, startup, configuration reloads, and periodic health checks include
 live linked checkouts found by Git. Explicitly configured checkouts keep their
