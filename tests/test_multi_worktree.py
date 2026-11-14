@@ -3,15 +3,23 @@
 from __future__ import annotations
 
 import signal
+import sqlite3
 import subprocess
 import threading
+from contextlib import closing
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from code_review_graph.graph import GraphStore
-from code_review_graph.graph_generations import indexed_content_identity
+from code_review_graph.graph_generations import (
+    ensure_indexed_generation,
+    indexed_content_identity,
+    initialize_bindings,
+    publish_binding,
+    read_checkout_manifest,
+)
 from code_review_graph.incremental import full_build, get_db_path, incremental_update
 from code_review_graph.multi_worktree import (
     _MAX_INFLIGHT_REQUESTS,
@@ -64,14 +72,38 @@ def test_indexed_content_identity_reuses_sibling_content_and_tracks_wip(tmp_path
     with (
         GraphStore(tmp_path / "left.db") as left,
         GraphStore(tmp_path / "right.db") as right,
+        closing(sqlite3.connect(tmp_path / "shared.db")) as shared,
     ):
         assert full_build(repo, left)["errors"] == []
         assert full_build(linked, right)["errors"] == []
         base = indexed_content_identity(repo, left)
         assert indexed_content_identity(linked, right) == base
+        initialize_bindings(shared)
+        shared.execute("BEGIN IMMEDIATE")
+        generation = ensure_indexed_generation(
+            shared, repository="repo", profile_digest="default", repo_root=repo, store=left,
+        )
+        assert ensure_indexed_generation(
+            shared, repository="repo", profile_digest="default", repo_root=linked, store=right,
+        ) == generation
+        assert publish_binding(shared, "left", generation, expected_revision=0)
+        assert publish_binding(shared, "right", generation, expected_revision=0)
+        shared.commit()
+        original = read_checkout_manifest(shared, "left")
+        assert "app.py" in original
+        assert read_checkout_manifest(shared, "right") == original
         (linked / "app.py").write_text("def edited(): return 2\n", encoding="utf-8")
         assert incremental_update(linked, right, changed_files=["app.py"])["errors"] == []
         assert indexed_content_identity(linked, right) != base
+        shared.execute("BEGIN IMMEDIATE")
+        edited = ensure_indexed_generation(
+            shared, repository="repo", profile_digest="default", repo_root=linked, store=right,
+        )
+        assert edited != generation
+        assert publish_binding(shared, "right", edited, expected_revision=1)
+        shared.commit()
+        assert read_checkout_manifest(shared, "left") == original
+        assert read_checkout_manifest(shared, "right")["app.py"] != original["app.py"]
         assert indexed_content_identity(repo, left) == base
         with pytest.raises(ValueError):
             indexed_content_identity(repo, right)

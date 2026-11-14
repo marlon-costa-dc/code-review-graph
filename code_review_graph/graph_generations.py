@@ -40,13 +40,17 @@ def content_identity(files: Mapping[str, str]) -> str:
     return digest.hexdigest()
 
 
-def indexed_content_identity(repo_root: Path, store: GraphStore) -> str:
-    """Identify the indexed bytes without rereading or hashing the checkout."""
+def indexed_file_manifest(repo_root: Path, store: GraphStore) -> dict[str, str]:
+    """Return checkout-relative file hashes from the indexed bytes."""
     root = repo_root.resolve()
-    return content_identity({
+    return {
         (root / path).relative_to(root).as_posix(): digest
         for path, digest in store.get_file_hashes().items()
-    })
+    }
+
+
+def indexed_content_identity(repo_root: Path, store: GraphStore) -> str:
+    return content_identity(indexed_file_manifest(repo_root, store))
 
 
 def initialize_bindings(conn: sqlite3.Connection) -> None:
@@ -61,6 +65,14 @@ def initialize_bindings(conn: sqlite3.Connection) -> None:
             profile_digest TEXT NOT NULL,
             UNIQUE (repository, content_digest, profile_digest)
         )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS generation_files (
+            generation INTEGER NOT NULL REFERENCES graph_generations(id) ON DELETE CASCADE,
+            path TEXT NOT NULL,
+            digest TEXT NOT NULL,
+            PRIMARY KEY (generation, path)
+        ) WITHOUT ROWID
     """)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS checkout_bindings (
@@ -90,6 +102,30 @@ def ensure_generation(
     )
     assert cursor.lastrowid is not None
     return cursor.lastrowid
+
+
+def ensure_indexed_generation(
+    conn: sqlite3.Connection, *, repository: str, profile_digest: str,
+    repo_root: Path, store: GraphStore,
+) -> int:
+    """Persist the indexed manifest in the pending publication transaction."""
+    files = indexed_file_manifest(repo_root, store)
+    generation = ensure_generation(conn, repository, content_identity(files), profile_digest)
+    conn.executemany(
+        "INSERT INTO generation_files (generation, path, digest) VALUES (?, ?, ?) "
+        "ON CONFLICT(generation, path) DO NOTHING",
+        ((generation, path, digest.lower()) for path, digest in files.items()),
+    )
+    return generation
+
+
+def read_checkout_manifest(conn: sqlite3.Connection, checkout: str) -> dict[str, str]:
+    """Read only the indexed paths bound to this checkout, in one statement."""
+    return dict(conn.execute(
+        "SELECT files.path, files.digest FROM checkout_bindings AS binding "
+        "JOIN generation_files AS files ON files.generation = binding.generation "
+        "WHERE binding.checkout = ?", (checkout,),
+    ).fetchall())
 
 
 def read_binding(conn: sqlite3.Connection, checkout: str) -> tuple[int, int] | None:
