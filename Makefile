@@ -104,3 +104,7 @@ test-embedding-notices:
 .PHONY: test-baseline-compat
 test-baseline-compat:
 	uv run --locked --extra dev pytest tests/test_readme_parity.py tests/test_released_shapes.py tests/test_numeric_reports.py tests/test_registered_data_dir_recovery.py -q --tb=short
+
+.PHONY: test-parser-process-locks
+test-parser-process-locks:
+	uv run --locked --extra dev pytest tests/test_concurrency_and_daemon.py -m concurrency -k TestSingleFlightWriteLock -q --tb=short
