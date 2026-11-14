@@ -111,7 +111,7 @@ def _flock(handle: Any, blocking: bool) -> bool:
     return True
 
 
-def _windows_owner_lock(handle: Any, blocking: bool) -> bool:
+def _windows_lock(handle: Any, blocking: bool) -> bool:
     """Lock the first byte until the descriptor closes, even for an empty file."""
     import msvcrt
 
@@ -163,20 +163,17 @@ class WriteLock:
     def acquire(self, *, blocking: bool = False) -> bool:
         """Claim the lock, or report that somebody else holds it.
 
-        Returns True when this instance owns the lock afterwards. On Windows,
-        checkout ownership uses a byte-range lock; ordinary write locks keep
-        their existing behavior.
+        Returns True when this instance owns the lock afterwards. Windows
+        uses a byte-range lock for both checkout ownership and graph writes.
         """
         if self._handle is not None:
             return True
         use_flock = _flock_supported()
-        if not use_flock and not self._strict:
-            return True
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             handle = open(self.path, "a+", encoding="utf-8")  # noqa: SIM115
         except OSError as exc:
-            if self._strict:
+            if self._strict or not use_flock:
                 raise
             # A lock file we cannot even open must not fail the build: losing
             # the guard degrades to the old behaviour, which is what the user
@@ -187,10 +184,10 @@ class WriteLock:
         _open_locks.add(self)
         acquired = False
         try:
-            acquire = _flock if use_flock else _windows_owner_lock
+            acquire = _flock if use_flock else _windows_lock
             acquired = acquire(handle, blocking)
         except OSError as exc:
-            if self._strict:
+            if self._strict or not use_flock:
                 raise
             # No lock support is not a competing writer, and it must not fail
             # the build either. Degrade like a lock file that cannot be opened.
@@ -203,7 +200,7 @@ class WriteLock:
                 handle.close()
         if not acquired:
             return False
-        if not self._strict:
+        if not self._strict and use_flock:
             self._record_holder(handle)
         return True
 
@@ -228,7 +225,7 @@ class WriteLock:
         _open_locks.discard(self)
         if handle is None:
             return
-        if not self._strict:
+        if not self._strict and _flock_supported():
             try:
                 handle.seek(0)
                 handle.truncate()
@@ -236,7 +233,7 @@ class WriteLock:
             except OSError:  # pragma: no cover - best-effort cleanup
                 pass
         try:
-            handle.close()  # closing the description releases the flock
+            handle.close()  # closing the descriptor releases the lock
         except OSError:  # pragma: no cover - best-effort cleanup
             pass
 

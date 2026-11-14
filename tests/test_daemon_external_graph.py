@@ -12,17 +12,18 @@ from code_review_graph.locking import WriteLock
 from code_review_graph.registry import Registry
 
 
-def test_watcher_ownership_excludes_other_processes_until_release(tmp_path):
+@pytest.mark.parametrize("checkout_owner", [False, True])
+def test_lock_excludes_other_processes_until_release(tmp_path, checkout_owner):
     db = tmp_path / "graph.db"
-    path = tmp_path / "watch.lock"
+    path = tmp_path / "watch.lock" if checkout_owner else None
     owner = WriteLock(db, owner_path=path)
     probe = [
         sys.executable, "-c",
         "from pathlib import Path; from sys import argv; "
         "from code_review_graph.locking import WriteLock; "
-        "lock = WriteLock(Path(argv[1]), owner_path=Path(argv[2])); "
+        "lock = WriteLock(Path(argv[1]), owner_path=Path(argv[2]) if argv[2] else None); "
         "print(lock.acquire())",
-        str(db), str(path),
+        str(db), str(path) if path is not None else "",
     ]
     assert owner.acquire()
     try:
