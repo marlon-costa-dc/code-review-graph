@@ -80,3 +80,35 @@ test-registry:
 .PHONY: test-mcp-client
 test-mcp-client:
 	uv run --locked --extra dev pytest tests/test_e2e_mcp_client.py -q --tb=short
+
+.PHONY: test-change-discovery
+test-change-discovery:
+	uv run --locked --extra dev pytest tests/test_changes.py tests/test_agent_transparency.py -q --tb=short
+
+.PHONY: test-review-entrypoints
+test-review-entrypoints:
+	uv run --locked --extra dev pytest tests/test_action_render.py tests/test_churn_runtime.py tests/test_cli_help.py tests/test_query_path_to.py -q --tb=short
+
+.PHONY: test-watcher-lifecycle
+test-watcher-lifecycle:
+	uv run --locked --extra dev pytest tests/test_mcp_watch_store_shutdown.py tests/test_watch_set.py tests/test_windows_path_identity.py tests/test_edit_hook_follows_the_edited_file.py -q --tb=short
+
+.PHONY: test-unmatched-risk
+test-unmatched-risk:
+	uv run --locked --extra dev pytest tests/test_unmatched_risk.py -q --tb=short
+
+.PHONY: test-review-analysis
+test-review-analysis:
+	uv run --locked --extra dev pytest tests/test_generic_yaml_edge_cases.py tests/test_pure_deletion_review.py tests/test_token_budget.py -q --tb=short
+
+.PHONY: test-embedding-notices
+test-embedding-notices:
+	uv run --locked --extra dev pytest tests/test_embedding_refresh_skip_notice.py tests/test_yaml_locale_files.py -q --tb=short
+
+.PHONY: test-baseline-compat
+test-baseline-compat:
+	uv run --locked --extra dev pytest tests/test_readme_parity.py tests/test_released_shapes.py tests/test_numeric_reports.py tests/test_registered_data_dir_recovery.py -q --tb=short
+
+.PHONY: test-parser-process-locks
+test-parser-process-locks:
+	uv run --locked --extra dev pytest tests/test_concurrency_and_daemon.py -m concurrency -k TestSingleFlightWriteLock -q --tb=short

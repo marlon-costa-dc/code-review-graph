@@ -1223,6 +1223,12 @@ class ConfigWatcher:
                     if Path(event.src_path).resolve() == watcher._config_path.resolve():
                         watcher._on_config_changed()
 
+                on_created = on_modified
+
+                def on_moved(self, event: Any) -> None:
+                    if Path(event.dest_path).resolve() == watcher._config_path.resolve():
+                        watcher._on_config_changed()
+
             handler = _Handler()
             self._observer = Observer()
             self._observer.schedule(

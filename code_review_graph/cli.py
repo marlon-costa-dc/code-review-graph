@@ -193,6 +193,8 @@ _BANNER_GROUPS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
         ("register", "Add a repository to the multi-repo list"),
         ("unregister", "Remove a repository from that list"),
         ("repos", "Show the listed repositories"),
+        ("prune", "Find stale registry entries and orphaned graph directories"),
+        ("vstore", "Store and retrieve graph bundles by tree hash"),
         ("eval", "Run the benchmarks"),
     )),
 )

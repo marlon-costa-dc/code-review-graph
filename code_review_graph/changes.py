@@ -1630,15 +1630,18 @@ def analyze_changes(
     changed_json_paths = [n for n in changed_nodes if n.kind == "JsonPath"]
 
     changed_functions_total = len(changed_funcs)
-    _max_funcs = _changed_funcs_bound()
+    _max_funcs = _change_bound("CRG_MAX_CHANGED_FUNCS")
     funcs_truncated = _max_funcs is not None and changed_functions_total > _max_funcs
     if funcs_truncated:
         changed_funcs = changed_funcs[:_max_funcs]
 
     # Keep one public YAML metadata contract. ``node_to_dict`` owns
     # sanitization and output limits for query and change analysis.
-    yaml_path_results = [node_to_dict(node) for node in changed_yaml_paths]
-    json_path_results = [node_to_dict(node) for node in changed_json_paths]
+    max_paths = _change_bound("CRG_MAX_CHANGED_YAML_PATHS")
+    yaml_path_results = [node_to_dict(node) for node in changed_yaml_paths[:max_paths]]
+    json_path_results = [node_to_dict(node) for node in changed_json_paths[:max_paths]]
+    yaml_paths_truncated = len(yaml_path_results) < len(changed_yaml_paths)
+    json_paths_truncated = len(json_path_results) < len(changed_json_paths)
 
     # Classify test coverage before scoring: the same answer decides both the
     # gap report and the coverage term of every node's risk score, and doing
@@ -1833,6 +1836,15 @@ def analyze_changes(
             f"{changed_functions_total} changed functions "
             f"(set CRG_MAX_CHANGED_FUNCS to adjust)"
         )
+    for format_name, shown, total in (
+        ("YAML", len(yaml_path_results), len(changed_yaml_paths)),
+        ("JSON", len(json_path_results), len(changed_json_paths)),
+    ):
+        if shown < total:
+            summary_parts.append(
+                f"  - Showing {shown} of {total} changed {format_name} paths "
+                "(set CRG_MAX_CHANGED_YAML_PATHS to adjust)"
+            )
     if ranges_unavailable:
         summary_parts.append(
             "  - Warning: line-level diff unavailable, whole files scored "
@@ -1879,8 +1891,10 @@ def analyze_changes(
         "review_priorities": review_priorities,
         "changed_functions_total": changed_functions_total,
         "functions_truncated": funcs_truncated,
-        "yaml_paths_truncated": False,
-        "json_paths_truncated": False,
+        "changed_yaml_paths_total": len(changed_yaml_paths),
+        "changed_json_paths_total": len(changed_json_paths),
+        "yaml_paths_truncated": yaml_paths_truncated,
+        "json_paths_truncated": json_paths_truncated,
         "diff_ranges_unavailable": ranges_unavailable,
         "churn_status": churn_status,
     }
@@ -1976,17 +1990,12 @@ def format_brief(
     return "\n".join(lines)
 
 
-def _changed_funcs_bound() -> int | None:
-    """Return the opt-in ``CRG_MAX_CHANGED_FUNCS`` bound, or ``None``.
-
-    Unset means no bound: the change analysis covers every changed
-    function. A set value must be a positive integer; anything else raises
-    instead of silently selecting a different bound.
-    """
-    raw = os.environ.get("CRG_MAX_CHANGED_FUNCS")
+def _change_bound(name: str) -> int | None:
+    """Read an optional positive limit; unset leaves the analysis complete."""
+    raw = os.environ.get(name)
     if raw is None:
         return None
     bound = int(raw)
     if bound < 1:
-        raise ValueError(f"CRG_MAX_CHANGED_FUNCS must be a positive integer, got {raw!r}")
+        raise ValueError(f"{name} must be a positive integer, got {raw!r}")
     return bound

@@ -159,6 +159,14 @@ def _report_refresh_skipped(result: dict[str, Any], warnings: list[str]) -> None
     result["embeddings_refresh_skipped"] = True
 
 
+def _has_postprocess_failure(warnings: list[str]) -> bool:
+    if not warnings:
+        return False
+    from code_review_graph.embeddings import REFRESH_SKIPPED_WARNING
+
+    return any(warning != REFRESH_SKIPPED_WARNING for warning in warnings)
+
+
 # SQLITE_BUSY and SQLITE_LOCKED are the only two primary result codes that
 # mean "somebody else holds it, come back later".  Extended result codes carry
 # their detail in the high bits, so the low byte is what identifies the family.
@@ -387,7 +395,7 @@ def _run_postprocess(
             model=embedding_model,
         )
         build_result["postprocess_timing"] = timing
-        if not warnings:
+        if not _has_postprocess_failure(warnings):
             store.set_metadata("postprocess_level", postprocess)
         return warnings
 
@@ -739,7 +747,9 @@ def build_or_update_graph(
                     build_result["warnings"] = warnings
                 if build_result.get("postprocess_failed"):
                     build_result["status"] = "partial"
-                if not warnings and not build_result.get("postprocess_contended"):
+                if not build_result.get("postprocess_contended") and not _has_postprocess_failure(
+                    warnings,
+                ):
                     if previous_level == "full" and not repair:
                         store.set_metadata("postprocess_level", previous_level)
                     store.set_metadata(BUILD_STATE_KEY, BUILD_COMPLETE)
@@ -820,7 +830,11 @@ def build_or_update_graph(
         # genuinely what its freshness metadata claims.  A stage that lost the
         # write lock keeps the marker set so the next run redoes it, rather
         # than leaving an empty FTS index behind a "complete" verdict.
-        if build_result["status"] == "ok" and not warnings and postprocess != "none":
+        if (
+            build_result["status"] == "ok"
+            and not _has_postprocess_failure(warnings)
+            and postprocess != "none"
+        ):
             store.set_metadata(BUILD_STATE_KEY, BUILD_COMPLETE)
         elif postprocess == "none" and failed:
             # A partial update can store some changed rows while another file
@@ -1078,7 +1092,7 @@ def run_postprocess(
                 "Post-processing ran, but the graph is missing files from an "
                 "unfinished build. Run a full build to repair it."
             )
-        elif warnings:
+        elif _has_postprocess_failure(warnings):
             store.set_metadata(BUILD_STATE_KEY, POSTPROCESS_PENDING)
             result["status"] = "partial"
             result["summary"] = "Post-processing has unresolved warnings."

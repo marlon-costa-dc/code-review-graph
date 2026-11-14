@@ -67,12 +67,14 @@ def test_numeric_reports_keep_rank_order_and_gap_categories(numeric_graph):
     assert totals == sorted(totals, reverse=True)
 
     gaps = find_knowledge_gaps(store)
-    assert tuple(gaps) == (
+    assert set(gaps) == {
         "isolated_nodes",
         "thin_communities",
         "untested_hotspots",
         "single_file_communities",
-    )
+        "import_cycles",
+    }
+    assert gaps["import_cycles"] == []
     assert gaps["untested_hotspots"][0]["name"] == "hub"
     assert gaps["untested_hotspots"][0]["degree"] == 6
 
