@@ -94,6 +94,18 @@ def initialize_bindings(conn: sqlite3.Connection) -> None:
         ) WITHOUT ROWID
     """)
     conn.execute("""
+        CREATE TABLE IF NOT EXISTS generation_edges (
+            generation INTEGER NOT NULL REFERENCES graph_generations(id) ON DELETE CASCADE,
+            file_path TEXT NOT NULL,
+            ordinal INTEGER NOT NULL,
+            kind TEXT NOT NULL,
+            source TEXT NOT NULL,
+            target TEXT NOT NULL,
+            line INTEGER NOT NULL,
+            PRIMARY KEY (generation, file_path, ordinal)
+        ) WITHOUT ROWID
+    """)
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS checkout_bindings (
             checkout TEXT PRIMARY KEY,
             generation INTEGER NOT NULL REFERENCES graph_generations(id),
@@ -154,6 +166,16 @@ def ensure_indexed_generation(
                 if node.kind != "File"
             ),
         )
+        prefix = root.as_posix().rstrip("/") + "/"
+        conn.executemany(
+            "INSERT INTO generation_edges VALUES (?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(generation, file_path, ordinal) DO NOTHING",
+            (
+                (generation, path, ordinal, edge.kind, edge.source_qualified.removeprefix(prefix),
+                 edge.target_qualified.removeprefix(prefix), edge.line)
+                for ordinal, edge in enumerate(store.iter_file_edges(str(root / path)))
+            ),
+        )
     return generation
 
 
@@ -181,6 +203,19 @@ def read_checkout_symbols(
         (str(root), relative_path),
     )
     return [(root / path, kind, name, start, end) for path, kind, name, start, end in rows]
+
+
+def read_checkout_edges(
+    conn: sqlite3.Connection, checkout_root: Path, relative_path: str,
+) -> list[tuple[str, str, str, int]]:
+    """Read a file's edges from the generation bound to this checkout."""
+    return [(kind, source, target, line) for kind, source, target, line in conn.execute(
+        "SELECT edges.kind, edges.source, edges.target, edges.line "
+        "FROM checkout_bindings AS binding "
+        "JOIN generation_edges AS edges ON edges.generation = binding.generation "
+        "WHERE binding.checkout = ? AND edges.file_path = ? ORDER BY edges.ordinal",
+        (str(checkout_root.resolve()), relative_path),
+    )]
 
 
 def read_binding(conn: sqlite3.Connection, checkout: str) -> tuple[int, int] | None:

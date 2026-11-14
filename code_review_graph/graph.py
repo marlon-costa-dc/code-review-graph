@@ -2188,6 +2188,14 @@ class GraphStore:
             rows = self._conn.execute("SELECT * FROM nodes").fetchall()
         return [self._row_to_node(r) for r in rows]
 
+    def iter_file_edges(self, file_path: str) -> Iterator[GraphEdge]:
+        """Yield edges contributed by a file, including non-symbol sources."""
+        for row in self._conn.execute(
+            "SELECT * FROM edges WHERE file_path = ? ORDER BY id",
+            (normalize_file_path(file_path),),
+        ):
+            yield self._row_to_edge(row)
+
     def get_edges_by_source(self, qualified_name: str) -> list[GraphEdge]:
         return list(self.iter_edges_by_source(qualified_name))
 

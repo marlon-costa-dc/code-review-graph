@@ -18,6 +18,7 @@ from code_review_graph.graph_generations import (
     indexed_content_identity,
     initialize_bindings,
     publish_binding,
+    read_checkout_edges,
     read_checkout_manifest,
     read_checkout_symbols,
 )
@@ -66,7 +67,7 @@ def _repository(tmp_path: Path) -> Path:
 def test_indexed_content_identity_reuses_sibling_content_and_tracks_wip(tmp_path: Path):
     repo = _repository(tmp_path)
     linked = tmp_path / "linked"
-    (repo / "app.py").write_text("def original(): return 1\n", encoding="utf-8")
+    (repo / "app.py").write_text("def original(): return first_target()\n", encoding="utf-8")
     _git(repo, "add", "app.py")
     _git(repo, "commit", "-qm", "source")
     _git(repo, "worktree", "add", "-q", "--detach", str(linked))
@@ -93,7 +94,7 @@ def test_indexed_content_identity_reuses_sibling_content_and_tracks_wip(tmp_path
         original = read_checkout_manifest(shared, str(repo.resolve()))
         assert "app.py" in original
         assert read_checkout_manifest(shared, str(linked.resolve())) == original
-        (linked / "app.py").write_text("def edited(): return 2\n", encoding="utf-8")
+        (linked / "app.py").write_text("def edited(): return second_target()\n", encoding="utf-8")
         assert incremental_update(linked, right, changed_files=["app.py"])["errors"] == []
         assert indexed_content_identity(linked, right) != base
         shared.execute("BEGIN IMMEDIATE")
@@ -113,6 +114,17 @@ def test_indexed_content_identity_reuses_sibling_content_and_tracks_wip(tmp_path
         assert read_checkout_symbols(shared, linked, "app.py") == [
             (linked / "app.py", "Function", "edited", 1, 1),
         ]
+        for checkout, expected, excluded in (
+            (repo, "first_target", "second_target"),
+            (linked, "second_target", "first_target"),
+        ):
+            calls = [
+                (source, target) for kind, source, target, _ in
+                read_checkout_edges(shared, checkout, "app.py") if kind == "CALLS"
+            ]
+            assert any(expected in target for _, target in calls)
+            assert all(excluded not in target and str(checkout) not in source
+                       for source, target in calls)
         (shared_files,) = shared.execute(
             "SELECT COUNT(*) FROM generation_files AS original "
             "JOIN generation_files AS edited USING (file_version) "
