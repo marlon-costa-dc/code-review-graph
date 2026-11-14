@@ -5699,7 +5699,9 @@ class CodeParser:
                     cell.cell_index, current_line, current_line + cell_line_count - 1,
                 ))
                 code_chunks.append(cell.source)
-                current_line += cell_line_count + 1
+                # The separator adds a blank line only if the cell already
+                # ends with a newline.
+                current_line += cell_line_count + int(cell.source.endswith("\n"))
 
             concatenated = "\n".join(code_chunks)
             concat_bytes = concatenated.encode("utf-8")
