@@ -2,13 +2,9 @@
 
 from __future__ import annotations
 
-import hashlib
 import logging
-import os
 import re
-import sqlite3
 from collections import defaultdict, deque
-from contextlib import closing
 from pathlib import Path
 from typing import Any
 
@@ -38,12 +34,6 @@ from ..graph import (
     import_scope_ancestors,
     node_to_dict,
 )
-from ..graph_generations import (
-    read_binding,
-    read_checkout_nodes,
-    read_generation_file_digest,
-    read_indexed_commit,
-)
 from ..hints import generate_hints, get_session
 from ..incremental import (
     discover_review_changes,
@@ -65,7 +55,6 @@ from ._common import (
     _get_store_for_read,
     _resolve_graph_file_paths,
     _resolve_graph_file_paths_with_unmatched,
-    _resolve_root,
     _shown_of,
     _unmatched_file_warning,
     _validate_positive_int,
@@ -1028,49 +1017,6 @@ def get_impact_radius(
 # ---------------------------------------------------------------------------
 
 
-def _shared_file_summary(
-    database: Path, root: Path, target: str, *, minimal: bool, limit: int,
-) -> dict[str, Any]:
-    physical = (root / target).resolve()
-    if not physical.is_relative_to(root):
-        raise ValueError("file_summary target is outside the requested checkout")
-    relative = physical.relative_to(root).as_posix()
-    with closing(sqlite3.connect(database.resolve().as_uri() + "?mode=ro", uri=True)) as conn:
-        conn.execute("BEGIN")
-        binding = read_binding(conn, str(root))
-        if binding is None:
-            return {"status": "not_built", "error": "No shared generation for this checkout"}
-        nodes = read_checkout_nodes(conn, root, relative)
-        indexed_commit = read_indexed_commit(conn, str(root))
-        digest = read_generation_file_digest(conn, binding[0], relative)
-    freshness = "not_indexed"
-    if digest is not None and not physical.is_file():
-        freshness = "missing"
-    elif digest is not None:
-        try:
-            current = hashlib.sha256()
-            with physical.open("rb") as source:
-                for block in iter(lambda: source.read(64 * 1024), b""):
-                    current.update(block)
-            freshness = "matches" if digest == current.hexdigest() else "changed"
-        except (FileNotFoundError, NotADirectoryError, IsADirectoryError):
-            freshness = "missing"
-    results = [node_to_dict(node) for node in nodes[:min(limit, 5) if minimal else limit]]
-    if minimal:
-        results = [{k: row[k] for k in ("name", "kind", "file_path")} for row in results]
-    response = {
-        "status": "ok", "pattern": "file_summary", "target": target,
-        "description": _QUERY_PATTERNS["file_summary"],
-        "summary": f"Found {len(nodes)} result(s) for file_summary('{target}')",
-        "result_count": len(nodes), "results_omitted": len(nodes) - len(results),
-        "results": results, "generation": binding[0], "indexed_commit": indexed_commit,
-        "target_freshness": freshness,
-    }
-    if not minimal:
-        response["edges"] = []
-    return response
-
-
 def query_graph(
     pattern: str,
     target: str,
@@ -1120,13 +1066,6 @@ def query_graph(
         )
     if pattern == "path_to" and not to:
         return _error_response("path_to needs to: the node or file to reach.")
-
-    shared = os.environ.get("CRG_SHARED_FILE_SUMMARY_DB")
-    if shared and pattern == "file_summary":
-        return _shared_file_summary(
-            Path(shared), _resolve_root(repo_root), target,
-            minimal=detail_level == "minimal", limit=max_results,
-        )
 
     store, root, not_built = _get_store_for_read(repo_root)
     if not_built is not None:

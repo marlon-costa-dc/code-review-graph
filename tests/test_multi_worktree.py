@@ -3,26 +3,14 @@
 from __future__ import annotations
 
 import signal
-import sqlite3
 import subprocess
 import threading
-from contextlib import closing
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from code_review_graph.graph import GraphStore
-from code_review_graph.graph_generations import (
-    ensure_indexed_generation,
-    indexed_content_identity,
-    initialize_bindings,
-    publish_binding,
-    read_checkout_edges,
-    read_checkout_manifest,
-    read_checkout_nodes,
-)
-from code_review_graph.incremental import full_build, get_db_path, incremental_update
+from code_review_graph.incremental import get_db_path
 from code_review_graph.multi_worktree import (
     _MAX_INFLIGHT_REQUESTS,
     MultiWorktreeError,
@@ -62,100 +50,6 @@ def _repository(tmp_path: Path) -> Path:
     _git(repo, "add", "README.md")
     _git(repo, "commit", "-q", "-m", "initial")
     return repo
-
-
-def test_shared_generations_reuse_sibling_content_and_isolate_wip(tmp_path: Path, monkeypatch):
-    from code_review_graph.tools.query import query_graph
-
-    repo = _repository(tmp_path)
-    linked = tmp_path / "linked"
-    (repo / "app.py").write_text("def original(): return first_target()\n", encoding="utf-8")
-    _git(repo, "add", "app.py")
-    _git(repo, "commit", "-qm", "source")
-    _git(repo, "worktree", "add", "-q", "--detach", str(linked))
-    with (
-        GraphStore(tmp_path / "left.db") as left,
-        GraphStore(tmp_path / "right.db") as right,
-        closing(sqlite3.connect(tmp_path / "shared.db")) as shared,
-    ):
-        assert full_build(repo, left)["errors"] == []
-        assert full_build(linked, right)["errors"] == []
-        base = indexed_content_identity(repo, left)
-        assert indexed_content_identity(linked, right) == base
-        initialize_bindings(shared)
-        shared.execute("BEGIN IMMEDIATE")
-        generation = ensure_indexed_generation(
-            shared, repository="repo", profile_digest="default", repo_root=repo, store=left,
-        )
-        with (
-            patch.object(right, "iter_nodes_by_file", side_effect=AssertionError("reread nodes")),
-            patch.object(right, "iter_file_edges", side_effect=AssertionError("reread edges")),
-        ):
-            assert ensure_indexed_generation(
-                shared, repository="repo", profile_digest="default", repo_root=linked, store=right,
-            ) == generation
-        assert publish_binding(shared, str(repo.resolve()), generation, expected_revision=0)
-        assert publish_binding(shared, str(linked.resolve()), generation, expected_revision=0)
-        shared.commit()
-        linked_file = next(
-            node for node in read_checkout_nodes(shared, linked, "app.py") if node.kind == "File"
-        )
-        assert linked_file.name == linked_file.file_path == (linked / "app.py").as_posix()
-        original = read_checkout_manifest(shared, str(repo.resolve()))
-        assert "app.py" in original
-        assert read_checkout_manifest(shared, str(linked.resolve())) == original
-        (linked / "app.py").write_text("def edited(): return second_target()\n", encoding="utf-8")
-        assert incremental_update(linked, right, changed_files=["app.py"])["errors"] == []
-        assert indexed_content_identity(linked, right) != base
-        shared.execute("BEGIN IMMEDIATE")
-        edited = ensure_indexed_generation(
-            shared, repository="repo", profile_digest="default", repo_root=linked, store=right,
-        )
-        assert edited != generation
-        assert publish_binding(shared, str(linked.resolve()), edited, expected_revision=1)
-        shared.commit()
-        assert read_checkout_manifest(shared, str(repo.resolve())) == original
-        assert read_checkout_manifest(shared, str(linked.resolve()))["app.py"] != original["app.py"]
-        (total_versions,) = shared.execute("SELECT COUNT(*) FROM indexed_file_versions").fetchone()
-        assert total_versions == len(original) + 1
-        for checkout, store in ((repo, left), (linked, right)):
-            source = store.get_nodes_by_file(str(checkout / "app.py"))
-            actual = read_checkout_nodes(shared, checkout, "app.py")
-            assert sorted(actual, key=lambda node: node.qualified_name) == sorted(
-                source, key=lambda node: node.qualified_name,
-            )
-        for checkout, expected, excluded in (
-            (repo, "first_target", "second_target"),
-            (linked, "second_target", "first_target"),
-        ):
-            calls = [
-                (source, target) for kind, source, target, _ in
-                read_checkout_edges(shared, checkout, "app.py") if kind == "CALLS"
-            ]
-            assert any(expected in target for _, target in calls)
-            assert all(excluded not in target and str(checkout) not in source
-                       for source, target in calls)
-        monkeypatch.setenv("CRG_SHARED_FILE_SUMMARY_DB", str(tmp_path / "shared.db"))
-        for checkout, generation_id, name in (
-            (repo, generation, "original"), (linked, edited, "edited"),
-        ):
-            result = query_graph("file_summary", "app.py", str(checkout), "minimal")
-            assert result["generation"] == generation_id
-            assert [row["name"] for row in result["results"] if row["kind"] == "Function"] == [name]
-            assert all(row["file_path"] == (checkout / "app.py").as_posix()
-                       for row in result["results"])
-        unbound = _repository(tmp_path / "unbound")
-        assert query_graph("file_summary", "app.py", str(unbound))["status"] == "not_built"
-        (shared_files,) = shared.execute(
-            "SELECT COUNT(*) FROM generation_files AS original "
-            "JOIN generation_files AS edited USING (file_version) "
-            "WHERE original.generation = ? AND edited.generation = ?",
-            (generation, edited),
-        ).fetchone()
-        assert shared_files == len(original) - 1
-        assert indexed_content_identity(repo, left) == base
-        with pytest.raises(ValueError):
-            indexed_content_identity(repo, right)
 
 
 def test_discovery_tracks_moved_and_detached_checkouts(tmp_path: Path) -> None:

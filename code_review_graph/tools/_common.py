@@ -15,6 +15,12 @@ from pydantic_core import to_json
 from ..graph import GraphStore, _sanitize_name
 from ..incremental import find_project_root, get_db_path
 from ..parser import normalize_file_path
+from ..shared_sqlite import (
+    CheckoutConnection,
+    UnbuiltCheckoutError,
+    shared_database,
+    verify_shared_file,
+)
 
 _MAX_PAGE_BYTES = 40_000
 _MCP_FRAME_RESERVE_BYTES = 1_024
@@ -86,8 +92,12 @@ def graph_provenance(repo_root: str | None = None) -> dict[str, Any] | None:
             database_uri,
             uri=True,
             timeout=_PROVENANCE_READ_TIMEOUT_SECONDS,
+            factory=CheckoutConnection,
         )
         try:
+            if db_path == shared_database():
+                verify_shared_file(connection, db_path, initialize=False)
+                connection.bind(root)
             rows = dict(
                 connection.execute(
                     "SELECT key, value FROM metadata WHERE key IN "
@@ -186,7 +196,13 @@ def _get_store_for_read(
     # would silently create an empty db, so short-circuit before that happens.
     if not Path(db_path).exists():
         return None, None, _not_built_response()
-    store, root = _get_store(str(root), db_path=db_path)
+    if db_path == shared_database():
+        try:
+            store = GraphStore(db_path, checkout=root, read_only=True)
+        except UnbuiltCheckoutError:
+            return None, None, _not_built_response()
+    else:
+        store, root = _get_store(str(root), db_path=db_path)
     try:
         if _graph_is_built(store):
             return store, root, None
@@ -461,7 +477,10 @@ def _get_store(
     root = _resolve_root(repo_root)
     if db_path is None:
         db_path = get_db_path(root)
-    store = _open_graph_store(db_path, "build") if recover_corrupt else GraphStore(db_path)
+    if db_path == shared_database():
+        store = GraphStore(db_path, checkout=root)
+    else:
+        store = _open_graph_store(db_path, "build") if recover_corrupt else GraphStore(db_path)
     try:
         assert_graph_serves_root(root, store)
     except BaseException:

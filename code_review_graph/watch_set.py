@@ -30,6 +30,7 @@ from typing import Any
 
 from .graph import GraphStore
 from .incremental import _WATCH_STOP_TIMEOUT, _WATCH_TICK_SECONDS, watch
+from .shared_sqlite import shared_database
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +59,7 @@ def load_manifest(path: Path) -> tuple[WatchTarget, ...]:
     entries = document["repos"]
     if not isinstance(entries, list):
         raise ValueError(f"watch manifest {path}: 'repos' must be a list")
+    shared = shared_database()
     targets: list[WatchTarget] = []
     for entry in entries:
         if not isinstance(entry, dict) or set(entry) != {"repo", "data_dir"}:
@@ -68,7 +70,7 @@ def load_manifest(path: Path) -> tuple[WatchTarget, ...]:
         if not repo.is_absolute() or not data_dir.is_absolute():
             raise ValueError(f"watch manifest {path}: paths must be absolute: {entry}")
         target = WatchTarget(repo=repo.resolve(strict=True), data_dir=data_dir.resolve())
-        if not (target.data_dir / _DATABASE_NAME).is_file():
+        if not (shared or target.data_dir / _DATABASE_NAME).is_file():
             raise ValueError(
                 f"watch manifest {path}: no graph at {target.data_dir / _DATABASE_NAME}; "
                 "build it before watching"
@@ -76,7 +78,7 @@ def load_manifest(path: Path) -> tuple[WatchTarget, ...]:
         targets.append(target)
     for name, values in (
         ("repository", [target.repo for target in targets]),
-        ("data directory", [target.data_dir for target in targets]),
+        ("data directory", [target.data_dir for target in targets] if shared is None else []),
     ):
         if len(set(values)) != len(values):
             raise ValueError(f"watch manifest {path}: duplicate {name}")
@@ -128,7 +130,10 @@ def watch_set(
     def run(watcher: _Watcher) -> None:
         store: GraphStore | None = None
         try:
-            store = GraphStore(watcher.target.data_dir / _DATABASE_NAME)
+            store = GraphStore(
+                shared_database() or watcher.target.data_dir / _DATABASE_NAME,
+                checkout=watcher.target.repo,
+            )
             watch(
                 watcher.target.repo,
                 store,

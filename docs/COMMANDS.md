@@ -383,6 +383,21 @@ A hook or CI job can tell these apart without reading the message. `75` is
   `CRG_CONTEXT_HISTORY=1` where the MCP server or the CLI runs to turn it on.
   See [USAGE.md](USAGE.md#context-history).
 
+## Shared SQLite
+
+Set `CRG_SHARED_DB` to an absolute SQLite path and use the same value in
+the CLI, MCP server, and watcher service. Build each checkout with
+`code-review-graph build --repo /path/to/checkout`. Existing per-checkout
+databases are left intact; the shared file is populated from source. Use
+`--repo` or the MCP `repo_root` to select the checkout. Do not combine the
+shared setting with a per-command `--data-dir`.
+
+The watcher uses the same completion record as CLI and MCP refreshes.
+A checkout, input snapshot and indexing profile must match before a
+completed refresh can be reused. The kernel releases the write lock on
+process death and SQLite rolls back the unfinished refresh. See
+[Shared SQLite ADR](adr/0001-shared-sqlite.md).
+
 ## Standalone Daemon CLI (`crg-daemon`)
 
 `crg-daemon` is installed with `code-review-graph` and mirrors the

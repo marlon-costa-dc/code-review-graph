@@ -825,7 +825,10 @@ def count_stored_embeddings(conn: sqlite3.Connection) -> int:
     try:
         return int(conn.execute("SELECT COUNT(*) FROM embeddings").fetchone()[0])
     except sqlite3.OperationalError as exc:
-        if str(exc).lower() == "no such table: embeddings":
+        from .shared_sqlite import CheckoutConnection
+
+        table = conn.table("embeddings") if isinstance(conn, CheckoutConnection) else "embeddings"
+        if str(exc).lower() == f"no such table: {table}":
             return 0
         raise
 
@@ -846,7 +849,7 @@ def _embedding_search(
     Returns list of ``(node_id, similarity_score)`` tuples.
     Gracefully returns an empty list if embeddings are not available.
     """
-    if store.read_only:
+    if store.read_only and store.checkout is None:
         # EmbeddingStore creates and migrates its table when opened.
         return []
     if not count_stored_embeddings(store._conn):
@@ -857,7 +860,10 @@ def _embedding_search(
         return []
 
     try:
-        emb_store = EmbeddingStore(store.db_path, provider=provider, model=model)
+        emb_store = EmbeddingStore(
+            store.db_path, provider=provider, model=model,
+            **({"graph_store": store} if store.checkout is not None else {}),
+        )
         try:
             if not emb_store.available or emb_store.count() == 0:
                 return []

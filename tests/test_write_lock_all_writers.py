@@ -367,20 +367,6 @@ def test_watch_batch_waits_out_another_writer_and_is_not_lost(repo, held):
             handler.stop()
 
 
-def test_watch_publishes_its_shared_file_summary(repo, monkeypatch):
-    from code_review_graph.tools.query import query_graph
-
-    monkeypatch.setenv("CRG_SHARED_FILE_SUMMARY_DB", str(repo.parent / "shared.db"))
-    with GraphStore(incremental.get_db_path(repo)) as store:
-        handler = incremental._create_watch_handler(repo, store, None)
-        handler.process([_edit(repo, "publishedByWatch")])
-        handler.raise_if_failed()
-
-    result = query_graph("file_summary", "keep.py", str(repo))
-    assert result["target_freshness"] == "matches"
-    assert "publishedByWatch" in {node["name"] for node in result["results"]}
-
-
 def test_watch_reuses_graph_rows_already_refreshed_by_command(repo):
     event = _edit(repo, "updatedByCommand")
     db = incremental.get_db_path(repo)
