@@ -556,13 +556,30 @@ pip install "code-review-graph[wiki]"                # Wiki generation with LLM 
 pip install "code-review-graph[all]"                 # All optional dependencies
 ```
 
+### Shared registry consistency
+
+The registry is shared by independent CLI and watch processes. Mutations must
+reload its current contents while holding the same native inter-process lock,
+then publish a complete JSON document atomically. An older `Registry` instance
+must not overwrite entries added by another instance or process. Reads observe
+the current published registry, and an unchanged registration leaves the file
+untouched. Invalid JSON or registry structure is an error; it must never be
+replaced with an empty registry. CLI data-directory registration and graph-data
+resolution propagate that error instead of selecting another directory or
+replacing its traceback. An absent registry or an absent repository entry keeps
+the documented environment/default selection behavior.
+
+This contract also applies when concurrent builds register separate external
+data directories under the same `CRG_HOME`. Each checkout keeps its own graph;
+the shared registry records their locations. It is not a second graph store.
+
 ### Environment Variables
 
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `CRG_GIT_TIMEOUT` | Timeout in seconds for Git operations | `30` |
 | `CRG_DATA_DIR` | Override directory for graph databases and generated graph artefacts | - |
-| `CRG_REGISTRY_PATH` | Override the multi-repository registry file for an isolated runtime or test process | `~/.code-review-graph/registry.json` |
+| `CRG_HOME` | Override the per-user state root containing `registry.json` and watch/daemon state | `~/.code-review-graph` |
 | `CRG_EMBEDDING_MODEL` | Default model for vector embeddings | `all-MiniLM-L6-v2` |
 | `CRG_ACCEPT_CLOUD_EMBEDDINGS` | Suppress the cloud embedding egress warning after explicit acknowledgement | - |
 | `CRG_ALLOW_REMOTE_CODE` | Allow HuggingFace models that require `trust_remote_code=True` | `0` |

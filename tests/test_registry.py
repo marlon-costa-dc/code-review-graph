@@ -1,11 +1,22 @@
 """Tests for multi-repo registry and connection pool."""
 
+import json
+import multiprocessing
 import sqlite3
 import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from code_review_graph.registry import ConnectionPool, Registry, resolve_repo
+
+
+def _register_after_barrier(registry_path, repo, ready):
+    """Use independent public registry instances before either process writes."""
+    registry = Registry(path=registry_path)
+    ready.wait(timeout=20)
+    registry.register(str(repo), data_dir=str(repo / "graph-data"))
 
 
 class TestRegistry:
@@ -128,6 +139,107 @@ class TestRegistry:
         repos = registry2.list_repos()
         assert len(repos) == 1
         assert repos[0]["alias"] == "persistent"
+
+    def test_existing_instances_preserve_each_others_registrations(self):
+        """An instance created earlier must refresh before writing or reading."""
+        second = Registry(path=self.registry_path)
+        self.registry.register(str(self.repo1), alias="first")
+        second.register(str(self.repo2), alias="second")
+
+        expected = {str(self.repo1.resolve()), str(self.repo2.resolve())}
+        assert {row["path"] for row in self.registry.list_repos()} == expected
+        assert {row["path"] for row in second.list_repos()} == expected
+
+    def test_processes_preserve_all_external_data_directories(self):
+        """Concurrent builds must not lose another checkout's registry entry."""
+        context = multiprocessing.get_context("spawn")
+        repositories = (self.repo1, self.repo2)
+        ready = context.Barrier(len(repositories))
+        processes = [
+            context.Process(
+                target=_register_after_barrier,
+                args=(self.registry_path, repo, ready),
+            )
+            for repo in repositories
+        ]
+        started = []
+        try:
+            for process in processes:
+                process.start()
+                started.append(process)
+            for process in started:
+                process.join(timeout=25)
+                assert process.exitcode == 0
+        finally:
+            for process in started:
+                if process.is_alive():
+                    process.terminate()
+                process.join(timeout=5)
+
+        registry = Registry(path=self.registry_path)
+        assert {
+            row["path"]: row["data_dir"] for row in registry.list_repos()
+        } == {
+            str(repo.resolve()): str((repo / "graph-data").resolve())
+            for repo in repositories
+        }
+
+    def test_corrupt_registry_is_not_replaced(self):
+        """A corrupt file must fail before any registration can discard it."""
+        import pytest
+
+        original = b'{"repos": [invalid]}\n'
+        self.registry_path.write_bytes(original)
+        with pytest.raises(json.JSONDecodeError):
+            Registry(path=self.registry_path)
+        assert self.registry_path.read_bytes() == original
+
+    def test_existing_instance_does_not_overwrite_corrupt_registry(self):
+        """Reload errors must escape before an existing instance can write."""
+        original = b'{"repos": [invalid]}\n'
+        self.registry_path.write_bytes(original)
+
+        with pytest.raises(json.JSONDecodeError):
+            self.registry.register(str(self.repo1), alias="must-not-write")
+
+        assert self.registry_path.read_bytes() == original
+
+    def test_unchanged_registration_preserves_file_identity(self):
+        """Repeating the same registration must leave the published file alone."""
+        self.registry.register(str(self.repo1), alias="same")
+        before = self.registry_path.stat()
+        original = self.registry_path.read_bytes()
+
+        self.registry.register(str(self.repo1), alias="same")
+
+        after = self.registry_path.stat()
+        assert self.registry_path.read_bytes() == original
+        assert (after.st_dev, after.st_ino, after.st_mtime_ns) == (
+            before.st_dev, before.st_ino, before.st_mtime_ns
+        )
+
+    @pytest.mark.parametrize("create", [False, True])
+    def test_corrupt_registry_does_not_select_another_graph(
+        self, tmp_path, monkeypatch, create
+    ):
+        """A broken registry must not redirect graph consumers to another path."""
+        from code_review_graph.incremental import get_data_dir
+
+        registry_home = tmp_path / "registry-home"
+        registry_home.mkdir()
+        registry_path = registry_home / "registry.json"
+        original = b'{"repos": [invalid]}\n'
+        registry_path.write_bytes(original)
+        alternative = tmp_path / "alternative"
+        monkeypatch.setenv("CRG_HOME", str(registry_home))
+        monkeypatch.setenv("CRG_DATA_DIR", str(alternative))
+
+        with pytest.raises(json.JSONDecodeError):
+            get_data_dir(self.repo1, create=create)
+
+        assert registry_path.read_bytes() == original
+        assert not alternative.exists()
+        assert not (self.repo1 / ".code-review-graph").exists()
 
     def test_resolve_by_alias(self):
         """resolve_repo resolves alias to path."""

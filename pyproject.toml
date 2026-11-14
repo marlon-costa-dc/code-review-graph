@@ -32,6 +32,7 @@ dependencies = [
     "pyyaml>=6.0,<7",
     "networkx>=3.2,<4",
     "watchdog>=4.0.0,<7",
+    "filelock>=3.32.5,<4",
     # Core analysis stack — mandatory (previously optional extras).
     # numpy: vectorised embedding search hot path (embeddings.py).
     # jedi: Python call resolution that removes OO/MRO dead-code false
