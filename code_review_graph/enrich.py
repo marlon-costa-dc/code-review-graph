@@ -11,40 +11,23 @@ import json
 import logging
 import os
 import re
+import sqlite3
 import sys
 from pathlib import Path
 from typing import Any
 
+from .errors import GraphStoreError
+
 logger = logging.getLogger(__name__)
 
 # Flags that consume the next token in grep/rg commands
-_RG_FLAGS_WITH_VALUES = frozenset(
-    {
-        "-e",
-        "-f",
-        "-m",
-        "-A",
-        "-B",
-        "-C",
-        "-g",
-        "--glob",
-        "-t",
-        "--type",
-        "--include",
-        "--exclude",
-        "--max-count",
-        "--max-depth",
-        "--max-filesize",
-        "--color",
-        "--colors",
-        "--context-separator",
-        "--field-match-separator",
-        "--path-separator",
-        "--replace",
-        "--sort",
-        "--sortr",
-    }
-)
+_RG_FLAGS_WITH_VALUES = frozenset({
+    "-e", "-f", "-m", "-A", "-B", "-C", "-g", "--glob",
+    "-t", "--type", "--include", "--exclude", "--max-count",
+    "--max-depth", "--max-filesize", "--color", "--colors",
+    "--context-separator", "--field-match-separator",
+    "--path-separator", "--replace", "--sort", "--sortr",
+})
 
 
 def extract_pattern(tool_name: str, tool_input: dict[str, Any]) -> str | None:
@@ -98,7 +81,9 @@ def _make_relative(file_path: str, repo_root: str) -> str:
 
 def _get_community_name(conn: Any, community_id: int) -> str:
     """Fetch a community name by ID."""
-    row = conn.execute("SELECT name FROM communities WHERE id = ?", (community_id,)).fetchone()
+    row = conn.execute(
+        "SELECT name FROM communities WHERE id = ?", (community_id,)
+    ).fetchone()
     return row["name"] if row else ""
 
 
@@ -121,7 +106,6 @@ def _format_node_context(
 ) -> list[str]:
     """Format a single node's structural context as plain text lines."""
     from .graph import GraphNode
-
     assert isinstance(node, GraphNode)
 
     qn = node.qualified_name
@@ -138,7 +122,9 @@ def _format_node_context(
             header += f" [{cname}]"
     else:
         # Check via direct query
-        row = conn.execute("SELECT community_id FROM nodes WHERE id = ?", (node.id,)).fetchone()
+        row = conn.execute(
+            "SELECT community_id FROM nodes WHERE id = ?", (node.id,)
+        ).fetchone()
         if row and row["community_id"]:
             cname = _get_community_name(conn, row["community_id"])
             if cname:
@@ -252,7 +238,10 @@ def enrich_file_read(file_path: str, repo_root: str) -> str:
             return ""
 
         # Filter to functions/classes/types (skip File nodes), limit to 10
-        interesting = [n for n in nodes if n.kind in ("Function", "Class", "Type", "Test")][:10]
+        interesting = [
+            n for n in nodes
+            if n.kind in ("Function", "Class", "Type", "Test")
+        ][:10]
 
         if not interesting:
             return ""
@@ -264,7 +253,9 @@ def enrich_file_read(file_path: str, repo_root: str) -> str:
             all_lines.append("")
 
         rel_path = _make_relative(file_path, repo_root)
-        header = f"[code-review-graph] {len(interesting)} symbol(s) in {rel_path}:\n"
+        header = (
+            f"[code-review-graph] {len(interesting)} symbol(s) in {rel_path}:\n"
+        )
         return header + "\n".join(all_lines)
     finally:
         store.close()
@@ -277,12 +268,18 @@ def run_hook() -> None:
     queries the graph, and outputs hookSpecificOutput JSON to stdout.
     """
     try:
-        hook_input = json.load(sys.stdin)
-    except (json.JSONDecodeError, ValueError):
+        # Bytes, so json finds the UTF-8 hosts write: on Windows a text-mode
+        # stdin decodes a pipe with the ANSI code page.
+        hook_input = json.loads(getattr(sys.stdin, "buffer", sys.stdin).read())
+    except (json.JSONDecodeError, OSError, ValueError):
+        return
+    if not isinstance(hook_input, dict):
         return
 
     tool_name = hook_input.get("tool_name", "")
     tool_input = hook_input.get("tool_input", {})
+    if not isinstance(tool_input, dict):
+        return
     cwd = hook_input.get("cwd", os.getcwd())
 
     # Find repo root by walking up from cwd
@@ -294,17 +291,22 @@ def run_hook() -> None:
     if not db_path.exists():
         return
 
-    # Dispatch
+    # Dispatch. The tool call goes ahead either way, so a graph that cannot be
+    # read costs the extra context and nothing else.
     context = ""
-    if tool_name == "Read":
-        fp = tool_input.get("file_path", "")
-        if fp:
-            context = enrich_file_read(fp, repo_root)
-    else:
-        pattern = extract_pattern(tool_name, tool_input)
-        if not pattern or len(pattern) < 3:
-            return
-        context = enrich_search(pattern, repo_root)
+    try:
+        if tool_name == "Read":
+            fp = tool_input.get("file_path", "")
+            if fp:
+                context = enrich_file_read(fp, repo_root)
+        else:
+            pattern = extract_pattern(tool_name, tool_input)
+            if not pattern or len(pattern) < 3:
+                return
+            context = enrich_search(pattern, repo_root)
+    except (GraphStoreError, sqlite3.Error, OSError) as exc:
+        logger.warning("Could not read the graph for hook enrichment: %s", exc)
+        return
 
     if not context:
         return

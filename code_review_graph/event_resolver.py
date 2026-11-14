@@ -19,7 +19,10 @@ _DERIVED_FLAG = "spring_event_resolved"
 
 def _clear_derived_event_data(store: GraphStore) -> tuple[int, int]:
     """Remove event nodes and derived calls before rebuilding the relation."""
-    call_rows = store._conn.execute("SELECT id, extra FROM edges WHERE kind = 'CALLS'").fetchall()
+    call_rows = store._conn.execute(
+        "SELECT id, extra FROM edges WHERE kind = 'CALLS' "
+        "AND extra LIKE '%\"spring_event_resolved\"%'"
+    ).fetchall()
     derived_ids: list[tuple[int]] = []
     for row in call_rows:
         try:
@@ -35,7 +38,8 @@ def _clear_derived_event_data(store: GraphStore) -> tuple[int, int]:
         "DELETE FROM nodes WHERE kind = 'Event' AND file_path = ?",
         (_EVENT_NODE_FILE,),
     ).rowcount
-    store.commit()
+    if derived_ids or removed_nodes:
+        store.commit()
     return len(derived_ids), removed_nodes
 
 
@@ -71,17 +75,15 @@ def resolve_spring_events(store: GraphStore) -> dict[str, int]:
         collection.setdefault(target, []).append(row)
 
     for target, identity in sorted(event_types.items()):
-        store.upsert_node(
-            NodeInfo(
-                kind="Event",
-                name=identity,
-                file_path=_EVENT_NODE_FILE,
-                line_start=0,
-                line_end=0,
-                language="java",
-                extra={"event_type": identity, "virtual": True},
-            )
-        )
+        store.upsert_node(NodeInfo(
+            kind="Event",
+            name=identity,
+            file_path=_EVENT_NODE_FILE,
+            line_start=0,
+            line_end=0,
+            language="java",
+            extra={"event_type": identity, "virtual": True},
+        ))
         if target != f"event::{identity}":
             logger.warning("Unexpected Spring event identity target: %s", target)
 
@@ -93,26 +95,28 @@ def resolve_spring_events(store: GraphStore) -> dict[str, int]:
         identity = event_types[event_target]
         for publisher in event_publishers:
             for listener in event_listeners:
-                store.upsert_edge(
-                    EdgeInfo(
-                        kind="CALLS",
-                        source=publisher["source_qualified"],
-                        target=listener["source_qualified"],
-                        file_path=publisher["file_path"],
-                        line=publisher["line"],
-                        extra={
-                            _DERIVED_FLAG: True,
-                            "event_type": identity,
-                            "resolution": "spring_application_event",
-                            "confidence": 0.95,
-                            "confidence_tier": "INFERRED",
-                        },
-                    )
-                )
+                store.upsert_edge(EdgeInfo(
+                    kind="CALLS",
+                    source=publisher["source_qualified"],
+                    target=listener["source_qualified"],
+                    file_path=publisher["file_path"],
+                    line=publisher["line"],
+                    extra={
+                        _DERIVED_FLAG: True,
+                        "event_type": identity,
+                        "resolution": "spring_application_event",
+                        "confidence": 0.95,
+                        "confidence_tier": "INFERRED",
+                    },
+                ))
                 emitted += 1
 
     store.commit()
-    logger.info(
+    # Most repositories have no Spring events at all; a line of zeros on
+    # every build says nothing, so it is DEBUG unless something was found.
+    found = bool(event_types or emitted or removed_calls)
+    logger.log(
+        logging.INFO if found else logging.DEBUG,
         "Spring event resolver: indexed %d events and emitted %d CALLS edges",
         len(event_types),
         emitted,

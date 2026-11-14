@@ -4,10 +4,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
+from unittest.mock import patch
 
-from code_review_graph import skills, uninstall
-from code_review_graph.cli import _handle_init
+import pytest
+
+from code_review_graph import cli, skills, uninstall
+from code_review_graph.cli import _PLATFORM_CHOICES, _handle_init
+from code_review_graph.skills import _detect_serve_command
 
 
 def _args(tmp_path: Path, platform: str) -> argparse.Namespace:
@@ -22,7 +27,64 @@ def _args(tmp_path: Path, platform: str) -> argparse.Namespace:
     )
 
 
-def test_copilot_cli_install_reinstall_uninstall_lifecycle(monkeypatch, tmp_path):
+def test_codex_skill_install_failure_is_reported_without_traceback(
+    monkeypatch, tmp_path, capsys
+):
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    (codex_home / "skills").write_text("occupied\n", encoding="utf-8")
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+    with patch.object(sys, "argv", [
+        "code-review-graph", "install", "--platform", "codex",
+        "--repo", str(repo), "--no-hooks", "--no-instructions", "--yes",
+    ]), pytest.raises(SystemExit) as exc_info:
+        cli.main()
+
+    out = capsys.readouterr()
+    assert exc_info.value.code == 1
+    assert "Could not install Codex skill" in out.err
+    assert "Traceback" not in out.err
+    assert "Installed Codex skill" not in out.out
+
+
+def test_dsh_install_reinstall_uninstall_lifecycle(monkeypatch, tmp_path):
+    """DSH gets its MCP row in the home patch layer and AGENTS.md (PR #1101)."""
+    from code_review_graph import dsh
+
+    repo = tmp_path / "repo"
+    (repo / ".git" / "hooks").mkdir(parents=True)
+    dsh_home = tmp_path / "dsh"
+    dsh_home.mkdir()
+    monkeypatch.setenv("DSH_HOME", str(dsh_home))
+    config = dsh_home / "cordis.patch.yml"
+    user_layer = "# mine\n- id: model\n  config: {temperature: 1}\n"
+    config.write_text(user_layer, encoding="utf-8")
+    args = _args(repo, "dsh")
+    args.no_instructions = False
+
+    _handle_init(args)
+    first = config.read_bytes()
+    _handle_init(args)
+
+    assert config.read_bytes() == first
+    document = dsh.load(config.read_text(encoding="utf-8"))
+    assert document[0] == {"id": "model", "config": {"temperature": 1}}
+    assert document[1]["insert"][0]["id"] == dsh.ENTRY_ID
+    assert skills._CLAUDE_MD_SECTION_MARKER in (repo / "AGENTS.md").read_text(encoding="utf-8")
+    assert not (repo / "CLAUDE.md").exists()
+
+    report = uninstall.run(repo=repo, platforms=["dsh"])
+
+    assert not report.errors
+    assert config.read_text(encoding="utf-8") == user_layer
+
+
+def test_copilot_cli_install_reinstall_uninstall_lifecycle(
+    monkeypatch, tmp_path
+):
     """The public lifecycle migrates safely and is repeatable without a client."""
     repo = tmp_path / "repo"
     (repo / ".git" / "hooks").mkdir(parents=True)
@@ -58,7 +120,12 @@ def test_copilot_cli_install_reinstall_uninstall_lifecycle(monkeypatch, tmp_path
 
     _handle_init(args)
     first_config = config.read_bytes()
-    current_instruction = repo / ".github" / "instructions" / "code-review-graph.instructions.md"
+    current_instruction = (
+        repo
+        / ".github"
+        / "instructions"
+        / "code-review-graph.instructions.md"
+    )
     first_instruction = current_instruction.read_bytes()
     _handle_init(args)
 
@@ -91,7 +158,46 @@ def test_copilot_cli_install_reinstall_uninstall_lifecycle(monkeypatch, tmp_path
     assert not current_instruction.exists()
 
 
+def test_handle_init_mimo_registers_only_the_mimo_platform(monkeypatch, tmp_path, capsys):
+    assert "mimo" in _PLATFORM_CHOICES
+    monkeypatch.setattr(
+        "code_review_graph.incremental.ensure_repo_gitignore_excludes_crg",
+        lambda repo_root: "created",
+    )
+    targets: list[str] = []
+    monkeypatch.setattr(
+        "code_review_graph.skills.install_platform_configs",
+        lambda repo_root, target, dry_run=False, platforms=None: (
+            targets.append(target) or ["MiMo Code"]
+        ),
+    )
+
+    _handle_init(_args(tmp_path, "mimo"))
+
+    assert targets == ["mimo"]
+    assert "Configured 1 platform(s): MiMo Code" in capsys.readouterr().out
+
+
+def test_handle_init_mimo_writes_a_runnable_project_config(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        "code_review_graph.incremental.ensure_repo_gitignore_excludes_crg",
+        lambda repo_root: "created",
+    )
+
+    _handle_init(_args(tmp_path, "mimo"))
+
+    config = json.loads(
+        (tmp_path / ".mimocode" / "mimocode.json").read_text(encoding="utf-8")
+    )
+    command, args = _detect_serve_command()
+    assert config["mcp"]["code-review-graph"] == {
+        "type": "local",
+        "command": [command, *args, "--repo", str(tmp_path)],
+    }
+
+
 def test_handle_init_codex_skips_claude_skills(monkeypatch, tmp_path, capsys):
+    (tmp_path / ".git" / "hooks").mkdir(parents=True)
     monkeypatch.setattr(
         "code_review_graph.incremental.find_repo_root",
         lambda: tmp_path,
@@ -102,10 +208,15 @@ def test_handle_init_codex_skips_claude_skills(monkeypatch, tmp_path, capsys):
     )
     monkeypatch.setattr(
         "code_review_graph.skills.install_platform_configs",
-        lambda repo_root, target, dry_run=False: ["Codex"],
+        lambda repo_root, target, dry_run=False, platforms=None: ["Codex"],
     )
 
-    called = {"generate_skills": False, "codex_hooks": False, "git_hook": False}
+    called = {
+        "generate_skills": False,
+        "codex_skill": False,
+        "codex_hooks": False,
+        "git_hook": False,
+    }
 
     def _generate_skills(repo_root):
         called["generate_skills"] = True
@@ -115,11 +226,16 @@ def test_handle_init_codex_skips_claude_skills(monkeypatch, tmp_path, capsys):
         called["codex_hooks"] = True
         return Path("/tmp/fake-codex-hooks.json")
 
+    def _install_codex_skill():
+        called["codex_skill"] = True
+        return tmp_path / "codex" / "skills" / "code-review-graph"
+
     def _install_git_hook(repo_root):
         called["git_hook"] = True
         return repo_root / ".git" / "hooks" / "pre-commit"
 
     monkeypatch.setattr("code_review_graph.skills.generate_skills", _generate_skills)
+    monkeypatch.setattr("code_review_graph.skills.install_codex_skill", _install_codex_skill)
     monkeypatch.setattr("code_review_graph.skills.install_codex_hooks", _install_codex_hooks)
     monkeypatch.setattr("code_review_graph.skills.install_git_hook", _install_git_hook)
 
@@ -127,9 +243,43 @@ def test_handle_init_codex_skips_claude_skills(monkeypatch, tmp_path, capsys):
     out = capsys.readouterr().out
 
     assert called["generate_skills"] is False
+    assert called["codex_skill"] is True
     assert called["codex_hooks"] is True
     assert called["git_hook"] is True
     assert "Installed Codex hooks" in out
+
+
+def test_handle_init_all_skips_codex_skill_when_not_detected(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(
+        "code_review_graph.incremental.ensure_repo_gitignore_excludes_crg",
+        lambda repo_root: "created",
+    )
+    monkeypatch.setattr(
+        "code_review_graph.skills.install_platform_configs",
+        lambda repo_root, target, dry_run=False, platforms=None: [],
+    )
+    monkeypatch.setitem(
+        skills.PLATFORMS,
+        "codex",
+        {**skills.PLATFORMS["codex"], "detect": lambda: False},
+    )
+    called = False
+
+    def _install_codex_skill():
+        nonlocal called
+        called = True
+        return tmp_path / "codex" / "skills" / "code-review-graph"
+
+    monkeypatch.setattr("code_review_graph.skills.install_codex_skill", _install_codex_skill)
+    args = _args(tmp_path, "all")
+    args.no_hooks = True
+    args.no_instructions = True
+
+    _handle_init(args)
+
+    assert called is False
 
 
 def test_handle_init_cursor_installs_cursor_hooks(monkeypatch, tmp_path, capsys):
@@ -143,7 +293,7 @@ def test_handle_init_cursor_installs_cursor_hooks(monkeypatch, tmp_path, capsys)
     )
     monkeypatch.setattr(
         "code_review_graph.skills.install_platform_configs",
-        lambda repo_root, target, dry_run=False: ["Cursor"],
+        lambda repo_root, target, dry_run=False, platforms=None: ["Cursor"],
     )
     monkeypatch.setitem(
         __import__("code_review_graph.skills", fromlist=["PLATFORMS"]).PLATFORMS,
@@ -169,13 +319,33 @@ def test_handle_init_cursor_installs_cursor_hooks(monkeypatch, tmp_path, capsys)
     assert "Installed Cursor hooks" in out
 
 
-def test_handle_init_codebuddy_installs_only_codebuddy_native_files(monkeypatch, tmp_path, capsys):
+def test_handle_init_does_not_claim_hooks_it_refused_to_write(
+    monkeypatch, tmp_path, capsys
+):
+    (tmp_path / ".git").mkdir()
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(Path, "home", lambda: home)
+    settings = tmp_path / ".claude" / "settings.json"
+    settings.parent.mkdir()
+    settings.write_text('{"model": "opus", oops}\n', encoding="utf-8")
+
+    _handle_init(_args(tmp_path, "claude"))
+    out = capsys.readouterr().out
+
+    assert settings.read_text(encoding="utf-8") == '{"model": "opus", oops}\n'
+    assert "contains unparseable JSON" in out
+    assert "Installed hooks" not in out
+
+
+def test_handle_init_codebuddy_installs_only_codebuddy_native_files(
+    monkeypatch, tmp_path, capsys
+):
     import code_review_graph.skills as skills_module
 
-    assert (
-        "codebuddy"
-        in __import__("code_review_graph.cli", fromlist=["_PLATFORM_CHOICES"])._PLATFORM_CHOICES
-    )
+    assert "codebuddy" in __import__(
+        "code_review_graph.cli", fromlist=["_PLATFORM_CHOICES"]
+    )._PLATFORM_CHOICES
 
     monkeypatch.setattr(
         "code_review_graph.incremental.find_repo_root",
@@ -187,7 +357,7 @@ def test_handle_init_codebuddy_installs_only_codebuddy_native_files(monkeypatch,
     )
     monkeypatch.setattr(
         "code_review_graph.skills.install_platform_configs",
-        lambda repo_root, target, dry_run=False: ["CodeBuddy Code"],
+        lambda repo_root, target, dry_run=False, platforms=None: ["CodeBuddy Code"],
     )
 
     called = {
@@ -209,7 +379,9 @@ def test_handle_init_codebuddy_installs_only_codebuddy_native_files(monkeypatch,
         called["codebuddy_hooks"] = True
         return repo_root / ".codebuddy" / "settings.json"
 
-    def _inject_instruction_files(repo_root, target="all", *, include_claude_md=True):
+    def _inject_instruction_files(
+        repo_root, target="all", *, include_claude_md=True, platforms=None
+    ):
         called["codebuddy_instructions"] = target == "codebuddy"
         return {"CODEBUDDY.md": "created"}
 
@@ -245,3 +417,205 @@ def test_handle_init_codebuddy_installs_only_codebuddy_native_files(monkeypatch,
     }
     assert "Installed CodeBuddy skills" in out
     assert "Installed CodeBuddy hooks" in out
+
+
+# ---------------------------------------------------------------------------
+# --platform all writes only for the tools found here
+# ---------------------------------------------------------------------------
+
+
+def _only_detect(monkeypatch, *found: str) -> None:
+    for key, spec in list(skills.PLATFORMS.items()):
+        monkeypatch.setitem(
+            skills.PLATFORMS, key, {**spec, "detect": lambda found_here=key in found: found_here}
+        )
+
+
+def _files_under(root: Path) -> set[str]:
+    return {path.relative_to(root).as_posix() for path in root.rglob("*") if path.is_file()}
+
+
+def test_install_all_writes_nothing_for_tools_that_are_not_found(
+    monkeypatch, tmp_path, capsys
+):
+    """Only Copilot is here: no Claude, Gemini, Qoder, CodeBuddy, Codex or OpenCode files."""
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(Path, "home", lambda: home)
+    monkeypatch.setattr(skills, "_git_hooks_dir", lambda root: None)
+    _only_detect(monkeypatch, "copilot")
+    args = _args(repo, "all")
+    args.no_instructions = False
+
+    _handle_init(args)
+    out = capsys.readouterr().out
+
+    written = {
+        ".vscode/mcp.json",
+        ".github/instructions/code-review-graph.instructions.md",
+    }
+    record = {".code-review-graph/install-manifest.json", ".code-review-graph/.gitignore"}
+    assert _files_under(repo) - {".gitignore"} == written | record
+    assert _files_under(home) == set()
+    assert "Configured 1 platform(s): GitHub Copilot" in out
+    assert "Not found here, so not set up: codex, claude, cursor," in out
+    assert "Add one anyway with: code-review-graph install --platform NAME" in out
+
+
+def test_install_names_a_platform_that_was_not_found(monkeypatch, tmp_path):
+    """``--platform`` writes for a tool even when it is not found here."""
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(Path, "home", lambda: home)
+    monkeypatch.setattr(skills, "_git_hooks_dir", lambda root: None)
+    _only_detect(monkeypatch)
+
+    _handle_init(_args(repo, "gemini-cli"))
+
+    assert {
+        ".gemini/settings.json",
+        ".gemini/hooks/crg-update.sh",
+        ".gemini/skills/review-changes/SKILL.md",
+    } <= _files_under(repo)
+    assert not (repo / ".claude").exists()
+
+
+def test_install_gitignore_block_lists_only_selected_platforms(monkeypatch, tmp_path):
+    from code_review_graph import install_gitignore
+
+    _only_detect(monkeypatch, "claude")
+    files = install_gitignore.repo_files(
+        tmp_path, "all", with_skills=True, with_hooks=True, with_instructions=True
+    )
+
+    assert ".mcp.json" in files
+    assert "CLAUDE.md" in files
+    assert not [path for path in files if path.startswith((".gemini", ".qoder", ".codebuddy"))]
+    assert "AGENTS.md" not in files
+
+
+@pytest.mark.parametrize(
+    ("detector", "env", "folder", "program"),
+    [
+        ("_claude_code_detected", "CLAUDECODE", ".claude", "claude"),
+        ("_opencode_detected", None, ".config/opencode", "opencode"),
+        ("_qoder_detected", None, ".qoder", "qodercli"),
+        ("_codebuddy_detected", None, ".codebuddy", "codebuddy"),
+    ],
+)
+def test_platforms_that_used_to_be_always_on_are_detected(
+    monkeypatch, tmp_path, detector, env, folder, program
+):
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(Path, "home", lambda: home)
+    monkeypatch.setattr(skills.platform, "system", lambda: "Linux")
+    for name in ("CLAUDECODE", "CLAUDE_CONFIG_DIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(skills.shutil, "which", lambda name: None)
+    detect = getattr(skills, detector)
+    assert detect() is False
+
+    (home / folder).mkdir(parents=True)
+    assert detect() is True
+
+    (home / folder).rmdir()
+    monkeypatch.setattr(
+        skills.shutil, "which", lambda name: f"/usr/bin/{name}" if name == program else None
+    )
+    assert detect() is True
+
+    if env:
+        monkeypatch.setattr(skills.shutil, "which", lambda name: None)
+        monkeypatch.setenv(env, "1")
+        assert detect() is True
+
+
+def test_codex_on_path_counts_as_found(monkeypatch, tmp_path):
+    """Codex makes ~/.codex on its first run; its program on PATH is enough."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(Path, "home", lambda: home)
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    monkeypatch.setattr(skills.shutil, "which", lambda name: None)
+    detect = skills.PLATFORMS["codex"]["detect"]
+    assert detect() is False
+
+    monkeypatch.setattr(
+        skills.shutil, "which", lambda name: "/usr/bin/codex" if name == "codex" else None
+    )
+    assert detect() is True
+
+
+@pytest.mark.parametrize(
+    ("detector", "made"),
+    [
+        ("_claude_code_detected", ".claude.json"),
+        ("_opencode_detected", ".opencode/"),
+        ("_opencode_detected", ".local/share/opencode/"),
+    ],
+)
+def test_more_signs_that_a_tool_is_here(monkeypatch, tmp_path, detector, made):
+    """A file or folder the tool leaves in the home folder counts as found,
+    so install does not skip a tool it is set up beside."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(Path, "home", lambda: home)
+    for name in ("CLAUDECODE", "CLAUDE_CONFIG_DIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(skills.shutil, "which", lambda name: None)
+    detect = getattr(skills, detector)
+    assert detect() is False
+
+    path = home / made
+    if made.endswith("/"):
+        path.mkdir(parents=True)
+    else:
+        path.write_text("{}", encoding="utf-8")
+    assert detect() is True
+
+
+
+def test_install_writes_each_git_hook_once_and_shows_short_paths(
+    monkeypatch, tmp_path, capsys
+):
+    """Codex, Claude Code and Qoder all want the git hooks; they are written once."""
+    import subprocess
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(Path, "home", lambda: home)
+    _only_detect(monkeypatch, "claude", "qoder", "codex")
+
+    _handle_init(_args(repo, "all"))
+    out = capsys.readouterr().out
+
+    assert out.count("Installed git pre-commit hook in .git/hooks/pre-commit") == 1
+    assert out.count("Installed git post-merge hook in .git/hooks/post-merge") == 1
+    assert "Installed hooks in .claude/settings.json" in out
+    assert "Installed Codex hooks in ~/.codex/hooks.json" in out
+    assert "Claude Code: configured .mcp.json" in out
+    assert str(repo) not in out
+
+
+def test_install_outside_git_warns_once_about_git_hooks(monkeypatch, tmp_path, caplog):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(Path, "home", lambda: home)
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
+    _only_detect(monkeypatch, "claude", "qoder", "codex")
+
+    with caplog.at_level("WARNING", logger="code_review_graph.skills"):
+        _handle_init(_args(repo, "all"))
+
+    warnings = [r for r in caplog.records if "No git hooks directory" in r.getMessage()]
+    assert len(warnings) == 1

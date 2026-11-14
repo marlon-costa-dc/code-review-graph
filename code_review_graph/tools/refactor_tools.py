@@ -15,8 +15,7 @@ from ..refactor import (
 )
 from ._common import (
     _bounded,
-    _get_store_for_read,
-    _not_built_response,
+    _get_store,
     _shown_of,
     _validate_positive_int,
     _validate_repo_root,
@@ -79,19 +78,22 @@ def refactor_func(
     if mode not in valid_modes:
         return {
             "status": "error",
-            "error": (f"Invalid mode '{mode}'. Must be one of: {', '.join(sorted(valid_modes))}"),
+            "error": (
+                f"Invalid mode '{mode}'. "
+                f"Must be one of: {', '.join(sorted(valid_modes))}"
+            ),
         }
     _validate_positive_int(max_results, "max_results")
 
-    store, root, not_built = _get_store_for_read(repo_root)
-    if store is None or root is None:
-        return not_built if not_built is not None else _not_built_response()
+    store, root = _get_store(repo_root)
     try:
         if mode == "rename":
             if not old_name or not new_name:
                 return {
                     "status": "error",
-                    "error": ("rename mode requires both old_name and new_name."),
+                    "error": (
+                        "rename mode requires both old_name and new_name."
+                    ),
                 }
             preview = rename_preview(store, old_name, new_name)
             if preview is None:
@@ -103,17 +105,16 @@ def refactor_func(
             # the pending-refactor registry, so apply_refactor still writes
             # every edit; slicing it here would silently drop real edits.
             edits, total, truncated = _bounded(
-                preview["edits"],
-                max_results,
-                _MAX_REFACTOR_RESULTS,
+                preview["edits"], max_results, _MAX_REFACTOR_RESULTS,
             )
             if detail_level == "minimal":
                 edits = _project(edits, _MINIMAL_EDIT_FIELDS)
-            result = {
+            result: dict[str, Any] = {
                 "status": "ok",
                 "summary": (
                     f"Rename preview: {old_name} -> {new_name}, "
-                    f"{total} edit(s)" + _shown_of(len(edits), total) + ". "
+                    f"{total} edit(s)"
+                    + _shown_of(len(edits), total) + ". "
                     f"Use apply_refactor_tool(refactor_id="
                     f"'{preview['refactor_id']}') to apply."
                 ),
@@ -122,12 +123,16 @@ def refactor_func(
                 "total": total,
                 "truncated": truncated,
             }
-            result["_hints"] = generate_hints("refactor", result, get_session())
+            result["_hints"] = generate_hints(
+                "refactor_tool", result, get_session()
+            )
             return result
 
         elif mode == "dead_code":
             dead, total, truncated = _bounded(
-                find_dead_code(store, kind=kind, file_pattern=file_pattern, root=root),
+                find_dead_code(
+                    store, kind=kind, file_pattern=file_pattern, root=root
+                ),
                 max_results,
                 _MAX_REFACTOR_RESULTS,
             )
@@ -136,20 +141,21 @@ def refactor_func(
             result = {
                 "status": "ok",
                 "summary": (
-                    f"Found {total} dead code symbol(s)" + _shown_of(len(dead), total) + "."
+                    f"Found {total} dead code symbol(s)"
+                    + _shown_of(len(dead), total) + "."
                 ),
                 "dead_code": dead,
                 "total": total,
                 "truncated": truncated,
             }
-            result["_hints"] = generate_hints("refactor", result, get_session())
+            result["_hints"] = generate_hints(
+                "refactor_tool", result, get_session()
+            )
             return result
 
         else:  # suggest
             suggestions, total, truncated = _bounded(
-                suggest_refactorings(store),
-                max_results,
-                _MAX_REFACTOR_RESULTS,
+                suggest_refactorings(store), max_results, _MAX_REFACTOR_RESULTS,
             )
             if detail_level == "minimal":
                 suggestions = _project(suggestions, _MINIMAL_SUGGESTION_FIELDS)
@@ -157,14 +163,15 @@ def refactor_func(
                 "status": "ok",
                 "summary": (
                     f"Generated {total} refactoring suggestion(s)"
-                    + _shown_of(len(suggestions), total)
-                    + "."
+                    + _shown_of(len(suggestions), total) + "."
                 ),
                 "suggestions": suggestions,
                 "total": total,
                 "truncated": truncated,
             }
-            result["_hints"] = generate_hints("refactor", result, get_session())
+            result["_hints"] = generate_hints(
+                "refactor_tool", result, get_session()
+            )
             return result
 
     except Exception as exc:
@@ -212,7 +219,11 @@ def apply_refactor_func(
     _validate_positive_int(max_diff_files, "max_diff_files")
 
     try:
-        root = _validate_repo_root(Path(repo_root)) if repo_root else find_project_root()
+        root = (
+            _validate_repo_root(Path(repo_root))
+            if repo_root
+            else find_project_root()
+        )
     except (RuntimeError, ValueError) as exc:
         return {"status": "error", "error": str(exc)}
 

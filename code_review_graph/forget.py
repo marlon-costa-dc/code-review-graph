@@ -49,7 +49,7 @@ def _referrer_files(
     referrers: set[str] = set()
     names = list(deleted_qualified_names)
     for start in range(0, len(names), _SQL_PARAM_CHUNK):
-        window = names[start : start + _SQL_PARAM_CHUNK]
+        window = names[start:start + _SQL_PARAM_CHUNK]
         placeholders = ",".join("?" for _ in window)
         rows = conn.execute(
             f"SELECT DISTINCT file_path FROM edges "
@@ -97,16 +97,12 @@ def forget_files(
     Returns:
         A summary dict with the forgotten files, the referrer files that were
         re-parsed, and the number of orphaned embedding vectors purged.
-
-    Raises:
-        RuntimeError: If the connection holds a caller-owned transaction.
     """
     from .parser import CodeParser
     from .postprocessing import run_post_processing
     from .python_resolver import resolve_python_imports
+    from .scoped_resolver import resolve_scoped_calls
 
-    if store._conn.in_transaction:
-        raise RuntimeError("forget requires a connection without an open transaction")
     forgotten = set(targets)
 
     # 1. Snapshot the qualified names about to disappear so we can find the
@@ -119,7 +115,12 @@ def forget_files(
     referrers = _referrer_files(store, deleted_qualified_names, forgotten)
 
     # 2. Drop the forgotten files' own nodes and edges.
-    store.apply_file_changes_atomic([(file_path, [], [], "") for file_path in targets])
+    for file_path in targets:
+        store.remove_file_data(file_path)
+    store.set_metadata("intentionally_incomplete", "1")
+    # Persist deletions before store_file_nodes_edges() opens its own
+    # explicit transaction (BEGIN IMMEDIATE) during the re-parse below.
+    store.commit()
 
     # 3. Re-parse the surviving referrers so their cross-file edges are
     #    re-derived exactly as a build would: edges that had resolved into a
@@ -128,8 +129,11 @@ def forget_files(
     #    forgotten files are hidden from import resolution so a still-on-disk
     #    file is not silently re-resolved (forget removes it from the graph,
     #    not from the working tree).
+    from .incremental import _load_followed_dirs, _relink_edges
+
     parser = CodeParser(repo_root)
     parser.exclude_files(forgotten)
+    followed_dirs = _load_followed_dirs(store)
     reparsed: list[str] = []
     for file_path in referrers:
         abs_path = Path(file_path)
@@ -143,6 +147,7 @@ def forget_files(
             source = abs_path.read_bytes()
             fhash = hashlib.sha256(source).hexdigest()
             nodes, edges = parser.parse_bytes(abs_path, source)
+            _relink_edges(edges, Path(repo_root).resolve(), followed_dirs)
             store.store_file_nodes_edges(str(abs_path), nodes, edges, fhash)
             reparsed.append(file_path)
         except (OSError, PermissionError) as exc:
@@ -158,6 +163,13 @@ def forget_files(
         resolve_python_imports(store)
     except Exception as exc:  # noqa: BLE001 - resolver failure is non-fatal
         logger.warning("Python import resolver failed after forget: %s", exc)
+
+    #    Re-parsed C#, PHP and Rust referrers hold raw scoped calls again, even
+    #    for same-file targets, so bind them the way a build does (#964).
+    try:
+        resolve_scoped_calls(store, repo_root)
+    except Exception as exc:  # noqa: BLE001 - resolver failure is non-fatal
+        logger.warning("Scoped call resolver failed after forget: %s", exc)
 
     # 5. Re-run the shared post-processing pipeline. store_flows and
     #    store_communities clear their tables first, so flows and communities

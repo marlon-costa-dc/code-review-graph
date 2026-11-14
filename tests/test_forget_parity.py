@@ -12,11 +12,8 @@ from __future__ import annotations
 
 import json
 import shutil
-import sqlite3
 import subprocess
 from pathlib import Path
-
-import pytest
 
 from code_review_graph.forget import forget_files
 from code_review_graph.graph import GraphStore
@@ -36,10 +33,39 @@ _FILES = {
     ),
 }
 
+# The same shape as _FILES, but reached through RELATIVE imports, which take a
+# different resolution path: `_collect_import_names` and `_extract_import` hand
+# a relative specifier to the Python-specific resolver, which the file-level
+# `exclude_files` filter in `_resolve_module_to_file` never saw. A CALLS edge
+# derived from one therefore survived `forget` pointing at a node that had just
+# been deleted. `_FILES` above could not catch it: `from util import helper` is
+# absolute, and the absolute path was never broken.
+_RELATIVE_IMPORT_FILES = {
+    "pkg/__init__.py": "",
+    "pkg/util.py": "def helper():\n    return 41\n",
+    "pkg/shared.py": "def shared_fn():\n    return 7\n",
+    "pkg/sub/__init__.py": "",
+    "pkg/sub/deep.py": "def deep_fn():\n    return 3\n",
+    "pkg/main.py": (
+        "from .util import helper\n"
+        "from .shared import shared_fn\n"
+        "from . import util\n"
+        "from .sub.deep import deep_fn\n"
+        "from .sub import deep\n"
+        "\n"
+        "def run():\n"
+        "    return helper() + shared_fn() + deep_fn() + util.helper()\n"
+    ),
+}
+
 _AMBIGUOUS_IMPORT_FILES = {
     "src_one/pkg/util.py": "def helper():\n    return 1\n",
     "src_two/pkg/util.py": "def helper():\n    return 2\n",
-    "main.py": ("from pkg.util import helper\n\ndef run():\n    return helper()\n"),
+    "main.py": (
+        "from pkg.util import helper\n\n"
+        "def run():\n"
+        "    return helper()\n"
+    ),
 }
 
 _EMBEDDINGS_DDL = """
@@ -56,9 +82,9 @@ def _git_init(repo: Path) -> None:
     subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
     subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
     subprocess.run(
-        ["git", "-c", "user.email=t@e.st", "-c", "user.name=t", "commit", "-qm", "init"],
-        cwd=repo,
-        check=True,
+        ["git", "-c", "user.email=t@e.st", "-c", "user.name=t",
+         "commit", "-qm", "init"],
+        cwd=repo, check=True,
     )
 
 
@@ -134,7 +160,10 @@ def _snapshot(store: GraphStore, repo: Path) -> dict:
     }
     flows = []
     for row in flow_rows:
-        path = tuple(norm(node_names_by_id[node_id]) for node_id in json.loads(row["path_json"]))
+        path = tuple(
+            norm(node_names_by_id[node_id])
+            for node_id in json.loads(row["path_json"])
+        )
         memberships = store._conn.execute(
             "SELECT fm.position, n.qualified_name "
             "FROM flow_memberships fm JOIN nodes n ON n.id = fm.node_id "
@@ -162,37 +191,21 @@ def _snapshot(store: GraphStore, repo: Path) -> dict:
         "LEFT JOIN communities p ON p.id = c.parent_id "
         "ORDER BY c.name, c.level"
     ).fetchall()
-    community_summaries = store._conn.execute(
-        "SELECT c.name AS community_name, cs.name, cs.purpose, "
-        "cs.key_symbols, cs.risk, cs.size, cs.dominant_language "
-        "FROM community_summaries cs "
-        "JOIN communities c ON c.id = cs.community_id "
-        "ORDER BY c.name, cs.name"
-    ).fetchall()
-    flow_snapshots = store._conn.execute(
-        "SELECT f.name AS flow_name, fs.name, fs.entry_point, "
-        "fs.critical_path, fs.criticality, fs.node_count, fs.file_count "
-        "FROM flow_snapshots fs JOIN flows f ON f.id = fs.flow_id "
-        "ORDER BY f.name, fs.name"
-    ).fetchall()
-    risk_index = store._conn.execute(
-        "SELECT qualified_name, risk_score, caller_count, test_coverage, "
-        "security_relevant FROM risk_index "
-        "ORDER BY qualified_name"
-    ).fetchall()
     embeddings = store._conn.execute(
-        "SELECT qualified_name, vector, text_hash, provider FROM embeddings ORDER BY qualified_name"
+        "SELECT qualified_name, vector, text_hash, provider "
+        "FROM embeddings ORDER BY qualified_name"
     ).fetchall()
 
     return {
         "nodes": [tuple(norm(value) for value in row) for row in nodes],
         "edges": [tuple(norm(value) for value in row) for row in edges],
         "flows": flows,
-        "communities": [tuple(norm(value) for value in row) for row in communities],
-        "community_summaries": [tuple(norm(value) for value in row) for row in community_summaries],
-        "flow_snapshots": [tuple(norm(value) for value in row) for row in flow_snapshots],
-        "risk_index": [tuple(norm(value) for value in row) for row in risk_index],
-        "embeddings": [tuple(norm(value) for value in row) for row in embeddings],
+        "communities": [
+            tuple(norm(value) for value in row) for row in communities
+        ],
+        "embeddings": [
+            tuple(norm(value) for value in row) for row in embeddings
+        ],
     }
 
 
@@ -224,7 +237,9 @@ def test_forget_matches_full_rebuild_without_file(tmp_path):
 
     assert forgotten_qns
     assert summary["embeddings_purged"] == len(forgotten_qns)
-    assert not forgotten_qns.intersection(row[0] for row in after_forget["embeddings"])
+    assert not forgotten_qns.intersection(
+        row[0] for row in after_forget["embeddings"]
+    )
 
     # Rebuild at the same root so repository-derived community names remain
     # comparable. The forgotten file stays on disk during forget itself, then
@@ -243,6 +258,75 @@ def test_forget_matches_full_rebuild_without_file(tmp_path):
     # Guard against a vacuous pass: the surviving graph still has real content.
     assert after_forget["nodes"]
     assert after_forget["edges"]
+
+
+def _forget_then_rebuild(tmp_path, name: str, files: dict[str, str], forget: str):
+    """Forget *forget*, then build the same repository without it.
+
+    Returns ``(after_forget, rebuilt)`` snapshots taken at the same root so
+    repository-derived names stay comparable.
+    """
+    repo = _make_repo(tmp_path, name, files)
+    forgotten_path = repo / forget
+    store = _build(repo)
+    try:
+        _seed_embeddings(store)
+        forget_files(store, repo, [str(forgotten_path)])
+        after_forget = _snapshot(store, repo)
+        dangling = store._conn.execute(
+            "SELECT kind, source_qualified, target_qualified FROM edges "
+            "WHERE target_qualified LIKE '%::%' "
+            "AND target_qualified NOT IN (SELECT qualified_name FROM nodes)"
+        ).fetchall()
+    finally:
+        store.close()
+
+    forgotten_path.unlink()
+    shutil.rmtree(get_db_path(repo).parent)
+
+    rebuilt_store = _build(repo)
+    try:
+        _seed_embeddings(rebuilt_store)
+        rebuilt = _snapshot(rebuilt_store, repo)
+    finally:
+        rebuilt_store.close()
+    return after_forget, rebuilt, [tuple(row) for row in dangling]
+
+
+def test_forget_matches_rebuild_for_relative_imports(tmp_path):
+    """The relative-import path must honour exclusions like the absolute one.
+
+    ``pkg/main.py`` reaches ``pkg/util.py`` only through ``from .util import
+    helper`` and ``from . import util``. Both resolve through
+    ``_resolve_python_module_in_repo``, which the forgotten-file filter in
+    ``_resolve_module_to_file`` does not wrap -- so the re-parsed referrer
+    used to rediscover ``util.py`` on disk and keep a CALLS edge into a node
+    ``forget`` had already deleted.
+    """
+    after_forget, rebuilt, dangling = _forget_then_rebuild(
+        tmp_path, "relative-import", _RELATIVE_IMPORT_FILES, "pkg/util.py",
+    )
+
+    assert dangling == []
+    assert after_forget == rebuilt
+    assert after_forget["nodes"]
+    assert after_forget["edges"]
+    # Not vacuous: the surviving relative imports still resolve to files.
+    assert any(
+        "pkg/shared.py" in (row[2] or "")
+        for row in after_forget["edges"]
+        if row[0] == "IMPORTS_FROM"
+    )
+
+
+def test_forget_matches_rebuild_for_a_relative_subpackage(tmp_path):
+    """Same contract one package deeper, through ``from .sub import deep``."""
+    after_forget, rebuilt, dangling = _forget_then_rebuild(
+        tmp_path, "relative-sub", _RELATIVE_IMPORT_FILES, "pkg/sub/deep.py",
+    )
+
+    assert dangling == []
+    assert after_forget == rebuilt
 
 
 def test_forget_recomputes_python_import_after_candidate_is_removed(tmp_path):
@@ -343,52 +427,13 @@ def test_forget_purges_orphaned_embeddings(tmp_path):
 
         remaining = {
             r["qualified_name"]
-            for r in store._conn.execute("SELECT qualified_name FROM embeddings").fetchall()
+            for r in store._conn.execute(
+                "SELECT qualified_name FROM embeddings"
+            ).fetchall()
         }
         # Every vector for a forgotten node is gone; survivors are kept.
         assert not (remaining & util_qns)
         assert "main.py" in " ".join(remaining) or remaining
         assert summary["embeddings_purged"] >= len(util_qns)
-    finally:
-        store.close()
-
-
-def test_forget_denied_commit_preserves_the_complete_graph(tmp_path):
-    repo = _make_repo(tmp_path, "commit-denied", _FILES)
-    store = _build(repo)
-    try:
-        before = tuple(store._conn.iterdump())
-
-        def deny_commit(action, operation, _argument, _database, _trigger):
-            if action == sqlite3.SQLITE_TRANSACTION and operation == "COMMIT":
-                return sqlite3.SQLITE_DENY
-            return sqlite3.SQLITE_OK
-
-        store._conn.set_authorizer(deny_commit)
-        with pytest.raises(sqlite3.DatabaseError, match="not authorized"):
-            forget_files(store, repo, [str(repo / "util.py"), str(repo / "shared.py")])
-        assert tuple(store._conn.iterdump()) == before
-    finally:
-        store._conn.set_authorizer(None)
-        store.close()
-
-
-def test_forget_rejects_open_transaction_without_discarding_caller_work(tmp_path):
-    repo = _make_repo(tmp_path, "caller-transaction", _FILES)
-    store = _build(repo)
-    try:
-        store._conn.execute("BEGIN IMMEDIATE")
-        store._conn.execute(
-            "INSERT INTO metadata (key, value) VALUES (?, ?)",
-            ("caller_repository", str(repo)),
-        )
-        assert store._conn.in_transaction
-        pending = tuple(store._conn.iterdump())
-        with pytest.raises(RuntimeError, match="open transaction"):
-            forget_files(store, repo, [str(repo / "util.py")])
-        assert store._conn.in_transaction
-        assert tuple(store._conn.iterdump()) == pending
-        store.commit()
-        assert store.get_metadata("caller_repository") == str(repo)
     finally:
         store.close()

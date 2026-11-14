@@ -28,8 +28,9 @@ def test_ordinary_yaml_in_tasks_directory_is_not_treated_as_ansible() -> None:
         source,
     )
 
-    assert nodes == []
-    assert edges == []
+    assert any(node.kind == "YamlPath" for node in nodes)
+    assert not any(node.language == "ansible" for node in nodes)
+    assert all(edge.kind == "CONTAINS" for edge in edges)
 
 
 def test_ansible_relationships_reference_real_unique_nodes(tmp_path: Path) -> None:
@@ -56,7 +57,11 @@ def test_ansible_relationships_reference_real_unique_nodes(tmp_path: Path) -> No
 
     nodes, edges = parser.parse_bytes(path, source)
 
-    tasks = [node for node in nodes if node.extra.get("ansible_kind") == "task"]
+    tasks = [
+        node
+        for node in nodes
+        if node.extra.get("ansible_kind") == "task"
+    ]
     assert len(tasks) == 2
     assert len({node.name for node in tasks}) == 2
     assert all(node.name.startswith("Restart application") for node in tasks)
@@ -65,7 +70,8 @@ def test_ansible_relationships_reference_real_unique_nodes(tmp_path: Path) -> No
     internal_edges = [
         edge
         for edge in edges
-        if edge.kind == "CONTAINS" or edge.extra.get("ansible_kind") == "notify"
+        if edge.kind == "CONTAINS"
+        or edge.extra.get("ansible_kind") == "notify"
     ]
     assert internal_edges
     assert all(edge.source in qualified for edge in internal_edges)
@@ -78,7 +84,11 @@ def test_ansible_relationships_reference_real_unique_nodes(tmp_path: Path) -> No
         for edge in edges:
             store.upsert_edge(edge)
 
-        notify = next(edge for edge in internal_edges if edge.extra.get("ansible_kind") == "notify")
+        notify = next(
+            edge
+            for edge in internal_edges
+            if edge.extra.get("ansible_kind") == "notify"
+        )
         assert store.get_node(notify.source) is not None
         handler = store.get_node(notify.target)
         assert handler is not None

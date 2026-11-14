@@ -1,5 +1,9 @@
 # Pull Request
 
+<!-- Base branch: feature and fix PRs target `staging` (the default). Do not open PRs
+     against `testing` or `main`; those only receive promotion PRs from the maintainer.
+     See CONTRIBUTING.md "Branching and promotion". -->
+
 ## Linked issue
 
 <!-- Link the issue this PR addresses, e.g. "Closes #123".
@@ -31,4 +35,4 @@ uv run mypy code_review_graph/ --ignore-missing-imports --no-strict-optional
 - [ ] Linting passes: `uv run ruff check code_review_graph/`
 - [ ] Type checking passes: `uv run mypy code_review_graph/ --ignore-missing-imports --no-strict-optional`
 - [ ] Lines are at most 100 characters
-- [ ] Docs updated where behavior changed (README, `docs/`, docstrings)
+- [ ] Docs updated where behaviour changed (README, `docs/`, docstrings)

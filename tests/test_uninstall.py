@@ -6,6 +6,7 @@ never be reachable from this suite.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import stat
@@ -40,6 +41,8 @@ def fake_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     # real config. Re-point it inside this fake home so the Hermes platform
     # is exercised within the user-scope boundary uninstall enforces.
     monkeypatch.setenv("HERMES_HOME", str(home / ".hermes"))
+    # The same holds for DSH_HOME, which conftest also pins.
+    monkeypatch.setenv("DSH_HOME", str(home / ".dsh"))
     return home
 
 
@@ -63,10 +66,21 @@ def test_uninstall_removes_mcp_entry_for_every_current_platform_spec(
     if spec["format"] == "toml":
         _write(
             config_path,
-            'theme = "dark"\n\n'
+            "theme = \"dark\"\n\n"
             "[mcp_servers.code-review-graph]\n"
-            'command = "code-review-graph"\n\n'
-            '[mcp_servers.other]\ncommand = "other"\n',
+            "command = \"code-review-graph\"\n\n"
+            "[mcp_servers.other]\ncommand = \"other\"\n",
+        )
+    elif spec["format"] == "dsh-patch":
+        _write(
+            config_path,
+            "- id: model\n"
+            "  config: {theme: dark}\n"
+            "- insert:\n"
+            "    - id: mcp-code-review-graph\n"
+            "      name: '@deepseek-ai/dsh-mcp-client'\n"
+            "      config: {serverName: code-review-graph, transport: stdio,\n"
+            "               command: code-review-graph, args: [serve]}\n",
         )
     elif spec["format"] == "yaml":
         _write(
@@ -99,6 +113,10 @@ def test_uninstall_removes_mcp_entry_for_every_current_platform_spec(
         assert "[mcp_servers.code-review-graph]" not in text
         assert "[mcp_servers.other]" in text
         assert 'theme = "dark"' in text
+    elif spec["format"] == "dsh-patch":
+        assert config_path.read_text(encoding="utf-8") == (
+            "- id: model\n  config: {theme: dark}\n"
+        )
     elif spec["format"] == "yaml":
         import yaml
 
@@ -113,6 +131,100 @@ def test_uninstall_removes_mcp_entry_for_every_current_platform_spec(
         else:
             assert set(container) == {"other"}
         assert data["theme"] == "dark"
+
+
+def test_uninstall_mimo_jsonc_removes_only_crg_entry(
+    fake_repo: Path, fake_home: Path
+) -> None:
+    config = fake_repo / ".mimocode" / "mimocode.jsonc"
+    _write(
+        config,
+        '{\n'
+        '  // preserve MiMo settings\n'
+        '  "$schema": "https://mimo.xiaomi.com/mimocode/config.json",\n'
+        '  "theme": "dark",\n'
+        '  "mcp": {\n'
+        '    "code-review-graph": {"type": "local", "command": ["crg"]},\n'
+        '    "other": {"type": "local", "command": ["other"]}\n'
+        '  }\n'
+        '}\n',
+    )
+    json_config = config.with_suffix(".json")
+    _write(json_config, '{"theme": "light"}\n')
+
+    report = uninstall.run(repo=fake_repo, keep_data=True, platforms=["mimo"])
+
+    assert report.errors == []
+    assert "preserve MiMo settings" in config.read_text(encoding="utf-8")
+    assert _read_jsonc(config) == {
+        "$schema": "https://mimo.xiaomi.com/mimocode/config.json",
+        "theme": "dark",
+        "mcp": {"other": {"type": "local", "command": ["other"]}},
+    }
+    assert json_config.read_text(encoding="utf-8") == '{"theme": "light"}\n'
+
+
+def _mimo_entry_in_both_files(repo: Path) -> tuple[Path, Path]:
+    """Install into ``mimocode.json``, then into a ``mimocode.jsonc`` added later.
+
+    MiMo Code loads both files, so both registrations are live.
+    """
+    json_config, jsonc_config = skills._mimo_config_paths(repo)
+    assert skills.install_platform_configs(repo, target="mimo") == ["MiMo Code"]
+    _write(
+        jsonc_config,
+        '{\n'
+        '  // added by the user after the first install\n'
+        '  "theme": "dark",\n'
+        '  "mcp": {\n'
+        '    "other": {"type": "local", "command": ["other"]}\n'
+        '  }\n'
+        '}\n',
+    )
+    assert skills.install_platform_configs(repo, target="mimo") == ["MiMo Code"]
+    for path in (json_config, jsonc_config):
+        assert "code-review-graph" in _read_jsonc(path)["mcp"]  # type: ignore[index]
+    return json_config, jsonc_config
+
+
+@pytest.mark.parametrize("platforms", [["mimo"], None], ids=["unbind", "full"])
+def test_uninstall_mimo_cleans_both_config_files(
+    fake_repo: Path, fake_home: Path, platforms: list[str] | None
+) -> None:
+    """Review of #688: an entry left in either MiMo file stays registered."""
+    json_config, jsonc_config = _mimo_entry_in_both_files(fake_repo)
+
+    report = uninstall.run(repo=fake_repo, keep_data=True, platforms=platforms)
+
+    assert report.errors == []
+    assert _read_jsonc(json_config) == {"mcp": {}}
+    assert "// added by the user after the first install" in jsonc_config.read_text(
+        encoding="utf-8"
+    )
+    assert _read_jsonc(jsonc_config) == {
+        "theme": "dark",
+        "mcp": {"other": {"type": "local", "command": ["other"]}},
+    }
+    # "mimocode.json" is a prefix of "mimocode.jsonc", so match up to the bracket.
+    for path in (json_config, jsonc_config):
+        assert any(line.startswith(f"{path} (") for line in report.edited_paths)
+
+
+def test_uninstall_dry_run_lists_both_mimo_files_and_writes_nothing(
+    fake_repo: Path, fake_home: Path
+) -> None:
+    json_config, jsonc_config = _mimo_entry_in_both_files(fake_repo)
+    before = {path: path.read_bytes() for path in (json_config, jsonc_config)}
+
+    report = uninstall.run(repo=fake_repo, keep_data=True, platforms=["mimo"], dry_run=True)
+
+    assert report.errors == []
+    assert {path: path.read_bytes() for path in before} == before
+    for path in (json_config, jsonc_config):
+        assert any(
+            line.startswith(f"{path} (would remove")
+            for line in report.edited_paths
+        ), report.edited_paths
 
 
 def test_platform_inventory_is_derived_not_hard_coded(
@@ -333,7 +445,11 @@ def test_hook_cleanup_handles_owned_entries_and_mixed_nested_groups(
     uninstall.run(repo=fake_repo, keep_data=True)
 
     assert _read_jsonc(hooks_path) == {
-        "hooks": {"sessionStart": [{"matcher": "", "hooks": [{"command": "user-session-hook"}]}]}
+        "hooks": {
+            "sessionStart": [
+                {"matcher": "", "hooks": [{"command": "user-session-hook"}]}
+            ]
+        }
     }
 
 
@@ -368,6 +484,74 @@ def test_source_pr_legacy_hook_commands_are_removed_exactly(
     assert _read_jsonc(fake_home / ".codex" / "hooks.json") == {}
 
 
+def test_removes_codex_hooks_every_release_wrote(fake_home: Path, fake_repo: Path):
+    """The v2.3.9 commands are no longer what the installer generates."""
+    released = {
+        "PostToolUse": (
+            "cat >/dev/null || true; git rev-parse --git-dir >/dev/null 2>&1"
+            " && code-review-graph update --skip-flows || true"
+        ),
+        "SessionStart": (
+            "cat >/dev/null || true; git rev-parse --git-dir >/dev/null 2>&1"
+            " && code-review-graph status || echo 'Not a git repo, skipping'"
+        ),
+    }
+    path = fake_home / ".codex" / "hooks.json"
+    _write_json(
+        path,
+        {
+            "hooks": {
+                event: [{"hooks": [{"type": "command", "command": command}]}]
+                for event, command in released.items()
+            }
+        },
+    )
+
+    uninstall.run(repo=fake_repo, keep_data=True)
+
+    assert _read_jsonc(path) == {}
+
+
+@pytest.mark.parametrize("settings_dir", [".claude", ".qoder", ".codebuddy"])
+def test_removes_project_edit_hooks_every_release_wrote(
+    fake_home: Path, fake_repo: Path, settings_dir: str
+):
+    """The edit hook moved to hook-update (#311); older ones must still go."""
+    repo_arg = json.dumps(fake_repo.resolve().as_posix())
+    released = [
+        # v2.3.3
+        "git rev-parse --git-dir >/dev/null 2>&1"
+        f" && code-review-graph update --skip-flows --repo {repo_arg} || true",
+        # v2.3.4 - v2.3.6
+        "cat >/dev/null || true; git rev-parse --git-dir >/dev/null 2>&1"
+        f" && code-review-graph update --skip-flows --repo {repo_arg} || true",
+        # v2.3.7 - v2.3.9
+        "cat >/dev/null || true; command -v code-review-graph >/dev/null 2>&1 || exit 0;"
+        " git rev-parse --git-dir >/dev/null 2>&1 && code-review-graph update"
+        ' --skip-flows --repo "$(git rev-parse --show-toplevel 2>/dev/null)" || true',
+    ]
+    path = fake_repo / settings_dir / "settings.json"
+    for command in released:
+        _write_json(
+            path,
+            {
+                "model": "kept",
+                "hooks": {
+                    "PostToolUse": [
+                        {
+                            "matcher": "Edit|Write",
+                            "hooks": [{"type": "command", "command": command}],
+                        }
+                    ]
+                },
+            },
+        )
+
+        uninstall.run(repo=fake_repo, keep_data=True)
+
+        assert _read_jsonc(path) == {"model": "kept"}, command
+
+
 def test_shared_skill_directories_keep_user_files_and_unrelated_skills(
     fake_repo: Path,
     fake_home: Path,
@@ -383,6 +567,16 @@ def test_shared_skill_directories_keep_user_files_and_unrelated_skills(
         _write(root / generated_slug / "notes.txt", "keep\n")
         _write(root / "user-skill" / "SKILL.md", "keep\n")
 
+    # What install actually writes since #909: the workflows bundled in the
+    # distribution, in a repository that has no top-level skills/ of its own.
+    bundled = skills.bundled_skill_names()
+    assert bundled, "no bundled skills found to exercise the Qoder path"
+    for name in bundled:
+        _write(fake_repo / ".qoder" / "skills" / name / "SKILL.md", "bundled\n")
+    _write(fake_repo / ".qoder" / "skills" / bundled[0] / "notes.txt", "keep\n")
+
+    # What releases before #909 wrote: a copy of the target project's own
+    # top-level skills/ directory. Those copies must still be removable.
     _write(fake_repo / "skills" / "project-skill" / "SKILL.md", "source\n")
     _write(fake_repo / ".qoder" / "skills" / "project-skill" / "SKILL.md", "copy\n")
     _write(fake_repo / ".qoder" / "skills" / "project-skill" / "notes.txt", "keep\n")
@@ -394,9 +588,33 @@ def test_shared_skill_directories_keep_user_files_and_unrelated_skills(
         assert not (root / generated_slug / "SKILL.md").exists()
         assert (root / generated_slug / "notes.txt").exists()
         assert (root / "user-skill" / "SKILL.md").exists()
+    for name in bundled:
+        assert not (fake_repo / ".qoder" / "skills" / name / "SKILL.md").exists()
+    assert (fake_repo / ".qoder" / "skills" / bundled[0] / "notes.txt").exists()
     assert not (fake_repo / ".qoder" / "skills" / "project-skill" / "SKILL.md").exists()
     assert (fake_repo / ".qoder" / "skills" / "project-skill" / "notes.txt").exists()
     assert (fake_repo / ".qoder" / "skills" / "user-skill" / "SKILL.md").exists()
+
+
+def test_qoder_skills_are_removed_without_a_repository_skills_directory(
+    fake_repo: Path,
+    fake_home: Path,
+) -> None:
+    """The shape a real user repository has: install's own bundled workflows.
+
+    Deriving the list from ``<repo>/skills`` removed none of them, because a
+    normal project has no such directory (#909).
+    """
+    assert not (fake_repo / "skills").exists()
+    bundled = skills.bundled_skill_names()
+    assert bundled, "no bundled skills found to exercise the Qoder path"
+    for name in bundled:
+        _write(fake_repo / ".qoder" / "skills" / name / "SKILL.md", "bundled\n")
+
+    uninstall.run(repo=fake_repo, keep_data=True)
+
+    for name in bundled:
+        assert not (fake_repo / ".qoder" / "skills" / name / "SKILL.md").exists()
 
 
 def test_instruction_inventory_and_git_hook_are_surgical(
@@ -437,7 +655,10 @@ def test_uninstall_cleans_current_and_legacy_copilot_instruction_paths(
 ) -> None:
     """Both Copilot paths lose only the generated CRG instruction section."""
     paths = (
-        fake_repo / ".github" / "instructions" / "code-review-graph.instructions.md",
+        fake_repo
+        / ".github"
+        / "instructions"
+        / "code-review-graph.instructions.md",
         fake_repo / ".github" / "code-review-graph.instruction.md",
     )
     for path in paths:
@@ -453,7 +674,9 @@ def test_uninstall_cleans_current_and_legacy_copilot_instruction_paths(
 def _legacy_claude_section() -> str:
     """The longest recorded pre-guardrails CLAUDE.md-shaped block."""
     return next(
-        block for block in skills.LEGACY_INSTRUCTION_SECTIONS if not block.startswith("---\n")
+        block
+        for block in skills.LEGACY_INSTRUCTION_SECTIONS
+        if not block.startswith("---\n")
     )
 
 
@@ -528,7 +751,11 @@ def test_uninstall_clears_every_duplicate_stale_block(
     fake_home: Path,
 ) -> None:
     """Repeat installs used to stack blocks (#558); removal must clear them all."""
-    older = [block for block in skills.LEGACY_INSTRUCTION_SECTIONS if not block.startswith("---\n")]
+    older = [
+        block
+        for block in skills.LEGACY_INSTRUCTION_SECTIONS
+        if not block.startswith("---\n")
+    ]
     path = fake_repo / "CLAUDE.md"
     _write(path, "user instructions\n\n" + older[0] + "\n" + older[1] + "\n" + older[0])
 
@@ -627,7 +854,10 @@ def test_dry_run_is_meaningful_and_byte_for_byte_read_only(
     data.write_bytes(b"graph")
     plugin = fake_home / ".config" / "opencode" / "plugins" / "crg-plugin.ts"
     _write(plugin, "plugin")
-    before = {path: path.read_bytes() for path in (config, data, plugin)}
+    before = {
+        path: path.read_bytes()
+        for path in (config, data, plugin)
+    }
 
     report = uninstall.run(repo=fake_repo, dry_run=True)
 
@@ -678,6 +908,7 @@ def test_atomic_config_replace_preserves_file_mode(
     config = fake_repo / ".mcp.json"
     _write_json(config, {"mcpServers": {"code-review-graph": {}, "other": {}}})
     config.chmod(0o640)
+    original_mode = stat.S_IMODE(config.stat().st_mode)
 
     report = uninstall.run(
         repo=fake_repo,
@@ -686,7 +917,7 @@ def test_atomic_config_replace_preserves_file_mode(
     )
 
     assert report.errors == []
-    assert stat.S_IMODE(config.stat().st_mode) == 0o640
+    assert stat.S_IMODE(config.stat().st_mode) == original_mode
     assert _read_jsonc(config) == {"mcpServers": {"other": {}}}
 
 
@@ -742,7 +973,12 @@ def test_symlink_and_out_of_boundary_paths_are_skipped(
     outside_data = tmp_path / "outside-data"
     outside_data.mkdir()
     _write(outside_data / "keep.txt", "keep")
-    os.symlink(outside_data, fake_repo / ".code-review-graph", target_is_directory=True)
+    try:
+        os.symlink(outside_data, fake_repo / ".code-review-graph", target_is_directory=True)
+    except OSError as exc:
+        if getattr(exc, "winerror", None) == 1314:
+            pytest.skip("Windows account lacks symbolic-link privilege")
+        raise
 
     outside_config = tmp_path / "outside-config.json"
     _write_json(outside_config, {"servers": {"code-review-graph": {}, "other": {}}})
@@ -920,6 +1156,31 @@ def test_cli_dry_run_and_confirmation_are_safe(
     assert "code-review-graph" in config.read_text(encoding="utf-8")
 
 
+def test_uninstall_with_no_terminal_says_it_took_the_default(
+    fake_repo: Path, fake_home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import io
+
+    from code_review_graph import cli
+
+    class _Pipe(io.StringIO):
+        def isatty(self) -> bool:
+            return False
+
+    config = fake_repo / ".mcp.json"
+    _write_json(config, {"mcpServers": {"code-review-graph": {}}})
+    with (
+        patch.object(sys, "argv", ["code-review-graph", "uninstall", "--repo", str(fake_repo)]),
+        patch.object(sys, "stdin", _Pipe()),
+    ):
+        cli.main()
+
+    out = capsys.readouterr().out
+    assert "No terminal: taking the default (no). Use --yes to go ahead." in out
+    assert "Aborted." in out
+    assert "code-review-graph" in config.read_text(encoding="utf-8")
+
+
 # ---------------------------------------------------------------------------
 # Platform-scoped unbind (``uninstall --platform``)
 # ---------------------------------------------------------------------------
@@ -989,6 +1250,86 @@ def test_platform_scoped_unbind_targets_user_scope_toml(
     assert "code-review-graph" in claude_config.read_text(encoding="utf-8")
 
 
+def test_uninstall_uses_custom_codex_home_and_preserves_user_skill(
+    fake_repo: Path,
+    fake_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    codex_home = fake_home / "wsl-codex"
+    skill_dir = codex_home / "skills" / "code-review-graph"
+    skill_dir.mkdir(parents=True)
+    skill_file = skill_dir / "SKILL.md"
+    skill_file.write_text("generated\n", encoding="utf-8")
+    notes = skill_dir / "notes.txt"
+    notes.write_text("user\n", encoding="utf-8")
+    (skill_dir / ".code-review-graph-managed.json").write_text(
+        json.dumps({"version": 1, "files": {"SKILL.md": "not-the-file-hash"}}),
+        encoding="utf-8",
+    )
+    config = codex_home / "config.toml"
+    _write_codex_config(config)
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+    report = uninstall.run(repo=fake_repo, keep_data=True)
+
+    assert report.errors == []
+    config_text = config.read_text(encoding="utf-8")
+    assert "[mcp_servers.code-review-graph]" not in config_text
+    assert "[mcp_servers.other]" in config_text
+    assert skill_file.exists()
+    assert notes.exists()
+
+
+def test_uninstall_removes_only_managed_codex_skill_files(
+    fake_repo: Path,
+    fake_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from code_review_graph.codex_skill import install_codex_skill
+
+    codex_home = fake_home / "wsl-codex"
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    skill_dir = install_codex_skill()
+    notes = skill_dir / "notes.txt"
+    notes.write_text("user\n", encoding="utf-8")
+
+    report = uninstall.run(repo=fake_repo, keep_data=True)
+
+    assert report.errors == []
+    assert notes.read_text(encoding="utf-8") == "user\n"
+    assert not (skill_dir / "SKILL.md").exists()
+    assert not (skill_dir / "agents" / "openai.yaml").exists()
+    assert not (skill_dir / "scripts" / "crg_readonly.py").exists()
+    assert not (skill_dir / ".code-review-graph-managed.json").exists()
+
+
+def test_uninstall_ignores_symlinked_codex_manifest(
+    fake_repo: Path,
+    fake_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    codex_home = fake_home / "codex"
+    skill_dir = codex_home / "skills" / "code-review-graph"
+    skill_dir.mkdir(parents=True)
+    skill = skill_dir / "SKILL.md"
+    skill.write_text("user-owned\n", encoding="utf-8")
+    outside = fake_home / "outside.json"
+    outside.write_text(
+        json.dumps({"version": 1, "files": {
+            "SKILL.md": hashlib.sha256(skill.read_bytes()).hexdigest()
+        }}),
+        encoding="utf-8",
+    )
+    (skill_dir / ".code-review-graph-managed.json").symlink_to(outside)
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+    report = uninstall.run(repo=fake_repo, keep_data=True)
+
+    assert report.errors == []
+    assert skill.read_text(encoding="utf-8") == "user-owned\n"
+    assert outside.is_file()
+
+
 def test_cli_uninstall_platform_scopes_to_one_binding(
     fake_repo: Path,
     fake_home: Path,
@@ -1005,13 +1346,8 @@ def test_cli_uninstall_platform_scopes_to_one_binding(
         sys,
         "argv",
         [
-            "code-review-graph",
-            "uninstall",
-            "--platform",
-            "claude",
-            "--repo",
-            str(fake_repo),
-            "--yes",
+            "code-review-graph", "uninstall",
+            "--platform", "claude", "--repo", str(fake_repo), "--yes",
         ],
     ):
         cli.main()
@@ -1020,3 +1356,192 @@ def test_cli_uninstall_platform_scopes_to_one_binding(
     assert "unbind" in out
     assert _read_jsonc(claude_config) == {"mcpServers": {"other": {}}}
     assert "[mcp_servers.code-review-graph]" in codex_config.read_text(encoding="utf-8")
+
+
+def test_uninstall_removes_the_empty_codex_skills_folder(
+    fake_home: Path, fake_repo: Path, monkeypatch,
+):
+    from code_review_graph import codex_skill
+
+    home = fake_home / ".codex"
+    monkeypatch.setenv("CODEX_HOME", str(home))
+    assert codex_skill.install_codex_skill() is not None
+    skills_root = home / "skills"
+    assert skills_root.is_dir()
+
+    uninstall.run(repo=fake_repo, keep_data=True)
+
+    assert not skills_root.exists()
+
+
+# Hooks name the copy that ran install, which may not be the copy uninstalling.
+_OTHER_COPY = skills._HookProgram(
+    "[ -x '/other venv/bin/python3' ]", "'/other venv/bin/python3' -m code_review_graph"
+)
+_ANY_COPY = pytest.mark.parametrize(
+    "program",
+    [_OTHER_COPY, skills._UVX_HOOK_PROGRAM, skills._PATH_HOOK_PROGRAM],
+    ids=["other-interpreter", "uvx", "path-as-2.4.0-wrote"],
+)
+
+
+@_ANY_COPY
+@pytest.mark.parametrize("settings_dir", [".claude", ".qoder", ".codebuddy"])
+def test_removes_project_hooks_that_name_any_copy(
+    fake_home: Path, fake_repo: Path, settings_dir: str, program: skills._HookProgram
+) -> None:
+    path = fake_repo / settings_dir / "settings.json"
+    _write_json(path, {"model": "kept", **skills.generate_hooks_config(fake_repo, program)})
+
+    uninstall.run(repo=fake_repo, keep_data=True)
+
+    assert _read_jsonc(path) == {"model": "kept"}
+
+
+@_ANY_COPY
+def test_removes_codex_hooks_that_name_any_copy(
+    fake_home: Path, fake_repo: Path, program: skills._HookProgram
+) -> None:
+    path = fake_home / ".codex" / "hooks.json"
+    _write_json(
+        path, {"note": "kept", **skills.generate_codex_hooks_config(fake_repo, program)}
+    )
+
+    uninstall.run(repo=fake_repo, keep_data=True)
+
+    assert _read_jsonc(path) == {"note": "kept"}
+
+
+@_ANY_COPY
+def test_removes_a_steering_hook_that_names_any_copy(
+    fake_home: Path, fake_repo: Path, program: skills._HookProgram
+) -> None:
+    path = fake_repo / ".claude" / "settings.json"
+    _write_json(path, {"model": "kept", **skills.generate_steering_hooks_config(program)})
+
+    report = uninstall.remove_steering_hook(fake_repo)
+
+    assert report.total_actions == 1
+    assert _read_jsonc(path) == {"model": "kept"}
+
+
+def test_a_steering_hook_under_another_matcher_is_the_users(
+    fake_home: Path, fake_repo: Path
+) -> None:
+    config = skills.generate_steering_hooks_config(_OTHER_COPY)
+    config["hooks"]["PreToolUse"][0]["matcher"] = "Read"
+    path = fake_repo / ".claude" / "settings.json"
+    _write_json(path, config)
+
+    uninstall.run(repo=fake_repo, keep_data=True)
+
+    assert _read_jsonc(path) == config
+
+
+def test_every_report_line_reads_right_in_a_dry_run_and_a_real_run(
+    fake_repo: Path, fake_home: Path
+) -> None:
+    """A dry run printed "would removed ..." for most actions."""
+    _write_json(fake_repo / ".mcp.json", {"mcpServers": {"code-review-graph": {}}})
+    _write_json(
+        fake_repo / ".claude" / "settings.json",
+        {"model": "kept", **skills.generate_hooks_config(fake_repo)},
+    )
+    _write(fake_repo / ".code-review-graph" / "graph.db", "")
+    _write(fake_repo / ".claude" / "skills" / "debug-issue" / "SKILL.md", "x\n")
+    skills.install_git_hook(fake_repo)
+
+    preview = uninstall.run(repo=fake_repo, keep_data=False, dry_run=True)
+    planned = preview.removed_paths + preview.edited_paths
+    assert len(planned) >= 5
+    for line in planned:
+        assert " (would remove" in line, line
+        assert "would removed" not in line, line
+
+    done = uninstall.run(repo=fake_repo, keep_data=False)
+    applied = done.removed_paths + done.edited_paths
+    assert len(applied) == len(planned)
+    for line in applied:
+        assert " (removed " in line, line
+        assert "(remove " not in line and "would" not in line, line
+
+
+# --- files install made and nothing else uses ---------------------------------
+
+
+def _git_repo(path: Path) -> Path:
+    import subprocess
+
+    path.mkdir()
+    subprocess.run(["git", "init", "-q", str(path)], check=True)
+    return path
+
+
+def _record(repo: Path, *files: str) -> None:
+    _write_json(
+        repo / ".code-review-graph" / "install-manifest.json",
+        {"version": 1, "files": sorted(files)},
+    )
+
+
+@pytest.mark.skipif(not __import__("shutil").which("git"), reason="needs git")
+def test_uninstall_removes_files_install_made_that_hold_nothing_else(
+    tmp_path: Path, fake_home: Path
+) -> None:
+    """An install and an uninstall used to leave {"mcpServers": {}}, a settings
+    file of {} and empty folders behind in a repository that had none of them."""
+    repo = _git_repo(tmp_path / "repo")
+    _write_json(repo / ".mcp.json", {"mcpServers": {"code-review-graph": {}}})
+    _write_json(repo / ".vscode" / "mcp.json", {"servers": {"code-review-graph": {}}})
+    _write_json(repo / ".claude" / "settings.json", skills.generate_hooks_config(repo))
+    _write(repo / ".claude" / "skills" / "debug-issue" / "SKILL.md", "x\n")
+    _record(
+        repo, ".mcp.json", ".vscode/mcp.json", ".claude/settings.json",
+        ".claude/skills/debug-issue/SKILL.md",
+    )
+
+    preview = uninstall.run(repo=repo, dry_run=True)
+    assert any(
+        ".mcp.json (would remove file install wrote" in line for line in preview.removed_paths
+    )
+    assert (repo / ".mcp.json").exists()
+
+    uninstall.run(repo=repo)
+
+    assert sorted(path.name for path in repo.iterdir()) == [".git"]
+
+
+@pytest.mark.skipif(not __import__("shutil").which("git"), reason="needs git")
+def test_uninstall_keeps_an_emptied_file_git_tracks_or_that_holds_more(
+    tmp_path: Path, fake_home: Path
+) -> None:
+    import subprocess
+
+    repo = _git_repo(tmp_path / "repo")
+    _write_json(repo / ".mcp.json", {"mcpServers": {"code-review-graph": {}}})
+    subprocess.run(["git", "-C", str(repo), "add", ".mcp.json"], check=True)
+    _write(
+        repo / ".vscode" / "mcp.json",
+        '{\n  // the team\'s note\n  "servers": {"code-review-graph": {}}\n}\n',
+    )
+    _write_json(
+        repo / ".claude" / "settings.json",
+        {"model": "kept", **skills.generate_hooks_config(repo)},
+    )
+    _record(repo, ".mcp.json", ".vscode/mcp.json", ".claude/settings.json")
+
+    uninstall.run(repo=repo)
+
+    assert _read_jsonc(repo / ".mcp.json") == {"mcpServers": {}}
+    assert "the team's note" in (repo / ".vscode" / "mcp.json").read_text(encoding="utf-8")
+    assert _read_jsonc(repo / ".claude" / "settings.json") == {"model": "kept"}
+
+
+def test_uninstall_without_an_install_record_keeps_emptied_files(
+    fake_repo: Path, fake_home: Path
+) -> None:
+    _write_json(fake_repo / ".mcp.json", {"mcpServers": {"code-review-graph": {}}})
+
+    uninstall.run(repo=fake_repo)
+
+    assert _read_jsonc(fake_repo / ".mcp.json") == {"mcpServers": {}}
