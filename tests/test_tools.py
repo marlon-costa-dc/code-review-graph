@@ -167,7 +167,9 @@ class TestTools:
         store.commit()
         rebuild_fts_index(store)
 
-        monkeypatch.setattr(query_mod, "_get_store", lambda repo_root=None: (store, tmp_path))
+        monkeypatch.setattr(
+            query_mod, "_get_store_for_read", lambda repo_root=None: (store, tmp_path, None)
+        )
         result = semantic_search_nodes("login")
         assert result["status"] == "ok"
         assert result["search_mode"] == "fts"

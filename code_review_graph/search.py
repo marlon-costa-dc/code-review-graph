@@ -820,6 +820,16 @@ def _fts_search(
 # ---------------------------------------------------------------------------
 
 
+def count_stored_embeddings(conn: sqlite3.Connection) -> int:
+    """Count persisted vectors without constructing a provider or changing schema."""
+    try:
+        return int(conn.execute("SELECT COUNT(*) FROM embeddings").fetchone()[0])
+    except sqlite3.OperationalError as exc:
+        if str(exc).lower() == "no such table: embeddings":
+            return 0
+        raise
+
+
 def _embedding_search(
     store: GraphStore,
     query: str,
@@ -838,6 +848,8 @@ def _embedding_search(
     """
     if store.read_only:
         # EmbeddingStore creates and migrates its table when opened.
+        return []
+    if not count_stored_embeddings(store._conn):
         return []
     try:
         from .embeddings import EmbeddingStore

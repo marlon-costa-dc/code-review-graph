@@ -60,3 +60,7 @@ test-freshness:
 .PHONY: test-install
 test-install:
 	uv run --locked --extra dev pytest tests/test_cli_install.py tests/test_steering_hook.py tests/test_installer_ownership.py tests/test_install_outputs_are_ignored.py -q --tb=short
+
+.PHONY: test-read-guard
+test-read-guard:
+	uv run --locked --extra dev pytest tests/test_not_built_guard.py tests/test_uncertainty.py -q --tb=short

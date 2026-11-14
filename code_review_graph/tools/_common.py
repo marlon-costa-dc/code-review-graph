@@ -186,11 +186,15 @@ def _get_store_for_read(
     # would silently create an empty db, so short-circuit before that happens.
     if not Path(db_path).exists():
         return None, None, _not_built_response()
-    store = GraphStore(db_path)
-    if not _graph_is_built(store):
+    store, root = _get_store(str(root), db_path=db_path)
+    try:
+        if _graph_is_built(store):
+            return store, root, None
+    except BaseException:
         store.close()
-        return None, None, _not_built_response()
-    return store, root, None
+        raise
+    store.close()
+    return None, None, _not_built_response()
 
 
 # Common JS/TS builtin method names filtered from callers_of results.
