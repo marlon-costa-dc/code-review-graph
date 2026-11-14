@@ -394,11 +394,7 @@ class TestCrossRepoSearch:
 
         with (
             patch("code_review_graph.registry.Registry") as mock_registry_cls,
-            patch(
-                "code_review_graph.tools.registry_tools.get_db_path",
-                side_effect=[android_db, ios_db],
-            ),
-            patch("code_review_graph.tools.registry_tools.GraphStore") as mock_store_cls,
+            patch("code_review_graph.tools.registry_tools._get_store_for_read") as read_store,
             patch(
                 "code_review_graph.tools.registry_tools.hybrid_search",
                 side_effect=[android_results, ios_results],
@@ -408,7 +404,7 @@ class TestCrossRepoSearch:
                 {"path": str(android_repo), "alias": "android"},
                 {"path": str(ios_repo), "alias": "ios"},
             ]
-            mock_store_cls.side_effect = [MagicMock(), MagicMock()]
+            read_store.side_effect = [(MagicMock(), None, None)] * 2
 
             result = cross_repo_search_func(query="splash", limit=2)
 
@@ -454,11 +450,7 @@ class TestCrossRepoSearch:
 
         with (
             patch("code_review_graph.registry.Registry") as mock_registry_cls,
-            patch(
-                "code_review_graph.tools.registry_tools.get_db_path",
-                side_effect=[entries[1][1], entries[2][1]],
-            ),
-            patch("code_review_graph.tools.registry_tools.GraphStore") as mock_store_cls,
+            patch("code_review_graph.tools.registry_tools._get_store_for_read") as read_store,
             patch(
                 "code_review_graph.tools.registry_tools.hybrid_search",
                 side_effect=[ios_results, web_results],
@@ -467,7 +459,7 @@ class TestCrossRepoSearch:
             mock_registry_cls.return_value.list_repos.return_value = [
                 entry for entry, _ in entries
             ]
-            mock_store_cls.side_effect = [MagicMock(), MagicMock()]
+            read_store.side_effect = [(MagicMock(), None, None)] * 2
 
             result = cross_repo_search_func(query="splash", repos=["web", "ios"])
 
@@ -485,11 +477,7 @@ class TestCrossRepoSearch:
 
         with (
             patch("code_review_graph.registry.Registry") as mock_registry_cls,
-            patch(
-                "code_review_graph.tools.registry_tools.get_db_path",
-                side_effect=[entries[0][1]],
-            ),
-            patch("code_review_graph.tools.registry_tools.GraphStore") as mock_store_cls,
+            patch("code_review_graph.tools.registry_tools._get_store_for_read") as read_store,
             patch(
                 "code_review_graph.tools.registry_tools.hybrid_search",
                 side_effect=[[{"name": "Splash", "score": 0.03}]],
@@ -498,7 +486,7 @@ class TestCrossRepoSearch:
             mock_registry_cls.return_value.list_repos.return_value = [
                 entry for entry, _ in entries
             ]
-            mock_store_cls.side_effect = [MagicMock()]
+            read_store.side_effect = [(MagicMock(), None, None)] * 1
 
             result = cross_repo_search_func(
                 query="splash", repos=["android", "desktop"]
@@ -542,11 +530,7 @@ class TestCrossRepoSearch:
 
         with (
             patch("code_review_graph.registry.Registry") as mock_registry_cls,
-            patch(
-                "code_review_graph.tools.registry_tools.get_db_path",
-                side_effect=[entries[0][1], entries[1][1]],
-            ),
-            patch("code_review_graph.tools.registry_tools.GraphStore") as mock_store_cls,
+            patch("code_review_graph.tools.registry_tools._get_store_for_read") as read_store,
             patch(
                 "code_review_graph.tools.registry_tools.hybrid_search",
                 side_effect=[android_results, ios_results],
@@ -555,7 +539,7 @@ class TestCrossRepoSearch:
             mock_registry_cls.return_value.list_repos.return_value = [
                 entry for entry, _ in entries
             ]
-            mock_store_cls.side_effect = [MagicMock(), MagicMock()]
+            read_store.side_effect = [(MagicMock(), None, None)] * 2
 
             result = cross_repo_search_func(query="splash", repos=["ios", "android"])
 
@@ -620,11 +604,7 @@ class TestCrossRepoSearchEchoBounds:
 
         with (
             patch("code_review_graph.registry.Registry") as mock_registry_cls,
-            patch(
-                "code_review_graph.tools.registry_tools.get_db_path",
-                side_effect=[db],
-            ),
-            patch("code_review_graph.tools.registry_tools.GraphStore") as mock_store_cls,
+            patch("code_review_graph.tools.registry_tools._get_store_for_read") as read_store,
             patch(
                 "code_review_graph.tools.registry_tools.hybrid_search",
                 side_effect=[[{"name": "Splash", "score": 0.03}]],
@@ -633,7 +613,7 @@ class TestCrossRepoSearchEchoBounds:
             mock_registry_cls.return_value.list_repos.return_value = [
                 {"path": str(repo), "alias": "droid"},
             ]
-            mock_store_cls.side_effect = [MagicMock()]
+            read_store.side_effect = [(MagicMock(), None, None)] * 1
 
             result = cross_repo_search_func(
                 query="splash", repos=["droid", "nope"]

@@ -15,6 +15,11 @@ its uncommitted changes. A caller may reuse a completion only for its own
 checkout, matching inputs and graph profile. The watcher and tool callers use
 the same writer and completion records.
 
+A parser worker may reuse a syntax tree for identical preprocessed bytes
+and the same loaded grammar. It still extracts nodes and resolves names for
+each checkout. Syntax trees are retained only in a bounded worker-local
+cache; the SQLite database is the only durable graph store.
+
 AI Hub selects and supervises the engine; it does not own graph data or
 refresh leases. Its runtime acceptance and activation remain governed by
 AI Hub ADR 0026 and ADR 0030.

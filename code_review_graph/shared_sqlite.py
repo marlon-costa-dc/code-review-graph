@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from .errors import GraphStoreError
+from .migrations import RETIRED_TABLES
 
 SHARED_DB_ENV = "CRG_SHARED_DB"
 
@@ -21,9 +22,9 @@ class UnbuiltCheckoutError(GraphStoreError):
 
 _TABLES = frozenset({
     "nodes", "edges", "metadata", "flows", "flow_memberships", "communities",
-    "community_summaries", "flow_snapshots", "risk_index", "nodes_fts",
+    "nodes_fts",
     "nodes_fts_state", "embeddings",
-})
+}) | RETIRED_TABLES
 _TOKEN = re.compile(
     r"--[^\n]*|/\*[\s\S]*?\*/|'(?:''|[^'])*'|\"(?:\"\"|[^\"])*\"|\b\w+\b",
 )
