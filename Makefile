@@ -1,8 +1,14 @@
 SHELL := /bin/sh
-.PHONY: setup check test test-concurrency graph graph-query mod rules-test rules-snapshots
+.PHONY: setup tools-lock tools-setup check test test-concurrency graph graph-query mod rules-test rules-snapshots
 
 setup:
 	uv sync --frozen --extra dev
+
+tools-lock:
+	uv lock --project .tools
+
+tools-setup:
+	uv sync --project .tools --frozen
 
 check:
 	uv run --frozen ruff check code_review_graph/
@@ -21,7 +27,7 @@ graph-query:
 	uv run --frozen code-review-graph query tests_for "$(CURDIR)/code_review_graph/daemon.py::WatchDaemon" --repo .
 
 mod:
-	flext-infra refactor mod --repository-root . --rule crg-daemon-native-graph-path
+	.tools/.venv/bin/flext-infra refactor mod --repository-root . --rule crg-daemon-native-graph-path
 
 rules-test:
 	ast-grep test --config config/rules/ast-grep/sgconfig.yml
