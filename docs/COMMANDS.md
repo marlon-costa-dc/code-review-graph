@@ -417,10 +417,10 @@ path = "/home/user/project-b"
 alias = "project-b"
 ```
 
-The daemon spawns one `code-review-graph watch` child process per repo with
-`subprocess.Popen`. It polls the config file and starts or stops children as
-repos are added or removed. A health check every 30 seconds restarts dead
-watchers. No tmux or screen is needed.
+The daemon starts one `code-review-graph watch` child per repository. It
+reloads `watch.toml` when the file changes or is replaced atomically and
+starts or stops children as repositories are added or removed. A health check
+every 30 seconds restarts dead watchers.
 
 ## MCP Tools
 
