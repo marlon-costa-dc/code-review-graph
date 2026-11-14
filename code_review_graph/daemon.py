@@ -1244,6 +1244,7 @@ class WatchDaemon:
         logger.info("Starting daemon '%s'", self._config.session_name)
 
         # Auto-register repos in the central registry
+        from .incremental import get_db_path
         from .registry import Registry
 
         registry = Registry()
@@ -1252,7 +1253,7 @@ class WatchDaemon:
 
         # Build initial graph for repos that lack a database
         for repo in self._config.repos:
-            db_path = Path(repo.path) / ".code-review-graph" / "graph.db"
+            db_path = get_db_path(Path(repo.path), read_only=True)
             if not db_path.exists():
                 self._initial_build(repo)
 
@@ -1320,6 +1321,7 @@ class WatchDaemon:
         # Register new/updated repos and build graphs *before* acquiring
         # the lock so that long-running builds don't block health checks.
         if to_add or to_update:
+            from .incremental import get_db_path
             from .registry import Registry
 
             registry = Registry()
@@ -1328,7 +1330,7 @@ class WatchDaemon:
             for alias in to_add | to_update:
                 repo = desired[alias]
                 registry.register(repo.path, alias=repo.alias, data_dir=repo.data_dir or None)
-                db_path = Path(repo.path) / ".code-review-graph" / "graph.db"
+                db_path = get_db_path(Path(repo.path), read_only=True)
                 if not db_path.exists():
                     repos_needing_build.append(repo)
 

@@ -43,4 +43,4 @@ test-skills:
 
 .PHONY: test-daemon
 test-daemon:
-	uv run --locked --extra dev pytest tests/test_daemon.py tests/test_prune.py -q --tb=short
+	uv run --locked --extra dev pytest tests/test_daemon.py tests/test_daemon_external_graph.py tests/test_prune.py -q --tb=short
