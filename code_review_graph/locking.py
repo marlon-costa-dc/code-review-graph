@@ -169,30 +169,14 @@ class WriteLock:
         if self._handle is not None:
             return True
         use_flock = _flock_supported()
-        try:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            handle = open(self.path, "a+", encoding="utf-8")  # noqa: SIM115
-        except OSError as exc:
-            if self._strict or not use_flock:
-                raise
-            # A lock file we cannot even open must not fail the build: losing
-            # the guard degrades to the old behaviour, which is what the user
-            # asked for anyway.
-            logger.warning("Cannot open write lock %s: %s", self.path, exc)
-            return True
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        handle = open(self.path, "a+", encoding="utf-8")  # noqa: SIM115
         self._handle = handle
         _open_locks.add(self)
         acquired = False
         try:
             acquire = _flock if use_flock else _windows_lock
             acquired = acquire(handle, blocking)
-        except OSError as exc:
-            if self._strict or not use_flock:
-                raise
-            # No lock support is not a competing writer, and it must not fail
-            # the build either. Degrade like a lock file that cannot be opened.
-            logger.warning("Cannot lock %s: %s", self.path, exc)
-            return True
         finally:
             if not acquired:
                 self._handle = None

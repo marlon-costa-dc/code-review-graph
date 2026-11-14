@@ -56,9 +56,9 @@ def test_only_lock_contention_is_reported_as_a_skip(tmp_path, monkeypatch, error
         if error in (errno.EAGAIN, errno.EACCES):
             assert lock.acquire(blocking=blocking) is False
         else:
-            # No flock support: run without the lock, as with a lock file that
-            # cannot be opened. It must not stop the build.
-            assert lock.acquire(blocking=blocking) is True
+            with pytest.raises(OSError) as caught:
+                lock.acquire(blocking=blocking)
+            assert caught.value.errno == error
     assert not lock.held
     # A failed acquisition must leave the instance reusable.
     assert lock.acquire()
