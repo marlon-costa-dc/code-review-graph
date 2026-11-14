@@ -14,12 +14,18 @@ def _call_targets(repo_root: Path, source_file: Path) -> set[str]:
 def test_star_import_resolves_public_function_from_direct_module(tmp_path: Path) -> None:
     helper = tmp_path / "helpers.py"
     helper.write_text(
-        "def public_helper():\n    return 1\n\ndef _private_helper():\n    return 2\n",
+        "def public_helper():\n"
+        "    return 1\n\n"
+        "def _private_helper():\n"
+        "    return 2\n",
         encoding="utf-8",
     )
     caller = tmp_path / "caller.py"
     caller.write_text(
-        "from helpers import *\n\ndef run():\n    public_helper()\n    _private_helper()\n",
+        "from helpers import *\n\n"
+        "def run():\n"
+        "    public_helper()\n"
+        "    _private_helper()\n",
         encoding="utf-8",
     )
 
@@ -41,7 +47,10 @@ def test_star_import_honors_explicit_dunder_all(tmp_path: Path) -> None:
     )
     caller = tmp_path / "caller.py"
     caller.write_text(
-        "from helpers import *\n\ndef run():\n    public_helper()\n    _selected_helper()\n",
+        "from helpers import *\n\n"
+        "def run():\n"
+        "    public_helper()\n"
+        "    _selected_helper()\n",
         encoding="utf-8",
     )
 
@@ -57,7 +66,8 @@ def test_star_import_resolves_transitive_relative_export(tmp_path: Path) -> None
     (package / "__init__.py").write_text("", encoding="utf-8")
     leaf = package / "leaf.py"
     leaf.write_text(
-        "def transitive_helper():\n    return 1\n",
+        "def transitive_helper():\n"
+        "    return 1\n",
         encoding="utf-8",
     )
     (package / "bridge.py").write_text(
@@ -66,7 +76,9 @@ def test_star_import_resolves_transitive_relative_export(tmp_path: Path) -> None
     )
     caller = tmp_path / "caller.py"
     caller.write_text(
-        "from package.bridge import *\n\ndef run():\n    transitive_helper()\n",
+        "from package.bridge import *\n\n"
+        "def run():\n"
+        "    transitive_helper()\n",
         encoding="utf-8",
     )
 
@@ -85,12 +97,15 @@ def test_star_import_does_not_follow_symlink_outside_repository(
     outside.mkdir()
     outside_helper = outside / "helpers.py"
     outside_helper.write_text(
-        "def external_helper():\n    return 1\n",
+        "def external_helper():\n"
+        "    return 1\n",
         encoding="utf-8",
     )
     outside_caller = outside / "caller.py"
     outside_caller.write_text(
-        "from helpers import *\n\ndef run():\n    external_helper()\n",
+        "from helpers import *\n\n"
+        "def run():\n"
+        "    external_helper()\n",
         encoding="utf-8",
     )
     linked_caller = repo / "caller.py"
@@ -121,12 +136,15 @@ def test_parse_worker_reuses_star_export_cache(
 
     helper = tmp_path / "helpers.py"
     helper.write_text(
-        "def cached_helper():\n    return 1\n",
+        "def cached_helper():\n"
+        "    return 1\n",
         encoding="utf-8",
     )
     for filename in ("caller_a.py", "caller_b.py"):
         (tmp_path / filename).write_text(
-            "from helpers import *\n\ndef run():\n    cached_helper()\n",
+            "from helpers import *\n\n"
+            "def run():\n"
+            "    cached_helper()\n",
             encoding="utf-8",
         )
 
@@ -144,7 +162,9 @@ def test_parse_worker_reuses_star_export_cache(
     _parse_single_file(("caller_a.py", str(tmp_path)))
     _parse_single_file(("caller_b.py", str(tmp_path)))
 
-    assert helper_reads == 1
+    # Once to check whether the module is a sys.modules shim, once for its
+    # star exports; both answers are cached process-wide.
+    assert helper_reads == 2
 
 
 def test_concurrent_parsers_compute_star_exports_once(
@@ -157,14 +177,17 @@ def test_concurrent_parsers_compute_star_exports_once(
 
     helper = tmp_path / "helpers.py"
     helper.write_text(
-        "def concurrent_helper():\n    return 1\n",
+        "def concurrent_helper():\n"
+        "    return 1\n",
         encoding="utf-8",
     )
     callers = []
     for index in range(8):
         caller = tmp_path / f"caller_{index}.py"
         caller.write_text(
-            "from helpers import *\n\ndef run():\n    concurrent_helper()\n",
+            "from helpers import *\n\n"
+            "def run():\n"
+            "    concurrent_helper()\n",
             encoding="utf-8",
         )
         callers.append(caller)
@@ -184,9 +207,13 @@ def test_concurrent_parsers_compute_star_exports_once(
     monkeypatch.setattr(Path, "read_bytes", slow_counting_read_bytes)
 
     with ThreadPoolExecutor(max_workers=len(callers)) as executor:
-        targets = list(executor.map(lambda caller: _call_targets(tmp_path, caller), callers))
+        targets = list(
+            executor.map(lambda caller: _call_targets(tmp_path, caller), callers)
+        )
 
-    assert helper_reads == 1
+    # Once to check whether the module is a sys.modules shim, once for its
+    # star exports; both answers are cached process-wide.
+    assert helper_reads == 2
     assert all(f"{helper.as_posix()}::concurrent_helper" in result for result in targets)
 
 
@@ -196,12 +223,15 @@ def test_star_export_parse_error_leaves_caller_parseable(
 ) -> None:
     helper = tmp_path / "helpers.py"
     helper.write_text(
-        "def broken_helper():\n    return 1\n",
+        "def broken_helper():\n"
+        "    return 1\n",
         encoding="utf-8",
     )
     caller = tmp_path / "caller.py"
     caller.write_text(
-        "from helpers import *\n\ndef run():\n    broken_helper()\n",
+        "from helpers import *\n\n"
+        "def run():\n"
+        "    broken_helper()\n",
         encoding="utf-8",
     )
     parser = CodeParser(tmp_path)
@@ -224,42 +254,41 @@ def test_star_export_parse_error_leaves_caller_parseable(
     nodes, edges = parser.parse_file(caller)
 
     assert any(node.kind == "File" for node in nodes)
-    assert "broken_helper" in {edge.target for edge in edges if edge.kind == "CALLS"}
+    assert "broken_helper" in {
+        edge.target for edge in edges if edge.kind == "CALLS"
+    }
 
 
 def test_notebook_star_import_resolves_repository_module(tmp_path: Path) -> None:
     helper = tmp_path / "helpers.py"
     helper.write_text(
-        "def notebook_helper():\n    return 1\n",
+        "def notebook_helper():\n"
+        "    return 1\n",
         encoding="utf-8",
     )
     notebook = tmp_path / "analysis.ipynb"
     notebook.write_text(
-        json.dumps(
-            {
-                "cells": [
-                    {
-                        "cell_type": "code",
-                        "execution_count": None,
-                        "metadata": {},
-                        "outputs": [],
-                        "source": [
-                            "from helpers import *\n",
-                            "notebook_helper()\n",
-                        ],
-                    }
+        json.dumps({
+            "cells": [{
+                "cell_type": "code",
+                "execution_count": None,
+                "metadata": {},
+                "outputs": [],
+                "source": [
+                    "from helpers import *\n",
+                    "notebook_helper()\n",
                 ],
-                "metadata": {
-                    "kernelspec": {
-                        "display_name": "Python 3",
-                        "language": "python",
-                        "name": "python3",
-                    },
+            }],
+            "metadata": {
+                "kernelspec": {
+                    "display_name": "Python 3",
+                    "language": "python",
+                    "name": "python3",
                 },
-                "nbformat": 4,
-                "nbformat_minor": 5,
-            }
-        ),
+            },
+            "nbformat": 4,
+            "nbformat_minor": 5,
+        }),
         encoding="utf-8",
     )
 

@@ -28,16 +28,18 @@ from typing import Any
 if sys.version_info >= (3, 11):
     import tomllib
 else:
-    import tomli as tomllib
+    try:
+        import tomli as tomllib  # type: ignore[no-redef]
+    except ImportError:
+        tomllib = None  # type: ignore[assignment]
 
-from .constants import crg_home
+from .constants import crg_home, env_float, release_os_memory
 
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Config file location
 # ---------------------------------------------------------------------------
-
 
 def default_config_path() -> Path:
     """Path to ``watch.toml`` under the per-user state directory."""
@@ -101,9 +103,94 @@ _HEALTH_CHECK_INTERVAL = 30
 # Restarting a watcher costs a full initial update, so a repo that cannot stay
 # up must not be restarted every health check forever.  The delay doubles per
 # consecutive failure and resets once a watcher has stayed up this long.
-_RESTART_BACKOFF_BASE = float(os.environ.get("CRG_RESTART_BACKOFF", "30"))
-_RESTART_BACKOFF_MAX = float(os.environ.get("CRG_RESTART_BACKOFF_MAX", "900"))
-_RESTART_HEALTHY_SECONDS = float(os.environ.get("CRG_RESTART_HEALTHY_AFTER", "600"))
+_RESTART_BACKOFF_BASE = env_float("CRG_RESTART_BACKOFF", 30.0)
+_RESTART_BACKOFF_MAX = env_float("CRG_RESTART_BACKOFF_MAX", 900.0)
+_RESTART_HEALTHY_SECONDS = env_float("CRG_RESTART_HEALTHY_AFTER", 600.0)
+
+_JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
+_JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
+
+
+class _WindowsJob:
+    """Own watcher processes so Windows cannot orphan them on daemon exit."""
+
+    def __init__(self) -> None:
+        import ctypes
+        from ctypes import wintypes
+
+        ctypes_api: Any = ctypes
+        self._ctypes: Any = ctypes_api
+        self._kernel32 = ctypes_api.WinDLL("kernel32", use_last_error=True)
+        kernel32 = self._kernel32
+        kernel32.CreateJobObjectW.argtypes = (wintypes.LPVOID, wintypes.LPCWSTR)
+        kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+        kernel32.SetInformationJobObject.argtypes = (
+            wintypes.HANDLE,
+            wintypes.DWORD,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+        )
+        kernel32.SetInformationJobObject.restype = wintypes.BOOL
+        kernel32.AssignProcessToJobObject.argtypes = (wintypes.HANDLE, wintypes.HANDLE)
+        kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        kernel32.CloseHandle.restype = wintypes.BOOL
+
+        class IoCounters(ctypes.Structure):
+            _fields_ = [(f"value_{index}", ctypes.c_ulonglong) for index in range(6)]
+
+        class BasicLimitInformation(ctypes.Structure):
+            _fields_ = [
+                ("per_process_user_time_limit", ctypes.c_longlong),
+                ("per_job_user_time_limit", ctypes.c_longlong),
+                ("limit_flags", wintypes.DWORD),
+                ("minimum_working_set_size", ctypes.c_size_t),
+                ("maximum_working_set_size", ctypes.c_size_t),
+                ("active_process_limit", wintypes.DWORD),
+                ("affinity", ctypes.c_size_t),
+                ("priority_class", wintypes.DWORD),
+                ("scheduling_class", wintypes.DWORD),
+            ]
+
+        class ExtendedLimitInformation(ctypes.Structure):
+            _fields_ = [
+                ("basic_limit_information", BasicLimitInformation),
+                ("io_info", IoCounters),
+                ("process_memory_limit", ctypes.c_size_t),
+                ("job_memory_limit", ctypes.c_size_t),
+                ("peak_process_memory_used", ctypes.c_size_t),
+                ("peak_job_memory_used", ctypes.c_size_t),
+            ]
+
+        self._handle = kernel32.CreateJobObjectW(None, None)
+        if not self._handle:
+            raise ctypes_api.WinError(ctypes_api.get_last_error())
+
+        limits = ExtendedLimitInformation()
+        limits.basic_limit_information.limit_flags = _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        if not kernel32.SetInformationJobObject(
+            self._handle,
+            _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+            ctypes.byref(limits),
+            ctypes.sizeof(limits),
+        ):
+            error = ctypes_api.get_last_error()
+            kernel32.CloseHandle(self._handle)
+            raise ctypes_api.WinError(error)
+
+    def assign(self, proc: subprocess.Popen[bytes]) -> None:
+        """Assign *proc* to this job before it can outlive the daemon."""
+        process_handle = getattr(proc, "_handle", None)
+        if process_handle is None:
+            raise RuntimeError("Windows subprocess has no process handle")
+        if not self._kernel32.AssignProcessToJobObject(self._handle, process_handle):
+            raise self._ctypes.WinError(self._ctypes.get_last_error())
+
+    def close(self) -> None:
+        """Release the job; kill-on-close handles abnormal daemon exits."""
+        if self._handle:
+            self._kernel32.CloseHandle(self._handle)
+            self._handle = None
 
 # ---------------------------------------------------------------------------
 # Dataclasses
@@ -119,6 +206,7 @@ class WatchRepo:
 
     alias: str
     """Short name for this repo (derived from directory name when not specified)."""
+
 
     data_dir: str = ""
     """Per-repo graph data dir (rendered as ``CRG_DATA_DIR`` in the watcher env)."""
@@ -172,7 +260,16 @@ def load_config(path: Path | None = None) -> DaemonConfig:
 
     Returns:
         A fully-validated :class:`DaemonConfig`.
+
+    Raises:
+        RuntimeError: If ``tomllib`` / ``tomli`` is unavailable on Python < 3.11.
     """
+    if tomllib is None:
+        raise RuntimeError(
+            "TOML parsing requires the 'tomli' package on Python < 3.11. "
+            "Install it with:  pip install tomli"
+        )
+
     config_path = path or default_config_path()
 
     if not config_path.exists():
@@ -223,15 +320,7 @@ def load_config(path: Path | None = None) -> DaemonConfig:
             continue
 
         seen_aliases.add(alias)
-        repos.append(
-            WatchRepo(
-                path=str(repo_path),
-                alias=alias,
-                data_dir=str(entry.get("data_dir", "") or ""),
-                recurse_submodules=bool(entry.get("recurse_submodules", False)),
-                embedding=str(entry.get("embedding", "") or ""),
-            )
-        )
+        repos.append(WatchRepo(path=str(repo_path), alias=alias))
 
     return DaemonConfig(
         session_name=session_name,
@@ -409,10 +498,199 @@ def remove_repo_from_config(
 # ---------------------------------------------------------------------------
 
 
+# A PID on its own is not an identity.  PIDs are recycled, so a stale
+# ``daemon.pid`` naming a number the kernel has since handed to something else
+# made ``start`` refuse to run and ``stop`` SIGTERM then SIGKILL a stranger.
+#
+# The identity is an exclusive advisory lock the daemon holds for its whole
+# lifetime.  The kernel releases it the instant the process dies — including a
+# SIGKILL or an OOM kill, where no cleanup code of ours ever runs — so "the
+# lock is free" is proof that our daemon is gone, whatever the PID file says.
+# ``flock`` is used rather than ``lockf`` deliberately: flock locks belong to
+# the open file description, so probing with a second descriptor cannot
+# silently drop a lock this process already holds.
+_lock_handles: dict[str, Any] = {}
+
+
+class DaemonAlreadyRunningError(RuntimeError):
+    """A live process already holds the daemon lock, so this one must not run.
+
+    ``is_daemon_running`` is a look, not a claim, and two ``crg-daemon start``
+    invocations a millisecond apart both used to pass it.  The lock is the only
+    thing that can decide between them, so refusing to start is expressed as an
+    exception out of the call that takes it rather than a boolean a caller can
+    ignore.
+    """
+
+    def __init__(self, pid: int | None, lock_path: Path) -> None:
+        self.pid = pid
+        self.lock_path = lock_path
+        holder = f"PID {pid}" if pid is not None else "an unrecorded PID"
+        super().__init__(
+            f"another code-review-graph daemon ({holder}) holds {lock_path}"
+        )
+
+
+def daemon_lock_path(path: Path | None = None) -> Path:
+    """Companion lock file for a PID file.
+
+    Kept separate so ``daemon.pid`` stays exactly what every other tool
+    expects it to be: one integer and nothing else.
+    """
+    return (path or default_pid_path()).with_suffix(".lock")
+
+
+def _flock_supported() -> bool:
+    return sys.platform != "win32"
+
+
+def _flock(handle: Any, blocking: bool = False) -> bool:
+    """Take an exclusive lock on *handle*. Returns False when it is held."""
+    import fcntl
+
+    flags = fcntl.LOCK_EX if blocking else fcntl.LOCK_EX | fcntl.LOCK_NB
+    try:
+        fcntl.flock(handle.fileno(), flags)
+    except OSError:
+        return False
+    return True
+
+
+def acquire_daemon_lock(path: Path | None = None) -> bool:
+    """Claim the daemon lock for this process, and hold it until it exits.
+
+    Returns True when this process owns the lock afterwards (including when it
+    already did), False when another live process holds it.  On platforms
+    without ``flock`` this is a no-op that reports success, and identity falls
+    back to the process command line.
+    """
+    if not _flock_supported():
+        return True
+    lock_path = daemon_lock_path(path)
+    key = str(lock_path)
+    if key in _lock_handles:
+        return True
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = open(lock_path, "a+")  # noqa: SIM115 - held for the process lifetime
+    if not _flock(handle):
+        handle.close()
+        return False
+    _lock_handles[key] = handle
+    return True
+
+
+def claim_daemon_lock(path: Path | None = None) -> None:
+    """Take the daemon lock, or refuse and name the process that holds it.
+
+    Call this before doing anything a second daemon must not do — forking,
+    spawning watchers, writing the PID file.  Under ``flock`` the lock belongs
+    to the open file description, so a daemon that forks after claiming keeps
+    holding it once the parents exit.
+
+    On Windows ``acquire_daemon_lock`` is a no-op that reports success, so this
+    never refuses there and two simultaneous starts are still possible.
+    """
+    if not acquire_daemon_lock(path):
+        raise DaemonAlreadyRunningError(read_pid(path), daemon_lock_path(path))
+
+
+def release_daemon_lock(path: Path | None = None) -> None:
+    """Drop the daemon lock this process holds, if any."""
+    handle = _lock_handles.pop(str(daemon_lock_path(path)), None)
+    if handle is not None:
+        try:
+            handle.close()  # closing the description releases the flock
+        except OSError:  # pragma: no cover - best-effort cleanup
+            pass
+
+
+def daemon_lock_held(path: Path | None = None) -> bool:
+    """True when some live process holds the daemon lock."""
+    if not _flock_supported():  # pragma: no cover - POSIX in CI
+        return True
+    key = str(daemon_lock_path(path))
+    if key in _lock_handles:
+        return True  # this process is the daemon
+    lock_path = daemon_lock_path(path)
+    if not lock_path.exists():
+        return False
+    try:
+        probe = open(lock_path, "a+")  # noqa: SIM115 - closed below
+    except OSError:  # pragma: no cover - unreadable state dir
+        return False
+    try:
+        if _flock(probe):
+            return False  # nobody held it; our probe did, and now releases it
+        return True
+    finally:
+        probe.close()
+
+
+def _process_command(pid: int) -> str | None:
+    """The command line of *pid*, or None when it cannot be determined.
+
+    Windows returns None, and ``_looks_like_our_daemon`` reads that as "keep
+    the old behaviour", so none of the PID-identity work below reaches a
+    Windows user: there is no ``flock`` to fall back from either, so a PID
+    file naming any live process is still adopted there. What that costs is
+    written out in :func:`_looks_like_our_daemon`. Closing it needs a real
+    command line, which Windows exposes only through WMI or
+    ``NtQueryInformationProcess`` — neither is a change to make blind, with no
+    Windows machine to test it on.
+    """
+    if sys.platform == "win32":  # pragma: no cover - POSIX in CI
+        return None
+    try:
+        result = subprocess.run(
+            # -ww: never truncate, so a long repository path still matches.
+            ["ps", "-ww", "-p", str(pid), "-o", "command="],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+            stdin=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.SubprocessError):  # pragma: no cover - no ps
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip() or None
+
+
+def _looks_like_our_daemon(pid: int) -> bool:
+    """Fallback identity check for platforms without ``flock``.
+
+    On Windows this always returns True, because ``_process_command`` cannot
+    answer there. A Windows user therefore keeps the pre-existing behaviour in
+    full: ``crg-daemon status`` reports a daemon whenever ``daemon.pid`` names
+    a live process, and ``crg-daemon stop`` signals it, even when the PID was
+    recycled and now belongs to something unrelated. For the same reason
+    ``claim_daemon_lock`` cannot exclude a second daemon on Windows — see
+    :func:`acquire_daemon_lock`.
+    """
+    command = _process_command(pid)
+    if command is None:  # pragma: no cover - cannot tell; keep old behaviour
+        return True
+    return "crg-daemon" in command or "code_review_graph.daemon" in command
+
+
 def write_pid(pid: int | None = None, path: Path | None = None) -> None:
-    """Write the current (or given) PID to the PID file."""
+    """Claim the daemon lock, then write the current (or given) PID.
+
+    The lock is the exclusion; the PID file is only a label on it.  Discarding
+    the result of :func:`acquire_daemon_lock` here meant the new lock could
+    identify the daemon but never exclude a second one: two ``crg-daemon
+    start`` invocations that both raced past ``is_daemon_running`` each wrote
+    the PID file and each went on running, one of them invisible to every
+    later ``status`` and ``stop``.
+
+    Raises:
+        DaemonAlreadyRunningError: another live process holds the lock. The PID
+            file is left exactly as its owner wrote it.
+    """
     pid_path = path or default_pid_path()
     pid_path.parent.mkdir(parents=True, exist_ok=True)
+    claim_daemon_lock(path)
     pid_path.write_text(str(pid or os.getpid()), encoding="utf-8")
 
 
@@ -428,8 +706,9 @@ def read_pid(path: Path | None = None) -> int | None:
 
 
 def clear_pid(path: Path | None = None) -> None:
-    """Remove the PID file."""
+    """Remove the PID file and release the daemon lock."""
     pid_path = path or default_pid_path()
+    release_daemon_lock(path)
     try:
         pid_path.unlink(missing_ok=True)
     except OSError:
@@ -521,13 +800,28 @@ def pid_alive(pid: int) -> bool:
 
 
 def is_daemon_running(path: Path | None = None) -> bool:
-    """Check whether a daemon process is alive."""
+    """Check whether *our* daemon process is alive.
+
+    A live PID is necessary but not sufficient: PIDs are recycled, and the
+    file outlives the process that wrote it.  The daemon holds an exclusive
+    lock for its whole lifetime, so a PID file naming a live process that does
+    not hold that lock names a stranger, and is cleared rather than adopted.
+    Without it, ``stop`` signalled that stranger.
+    """
     pid = read_pid(path)
     if pid is None:
         return False
-    if pid_alive(pid):
+    if not pid_alive(pid):
+        clear_pid(path)  # stale PID file — clean up
+        return False
+    identified = daemon_lock_held(path) if _flock_supported() else _looks_like_our_daemon(pid)
+    if identified:
         return True
-    # Stale PID file — clean up
+    logger.info(
+        "PID file names live process %d, which is not this daemon "
+        "(it holds no daemon lock); treating the file as stale",
+        pid,
+    )
     clear_pid(path)
     return False
 
@@ -547,7 +841,7 @@ def load_state(path: Path | None = None) -> dict[str, Any]:
     if not state_path.exists():
         return {}
     try:
-        return json.loads(state_path.read_text(encoding="utf-8"))
+        return json.loads(state_path.read_text(encoding="utf-8"))  # type: ignore[no-any-return]
     except (json.JSONDecodeError, OSError):
         return {}
 
@@ -555,6 +849,149 @@ def load_state(path: Path | None = None) -> dict[str, Any]:
 def _is_pid_alive(pid: int) -> bool:
     """Check whether a process with the given PID is running."""
     return pid_alive(pid)
+
+
+def clear_state(path: Path | None = None) -> None:
+    """Remove the persisted child-state file."""
+    state_path = path or default_state_path()
+    try:
+        state_path.unlink(missing_ok=True)
+    except OSError:  # pragma: no cover - best-effort cleanup
+        pass
+
+
+def is_our_watcher(pid: int, repo_path: str) -> bool:
+    """Is *pid* really a ``code-review-graph watch`` child for *repo_path*?
+
+    Same reasoning as the daemon PID file: signalling a number recorded on
+    disk is only safe once something ties that number to the process we mean.
+    The command line is that tie, and it is checked first — a health file
+    naming a PID proves only that some watcher once had it, and PIDs are
+    recycled, so trusting it alone could both block a legitimate start and
+    send SIGKILL to a stranger.  The health file is the fallback for platforms
+    with no ``ps``, and there only while its heartbeat is still fresh.
+    """
+    command = _process_command(pid)
+    if command is not None:
+        return (
+            "watch" in command
+            and ("code-review-graph" in command or "code_review_graph" in command)
+            and repo_path in command
+        )
+    health = read_watch_health(repo_path)  # pragma: no cover - POSIX in CI
+    return (
+        isinstance(health, dict)
+        and health.get("pid") == pid
+        and not health.get("stalled")
+    )
+
+
+def find_orphaned_watchers(
+    state_path: Path | None = None,
+) -> list[dict[str, Any]]:
+    """Watcher children still running with no daemon left to manage them.
+
+    The watchers are plain ``subprocess.Popen`` children in the daemon's
+    session, so a SIGKILLed daemon leaves every one of them running.  Nothing
+    used to look for them: ``status`` reported "not running" and listed
+    nothing while a live watcher kept writing ``graph.db``, and the next
+    ``start`` added a second watcher per repository — two writers on one
+    database, one of them invisible.
+    """
+    orphans: list[dict[str, Any]] = []
+    for alias, entry in load_state(state_path).items():
+        if not isinstance(entry, dict):
+            continue
+        pid = entry.get("pid")
+        repo_path = str(entry.get("path") or "")
+        if not isinstance(pid, int) or not repo_path:
+            continue
+        if not _is_pid_alive(pid):
+            continue
+        if not is_our_watcher(pid, repo_path):
+            logger.info(
+                "PID %d recorded for '%s' is no longer our watcher; leaving it alone",
+                pid,
+                alias,
+            )
+            continue
+        orphans.append({"alias": alias, "pid": pid, "path": repo_path})
+    return orphans
+
+
+def reap_orphaned_watchers(
+    state_path: Path | None = None,
+    *,
+    timeout: float = 5.0,
+) -> list[dict[str, Any]]:
+    """Terminate every orphaned watcher and forget the state that named them.
+
+    Only called with no daemon running, so every watcher the state names is
+    finished by the end of this, including those already dead. Their health
+    files go too. A watcher killed outright cannot clear its own, which is every
+    watcher on Windows: ``stop`` ends the daemon with ``TerminateProcess`` and the
+    Job Object takes the children with it, so no shutdown code runs. A file left
+    behind reads as a stalled watcher forever.
+
+    Returns the entries that were signalled, so the caller can report them.
+    """
+    state = load_state(state_path)
+    orphans = find_orphaned_watchers(state_path)
+    for orphan in orphans:
+        pid = int(orphan["pid"])
+        logger.info(
+            "Reaping orphaned watcher for '%s' (PID %d)", orphan["alias"], pid
+        )
+        _signal_until_dead(pid, timeout=timeout)
+    # After the signals: a watcher still running could publish again.
+    for entry in state.values():
+        if isinstance(entry, dict) and entry.get("path"):
+            _clear_health_left_by(str(entry["path"]), entry.get("pid"))
+    if state:
+        clear_state(state_path)
+    return orphans
+
+
+def _clear_health_left_by(repo_path: str, pid: Any) -> None:
+    """Drop the health file our watcher on *repo_path* left, not a replacement's.
+
+    Health files are keyed by repository, so a watcher started by hand after
+    ours died publishes to the same file. Deleting it would let the next
+    ``start`` miss that watcher and launch a second writer on the same database.
+    """
+    health = read_watch_health(repo_path)
+    publisher = health.get("pid") if isinstance(health, dict) else None
+    if (
+        isinstance(publisher, int)
+        and publisher != pid
+        and _is_pid_alive(publisher)
+        and is_our_watcher(publisher, repo_path)
+    ):
+        logger.info(
+            "Keeping the health file for '%s': live watcher PID %d publishes it",
+            repo_path,
+            publisher,
+        )
+        return
+    clear_watch_health(repo_path)
+
+
+def _signal_until_dead(pid: int, *, timeout: float = 5.0) -> bool:
+    """SIGTERM, then SIGKILL, then confirm. Returns True when the PID is gone."""
+    for sig in (signal.SIGTERM, getattr(signal, "SIGKILL", signal.SIGTERM)):
+        try:
+            os.kill(pid, sig)
+        except ProcessLookupError:
+            return True
+        except PermissionError:  # pragma: no cover - another user's process
+            logger.warning("Not permitted to signal PID %d", pid)
+            return False
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if not _is_pid_alive(pid):
+                return True
+            time.sleep(0.1)
+    return not _is_pid_alive(pid)
 
 
 # ---------------------------------------------------------------------------
@@ -565,7 +1002,7 @@ def _is_pid_alive(pid: int) -> bool:
 # alone reports it healthy forever.  Each watch child publishes its observer
 # state and last-event time here instead; anything older than this is a stall.
 # See: #811.
-_WATCH_HEALTH_STALE_SECONDS = float(os.environ.get("CRG_WATCH_HEALTH_STALE", "90"))
+_WATCH_HEALTH_STALE_SECONDS = env_float("CRG_WATCH_HEALTH_STALE", 90.0)
 
 
 def watch_health_dir() -> Path:
@@ -585,38 +1022,6 @@ def watch_health_path(repo_root: str | Path) -> Path:
     return watch_health_dir() / f"{digest}.json"
 
 
-def _read_health_text(path: Path) -> str:
-    """Read a heartbeat without preventing the publisher's atomic replacement."""
-    if sys.platform != "win32":
-        return path.read_text(encoding="utf-8")
-
-    import ctypes
-    import msvcrt
-    from ctypes import wintypes
-
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel32.CreateFileW.argtypes = (
-        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
-        wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
-    )
-    kernel32.CreateFileW.restype = wintypes.HANDLE
-    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
-    kernel32.CloseHandle.restype = wintypes.BOOL
-    # GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-    # OPEN_EXISTING and FILE_ATTRIBUTE_NORMAL. CRT open omits delete sharing.
-    handle = kernel32.CreateFileW(str(path), 0x80000000, 0x7, None, 3, 0x80, None)
-    if handle == wintypes.HANDLE(-1).value:
-        raise ctypes.WinError(ctypes.get_last_error())
-    try:
-        descriptor = msvcrt.open_osfhandle(handle, os.O_RDONLY | os.O_BINARY)
-    except BaseException:
-        kernel32.CloseHandle(handle)
-        raise
-    # open_osfhandle transfers ownership; closing the stream closes the HANDLE.
-    with os.fdopen(descriptor, "r", encoding="utf-8") as stream:
-        return stream.read()
-
-
 def read_watch_health(
     repo_root: str | Path,
     *,
@@ -628,7 +1033,7 @@ def read_watch_health(
     ``stalled`` (observer reported dead, or heartbeat too old).
     """
     try:
-        raw = _read_health_text(watch_health_path(repo_root))
+        raw = watch_health_path(repo_root).read_text(encoding="utf-8")
         data = json.loads(raw)
     except (OSError, json.JSONDecodeError, ValueError):
         return None
@@ -654,9 +1059,8 @@ def clear_watch_health(repo_root: str | Path) -> None:
 def watcher_status(alive: bool, health: dict[str, Any] | None) -> str:
     """Summarise one watcher: ``dead``, ``stalled``, ``partial``, ``unknown``, ``ok``.
 
-    ``partial`` means the watcher ran out of watch budget and fell back to a
-    coarser recursive watch — still watching everything, but no longer
-    filtering ignored trees.
+    ``partial`` means the watcher has reduced coverage: either an OS watch
+    registration failed, or the watch budget forced a coarser recursive watch.
     """
     if not alive:
         return "dead"
@@ -714,7 +1118,7 @@ class ConfigWatcher:
 
             watcher = self
 
-            class _Handler(FileSystemEventHandler):
+            class _Handler(FileSystemEventHandler):  # type: ignore[misc]
                 def on_modified(self, event: Any) -> None:
                     if Path(event.src_path).resolve() == watcher._config_path.resolve():
                         watcher._on_config_changed()
@@ -819,6 +1223,9 @@ class WatchDaemon:
         self._health_stop: threading.Event = threading.Event()
         self._lock: threading.Lock = threading.Lock()
         self._restarts: dict[str, dict[str, float]] = {}
+        self._windows_job: _WindowsJob | None = (
+            _WindowsJob() if sys.platform == "win32" else None
+        )
 
     # ------------------------------------------------------------------
     # Public interface
@@ -833,7 +1240,7 @@ class WatchDaemon:
 
         registry = Registry()
         for repo in self._config.repos:
-            registry.register(repo.path, alias=repo.alias)
+            registry.register(repo.path, alias=repo.alias, data_dir=repo.data_dir or None)
 
         # Build initial graph for repos that lack a database
         for repo in self._config.repos:
@@ -859,23 +1266,27 @@ class WatchDaemon:
 
         msg = f"Daemon started — watching {len(self._config.repos)} repo(s)"
         logger.info(msg)
-        print(msg)
+        print(msg)  # noqa: T201
 
     def stop(self) -> None:
         """Tear down the daemon: stop watchers, terminate children."""
-        self.stop_config_watcher()
-        self.stop_health_checker()
+        try:
+            self.stop_config_watcher()
+            self.stop_health_checker()
 
-        with self._lock:
-            for alias, proc in list(self._children.items()):
-                repo = self._current_repos.get(alias)
-                self._terminate_child(alias, proc, repo.path if repo else None)
-            self._children.clear()
+            with self._lock:
+                for alias, proc in list(self._children.items()):
+                    repo = self._current_repos.get(alias)
+                    self._terminate_child(alias, proc, repo.path if repo else None)
+                self._children.clear()
 
-        self._current_repos.clear()
-        self._clear_state()
-        clear_pid()
-        logger.info("Daemon stopped")
+            self._current_repos.clear()
+            self._clear_state()
+            clear_pid()
+            logger.info("Daemon stopped")
+        finally:
+            if self._windows_job is not None:
+                self._windows_job.close()
 
     def reconcile(self, new_config: DaemonConfig | None = None) -> None:
         """Reconcile running watchers with the (possibly updated) config.
@@ -908,7 +1319,7 @@ class WatchDaemon:
             repos_needing_build: list[WatchRepo] = []
             for alias in to_add | to_update:
                 repo = desired[alias]
-                registry.register(repo.path, alias=repo.alias)
+                registry.register(repo.path, alias=repo.alias, data_dir=repo.data_dir or None)
                 db_path = Path(repo.path) / ".code-review-graph" / "graph.db"
                 if not db_path.exists():
                     repos_needing_build.append(repo)
@@ -1262,8 +1673,39 @@ class WatchDaemon:
         except OSError:
             pass
 
+    def _existing_watcher(self, repo: WatchRepo) -> int | None:
+        """PID of a live watcher on *repo* that this daemon does not own.
+
+        Two watchers on one repository means two processes writing one
+        ``graph.db``.  The usual way to get there was a daemon crash: the
+        children survived, ``status`` could not see them, and the next
+        ``start`` spawned a full second set.  A watcher publishes its PID in
+        its health file, so the check costs one small read.
+        """
+        health = read_watch_health(repo.path)
+        if not isinstance(health, dict):
+            return None
+        pid = health.get("pid")
+        if not isinstance(pid, int) or not _is_pid_alive(pid):
+            return None
+        mine = self._children.get(repo.alias)
+        if mine is not None and mine.pid == pid and mine.poll() is None:
+            return None  # our own child, already accounted for
+        return pid if is_our_watcher(pid, repo.path) else None
+
     def _start_watcher(self, repo: WatchRepo) -> None:
         """Spawn a child process running ``code-review-graph watch`` for *repo*."""
+        existing = self._existing_watcher(repo)
+        if existing is not None:
+            logger.warning(
+                "A watcher for '%s' is already running (PID %d); not starting a "
+                "second one. Run `crg-daemon stop` first if it is an orphan from "
+                "a crashed daemon.",
+                repo.alias,
+                existing,
+            )
+            return
+
         self._config.log_dir.mkdir(parents=True, exist_ok=True)
         log_path = self._config.log_dir / f"{repo.alias}.log"
 
@@ -1280,18 +1722,58 @@ class WatchDaemon:
                 repo.path,
             ]
 
-        log_fd = open(log_path, "ab")
+        log_fd = open(log_path, "ab")  # noqa: SIM115
+        proc: subprocess.Popen[bytes] | None = None
         try:
             proc = subprocess.Popen(
                 cmd,
                 cwd=repo.path,
+                env=watcher_env(repo),
                 stdout=log_fd,
                 stderr=subprocess.STDOUT,
                 stdin=subprocess.DEVNULL,
-                env=watcher_env(repo),
             )
+            if self._windows_job is not None:
+                self._windows_job.assign(proc)
         except Exception:
-            log_fd.close()
+            try:
+                if proc is not None and proc.poll() is None:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        try:
+                            proc.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            logger.warning("Watcher '%s' remained alive after SIGKILL", repo.alias)
+            except OSError:
+                try:
+                    if proc is not None and proc.poll() is None:
+                        proc.kill()
+                        try:
+                            proc.wait(timeout=5)
+                        except (subprocess.TimeoutExpired, OSError):
+                            logger.warning(
+                                "Watcher '%s' did not stop after forced cleanup",
+                                repo.alias,
+                                exc_info=True,
+                            )
+                except OSError:
+                    logger.warning(
+                        "Failed to kill watcher '%s' during startup cleanup",
+                        repo.alias,
+                        exc_info=True,
+                    )
+            finally:
+                try:
+                    log_fd.close()
+                except OSError:
+                    logger.warning(
+                        "Failed to close log file for watcher '%s'",
+                        repo.alias,
+                        exc_info=True,
+                    )
             logger.exception("Failed to start watcher for '%s'", repo.alias)
             return
 
@@ -1355,6 +1837,7 @@ class WatchDaemon:
         result = subprocess.run(
             cmd,
             capture_output=True,
+            env=watcher_env(repo),
             text=True,
             check=False,
         )
@@ -1365,3 +1848,4 @@ class WatchDaemon:
                 result.returncode,
                 result.stderr.strip(),
             )
+        release_os_memory()

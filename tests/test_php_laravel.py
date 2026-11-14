@@ -31,7 +31,9 @@ def _write_php(path: Path, source: str = "<?php\nclass Placeholder {}\n") -> Pat
 def _php_import_target(parser: CodeParser, caller: Path, module: str) -> str:
     _write_php(
         caller,
-        f"<?php\nuse {module};\nclass Caller {{}}\n",
+        "<?php\n"
+        f"use {module};\n"
+        "class Caller {}\n",
     )
     _, edges = parser.parse_file(caller)
     imports = [edge.target for edge in edges if edge.kind == "IMPORTS_FROM"]
@@ -208,9 +210,7 @@ class TestComposerPsr4:
         caller = _write_php(tmp_path / "outside/Caller.php")
 
         resolved = CodeParser(repo)._resolve_module_to_file(
-            "App\\User",
-            str(caller),
-            "php",
+            "App\\User", str(caller), "php",
         )
 
         assert resolved is None
@@ -222,31 +222,25 @@ class TestComposerPsr4:
         _write_php(tmp_path / "Outside/Foo.php")
 
         resolved = CodeParser(repo)._resolve_module_to_file(
-            "Outside\\Foo",
-            str(caller),
-            "php",
+            "Outside\\Foo", str(caller), "php",
         )
 
         assert resolved is None
 
     def test_php_ancestor_fallback_without_repo_does_not_climb_above_caller(
-        self,
-        tmp_path,
+        self, tmp_path,
     ):
         caller = _write_php(tmp_path / "project/src/Caller.php")
         _write_php(tmp_path / "project/Outside/Foo.php")
 
         resolved = CodeParser()._resolve_module_to_file(
-            "Outside\\Foo",
-            str(caller),
-            "php",
+            "Outside\\Foo", str(caller), "php",
         )
 
         assert resolved is None
 
     def test_php_ancestor_fallback_rejects_symlink_target_outside_repo(
-        self,
-        tmp_path,
+        self, tmp_path,
     ):
         repo = tmp_path / "repo"
         outside = tmp_path / "outside"
@@ -262,17 +256,13 @@ class TestComposerPsr4:
             pytest.skip(f"directory symlinks unavailable: {exc}")
 
         resolved = CodeParser(repo)._resolve_module_to_file(
-            "Outside\\Foo",
-            str(caller),
-            "php",
+            "Outside\\Foo", str(caller), "php",
         )
 
         assert resolved is None
 
     def test_php_ancestor_fallback_fails_soft_when_start_resolution_raises(
-        self,
-        tmp_path,
-        monkeypatch,
+        self, tmp_path, monkeypatch,
     ):
         repo = tmp_path / "repo"
         caller = _write_php(repo / "src/Caller.php")
@@ -293,9 +283,7 @@ class TestComposerPsr4:
         monkeypatch.setattr(Path, "resolve", raise_for_caller)
 
         resolved = parser._resolve_module_to_file(
-            "App\\Foo",
-            str(caller),
-            "php",
+            "App\\Foo", str(caller), "php",
         )
 
         assert target.is_file()
@@ -327,9 +315,7 @@ class TestComposerCache:
         assert cache_info().maxsize == 128
 
     def test_composer_cache_reuses_unchanged_file_across_parsers(
-        self,
-        tmp_path,
-        monkeypatch,
+        self, tmp_path, monkeypatch,
     ):
         repo = tmp_path / "repo"
         composer = _write_composer(
@@ -350,14 +336,10 @@ class TestComposerCache:
         monkeypatch.setattr(Path, "read_text", counting_read_text)
 
         first = CodeParser(repo)._resolve_module_to_file(
-            "App\\User",
-            str(caller),
-            "php",
+            "App\\User", str(caller), "php",
         )
         second = CodeParser(repo)._resolve_module_to_file(
-            "App\\User",
-            str(caller),
-            "php",
+            "App\\User", str(caller), "php",
         )
 
         assert first == second == target.resolve().as_posix()
@@ -373,9 +355,7 @@ class TestComposerCache:
         caller = _write_php(repo / "src/Caller.php")
 
         first = CodeParser(repo)._resolve_module_to_file(
-            "App\\User",
-            str(caller),
-            "php",
+            "App\\User", str(caller), "php",
         )
 
         composer.write_text(
@@ -386,9 +366,7 @@ class TestComposerCache:
         )
         updated = _write_php(repo / "updated-source/User.php")
         second = CodeParser(repo)._resolve_module_to_file(
-            "App\\User",
-            str(caller),
-            "php",
+            "App\\User", str(caller), "php",
         )
 
         assert first != second
@@ -411,14 +389,10 @@ class TestComposerCache:
         second_caller = _write_php(second_repo / "src/Caller.php")
 
         first = CodeParser(first_repo)._resolve_module_to_file(
-            "App\\User",
-            str(first_caller),
-            "php",
+            "App\\User", str(first_caller), "php",
         )
         second = CodeParser(second_repo)._resolve_module_to_file(
-            "App\\User",
-            str(second_caller),
-            "php",
+            "App\\User", str(second_caller), "php",
         )
 
         assert first == first_target.resolve().as_posix()
@@ -447,8 +421,16 @@ class TestBladeParsing:
         assert nodes[0].language == "blade"
         assert nodes[0].line_end == 7
 
-        imports = {edge.target: edge.line for edge in edges if edge.kind == "IMPORTS_FROM"}
-        references = {edge.target: edge.line for edge in edges if edge.kind == "REFERENCES"}
+        imports = {
+            edge.target: edge.line
+            for edge in edges
+            if edge.kind == "IMPORTS_FROM"
+        }
+        references = {
+            edge.target: edge.line
+            for edge in edges
+            if edge.kind == "REFERENCES"
+        }
         assert imports == {
             "layouts.app": 3,
             "partials.header": 4,
@@ -520,20 +502,295 @@ class TestBladeParsing:
 
         nodes, edges = CodeParser(tmp_path).parse_bytes(path, source)
 
-        assert any(node.kind == "File" and node.language == "php" for node in nodes)
-        assert any(node.kind == "Class" and node.name == "Ordinary" for node in nodes)
-        assert not any(edge.kind == "IMPORTS_FROM" and edge.target == "not.blade" for edge in edges)
+        assert any(
+            node.kind == "File" and node.language == "php"
+            for node in nodes
+        )
+        assert any(
+            node.kind == "Class" and node.name == "Ordinary"
+            for node in nodes
+        )
+        assert not any(
+            edge.kind == "IMPORTS_FROM" and edge.target == "not.blade"
+            for edge in edges
+        )
 
 
 def _laravel_edges(edges, kind: str | None = None):
     return [
-        edge
-        for edge in edges
-        if edge.extra.get("framework") == "laravel" and (kind is None or edge.kind == kind)
+        edge for edge in edges
+        if edge.extra.get("framework") == "laravel"
+        and (kind is None or edge.kind == kind)
     ]
 
 
 class TestLaravelSemantics:
+    def test_laravel_endpoints_cover_verbs_handlers_and_closures(self, tmp_path):
+        repo = tmp_path / "repo"
+        _write_composer(repo, {"autoload": {"psr-4": {"App\\": "app/"}}})
+        controller = _write_php(
+            repo / "app/Http/Controllers/ItemController.php",
+            "<?php\nnamespace App\\Http\\Controllers;\n"
+            "class ItemController { public function index() {} public function __invoke() {} }\n",
+        )
+        source = br"""<?php
+use Illuminate\Support\Facades\Route;
+use App\Http\Controllers\ItemController as Items;
+Route::get('/items', [Items::class, 'index']);
+Route::post('/items', Items::class);
+Route::put('/items', 'App\Http\Controllers\ItemController@index');
+Route::patch('/items', function () {});
+Route::delete('/items', [Items::class, 'index']);
+Route::options('/items', [Items::class, 'index']);
+Route::match(['get', 'post'], '/lookup', [Items::class, 'index']);
+Route::any('/all', [Items::class, 'index']);
+"""
+        route_file = repo / "routes/web.php"
+        nodes, edges = CodeParser(repo).parse_bytes(route_file, source)
+        endpoints = [node for node in nodes if node.kind == "Endpoint"]
+        handles = [edge for edge in edges if edge.kind == "HANDLES"]
+
+        assert [(n.extra["http_method"], n.extra["route"]) for n in endpoints] == [
+            ("GET", "/items"), ("POST", "/items"), ("PUT", "/items"),
+            ("PATCH", "/items"), ("DELETE", "/items"),
+            ("OPTIONS", "/items"), ("GET", "/lookup"),
+            ("POST", "/lookup"), ("ANY", "/all"),
+        ]
+        assert len(handles) == 8
+        assert len({node.name for node in endpoints}) == 9
+        assert endpoints[3].extra["handler"] == "closure"
+        assert handles[1].source == f"{controller.resolve().as_posix()}::ItemController.__invoke"
+        assert handles[2].source == f"{controller.resolve().as_posix()}::ItemController.index"
+        assert all(edge.target == f"{route_file.resolve().as_posix()}::{node.name}"
+                   for edge, node in zip(handles[:3], endpoints[:3]))
+        assert len(_laravel_edges(edges, "CALLS")) == 4
+
+    def test_laravel_endpoint_groups_compose_prefix_and_controller(self, tmp_path):
+        repo = tmp_path / "repo"
+        _write_composer(repo, {"autoload": {"psr-4": {"App\\": "app/"}}})
+        controller = _write_php(repo / "app/Http/Controllers/ItemController.php")
+        source = br"""<?php
+use Illuminate\Support\Facades\Route as Router;
+use App\Http\Controllers\ItemController;
+Router::prefix('api')->group(function () {
+    Router::group(['prefix' => 'v1'], function () {
+        Router::controller(ItemController::class)->group(function () {
+            Router::get('items', 'index');
+        });
+    });
+});
+"""
+        nodes, edges = CodeParser(repo).parse_bytes(repo / "routes/api.php", source)
+        endpoints = [node for node in nodes if node.kind == "Endpoint"]
+        handles = [edge for edge in edges if edge.kind == "HANDLES"]
+
+        assert [(n.extra["http_method"], n.extra["route"]) for n in endpoints] == [
+            ("GET", "/api/v1/items"),
+        ]
+        assert [edge.source for edge in handles] == [
+            f"{controller.resolve().as_posix()}::ItemController.index",
+        ]
+
+    def test_laravel_arrow_closure_has_endpoint_without_handler_edge(self, tmp_path):
+        source = br"""<?php
+use Illuminate\Support\Facades\Route;
+Route::get('/health', fn () => 'ok');
+"""
+        nodes, edges = CodeParser(tmp_path).parse_bytes(tmp_path / "routes/web.php", source)
+
+        endpoints = [node for node in nodes if node.kind == "Endpoint"]
+        assert [(node.extra["http_method"], node.extra["route"]) for node in endpoints] == [
+            ("GET", "/health"),
+        ]
+        assert [edge for edge in edges if edge.kind == "HANDLES"] == []
+
+    def test_laravel_endpoints_require_static_route_evidence(self, tmp_path):
+        source = br"""<?php
+use Acme\Routing\Route;
+Route::get('/foreign', function () {});
+use Illuminate\Support\Facades\Route as Router;
+Router::get($path, function () {});
+Router::get('/dynamic', $handler);
+Router::prefix($prefix)->group(function () {
+    Router::get('/inside', function () {});
+});
+"""
+        nodes, edges = CodeParser(tmp_path).parse_bytes(tmp_path / "routes/web.php", source)
+
+        assert [node for node in nodes if node.kind == "Endpoint"] == []
+        assert [edge for edge in edges if edge.kind == "HANDLES"] == []
+
+    def test_laravel_endpoint_groups_accept_double_quotes_and_arrow_bodies(self, tmp_path):
+        source = br"""<?php
+use Illuminate\Support\Facades\Route;
+Route::group(["prefix" => "v1"], fn () => Route::get('items', fn () => 1));
+Route::prefix("v2")->group(fn () => Route::get("items/{id}", fn () => 1));
+Route::group(['as' => 'a.', "prefix" => 'v3'], function () {
+    Route::get('items', fn () => 1);
+});
+Route::get("items/$id", fn () => 1);
+"""
+        nodes, _ = CodeParser(tmp_path).parse_bytes(tmp_path / "routes/web.php", source)
+
+        assert [
+            (n.extra["http_method"], n.extra["route"]) for n in nodes if n.kind == "Endpoint"
+        ] == [("GET", "/v1/items"), ("GET", "/v2/items/{id}"), ("GET", "/v3/items")]
+
+    def test_laravel_endpoints_match_laravel_string_and_chain_semantics(self, tmp_path):
+        repo = tmp_path / "repo"
+        _write_composer(repo, {"autoload": {"psr-4": {"App\\": "app/"}}})
+        item = _write_php(repo / "app/Http/Controllers/ItemController.php")
+        other = _write_php(repo / "app/Http/Controllers/OtherController.php")
+        source = br"""<?php
+use Illuminate\Support\Facades\Route;
+use App\Http\Controllers\ItemController;
+use App\Http\Controllers\OtherController;
+use App\Http\Controllers\ItemController as Items;
+Route::get('it\'s', 'App\\Http\\Controllers\\ItemController@index');
+Route::controller(ItemController::class)->group(function () {
+    Route::group(['controller' => OtherController::class], function () {
+        Route::get('other', 'index');
+    });
+});
+Route::get('items', [ItemController::class, 'index'])->name('i')->prefix('v1');
+Route::get('alias', 'Items@index');
+Route::group(['controller' => $controller], fn () => Route::get('a', 'index'));
+Route::get('b', [ItemController::class, 'index'])->prefix($version);
+"""
+        nodes, edges = CodeParser(repo).parse_bytes(repo / "routes/web.php", source)
+        handles = [edge.source for edge in edges if edge.kind == "HANDLES"]
+
+        assert [
+            (n.extra["http_method"], n.extra["route"]) for n in nodes if n.kind == "Endpoint"
+        ] == [("GET", "/it's"), ("GET", "/other"), ("GET", "/v1/items"), ("GET", "/alias")]
+        assert handles[:3] == [
+            f"{item.resolve().as_posix()}::ItemController.index",
+            f"{other.resolve().as_posix()}::OtherController.index",
+            f"{item.resolve().as_posix()}::ItemController.index",
+        ]
+        assert handles[3] == "Items.index"
+
+    def test_laravel_endpoint_groups_skip_non_literal_options(self, tmp_path):
+        source = br"""<?php
+use Illuminate\Support\Facades\Route;
+Route::group($options, fn () => Route::get('a', fn () => 1));
+Route::group(config('admin.routes'), fn () => Route::get('b', fn () => 1));
+Route::group(array_merge($d, ['prefix' => 'v2']), fn () => Route::get('c', fn () => 1));
+Route::group(['as' => 'a.', ...$extra], fn () => Route::get('d', fn () => 1));
+Route::group([$key => 'v2'], fn () => Route::get('e', fn () => 1));
+Route::group(['prefix' => $prefix], fn () => Route::get('f', fn () => 1));
+Route::group(['prefix' => "v$n"], fn () => Route::get('g', fn () => 1));
+"""
+        nodes, _ = CodeParser(tmp_path).parse_bytes(tmp_path / "routes/web.php", source)
+
+        assert [node for node in nodes if node.kind == "Endpoint"] == []
+
+    @staticmethod
+    def _endpoint_routes(nodes):
+        return [
+            (n.extra["http_method"], n.extra["route"]) for n in nodes if n.kind == "Endpoint"
+        ]
+
+    def test_laravel_endpoint_name_survives_a_line_added_above(self, tmp_path):
+        source = b"""<?php
+use Illuminate\\Support\\Facades\\Route;
+Route::get('/health', fn () => 'ok');
+Route::match(['get', 'post'], '/both', fn () => 'ok');
+"""
+        route_file = tmp_path / "routes/web.php"
+        parser = CodeParser(tmp_path)
+        before, _ = parser.parse_bytes(route_file, source)
+        after, _ = parser.parse_bytes(route_file, source.replace(b"<?php\n", b"<?php\n// note\n"))
+
+        names = [n.name for n in before if n.kind == "Endpoint"]
+        assert len(set(names)) == 3
+        assert names == [n.name for n in after if n.kind == "Endpoint"]
+
+    def test_laravel_single_quoted_escapes_are_decoded(self, tmp_path):
+        repo = tmp_path / "repo"
+        _write_composer(repo, {"autoload": {"psr-4": {"App\\": "app/"}}})
+        controller = _write_php(repo / "app/Http/Controllers/ItemController.php")
+        source = rb"""<?php
+use Illuminate\Support\Facades\Route;
+Route::get('/it\'s', fn () => 1);
+Route::get('/full', 'App\\Http\\Controllers\\ItemController@index');
+Route::get('/single', 'App\Http\Controllers\ItemController@index');
+"""
+        nodes, edges = CodeParser(repo).parse_bytes(repo / "routes/web.php", source)
+
+        assert self._endpoint_routes(nodes) == [
+            ("GET", "/it's"), ("GET", "/full"), ("GET", "/single"),
+        ]
+        assert [e.source for e in edges if e.kind == "HANDLES"] == [
+            f"{controller.resolve().as_posix()}::ItemController.index",
+        ] * 2
+
+    def test_laravel_group_controller_attribute_overrides_the_outer_one(self, tmp_path):
+        repo = tmp_path / "repo"
+        _write_composer(repo, {"autoload": {"psr-4": {"App\\": "app/"}}})
+        _write_php(repo / "app/Http/Controllers/ItemController.php")
+        other = _write_php(repo / "app/Http/Controllers/OtherController.php")
+        source = br"""<?php
+use Illuminate\Support\Facades\Route;
+use App\Http\Controllers\ItemController;
+use App\Http\Controllers\OtherController;
+Route::controller(ItemController::class)->group(function () {
+    Route::group(['controller' => OtherController::class], function () {
+        Route::get('/inner', 'index');
+    });
+    Route::group(['controller' => $dynamic], function () {
+        Route::get('/dynamic', 'index');
+    });
+});
+"""
+        nodes, edges = CodeParser(repo).parse_bytes(repo / "routes/web.php", source)
+
+        assert self._endpoint_routes(nodes) == [("GET", "/inner")]
+        assert [e.source for e in edges if e.kind == "HANDLES"] == [
+            f"{other.resolve().as_posix()}::OtherController.index",
+        ]
+
+    def test_laravel_prefix_on_the_route_itself_is_applied(self, tmp_path):
+        source = br"""<?php
+use Illuminate\Support\Facades\Route;
+Route::get('a', fn () => 1)->prefix('v1');
+Route::get('b', fn () => 1)->name('b')->prefix('v1')->prefix('v2');
+Route::prefix('api')->group(fn () => Route::get('c', fn () => 1)->prefix('v1'));
+Route::get('d', fn () => 1)->prefix($version);
+Route::get('e', fn () => 1)->prefix();
+Route::get('f', fn () => 1)->name('f')->middleware('auth');
+"""
+        nodes, _ = CodeParser(tmp_path).parse_bytes(tmp_path / "routes/web.php", source)
+
+        assert self._endpoint_routes(nodes) == [
+            ("GET", "/v1/a"), ("GET", "/v2/v1/b"), ("GET", "/v1/api/c"), ("GET", "/f"),
+        ]
+
+    def test_laravel_fluent_registration_emits_an_endpoint(self, tmp_path):
+        repo = tmp_path / "repo"
+        _write_composer(repo, {"autoload": {"psr-4": {"App\\": "app/"}}})
+        controller = _write_php(repo / "app/Http/Controllers/ItemController.php")
+        source = br"""<?php
+use Illuminate\Support\Facades\Route;
+use App\Http\Controllers\ItemController;
+Route::middleware('auth')->get('/a', [ItemController::class, 'index']);
+Route::prefix('api')->middleware('auth')->post('b', fn () => 1);
+Route::controller(ItemController::class)->prefix('api')->put('c', 'index');
+Route::prefix('outer')->group(fn () => Route::prefix('in')->delete('d', fn () => 1));
+Route::prefix($dynamic)->get('skip-prefix', fn () => 1);
+$router->get('skip-receiver', fn () => 1);
+$client->middleware('auth')->get('skip-chain', fn () => 1);
+Route::middleware('auth')->resource('skip-resource', ItemController::class);
+"""
+        nodes, edges = CodeParser(repo).parse_bytes(repo / "routes/web.php", source)
+
+        assert self._endpoint_routes(nodes) == [
+            ("GET", "/a"), ("POST", "/api/b"), ("PUT", "/api/c"), ("DELETE", "/outer/in/d"),
+        ]
+        assert [e.source for e in edges if e.kind == "HANDLES"] == [
+            f"{controller.resolve().as_posix()}::ItemController.index",
+        ] * 2
+
     def test_laravel_route_alias_resolves_grouped_controller_import(self, tmp_path):
         repo = tmp_path / "repo"
         _write_composer(repo, {"autoload": {"psr-4": {"App\\": "app/"}}})
@@ -542,7 +799,7 @@ class TestLaravelSemantics:
             "<?php\nnamespace App\\Http\\Controllers;\n"
             "class UserController { public function index(): void {} }\n",
         )
-        source = rb"""<?php
+        source = br"""<?php
 use Illuminate\Support\Facades\Route as Router;
 use App\Http\Controllers\{UserController as Users};
 Router::get('/users', [Users::class, 'index']);
@@ -554,21 +811,20 @@ Router::get('/users', [Users::class, 'index']);
         assert [(edge.target, edge.extra["laravel_kind"]) for edge in semantic] == [
             (f"{controller.resolve().as_posix()}::UserController.index", "route"),
         ]
-        assert (
-            len([edge for edge in edges if edge.kind == "CALLS" and edge.target == "Router::get"])
-            == 1
-        )
+        assert len([
+            edge for edge in edges
+            if edge.kind == "CALLS" and edge.target == "Router::get"
+        ]) == 1
 
     def test_laravel_route_accepts_fully_qualified_framework_and_controller(
-        self,
-        tmp_path,
+        self, tmp_path,
     ):
         repo = tmp_path / "repo"
         _write_composer(repo, {"autoload": {"psr-4": {"App\\": "app/"}}})
         controller = _write_php(
             repo / "app/Http/Controllers/UserController.php",
         )
-        source = rb"""<?php
+        source = br"""<?php
 \Illuminate\Support\Facades\Route::post(
     '/users',
     [\App\Http\Controllers\UserController::class, "store"]
@@ -581,17 +837,11 @@ Router::get('/users', [Users::class, 'index']);
         assert [edge.target for edge in semantic] == [
             f"{controller.resolve().as_posix()}::UserController.store",
         ]
-        assert (
-            len(
-                [
-                    edge
-                    for edge in edges
-                    if edge.kind == "CALLS"
-                    and edge.target == "Illuminate\\Support\\Facades\\Route::post"
-                ]
-            )
-            == 1
-        )
+        assert len([
+            edge for edge in edges
+            if edge.kind == "CALLS"
+            and edge.target == "Illuminate\\Support\\Facades\\Route::post"
+        ]) == 1
 
     def test_laravel_eloquent_aliases_resolve_model_reference(self, tmp_path):
         repo = tmp_path / "repo"
@@ -600,7 +850,7 @@ Router::get('/users', [Users::class, 'index']);
             repo / "app/Models/Post.php",
             "<?php\nnamespace App\\Models;\nclass Post {}\n",
         )
-        source = rb"""<?php
+        source = br"""<?php
 namespace App\Models;
 use Illuminate\Database\Eloquent\Model as BaseModel;
 use App\Models\Post as Article;
@@ -618,15 +868,16 @@ class User extends BaseModel {
         assert [(edge.target, edge.extra["relationship"]) for edge in semantic] == [
             (f"{post.resolve().as_posix()}::Post", "hasMany"),
         ]
-        assert (
-            len([edge for edge in edges if edge.kind == "CALLS" and edge.target == "hasMany"]) == 1
-        )
+        assert len([
+            edge for edge in edges
+            if edge.kind == "CALLS" and edge.target == "hasMany"
+        ]) == 1
 
     def test_laravel_eloquent_accepts_fully_qualified_model_names(self, tmp_path):
         repo = tmp_path / "repo"
         _write_composer(repo, {"autoload": {"psr-4": {"App\\": "app/"}}})
         post = _write_php(repo / "app/Models/Post.php")
-        source = rb"""<?php
+        source = br"""<?php
 namespace App\Models;
 class User extends \Illuminate\Database\Eloquent\Model {
     public function post() {
@@ -647,7 +898,7 @@ class User extends \Illuminate\Database\Eloquent\Model {
         repo = tmp_path / "repo"
         _write_composer(repo, {"autoload": {"psr-4": {"App\\": "app/"}}})
         post = _write_php(repo / "app/Models/Post.php")
-        source = rb"""<?php
+        source = br"""<?php
 namespace App\Good {
     use Illuminate\Database\Eloquent\Model;
     use App\Models\Post;
@@ -671,10 +922,9 @@ namespace App\Bad {
         assert semantic[0].source.endswith("::User.posts")
 
     def test_laravel_requires_route_framework_and_static_handler_evidence(
-        self,
-        tmp_path,
+        self, tmp_path,
     ):
-        source = rb"""<?php
+        source = br"""<?php
 use Acme\Routing\Route;
 use App\Http\Controllers\UserController;
 Route::get('/unrelated', [UserController::class, 'index']);
@@ -687,21 +937,26 @@ Router::get('/dynamic', [UserController::class, $method]);
         _, edges = CodeParser(tmp_path).parse_bytes(tmp_path / "routes.php", source)
 
         assert _laravel_edges(edges, "CALLS") == []
-        generic_targets = {edge.target for edge in edges if edge.kind == "CALLS"}
+        generic_targets = {
+            edge.target for edge in edges if edge.kind == "CALLS"
+        }
         assert {"Route::get", "Router::get"} <= generic_targets
 
     def test_laravel_requires_route_import_when_short_facade_is_used(self, tmp_path):
-        source = rb"""<?php
+        source = br"""<?php
 Route::get('/users', [UserController::class, 'index']);
 """
 
         _, edges = CodeParser(tmp_path).parse_bytes(tmp_path / "routes.php", source)
 
         assert _laravel_edges(edges, "CALLS") == []
-        assert any(edge.kind == "CALLS" and edge.target == "Route::get" for edge in edges)
+        assert any(
+            edge.kind == "CALLS" and edge.target == "Route::get"
+            for edge in edges
+        )
 
     def test_laravel_requires_model_class_receiver_and_class_argument(self, tmp_path):
-        source = rb"""<?php
+        source = br"""<?php
 use Illuminate\Database\Eloquent\Model;
 use App\Models\Post;
 
@@ -724,13 +979,15 @@ class User extends Model {
         _, edges = CodeParser(tmp_path).parse_bytes(tmp_path / "Models.php", source)
 
         assert _laravel_edges(edges, "REFERENCES") == []
-        generic_targets = [edge.target for edge in edges if edge.kind == "CALLS"]
+        generic_targets = [
+            edge.target for edge in edges if edge.kind == "CALLS"
+        ]
         assert generic_targets.count("hasMany") == 2
         assert "hasManyCustom" in generic_targets
         assert "belongsTo" in generic_targets
 
     def test_laravel_unresolved_model_keeps_stable_short_target(self, tmp_path):
-        source = rb"""<?php
+        source = br"""<?php
 use Illuminate\Database\Eloquent\Model;
 use App\Models\Missing;
 class User extends Model {
@@ -779,17 +1036,18 @@ def test_composer_process_pool_matches_serial_build(tmp_path):
     )
     callers = []
     for index in range(8):
-        callers.append(
-            _write_php(
-                repo / f"app/Services/Service{index}.php",
-                "<?php\n"
-                f"namespace App\\Services;\nuse App\\Models\\User;\n"
-                f"class Service{index} {{\n"
-                "    public function build(): User { return new User(); }\n"
-                "}\n",
-            )
-        )
-    tracked = [str(path.relative_to(repo)) for path in [user, *callers]]
+        callers.append(_write_php(
+            repo / f"app/Services/Service{index}.php",
+            "<?php\n"
+            f"namespace App\\Services;\nuse App\\Models\\User;\n"
+            f"class Service{index} {{\n"
+            "    public function build(): User { return new User(); }\n"
+            "}\n",
+        ))
+    tracked = [
+        str(path.relative_to(repo))
+        for path in [user, *callers]
+    ]
 
     serial_store = GraphStore(repo / "serial.db")
     parallel_store = GraphStore(repo / "parallel.db")

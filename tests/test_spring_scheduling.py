@@ -57,7 +57,9 @@ def test_scheduled_annotations_create_addressable_nodes_and_edges(tmp_path: Path
 def test_scheduled_metadata_preserves_repeatable_values(tmp_path: Path) -> None:
     nodes, _ = _parsed(tmp_path / "Tasks.java")
     by_kind = {
-        node.extra["schedule_kind"]: node.extra for node in nodes if node.kind == "Scheduler"
+        node.extra["schedule_kind"]: node.extra
+        for node in nodes
+        if node.kind == "Scheduler"
     }
 
     assert by_kind["cron"] == {
@@ -83,7 +85,8 @@ def test_schedule_queries_follow_triggers_edges(tmp_path: Path) -> None:
         store.store_file_nodes_edges(str(path), nodes, edges, "hash")
 
     cron = next(
-        node for node in nodes if node.kind == "Scheduler" and node.extra["schedule_kind"] == "cron"
+        node for node in nodes
+        if node.kind == "Scheduler" and node.extra["schedule_kind"] == "cron"
     )
     cron_qn = f"{path.as_posix()}::Tasks.{cron.name}"
 

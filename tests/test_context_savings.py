@@ -57,6 +57,8 @@ def test_estimate_file_tokens_uses_file_sizes_without_reading_contents(tmp_path)
 
 
 def test_format_context_savings_is_one_short_line():
-    text = format_context_savings({"estimated": True, "saved_tokens": 1240, "saved_percent": 18})
+    text = format_context_savings(
+        {"estimated": True, "saved_tokens": 1240, "saved_percent": 18}
+    )
 
     assert text == "Estimated context saved: ~1,240 tokens (~18%)"

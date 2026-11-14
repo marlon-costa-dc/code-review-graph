@@ -3,6 +3,7 @@
 import shutil
 from pathlib import Path
 
+from code_review_graph import parser as parser_module
 from code_review_graph.graph import GraphStore
 from code_review_graph.incremental import full_build
 from code_review_graph.parser import CodeParser
@@ -133,6 +134,31 @@ typedef int value;
         assert _file_language(nodes) == "c", name
 
 
+def test_long_elif_chain_does_not_walk_ancestors_per_node(monkeypatch) -> None:
+    lines = ["#if defined(START_WITH_IF)"]
+    for index in range(256):
+        lines.extend([
+            f"#elif defined(START_{index})",
+            f"#undef START_{index}",
+            "#pragma section",
+        ])
+    lines.extend(["#endif", "typedef int value;"])
+
+    tree_parser = CodeParser()._get_parser("c")
+    assert tree_parser is not None
+    tree = tree_parser.parse("\n".join(lines).encode())
+
+    def unexpected_ancestor_walk(node) -> bool:
+        raise AssertionError("header evidence scan walked each node's ancestors")
+
+    monkeypatch.setattr(
+        parser_module,
+        "_is_in_static_dead_guard",
+        unexpected_ancestor_walk,
+    )
+    assert CodeParser._has_cpp_header_evidence(tree.root_node) is False
+
+
 def test_c_auto_and_c23_constexpr_are_not_cpp_evidence(tmp_path: Path) -> None:
     sources = {
         "auto_storage.h": "auto int value;\n",
@@ -157,28 +183,28 @@ def test_qt_structural_macros_do_not_hide_classes_or_become_functions(
     function_names = {node.name for node in nodes if node.kind == "Function"}
 
     assert {"MyWidget", "MyWidgetClass"} <= class_names
-    assert function_names.isdisjoint(
-        {
-            "QT_BEGIN_NAMESPACE",
-            "QT_END_NAMESPACE",
-            "Q_OBJECT",
-            "Q_SLOTS",
-            "Q_SIGNALS",
-        }
-    )
+    assert function_names.isdisjoint({
+        "QT_BEGIN_NAMESPACE",
+        "QT_END_NAMESPACE",
+        "Q_OBJECT",
+        "Q_SLOTS",
+        "Q_SIGNALS",
+    })
 
 
 def test_qt_macro_shielding_preserves_class_source_span(tmp_path: Path) -> None:
     _, nodes, _ = _parse(tmp_path, "MyWidget.hpp", QT_HEADER)
 
-    widget = next(node for node in nodes if node.kind == "Class" and node.name == "MyWidget")
+    widget = next(
+        node for node in nodes if node.kind == "Class" and node.name == "MyWidget"
+    )
     assert (widget.line_start, widget.line_end) == (7, 23)
 
 
 def test_qt_macro_shielding_leaves_literals_comments_and_directives_unchanged(
     tmp_path: Path,
 ) -> None:
-    source = b"""#define Q_OBJECT custom_object
+    source = b'''#define Q_OBJECT custom_object
 #include "Q_OBJECT"
 constexpr auto marker = R"tag(Q_SIGNALS \" Q_EMIT)tag";
 // Q_SLOTS
@@ -190,7 +216,7 @@ class Widget {
  Q_SIGNALS:
   void ready();
 };
-"""
+'''
 
     masked = CodeParser._mask_cpp_qt_macros(source)
 
@@ -344,7 +370,9 @@ def test_four_file_cpp_qt_fixture_survives_full_build(tmp_path: Path) -> None:
 
         qt_header_nodes = store.get_nodes_by_file(str(tmp_path / "MyWidget.h"))
         widget = next(
-            node for node in qt_header_nodes if node.kind == "Class" and node.name == "MyWidget"
+            node
+            for node in qt_header_nodes
+            if node.kind == "Class" and node.name == "MyWidget"
         )
         assert (widget.line_start, widget.line_end) == (7, 26)
         assert all(

@@ -128,10 +128,7 @@ def run_token_benchmark(
         )
 
     if results:
-        total = sum(
-            r["reduction_ratio"]
-            for r in results
-        )
+        total = sum(ratios)
         avg_ratio = total / len(results)
     else:
         avg_ratio = 0.0

@@ -101,8 +101,9 @@ def run(repo_path: Path, store, config: dict) -> list[dict]:
         # Graph-based: use get_review_context
         try:
             from code_review_graph.tools import get_review_context
-
-            ctx = get_review_context(changed_files=changed, repo_root=str(repo_path))
+            ctx = get_review_context(
+                changed_files=changed, repo_root=str(repo_path)
+            )
             graph_tokens = _count_tokens(json.dumps(ctx))
         except Exception as exc:
             # A failed tool call is not a measurement. Recording
@@ -133,6 +134,10 @@ def aggregate(results: list[dict]) -> dict:
         "total_rows": len(results),
         "ok_rows": len(ok),
         "error_rows": sum(1 for r in results if r.get("status") == "error"),
-        "median_naive_to_graph_ratio": (round(statistics.median(ratios), 1) if ratios else None),
-        "mean_naive_to_graph_ratio": (round(statistics.mean(ratios), 1) if ratios else None),
+        "median_naive_to_graph_ratio": (
+            round(statistics.median(ratios), 1) if ratios else None
+        ),
+        "mean_naive_to_graph_ratio": (
+            round(statistics.mean(ratios), 1) if ratios else None
+        ),
     }

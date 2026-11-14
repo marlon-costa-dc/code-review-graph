@@ -17,7 +17,6 @@ from .constants import crg_home
 
 logger = logging.getLogger(__name__)
 
-
 def default_registry_path() -> Path:
     """Return the full path to ``registry.json``.
 
@@ -63,10 +62,7 @@ class Registry:
         )
 
     def register(
-        self,
-        path: str,
-        alias: str | None = None,
-        data_dir: str | None = None,
+        self, path: str, alias: str | None = None, data_dir: str | None = None,
     ) -> dict[str, str]:
         """Register a repository path.
 
@@ -133,9 +129,9 @@ class Registry:
             resolved = str(Path(path_or_alias).resolve())
             original_len = len(self._repos)
             self._repos = [
-                entry
-                for entry in self._repos
-                if entry["path"] != resolved and entry.get("alias") != path_or_alias
+                entry for entry in self._repos
+                if entry["path"] != resolved
+                and entry.get("alias") != path_or_alias
             ]
             if len(self._repos) < original_len:
                 self._save()
@@ -204,7 +200,10 @@ class Registry:
                     return dict(entry)
 
             # Create new entry if not found
-            new_entry = {"path": resolved, "data_dir": data_resolved}
+            new_entry = {
+                "path": resolved,
+                "data_dir": data_resolved
+            }
             self._repos.append(new_entry)
             self._save()
             return new_entry
@@ -263,9 +262,7 @@ class ConnectionPool:
                 logger.debug("Evicted connection: %s", evict_key)
 
             conn = sqlite3.connect(
-                key,
-                timeout=30,
-                check_same_thread=False,
+                key, timeout=30, check_same_thread=False,
                 isolation_level=None,
             )
             conn.row_factory = sqlite3.Row

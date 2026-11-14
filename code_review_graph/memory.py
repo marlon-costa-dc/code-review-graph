@@ -35,8 +35,12 @@ def save_result(
     """
     if memory_dir is None:
         if repo_root is None:
-            raise ValueError("Either memory_dir or repo_root required")
-        memory_dir = repo_root / ".code-review-graph" / "memory"
+            raise ValueError(
+                "Either memory_dir or repo_root required"
+            )
+        memory_dir = (
+            repo_root / ".code-review-graph" / "memory"
+        )
 
     memory_dir.mkdir(parents=True, exist_ok=True)
 
@@ -56,15 +60,13 @@ def save_result(
         lines.append("nodes:")
         for n in nodes[:20]:
             lines.append(f"  - {n}")
-    lines.extend(
-        [
-            "---",
-            "",
-            f"# {question}",
-            "",
-            answer,
-        ]
-    )
+    lines.extend([
+        "---",
+        "",
+        f"# {question}",
+        "",
+        answer,
+    ])
 
     path = memory_dir / filename
     path.write_text("\n".join(lines), encoding="utf-8")
@@ -83,7 +85,9 @@ def list_memories(
     if memory_dir is None:
         if repo_root is None:
             return []
-        memory_dir = repo_root / ".code-review-graph" / "memory"
+        memory_dir = (
+            repo_root / ".code-review-graph" / "memory"
+        )
 
     if not memory_dir.exists():
         return []
@@ -122,7 +126,9 @@ def clear_memories(
     if memory_dir is None:
         if repo_root is None:
             return 0
-        memory_dir = repo_root / ".code-review-graph" / "memory"
+        memory_dir = (
+            repo_root / ".code-review-graph" / "memory"
+        )
 
     if not memory_dir.exists():
         return 0

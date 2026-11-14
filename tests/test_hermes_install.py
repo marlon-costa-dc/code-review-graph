@@ -95,7 +95,9 @@ class TestSuiteSafety:
         resolved = _hermes_home().resolve()
         real = (Path.home() / ".hermes").resolve()
         assert resolved != real
-        assert resolved.is_relative_to(Path(tmp_path_factory.getbasetemp()).resolve().parent)
+        assert resolved.is_relative_to(
+            Path(tmp_path_factory.getbasetemp()).resolve().parent
+        )
 
 
 class TestHermesHome:
@@ -103,7 +105,9 @@ class TestHermesHome:
         assert _hermes_home() == hermes_home
         assert _hermes_config_path() == hermes_home / "config.yaml"
 
-    def test_defaults_to_dot_hermes(self, fake_home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_defaults_to_dot_hermes(
+        self, fake_home: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         # fake_home patches Path.home(), so clearing the override here still
         # cannot reach the developer's real ~/.hermes.
         monkeypatch.delenv("HERMES_HOME", raising=False)
@@ -129,7 +133,9 @@ class TestInstall:
         assert "cwd" not in entry
         assert "type" not in entry
 
-    def test_preserves_comments_and_other_settings(self, repo: Path, hermes_home: Path) -> None:
+    def test_preserves_comments_and_other_settings(
+        self, repo: Path, hermes_home: Path
+    ) -> None:
         config = hermes_home / "config.yaml"
         config.write_text(_REAL_CONFIG, encoding="utf-8")
         _install(repo)

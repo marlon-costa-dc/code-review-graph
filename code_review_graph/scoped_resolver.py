@@ -13,16 +13,7 @@ When a local receiver was directly constructed (``$x = new Type(); $x->run()``),
 the parser stores the class as ``extra.receiver_scope`` and this pass uses that
 evidence to resolve the call without changing parse-only output (GitHub #745).
 
-C# receiver calls (``Service.StaticCall()``, ``obj.InstanceCall()``,
-``obj?.ConditionalCall()``) follow the same pattern: ``using`` directives import
-namespaces rather than files, so a single-file parse cannot know which file
-defines the receiver's class. The parser keeps the bare method target and
-records the receiver class in ``extra.receiver_scope`` (from the static class
-receiver itself, or from a declared/constructed local variable type); this pass
-resolves it against Class/method nodes in the graph, disambiguating multiple
-same-named candidates by call-site file and by namespace visibility
-(``using`` directives plus the caller file's own declared namespaces)
-(GitHub #612).
+C# calls use the dedicated namespace-aware pass in ``csharp_resolver``.
 
 This module runs after the graph is built and rewrites the resolvable
 ``Class::method`` targets to the canonical qualified name of the defined
@@ -35,8 +26,10 @@ It is deliberately conservative so it never fabricates an edge:
 * ``self`` / ``static`` (PHP) and ``self`` / ``Self`` (Rust) resolve to the
   enclosing class/type of the caller.
 * A target resolves when exactly one ``(class, method)`` node exists in the
-  graph, or when the caller file's ``IMPORTS_FROM`` edges disambiguate between
-  several same-named definitions.
+  graph and the caller's file backs it (same file, an import naming the class,
+  or for PHP the caller's own namespace), or when the caller file's
+  ``IMPORTS_FROM`` edges disambiguate between several same-named definitions.
+  Being the only match in the graph is not enough on its own.
 * Ambiguous or unknown targets (external types such as ``Vec::new`` or
   ``Redis::get`` with no in-graph definition) are left untouched, keeping the
   behaviour of unresolved external calls exactly as it is today.
@@ -61,7 +54,10 @@ from __future__ import annotations
 
 import json
 import logging
+from pathlib import Path
 from typing import TYPE_CHECKING, Optional
+
+from .csharp_resolver import resolve_csharp_calls
 
 if TYPE_CHECKING:
     from .graph import GraphStore
@@ -69,11 +65,11 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # Languages whose scoped/static calls dangle as ``Class::method`` targets.
-_SCOPED_LANGUAGES = ("php", "rust", "csharp")
+_SCOPED_LANGUAGES = ("php", "rust")
 
 # Languages whose parsers keep a bare method target and record the receiver
 # class in ``extra.receiver_scope`` for this pass to resolve.
-_RECEIVER_SCOPE_LANGUAGES = ("php", "csharp")
+_RECEIVER_SCOPE_LANGUAGES = ("php",)
 
 # Node kinds that can be a scoped-call target (methods live under a class).
 _METHOD_KINDS = ("Function", "Test", "Method")
@@ -122,13 +118,16 @@ def _path_key(file_path: str) -> str:
     return file_path.replace("\\", "/")
 
 
-def _path_ends_with(path_tokens: list[str], suffix: list[str], language: str) -> bool:
+def _path_ends_with(
+    path_tokens: list[str], suffix: list[str], language: str
+) -> bool:
     """Whether a complete import/module suffix matches a defining file path."""
     if not suffix or len(suffix) > len(path_tokens):
         return False
     path_tail = path_tokens[-len(suffix) :]
     return all(
-        _fold(left, language) == _fold(right, language) for left, right in zip(path_tail, suffix)
+        _fold(left, language) == _fold(right, language)
+        for left, right in zip(path_tail, suffix)
     )
 
 
@@ -189,7 +188,9 @@ def _enclosing_class(source_qualified: str) -> Optional[str]:
     return tail.rsplit(".", 1)[0]
 
 
-def _scope_and_method(target: str, language: str) -> Optional[tuple[Optional[str], str, bool]]:
+def _scope_and_method(
+    target: str, language: str
+) -> Optional[tuple[Optional[str], str, bool]]:
     """Parse a raw scoped target into ``(class, method, needs_enclosing)``.
 
     ``class`` is ``None`` when ``needs_enclosing`` is set (``self`` / ``Self`` /
@@ -228,27 +229,18 @@ def _scope_and_method(target: str, language: str) -> Optional[tuple[Optional[str
             return None
         return scope, method, False
 
-    if language == "csharp":
-        scope, _, method = target.partition("::")
-        if not scope or not method or "::" in method:
-            return None
-        # Strip any namespace qualifier: ``Acme.Services.Service`` → ``Service``.
-        class_name = scope.rsplit(".", 1)[-1]
-        if not class_name:
-            return None
-        return class_name, method, False
-
     return None
 
 
-def resolve_scoped_calls(store: GraphStore) -> dict:
+def resolve_scoped_calls(store: GraphStore, repo_root: Path | None = None) -> dict:
     """Rewrite evidence-backed scoped CALLS targets to node qualified names.
 
-    Safe to call repeatedly — rewritten edges start with a path head (and carry
-    ``extra.scoped_resolved``), so they are no longer treated as candidates.
+    Safe to call repeatedly. PHP/Rust skip resolved edges; C# re-evaluates
+    retained source references and only writes bindings that have changed.
 
     Returns a dict with resolution counts for telemetry.
     """
+    csharp_stats = resolve_csharp_calls(store, repo_root)
     conn = store._conn
 
     lang_placeholders = ",".join("?" for _ in _SCOPED_LANGUAGES)
@@ -262,7 +254,7 @@ def resolve_scoped_calls(store: GraphStore) -> dict:
         ).fetchall()
     }
     if not file_language:
-        return {"files_indexed": 0, "calls_resolved": 0}
+        return csharp_stats
 
     # ------------------------------------------------------------------
     # method_map: (language, class_key, method_key) → [qualified, ...]
@@ -285,68 +277,28 @@ def resolve_scoped_calls(store: GraphStore) -> dict:
         file_of[row["qualified_name"]] = row["file_path"]
 
     if not method_map:
-        return {"files_indexed": len(file_language), "calls_resolved": 0}
+        return {
+            "files_indexed": len(file_language) + csharp_stats["files_indexed"],
+            "calls_resolved": csharp_stats["calls_resolved"],
+        }
 
     # ------------------------------------------------------------------
     # imports_by_file: caller file → set of imported target strings, used to
     # disambiguate between several same-named definitions.
     # ------------------------------------------------------------------
     imports_by_file: dict[str, set[str]] = {}
-    for row in conn.execute(
-        "SELECT file_path, target_qualified FROM edges WHERE kind = 'IMPORTS_FROM'"
-    ).fetchall():
-        imports_by_file.setdefault(row["file_path"], set()).add(row["target_qualified"])
-
-    # ------------------------------------------------------------------
-    # csharp_namespaces_by_file: .cs file → namespaces it declares. C#
-    # ``using`` directives store the raw namespace string as their
-    # IMPORTS_FROM target, so namespace visibility is the disambiguation
-    # evidence between same-named C# classes (see #310, #612).
-    # ------------------------------------------------------------------
-    csharp_namespaces_by_file: dict[str, set[str]] = {}
-    if "csharp" in file_language.values():
+    scoped_file_list = sorted(file_language.keys())
+    for start in range(0, len(scoped_file_list), 450):
+        batch = scoped_file_list[start : start + 450]
+        placeholders = ",".join("?" for _ in batch)
         for row in conn.execute(
-            "SELECT file_path, extra FROM nodes WHERE kind = 'File' AND language = 'csharp'"
+            "SELECT file_path, target_qualified FROM edges "
+            f"WHERE kind = 'IMPORTS_FROM' AND file_path IN ({placeholders})",
+            batch,
         ).fetchall():
-            try:
-                node_extra = json.loads(row["extra"] or "{}")
-            except (json.JSONDecodeError, TypeError):
-                continue
-            if not isinstance(node_extra, dict):
-                continue
-            declared = node_extra.get("csharp_namespaces")
-            if isinstance(declared, list):
-                csharp_namespaces_by_file[row["file_path"]] = {
-                    ns for ns in declared if isinstance(ns, str)
-                }
-
-    def csharp_disambiguate(
-        candidates: list[str], caller_file: str
-    ) -> tuple[Optional[str], Optional[str]]:
-        """Pick the single candidate the C# call site can actually see.
-
-        Same-file definitions win outright; otherwise a candidate must be
-        the only one whose defining file declares a namespace visible to
-        the caller (via a ``using`` directive or the caller's own declared
-        namespaces).
-        """
-        same_file = [candidate for candidate in candidates if file_of.get(candidate) == caller_file]
-        if len(same_file) == 1:
-            return same_file[0], "same_file"
-        visible_ns = {
-            target
-            for target in imports_by_file.get(caller_file, set())
-            if "/" not in target and "\\" not in target
-        }
-        visible_ns |= csharp_namespaces_by_file.get(caller_file, set())
-        visible = [
-            candidate
-            for candidate in candidates
-            if csharp_namespaces_by_file.get(file_of.get(candidate, ""), set()) & visible_ns
-        ]
-        if len(visible) == 1:
-            return visible[0], "namespace"
-        return None, None
+            imports_by_file.setdefault(row["file_path"], set()).add(
+                row["target_qualified"]
+            )
 
     def disambiguate(
         candidates: list[str], caller_file: str, class_name: str, language: str
@@ -358,7 +310,9 @@ def resolve_scoped_calls(store: GraphStore) -> dict:
         # #574's PHP import resolver rewrites resolvable ``use`` targets to the
         # absolute path of the class file, so a direct path match is exact.
         imported_paths = {
-            _path_key(target) for target in imported if "/" in target or "\\" in target
+            _path_key(target)
+            for target in imported
+            if "/" in target or "\\" in target
         }
         matched = [
             candidate
@@ -383,17 +337,77 @@ def resolve_scoped_calls(store: GraphStore) -> dict:
                 if _fold(segments[-1], language) != _fold(class_name, language):
                     continue
                 suffixes = _safe_import_suffixes(segments, language)
-                if any(_path_ends_with(tokens, suffix, language) for suffix in suffixes):
+                if any(
+                    _path_ends_with(tokens, suffix, language)
+                    for suffix in suffixes
+                ):
                     matched_by_suffix.add(candidate)
                     break
         if len(matched_by_suffix) == 1:
             return next(iter(matched_by_suffix))
         return None
 
-    calls_rows = conn.execute(
-        "SELECT id, source_qualified, target_qualified, extra, file_path, line "
-        "FROM edges WHERE kind = 'CALLS'"
-    ).fetchall()
+    # php_namespaces: PHP file → the namespaces it declares. A class in the
+    # caller's own namespace needs no ``use``.
+    php_namespaces: dict[str, set[str]] = {}
+    for row in conn.execute(
+        "SELECT file_path, extra FROM nodes WHERE kind = 'File' AND language = 'php'"
+    ).fetchall():
+        try:
+            file_extra = json.loads(row["extra"] or "{}")
+        except (json.JSONDecodeError, TypeError):
+            file_extra = {}
+        declared = file_extra.get("php_namespaces") if isinstance(file_extra, dict) else None
+        if isinstance(declared, list):
+            php_namespaces[row["file_path"]] = {
+                name.casefold() for name in declared if isinstance(name, str)
+            }
+
+    def php_namespace_backs(candidate_file: str, caller_file: str, scope: str) -> bool:
+        """Is the class the scope names in the candidate's namespace?"""
+        theirs = php_namespaces.get(candidate_file, set())
+        ours = php_namespaces.get(caller_file, set())
+        written = scope.strip("\\").rpartition("\\")[0].casefold()
+        if not written:
+            # Unqualified: the caller's own namespace, or the global one.
+            return bool(theirs & ours) or (not theirs and not ours)
+        if scope.startswith("\\"):
+            return written in theirs
+        return written in theirs or any(f"{ns}\\{written}" in theirs for ns in ours)
+
+    def backed(
+        candidate: str, caller_file: str, class_name: str, scope: str, language: str,
+    ) -> bool:
+        """Does the caller's file say *candidate* is the class it means?
+
+        Being the one match in the whole graph is no evidence on its own: a
+        vendor class or another crate's type of the same name may be meant.
+        """
+        candidate_file = file_of.get(candidate, "")
+        if candidate_file == caller_file:
+            return True
+        if disambiguate([candidate], caller_file, class_name, language) is not None:
+            return True
+        folded = _fold(class_name, language)
+        for target in imports_by_file.get(caller_file, ()):
+            segments = _import_segments(target)
+            if segments and _fold(segments[-1], language) == folded:
+                return True
+        if language == "php":
+            return php_namespace_backs(candidate_file, caller_file, scope)
+        return False
+
+    calls_rows = []
+    for start in range(0, len(scoped_file_list), 450):
+        batch = scoped_file_list[start : start + 450]
+        placeholders = ",".join("?" for _ in batch)
+        calls_rows.extend(
+            conn.execute(
+                "SELECT id, source_qualified, target_qualified, extra, file_path, line "
+                f"FROM edges WHERE kind = 'CALLS' AND file_path IN ({placeholders})",
+                batch,
+            ).fetchall()
+        )
 
     resolved = 0
     for row in calls_rows:
@@ -441,12 +455,15 @@ def resolve_scoped_calls(store: GraphStore) -> dict:
         if len(candidates) == 1:
             new_target = candidates[0]
             via = "single_match"
-        elif language == "csharp":
-            new_target, via = csharp_disambiguate(candidates, row["file_path"])
-            if new_target is None:
+            if not needs_enclosing and not backed(
+                new_target, row["file_path"], class_name,
+                resolution_target.partition("::")[0], language,
+            ):
                 continue
         else:
-            new_target = disambiguate(candidates, row["file_path"], class_name, language)
+            new_target = disambiguate(
+                candidates, row["file_path"], class_name, language
+            )
             if new_target is None:
                 continue
             via = "import"
@@ -481,17 +498,17 @@ def resolve_scoped_calls(store: GraphStore) -> dict:
         resolved += 1
         logger.debug(
             "Scoped resolver: %s → %s (via %s)",
-            resolution_target,
-            new_target,
-            via,
+            resolution_target, new_target, via,
         )
 
     if resolved:
-        conn.commit()
+        store.commit()
 
     logger.info(
         "Scoped resolver: resolved %d CALLS edges across %d files",
-        resolved,
-        len(file_language),
+        resolved, len(file_language),
     )
-    return {"files_indexed": len(file_language), "calls_resolved": resolved}
+    return {
+        "files_indexed": len(file_language) + csharp_stats["files_indexed"],
+        "calls_resolved": resolved + csharp_stats["calls_resolved"],
+    }

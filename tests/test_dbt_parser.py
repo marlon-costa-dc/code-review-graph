@@ -39,13 +39,13 @@ class TestDbtModelParsing:
     def setup_method(self):
         self.parser = CodeParser()
         self.nodes, self.edges = self.parser.parse_bytes(
-            Path("models/staging/fct_orders.sql"),
-            DBT_MODEL,
+            Path("models/staging/fct_orders.sql"), DBT_MODEL,
         )
 
     def test_model_node_named_after_file_stem(self):
         models = [
-            n for n in self.nodes if n.kind == "Class" and n.extra.get("sql_kind") == "dbt_model"
+            n for n in self.nodes
+            if n.kind == "Class" and n.extra.get("sql_kind") == "dbt_model"
         ]
         assert len(models) == 1
         assert models[0].name == "fct_orders"
@@ -59,9 +59,9 @@ class TestDbtModelParsing:
     def test_ref_and_source_dependency_edges(self):
         imports = {e.target for e in self.edges if e.kind == "IMPORTS_FROM"}
         assert imports == {
-            "stg_orders",  # ref('stg_orders')
+            "stg_orders",            # ref('stg_orders')
             "analytics_utils.dim_customers",  # ref('package', 'model')
-            "core_db.payments",  # source() stays qualified
+            "core_db.payments",      # source() stays qualified
         }
 
     def test_package_qualified_refs_do_not_collide(self):
@@ -96,16 +96,20 @@ class TestDbtModelParsing:
     def test_plain_sql_without_jinja_keeps_ddl_extraction(self):
         nodes, edges = self.parser.parse_bytes(
             Path("schema.sql"),
-            b"CREATE TABLE users (id INT);\nCREATE VIEW active_users AS SELECT id FROM users;\n",
+            b"CREATE TABLE users (id INT);\n"
+            b"CREATE VIEW active_users AS SELECT id FROM users;\n",
         )
         kinds = {n.extra.get("sql_kind") for n in nodes if n.kind == "Class"}
         assert kinds == {"table", "view"}
-        assert not any(n.extra.get("sql_kind") == "dbt_model" for n in nodes)
+        assert not any(
+            n.extra.get("sql_kind") == "dbt_model" for n in nodes
+        )
 
 
 def test_full_build_links_dbt_models_by_ref(tmp_path: Path) -> None:
     (tmp_path / "dbt_project.yml").write_text(
-        "name: analytics\nconfig-version: 2\n",
+        "name: analytics\n"
+        "config-version: 2\n",
         encoding="utf-8",
     )
     models = tmp_path / "models"
@@ -115,7 +119,10 @@ def test_full_build_links_dbt_models_by_ref(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     (models / "fct_orders.sql").write_text(
-        "with orders as (\n    select * from {{ ref('stg_orders') }}\n)\nselect * from orders\n",
+        "with orders as (\n"
+        "    select * from {{ ref('stg_orders') }}\n"
+        ")\n"
+        "select * from orders\n",
         encoding="utf-8",
     )
 
@@ -142,7 +149,9 @@ def test_full_build_includes_dbt_model_without_jinja_dependencies(
     tmp_path: Path,
 ) -> None:
     (tmp_path / "dbt_project.yml").write_text(
-        "name: analytics\nconfig-version: 2\nmodel-paths: [warehouse_models]\n",
+        "name: analytics\n"
+        "config-version: 2\n"
+        "model-paths: [warehouse_models]\n",
         encoding="utf-8",
     )
     models = tmp_path / "warehouse_models"
@@ -170,6 +179,9 @@ def test_full_build_includes_dbt_model_without_jinja_dependencies(
             for node in base_nodes
         )
         outside_nodes = store.get_nodes_by_file(str(outside_model_paths))
-        assert not any(node.extra.get("sql_kind") == "dbt_model" for node in outside_nodes)
+        assert not any(
+            node.extra.get("sql_kind") == "dbt_model"
+            for node in outside_nodes
+        )
     finally:
         store.close()

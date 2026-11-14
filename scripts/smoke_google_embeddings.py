@@ -8,7 +8,8 @@ from code_review_graph.embeddings import GoogleEmbeddingProvider
 def main() -> None:
     requirements = metadata.requires("code-review-graph") or []
     assert any(
-        requirement.startswith("google-genai") and "google-embeddings" in requirement
+        requirement.startswith("google-genai")
+        and "google-embeddings" in requirement
         for requirement in requirements
     )
 

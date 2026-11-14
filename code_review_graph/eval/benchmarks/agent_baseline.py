@@ -31,73 +31,35 @@ import statistics
 from collections.abc import Iterator
 from pathlib import Path
 
+from code_review_graph.parser import is_test_file
 from code_review_graph.token_benchmark import estimate_tokens
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_TOP_K = 3
 
+# Mirrors search._TEST_RANK_PENALTY so the grep baseline and the graph are
+# ranked on the same footing.
+_TEST_FILE_PENALTY = 0.4
+_TEST_INTENT_TERMS = frozenset({
+    "test", "tests", "tested", "testing", "spec", "specs", "fixture",
+    "fixtures", "mock", "mocks", "stub", "stubs", "coverage",
+})
+
 _SOURCE_EXTS = (
-    ".py",
-    ".js",
-    ".ts",
-    ".tsx",
-    ".go",
-    ".rs",
-    ".java",
-    ".c",
-    ".cpp",
-    ".h",
-    ".rb",
-    ".php",
-    ".swift",
-    ".kt",
+    ".py", ".js", ".ts", ".tsx", ".go", ".rs", ".java",
+    ".c", ".cpp", ".h", ".rb", ".php", ".swift", ".kt",
 )
 
 _SKIP_DIRS = {
-    ".git",
-    ".hg",
-    ".svn",
-    "node_modules",
-    "__pycache__",
-    ".code-review-graph",
-    ".venv",
-    "venv",
-    "dist",
-    "build",
+    ".git", ".hg", ".svn", "node_modules", "__pycache__",
+    ".code-review-graph", ".venv", "venv", "dist", "build",
 }
 
 _STOPWORDS = {
-    "how",
-    "does",
-    "do",
-    "the",
-    "a",
-    "an",
-    "is",
-    "are",
-    "was",
-    "what",
-    "where",
-    "when",
-    "which",
-    "who",
-    "why",
-    "and",
-    "or",
-    "in",
-    "on",
-    "of",
-    "to",
-    "for",
-    "with",
-    "via",
-    "into",
-    "from",
-    "this",
-    "that",
-    "it",
-    "its",
+    "how", "does", "do", "the", "a", "an", "is", "are", "was", "what",
+    "where", "when", "which", "who", "why", "and", "or", "in", "on", "of",
+    "to", "for", "with", "via", "into", "from", "this", "that", "it", "its",
 }
 
 
@@ -135,29 +97,42 @@ def iter_source_files(repo_path: Path) -> Iterator[Path]:
 
 
 def grep_rank(
-    repo_path: Path,
-    terms: list[str],
-    k: int = DEFAULT_TOP_K,
+    repo_path: Path, terms: list[str], k: int = DEFAULT_TOP_K,
 ) -> list[tuple[str, int]]:
     """Rank source files by total case-insensitive term matches; take top-k.
 
     Pure python — no external grep/rg dependency. Deterministic: ties break
     on the relative path. Files with zero matches are dropped.
+
+    Test files are down-weighted by :data:`_TEST_FILE_PENALTY` unless the
+    question is about tests. A test names a symbol far more often than the
+    one place it is defined, so raw match count puts the whole test suite
+    above the implementation; left uncorrected this benchmark would compare
+    the graph against a grep nobody would accept. The graph's own search
+    carries the same correction
+    (``search._TEST_RANK_PENALTY``), so both sides are ranked on the same
+    footing.
     """
     lowered = [t.lower() for t in terms if t]
     if not lowered:
         return []
-    scores: list[tuple[str, int]] = []
+    test_intent = bool(set(lowered) & _TEST_INTENT_TERMS)
+    scores: list[tuple[str, float]] = []
     for path in iter_source_files(repo_path):
         try:
             text = path.read_text(encoding="utf-8", errors="replace").lower()
         except OSError:
             continue
         count = sum(text.count(term) for term in lowered)
-        if count > 0:
-            scores.append((str(path.relative_to(repo_path)), count))
+        if count <= 0:
+            continue
+        rel = str(path.relative_to(repo_path))
+        score = float(count)
+        if not test_intent and is_test_file(rel):
+            score *= _TEST_FILE_PENALTY
+        scores.append((rel, score))
     scores.sort(key=lambda item: (-item[1], item[0]))
-    return scores[:k]
+    return [(rel, int(round(score))) for rel, score in scores[:k]]
 
 
 def run(repo_path: Path, store, config: dict) -> list[dict]:
@@ -196,13 +171,13 @@ def run(repo_path: Path, store, config: dict) -> list[dict]:
 
         try:
             from code_review_graph.search import hybrid_search
-
             hits = hybrid_search(
                 store,
                 question,
                 limit=5,
                 provider=config.get("_embedding_provider"),
                 model=config.get("_embedding_model"),
+                repo_root=repo_path,
             )
         except Exception as exc:
             logger.warning("hybrid_search failed on %r: %s", question, exc)
@@ -247,7 +222,13 @@ def aggregate(results: list[dict]) -> dict:
         # against a populated graph means the vector index is missing —
         # re-run the eval with --embed.
         "no_graph_results_rows": no_graph,
-        "no_baseline_match_rows": sum(1 for r in results if r.get("status") == "no_baseline_match"),
-        "median_baseline_to_graph_ratio": (round(statistics.median(ratios), 1) if ratios else None),
-        "mean_baseline_to_graph_ratio": (round(statistics.mean(ratios), 1) if ratios else None),
+        "no_baseline_match_rows": sum(
+            1 for r in results if r.get("status") == "no_baseline_match"
+        ),
+        "median_baseline_to_graph_ratio": (
+            round(statistics.median(ratios), 1) if ratios else None
+        ),
+        "mean_baseline_to_graph_ratio": (
+            round(statistics.mean(ratios), 1) if ratios else None
+        ),
     }
