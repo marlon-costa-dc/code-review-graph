@@ -17,6 +17,7 @@ from code_review_graph.multi_worktree import (
     MultiWorktreeRouter,
     WorktreeAuthorizer,
     _Child,
+    discover_worktrees,
     run_multi_worktree_server,
 )
 
@@ -49,6 +50,23 @@ def _repository(tmp_path: Path) -> Path:
     _git(repo, "add", "README.md")
     _git(repo, "commit", "-q", "-m", "initial")
     return repo
+
+
+def test_discovery_tracks_moved_and_detached_checkouts(tmp_path: Path) -> None:
+    repo = _repository(tmp_path)
+    linked = tmp_path / "linked space"
+    moved = tmp_path / "moved space"
+    _git(repo, "worktree", "add", "-q", "-b", "review", str(linked))
+    first = {item.root: item for item in discover_worktrees(repo)}
+    assert first[linked.resolve()].branch_ref == "refs/heads/review"
+    assert first[linked.resolve()].head == first[repo.resolve()].head
+
+    _git(linked, "checkout", "--detach")
+    _git(repo, "worktree", "move", str(linked), str(moved))
+    second = {item.root: item for item in discover_worktrees(repo)}
+    assert linked.resolve() not in second
+    assert second[moved.resolve()].branch_ref is None
+    assert second[moved.resolve()].head == first[linked.resolve()].head
 
 
 def test_authorizer_accepts_linked_worktree_and_rejects_other_repo(tmp_path: Path) -> None:

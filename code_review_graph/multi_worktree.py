@@ -18,6 +18,7 @@ import subprocess
 import sys
 import threading
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -96,20 +97,31 @@ def _canonical_git_identity(path: str | Path) -> tuple[Path, Path]:
     return root, common
 
 
-def _listed_worktree_roots(primary_root: Path) -> set[Path]:
-    roots: set[Path] = set()
-    output = _run_git(primary_root, "worktree", "list", "--porcelain")
-    for line in output.splitlines():
-        if not line.startswith("worktree "):
+@dataclass(frozen=True)
+class WorktreeCheckout:
+    """A live checkout; branch_ref is absent for detached HEAD."""
+
+    root: Path
+    head: str
+    branch_ref: str | None
+
+
+def discover_worktrees(repo_root: Path) -> tuple[WorktreeCheckout, ...]:
+    """Read live checkouts and their revisions in one Git invocation."""
+    checkouts: list[WorktreeCheckout] = []
+    output = _run_git(repo_root, "worktree", "list", "--porcelain", "-z")
+    for record in output.split("\0\0"):
+        fields = dict(field.partition(" ")[::2] for field in record.split("\0") if field)
+        if "bare" in fields or "prunable" in fields or "worktree" not in fields:
             continue
-        candidate = Path(line.removeprefix("worktree ").strip()).expanduser()
+        candidate = Path(fields["worktree"])
         try:
             candidate = candidate.resolve(strict=True)
         except (OSError, RuntimeError):
             continue
         if candidate.is_dir():
-            roots.add(candidate)
-    return roots
+            checkouts.append(WorktreeCheckout(candidate, fields["HEAD"], fields.get("branch")))
+    return tuple(checkouts)
 
 
 class WorktreeAuthorizer:
@@ -129,7 +141,7 @@ class WorktreeAuthorizer:
             raise MultiWorktreeError(
                 "repo_root must be the primary repository or a linked worktree"
             )
-        if root not in _listed_worktree_roots(self.primary_root):
+        if not any(checkout.root == root for checkout in discover_worktrees(self.primary_root)):
             raise MultiWorktreeError(
                 "repo_root is not an active linked worktree of the primary repository"
             )
