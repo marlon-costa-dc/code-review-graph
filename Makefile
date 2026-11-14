@@ -31,7 +31,7 @@ test:
 	uv run --locked --extra dev pytest tests
 
 test-release:
-	uv run --locked --extra dev pytest tests/test_release_provenance.py -q --tb=short
+	uv run --locked --extra dev pytest tests/test_release_provenance.py tests/test_documentation.py -q --tb=short
 
 .PHONY: test-notebooks
 test-notebooks:
