@@ -693,30 +693,25 @@ def get_data_dir(repo_root: Path, *, create: bool = True) -> Path:
     files never get committed. Both are idempotent. Pass ``create=False``
     when resolving the path for a read-only existence check.
     """
-    # Check registry first
-    try:
-        from .registry import Registry, default_registry_path
+    from .registry import Registry, default_registry_path
 
-        # Registry construction creates its parent directory. A read-only
-        # lookup must skip it entirely when no registry file exists.
-        if create or default_registry_path().is_file():
-            registry_data_dir = Registry().get_data_dir_for_repo(str(repo_root))
-            if registry_data_dir:
-                data_dir = Path(registry_data_dir).resolve()
-                local_dir = repo_root / ".code-review-graph"
-                if not data_dir.exists() and (local_dir / "graph.db").is_file():
-                    logger.warning(
-                        "Registered graph directory %s is missing; falling back to "
-                        "normal resolution (local graph: %s).",
-                        data_dir, local_dir,
-                    )
-                else:
-                    if create:
-                        _create_data_dir(data_dir)
-                    return data_dir
-    except Exception as exc:
-        # If registry lookup fails, log and fall through to other methods
-        logger.debug("Registry lookup failed for %s: %s", repo_root, exc)
+    # Registry construction creates its parent directory. A read-only
+    # lookup must skip it entirely when no registry file exists.
+    if create or default_registry_path().is_file():
+        registry_data_dir = Registry().get_data_dir_for_repo(str(repo_root))
+        if registry_data_dir:
+            data_dir = Path(registry_data_dir).resolve()
+            local_dir = repo_root / ".code-review-graph"
+            if not data_dir.exists() and (local_dir / "graph.db").is_file():
+                logger.warning(
+                    "Registered graph directory %s is missing; falling back to "
+                    "normal resolution (local graph: %s).",
+                    data_dir, local_dir,
+                )
+            else:
+                if create:
+                    _create_data_dir(data_dir)
+                return data_dir
 
     # Check environment variable
     env_override = os.environ.get("CRG_DATA_DIR", "").strip()

@@ -897,15 +897,14 @@ def _seed_build_from_vstore(store_root: Path, repo_root: Path, *, quiet: bool) -
 def _handle_data_dir_option(args, repo_root: Path) -> None:
     """Handle --data-dir option by updating registry if specified."""
     if hasattr(args, "data_dir") and args.data_dir:
-        try:
-            from .registry import Registry
-            data_dir_path = Path(args.data_dir).expanduser().resolve()
-            data_dir_path.mkdir(parents=True, exist_ok=True)
-            Registry().set_data_dir(str(repo_root), str(data_dir_path))
-            logging.info(f"Graph database will be stored at: {data_dir_path}")
-        except Exception as exc:
-            logging.error(f"Failed to set data directory: {exc}")
-            sys.exit(1)
+        from .registry import Registry
+
+        # Validate the selected registry before creating a graph-data directory.
+        registry = Registry()
+        data_dir_path = Path(args.data_dir).expanduser().resolve()
+        data_dir_path.mkdir(parents=True, exist_ok=True)
+        registry.set_data_dir(str(repo_root), str(data_dir_path))
+        logging.info(f"Graph database will be stored at: {data_dir_path}")
 
 
 def _add_embedding_refresh_args(command) -> None:
