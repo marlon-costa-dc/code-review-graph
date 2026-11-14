@@ -76,3 +76,7 @@ test-update-contract:
 .PHONY: test-registry
 test-registry:
 	uv run --locked --extra dev pytest tests/test_registry.py tests/test_dependency_floors.py tests/test_cli_reconciliation.py tests/test_install_outputs_are_ignored.py -q --tb=short
+
+.PHONY: test-mcp-client
+test-mcp-client:
+	uv run --locked --extra dev pytest tests/test_e2e_mcp_client.py -q --tb=short

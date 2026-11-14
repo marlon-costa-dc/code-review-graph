@@ -26,8 +26,10 @@ import asyncio
 import json
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
+from contextlib import closing
 from pathlib import Path
 from typing import Any
 
@@ -363,6 +365,56 @@ async def test_mcp_client_full_review_journey(tmp_path: Path) -> None:
             # this is what keeps the test independent of the host machine.
             assert repos["repos"] == [], repos
             assert repos["summary"].startswith("0 registered repository")
+
+
+async def test_mcp_shared_file_summary_isolates_sibling_worktrees(tmp_path, monkeypatch):
+    from code_review_graph.graph import GraphStore
+    from code_review_graph.graph_generations import (
+        ensure_indexed_generation,
+        initialize_bindings,
+        publish_binding,
+    )
+    from code_review_graph.incremental import full_build
+
+    repo = _make_fixture_repo(tmp_path)
+    sibling = tmp_path / "sibling"
+    _git(repo, "worktree", "add", "-q", "--detach", str(sibling))
+    db = tmp_path / "shared.db"
+    with closing(sqlite3.connect(db)) as shared:
+        initialize_bindings(shared)
+        shared.execute("BEGIN IMMEDIATE")
+        for i, (root, name) in enumerate(((repo, "left_symbol"), (sibling, "right_symbol"))):
+            relative_path = "pkg/view.py"
+            (root / relative_path).write_text(f"def {name}(): return {i}\n", encoding="utf-8")
+            _git(root, "add", relative_path)
+            with GraphStore(tmp_path / f"fixture-{i}.db") as store:
+                assert full_build(root, store)["errors"] == []
+                generation = ensure_indexed_generation(
+                    shared, repository="repo", profile_digest="default", repo_root=root,
+                    store=store,
+                )
+            assert publish_binding(shared, str(root.resolve()), generation, expected_revision=0)
+        shared.commit()
+
+    monkeypatch.setenv("CRG_SHARED_FILE_SUMMARY_DB", str(db))
+    crg_home = tmp_path / "crg-home"
+    crg_home.mkdir()
+    async with stdio_client(
+        _server_params(repo, crg_home, multi_worktree=True)
+    ) as (read, write):
+        async with ClientSession(
+            read, write, read_timeout_seconds=read_timeout(CALL_TIMEOUT),
+        ) as session:
+            await asyncio.wait_for(session.initialize(), timeout=CALL_TIMEOUT)
+            for root, name in ((repo, "left_symbol"), (sibling, "right_symbol")):
+                result = _payload(await _call(session, "query_graph_tool", {
+                    "pattern": "file_summary", "target": relative_path, "repo_root": str(root),
+                }))
+                assert result["status"] == "ok"
+                assert [row["name"] for row in result["results"]
+                        if row["kind"] == "Function"] == [name]
+                assert all(_posix(row["file_path"]) == (root / relative_path).as_posix()
+                           for row in result["results"])
 
 
 async def test_mcp_multi_worktree_routes_parallel_graphs(tmp_path: Path) -> None:
