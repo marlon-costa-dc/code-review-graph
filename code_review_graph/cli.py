@@ -900,6 +900,10 @@ def _handle_data_dir_option(args, repo_root: Path) -> None:
     """Handle --data-dir option by updating registry if specified."""
     if hasattr(args, "data_dir") and args.data_dir:
         from .registry import Registry
+        from .shared_sqlite import shared_database
+
+        if shared_database() is not None:
+            raise ValueError("Select either CRG_SHARED_DB or --data-dir")
 
         # Validate the selected registry before creating a graph-data directory.
         registry = Registry()
@@ -1280,9 +1284,15 @@ def _warn_failed_files(result: dict) -> None:
     )
 
 
-def _open_graph_store(db_path: Path, command: str):
+def _open_graph_store(db_path: Path, command: str, *, checkout: Path | None = None):
     """Open a store; CLI builds request recovery inside their write lock."""
+    from .shared_sqlite import shared_database
     from .tools._common import _open_graph_store as open_store
+
+    if db_path == shared_database():
+        from .graph import GraphStore
+
+        return GraphStore(db_path, checkout=checkout, read_only=command != "watch")
 
     return open_store(db_path, command)
 
@@ -1361,6 +1371,10 @@ def _handle_build_update(args, repo_root: Path, embedding_refresh_kwargs) -> Non
         finally:
             logging.disable(previous_disable)
         _exit_if_contended(result)
+        if result.get("refresh_reused"):
+            if not args.quiet:
+                print(result["summary"])
+            return
         parsed = result.get("files_parsed", 0)
         nodes = result.get("total_nodes", 0)
         edges = result.get("total_edges", 0)
@@ -1416,7 +1430,9 @@ def _handle_build_update(args, repo_root: Path, embedding_refresh_kwargs) -> Non
             sys.exit(1)
         nodes = result.get("total_nodes", 0)
         edges = result.get("total_edges", 0)
-        if not args.quiet:
+        if not args.quiet and result.get("refresh_reused"):
+            print(result["summary"])
+        elif not args.quiet:
             if result.get("build_type") == "full":
                 # No usable incremental base (fresh/legacy graph, or the
                 # last-synced commit was lost to a rewrite/shallow clone),
@@ -1463,7 +1479,7 @@ def _handle_build_update(args, repo_root: Path, embedding_refresh_kwargs) -> Non
                     _exit_if_contended(_write_skipped_response(db_path, brief_lock.holder_pid()))
                 store = None
                 try:
-                    store = _open_graph_store(db_path, "update")
+                    store = _open_graph_store(db_path, "update", checkout=repo_root)
                     assert_graph_serves_root(repo_root, store)
                     impact = analyze_changes(
                         store,
@@ -1549,12 +1565,18 @@ def _handle_forget(args, repo_root: Path, db_path: Path, *, legacy: bool = False
 
             store = GraphStore(
                 repo_root / ".code-review-graph.db" if legacy else db_path,
-                read_only=True,
+                read_only=True, checkout=repo_root,
             )
         else:
             if legacy:
                 _prepare_db_path(repo_root, db_path)
-            store = _open_graph_store(db_path, args.command)
+            from .graph import GraphStore
+            from .shared_sqlite import shared_database
+
+            store = (
+                GraphStore(db_path, checkout=repo_root) if db_path == shared_database()
+                else _open_graph_store(db_path, "forget")
+            )
         assert_graph_serves_root(repo_root, store)
         stored_files = store.get_all_files()
         targets = _match_files_to_forget(stored_files, args.paths, repo_root)
@@ -1582,7 +1604,9 @@ def _handle_forget(args, repo_root: Path, db_path: Path, *, legacy: bool = False
 
         from .forget import forget_files
 
-        summary = forget_files(store, repo_root, targets)
+        with store.refresh():
+            store.invalidate_refresh()
+            summary = forget_files(store, repo_root, targets)
         reparsed = summary.get("reparsed", [])
         if reparsed:
             print(
@@ -3383,6 +3407,11 @@ def _dispatch() -> None:
         "watch",
     })
     explicit_data_dir = bool(getattr(args, "data_dir", None))
+    if explicit_data_dir:
+        from .shared_sqlite import shared_database
+
+        if shared_database() is not None:
+            ap.error("Select either CRG_SHARED_DB or --data-dir")
     read_only_explicit_data_dir = (
         args.command in _read_only_db_cmds and explicit_data_dir
     )
@@ -3429,7 +3458,7 @@ def _dispatch() -> None:
     if args.command == "forget":
         _handle_forget(args, repo_root, db_path, legacy=legacy_pending)
         return
-    store = _open_graph_store(db_path, args.command)
+    store = _open_graph_store(db_path, args.command, checkout=repo_root)
 
     try:
         # A graph.db copied or cached from another checkout answers every
@@ -3465,6 +3494,13 @@ def _dispatch() -> None:
                     print(f"  [{kind}] {name}  ({file_path}:{line})")
 
         elif args.command == "status":
+            from .tools._common import _graph_is_built
+
+            if store.checkout is not None and not _graph_is_built(store):
+                print("No committed graph for this checkout. Run `code-review-graph build` first.",
+                      file=sys.stderr)
+                raise SystemExit(1)
+
             from .build_state import BUILD_IN_PROGRESS, read_build_state
             from .tools.build import build_was_interrupted
 

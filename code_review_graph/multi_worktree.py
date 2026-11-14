@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any
 
 from .incremental import find_project_root, get_db_path
+from .shared_sqlite import shared_database
 
 logger = logging.getLogger(__name__)
 
@@ -525,7 +526,10 @@ class MultiWorktreeRouter:
                     return child
                 else:
                     for other_root, other_db_path in self.db_paths.items():
-                        if other_root != root and other_db_path == db_path:
+                        if (
+                            other_root != root and other_db_path == db_path
+                            and db_path != shared_database()
+                        ):
                             raise MultiWorktreeError(
                                 "worktrees must not share a graph database: "
                                 f"{root} and {other_root} resolve to {db_path}"

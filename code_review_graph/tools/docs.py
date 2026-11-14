@@ -86,52 +86,56 @@ def embed_graph(
             _prepare_db_path(root, db_path)
         store, root = _get_store(str(root), db_path=db_path)
         try:
-            try:
-                emb_store = EmbeddingStore(db_path, provider=provider, model=model)
-            except ValueError as exc:
-                # Unknown provider name or missing provider env vars — surface
-                # as a structured error rather than a traceback.
-                logger.error("embed_graph: %s", exc)
-                return {"status": "error", "error": str(exc)}
-            try:
-                if not emb_store.available:
-                    if provider in ("openai", "google", "minimax", "voyage"):
-                        err = (
-                            f"The '{provider}' embedding provider is not available. "
-                            "Check the required environment variables "
-                            "(see README and `get_provider()` docstring) and that "
-                            "the endpoint is reachable."
-                        )
-                    else:
-                        err = (
-                            "The local embedding provider needs sentence-transformers. "
-                            "Install with: pip install "
-                            "\"code-review-graph[embeddings]\" — "
-                            "or switch provider to 'openai' / 'google' / 'minimax' "
-                            "/ 'voyage'."
-                        )
-                    return {"status": "error", "error": err}
+            with store.refresh():
+                try:
+                    emb_store = EmbeddingStore(
+                        db_path, provider=provider, model=model,
+                        **({"graph_store": store} if store.checkout is not None else {}),
+                    )
+                except ValueError as exc:
+                    # Unknown provider name or missing provider env vars — surface
+                    # as a structured error rather than a traceback.
+                    logger.error("embed_graph: %s", exc)
+                    return {"status": "error", "error": str(exc)}
+                try:
+                    if not emb_store.available:
+                        if provider in ("openai", "google", "minimax", "voyage"):
+                            err = (
+                                f"The '{provider}' embedding provider is not available. "
+                                "Check the required environment variables "
+                                "(see README and `get_provider()` docstring) and that "
+                                "the endpoint is reachable."
+                            )
+                        else:
+                            err = (
+                                "The local embedding provider needs sentence-transformers. "
+                                "Install with: pip install "
+                                "\"code-review-graph[embeddings]\" — "
+                                "or switch provider to 'openai' / 'google' / 'minimax' "
+                                "/ 'voyage'."
+                            )
+                        return {"status": "error", "error": err}
 
-                newly_embedded = embed_all_nodes(store, emb_store)
-                total = emb_store.count()
-                search_status = (
-                    "Semantic search is now active."
-                    if total > 0
-                    else "No embeddings are available for semantic search."
-                )
+                    newly_embedded = embed_all_nodes(store, emb_store)
+                    total = emb_store.count()
+                    search_status = (
+                        "Semantic search is now active."
+                        if total > 0
+                        else "No embeddings are available for semantic search."
+                    )
 
-                return {
-                    "status": "ok",
-                    "summary": (
-                        f"Embedded {newly_embedded} new node(s). "
-                        f"Total embeddings: {total}. "
-                        f"{search_status}"
-                    ),
-                    "newly_embedded": newly_embedded,
-                    "total_embeddings": total,
-                }
-            finally:
-                emb_store.close()
+                    return {
+                        "status": "ok",
+                        "summary": (
+                            f"Embedded {newly_embedded} new node(s). "
+                            f"Total embeddings: {total}. "
+                            f"{search_status}"
+                        ),
+                        "newly_embedded": newly_embedded,
+                        "total_embeddings": total,
+                    }
+                finally:
+                    emb_store.close()
         finally:
             store.close()
     finally:

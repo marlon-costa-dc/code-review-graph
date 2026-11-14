@@ -383,6 +383,23 @@ A hook or CI job can tell these apart without reading the message. `75` is
   `CRG_CONTEXT_HISTORY=1` where the MCP server or the CLI runs to turn it on.
   See [USAGE.md](USAGE.md#context-history).
 
+## Shared SQLite
+
+Set `CRG_SHARED_DB` to an absolute SQLite path and use the same value in
+the CLI, MCP server, and watcher service. Build each checkout with
+`code-review-graph build --repo /path/to/checkout`. Existing per-checkout
+databases are left intact; the shared file is populated from source. Use
+`--repo` or the MCP `repo_root` to select the checkout. Do not combine the
+shared setting with a per-command `--data-dir`. Launch the VS Code extension
+host with the same setting to read the selected workspace checkout from the
+shared database.
+
+The watcher uses the same completion record as CLI and MCP refreshes.
+A checkout, input snapshot and indexing profile must match before a
+completed refresh can be reused. The kernel releases the write lock on
+process death and SQLite rolls back the unfinished refresh. See
+[Shared SQLite ADR](adr/0001-shared-sqlite.md).
+
 ## Standalone Daemon CLI (`crg-daemon`)
 
 `crg-daemon` is installed with `code-review-graph` and mirrors the
@@ -470,14 +487,19 @@ postprocess: str = "full"            # "full", "minimal" (signatures + FTS), or 
 recurse_submodules: bool | None      # None falls back to CRG_RECURSE_SUBMODULES
 embedding_provider: str | None       # Refresh an existing embedding index; needs embedding_model
 embedding_model: str | None          # Exact model for embedding_provider
+wait_for_lock: bool = False          # Join a matching in-flight CLI/MCP build or update
 ```
 If some files fail to parse, `status` is `"partial"` and the `summary` names
 them. Their previous graph rows are kept.
 
 One write runs per repository at a time. When another write to the graph is
 running, this tool, `run_postprocess_tool` and `embed_graph_tool`
-return at once with `status: "contended"`, `skipped: true` and the `holder_pid`;
-retry once it ends. An embedding refresh on a graph with no embeddings yet embeds
+return at once with `status: "contended"`, `skipped: true` and the `holder_pid`.
+CLI `--wait` and MCP `wait_for_lock` can reuse a completed, equivalent
+build or update with `refresh_reused: true`. A failed or killed writer
+does not provide an eligible completion. The operating system releases the
+lock when the writer dies; the PID text in the lock file is diagnostic only.
+An embedding refresh on a graph with no embeddings yet embeds
 nothing and sets `embeddings_refresh_skipped: true`; run `embed_graph_tool` once
 first.
 

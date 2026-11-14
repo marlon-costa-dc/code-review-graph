@@ -39,6 +39,7 @@ from .csharp_resolver import restore_csharp_references
 from .errors import ChangeDiscoveryError, GraphRootMismatchError, GraphStoreError
 from .graph import GraphStore
 from .locking import WriteLock, write_lock_path
+from .shared_sqlite import shared_database
 
 if TYPE_CHECKING:
     from .parser import CodeParser
@@ -735,6 +736,8 @@ def get_db_path(repo_root: Path, *, read_only: bool = False) -> Path:
     ``read_only=True`` to resolve the current path without creating a data
     directory, migrating a legacy database, or deleting side-files.
     """
+    if (shared := shared_database()) is not None:
+        return shared
     forced_read_only = read_only_requested()
     no_writes = read_only or forced_read_only
     crg_dir = get_data_dir(repo_root, create=not no_writes)
@@ -759,6 +762,8 @@ def get_db_path(repo_root: Path, *, read_only: bool = False) -> Path:
 def _prepare_db_path(repo_root: Path, new_db: Path) -> None:
     """Prepare an already resolved database path, under the writer's lock."""
     _create_data_dir(new_db.parent)
+    if shared_database() == new_db:
+        return
 
     # Migrate legacy database if present (only meaningful when the
     # legacy file sits at the repo root — if CRG_DATA_DIR is set we
@@ -5000,6 +5005,15 @@ def _create_watch_handler(
                 self.last_event_at = time.time()
                 self.events_seen += len(events)
                 try:
+                    if shared_database() is not None:
+                        from .tools.build import refresh_shared_watch
+
+                        refresh_shared_watch(repo_root, store, follow, on_files_updated)
+                        # The native watch planner still follows directory and symlink changes.
+                        ignore_patterns[:] = _load_ignore_patterns(repo_root)
+                        if follow:
+                            self._remember_followed()
+                        return
                     patterns_before = ignore_patterns
                     files_updated, newly_included = self._refresh_ignore_patterns(events)
                     changed_files = sorted(
@@ -5021,14 +5035,14 @@ def _create_watch_handler(
                         links_changed = links_changed or ignore_patterns is not patterns_before
                         if links_changed or contents_changed:
                             files_updated += self._reconcile_followed()
-                    if on_files_updated is not None and (
+                    if (
                         files_updated > 0
                         # A project file change parses nothing but can rebind
                         # C# calls in unchanged files; the binder marks flows.
                         or (changed_files and store.get_metadata("csharp_flows_dirty") == "1")
                     ):
-                        postprocess_result = on_files_updated(store)
-                        _raise_watch_postprocess_warnings(postprocess_result)
+                        if on_files_updated is not None:
+                            _raise_watch_postprocess_warnings(on_files_updated(store))
                 except BaseException as exc:
                     self.failure = exc
                 finally:
@@ -5287,15 +5301,22 @@ def _watch(
                 write_lock = WriteLock(store.db_path)
                 if _wait_for_watch_write_lock(write_lock, supervisor, stop_event):
                     try:
-                        base = store.get_metadata("git_head_sha")
-                        initial = incremental_update(
-                            repo_root, store, base=base or "HEAD",
-                            follow_symlinks=follow_symlinks,
-                        )
-                        _raise_watch_update_errors(initial, "initial watch reconciliation")
-                        if initial["files_updated"] > 0 and on_files_updated is not None:
-                            postprocess_result = on_files_updated(store)
-                            _raise_watch_postprocess_warnings(postprocess_result)
+                        if shared_database() is not None:
+                            from .tools.build import refresh_shared_watch
+
+                            refresh_shared_watch(
+                                repo_root, store, follow_symlinks, on_files_updated,
+                            )
+                        else:
+                            base = store.get_metadata("git_head_sha")
+                            initial = incremental_update(
+                                repo_root, store, base=base or "HEAD",
+                                follow_symlinks=follow_symlinks,
+                            )
+                            _raise_watch_update_errors(initial, "initial watch reconciliation")
+                            if initial["files_updated"] > 0 and on_files_updated is not None:
+                                postprocess_result = on_files_updated(store)
+                                _raise_watch_postprocess_warnings(postprocess_result)
                     finally:
                         write_lock.release()
             finally:

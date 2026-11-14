@@ -78,7 +78,11 @@ test-update-contract:
 
 .PHONY: test-registry
 test-registry:
-	uv run --locked --extra dev pytest tests/test_registry.py tests/test_dependency_floors.py tests/test_cli_reconciliation.py tests/test_install_outputs_are_ignored.py -q --tb=short
+	uv run --locked --extra dev pytest tests/test_registry.py tests/test_unread_tables_removed.py tests/test_dependency_floors.py tests/test_cli_reconciliation.py tests/test_install_outputs_are_ignored.py -q --tb=short
+
+.PHONY: test-mcp-client
+test-mcp-client:
+	uv run --locked --extra dev pytest tests/test_e2e_mcp_client.py -q --tb=short
 
 .PHONY: test-change-discovery
 test-change-discovery:
@@ -111,3 +115,13 @@ test-baseline-compat:
 .PHONY: test-parser-process-locks
 test-parser-process-locks:
 	uv run --locked --extra dev pytest tests/test_concurrency_and_daemon.py -m concurrency -k TestSingleFlightWriteLock -q --tb=short
+
+.PHONY: test-parser-reuse
+test-parser-reuse:
+	uv run --locked --extra dev pytest tests/test_parser.py -q --tb=short
+
+.PHONY: test-vscode
+test-vscode:
+	npm --prefix code-review-graph-vscode run compile
+	npm --prefix code-review-graph-vscode run lint
+	uv run --locked --extra dev env CRG_TEST_CLI="$(CURDIR)/.venv/bin/code-review-graph" npm --prefix code-review-graph-vscode test

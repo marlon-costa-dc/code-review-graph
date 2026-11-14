@@ -20,12 +20,14 @@ import subprocess
 import sys
 import threading
 from bisect import bisect_left, bisect_right
-from collections import deque
+from collections import OrderedDict, deque
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path, PurePath
 from typing import Any, NamedTuple, Optional
+
+from tree_sitter import Language, Parser, Tree
 
 try:
     import tomllib
@@ -3792,6 +3794,29 @@ _POWERSHELL_RANGE_RE = re.compile(
 _POWERSHELL_SCOPE_RE = re.compile(r"^(?:global|local|private|script):", re.IGNORECASE)
 
 
+_SYNTAX_TREES = threading.local()
+
+
+def _parse_syntax(parser: Parser, source: bytes) -> Tree:
+    """Reuse syntax within one worker, without retaining checkout state."""
+    grammar = parser.language
+    if grammar is None or len(source) > 32_768:
+        return parser.parse(source)
+    cache: OrderedDict[tuple[Language, bytes], Tree]
+    if not hasattr(_SYNTAX_TREES, "cache"):
+        _SYNTAX_TREES.cache = OrderedDict()
+    cache = _SYNTAX_TREES.cache
+    key = (grammar, source)
+    if key in cache:
+        cache.move_to_end(key)
+        return cache[key]
+    tree = parser.parse(source)
+    cache[key] = tree
+    if len(cache) > 64:
+        cache.popitem(last=False)
+    return tree
+
+
 class CodeParser:
     """Parses source files using Tree-sitter and extracts structural information."""
 
@@ -4140,7 +4165,7 @@ class CodeParser:
                 cpp_parser = self._get_parser("cpp")
                 if cpp_parser is not None:
                     cpp_source = self._mask_cpp_qt_macros(source)
-                    cpp_tree = cpp_parser.parse(cpp_source)
+                    cpp_tree = _parse_syntax(cpp_parser, cpp_source)
                     if self._has_cpp_header_evidence(cpp_tree.root_node):
                         language = "cpp"
                         parser = cpp_parser
@@ -4251,7 +4276,7 @@ class CodeParser:
             return [], []
 
         if tree is None:
-            tree = parser.parse(parse_source)
+            tree = _parse_syntax(parser, parse_source)
         nodes: list[NodeInfo] = []
         edges: list[EdgeInfo] = []
         file_path_str = normalize_file_path(path)
