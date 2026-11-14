@@ -66,6 +66,7 @@ def initialize_bindings(conn: sqlite3.Connection) -> None:
             repository TEXT NOT NULL,
             content_digest TEXT NOT NULL,
             profile_digest TEXT NOT NULL,
+            indexed INTEGER NOT NULL DEFAULT 0 CHECK (indexed IN (0, 1)),
             UNIQUE (repository, content_digest, profile_digest)
         )
     """)
@@ -142,6 +143,10 @@ def ensure_indexed_generation(
     """Persist the indexed manifest in the pending publication transaction."""
     files = indexed_file_manifest(repo_root, store)
     generation = ensure_generation(conn, repository, content_identity(files), profile_digest)
+    if conn.execute(
+        "SELECT indexed FROM graph_generations WHERE id = ?", (generation,),
+    ).fetchone()[0]:
+        return generation
     versions = [(path, digest.lower()) for path, digest in files.items()]
     conn.executemany(
         "INSERT INTO indexed_file_versions (path, digest) VALUES (?, ?) "
@@ -183,6 +188,7 @@ def ensure_indexed_generation(
                 for ordinal, edge in enumerate(store.iter_file_edges(str(root / path)))
             ),
         )
+    conn.execute("UPDATE graph_generations SET indexed = 1 WHERE id = ?", (generation,))
     return generation
 
 

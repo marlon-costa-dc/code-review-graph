@@ -87,9 +87,13 @@ def test_shared_generations_reuse_sibling_content_and_isolate_wip(tmp_path: Path
         generation = ensure_indexed_generation(
             shared, repository="repo", profile_digest="default", repo_root=repo, store=left,
         )
-        assert ensure_indexed_generation(
-            shared, repository="repo", profile_digest="default", repo_root=linked, store=right,
-        ) == generation
+        with (
+            patch.object(right, "iter_nodes_by_file", side_effect=AssertionError("reread nodes")),
+            patch.object(right, "iter_file_edges", side_effect=AssertionError("reread edges")),
+        ):
+            assert ensure_indexed_generation(
+                shared, repository="repo", profile_digest="default", repo_root=linked, store=right,
+            ) == generation
         assert publish_binding(shared, str(repo.resolve()), generation, expected_revision=0)
         assert publish_binding(shared, str(linked.resolve()), generation, expected_revision=0)
         shared.commit()
