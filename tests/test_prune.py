@@ -144,11 +144,14 @@ def test_watch_config_round_trips_per_repo_options(home: Path, tmp_path: Path) -
     live.mkdir()
     (live / ".git").mkdir()
 
+    tuned_root = tmp_path / "tuned"
+    (tuned_root / ".git").mkdir(parents=True)
+
     config = DaemonConfig(
         repos=[
             WatchRepo(path=str(live), alias="plain"),
             WatchRepo(
-                path=str(live),
+                path=str(tuned_root),
                 alias="tuned",
                 data_dir="/tmp/ext-data",
                 recurse_submodules=True,

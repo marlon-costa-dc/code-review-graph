@@ -3002,6 +3002,7 @@ def full_build(
             ``CRG_FOLLOW_SYMLINKS`` env var. Default: off.
     """
     repo_root = _canonical_repo_root(repo_root)
+    _assert_graph_matches_root(repo_root, store)
     parser = _get_code_parser_cls()(repo_root)
     files, followed, followed_dirs = _collect_files(
         repo_root, recurse_submodules, follow_symlinks,
@@ -3721,19 +3722,21 @@ class _WatchDebouncer(threading.Thread):
     unconditionally, so an event or a stop that arrives between ``start()``
     and that first wait is notified to nobody and then slept on.  The
     observer starts before startup work, so that event can be the only one.
+    Identical immutable events share one queue entry; reconciliation reads the
+    current filesystem rather than replaying each notification.
     """
 
     def __init__(self, interval: float, callback: Callable[[list[Any]], None]) -> None:
         super().__init__(name="crg-watch-debouncer", daemon=True)
         self._interval = interval
         self._callback = callback
-        self._events: list[Any] = []
+        self._events: dict[Any, None] = {}
         self._stopping = False
         self._cond = threading.Condition()
 
     def handle_event(self, event: Any) -> None:
         with self._cond:
-            self._events.append(event)
+            self._events[event] = None
             self._cond.notify()
 
     def requeue(self, events: list[Any]) -> None:
@@ -3743,7 +3746,7 @@ class _WatchDebouncer(threading.Thread):
         with the condition released, so a stop still gets through meanwhile.
         """
         with self._cond:
-            self._events[:0] = events
+            self._events = dict.fromkeys(events) | self._events
             self._cond.notify()
 
     def stop(self) -> None:
@@ -3764,7 +3767,8 @@ class _WatchDebouncer(threading.Thread):
                             break
                 if self._stopping:
                     break
-                events, self._events = self._events, []
+                events = list(self._events)
+                self._events.clear()
                 # Called with the condition held, as watchdog does: events
                 # arriving meanwhile wait in handle_event for the next batch.
                 self._callback(events)

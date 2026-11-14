@@ -276,10 +276,15 @@ def _watch_targets(
                     current = previous
                 if now - current.last_active >= repo.activity_ttl_seconds:
                     stamp = worktree_edit_stamp(checkout.root)
-                    if current.idle_stamp is None or stamp == current.idle_stamp:
-                        discovered[alias] = replace(current, idle_stamp=stamp)
+                    if current.idle_stamp is None:
+                        # Keep the observer through one more reconciliation.
+                        # Edits after this baseline must survive retirement.
+                        current = replace(current, idle_stamp=stamp)
+                    elif stamp == current.idle_stamp:
+                        discovered[alias] = current
                         continue
-                    current = replace(current, last_active=now, idle_stamp=None)
+                    else:
+                        current = replace(current, last_active=now, idle_stamp=None)
                 discovered[alias] = current
             targets[alias] = replace(
                 repo, path=path, alias=alias, data_dir="", discover_worktrees=False,
@@ -360,6 +365,7 @@ def load_config(path: Path | None = None) -> DaemonConfig:
     # -- [[repos]] array ----------------------------------------------------
     repos: list[WatchRepo] = []
     seen_aliases: set[str] = set()
+    seen_paths: dict[Path, str] = {}
 
     for entry in raw.get("repos", []):
         repo_path_str: str = entry.get("path", "")
@@ -391,7 +397,12 @@ def load_config(path: Path | None = None) -> DaemonConfig:
             logger.warning("Skipping duplicate alias '%s' for repo %s", alias, repo_path)
             continue
 
+        if repo_path in seen_paths:
+            raise ValueError(
+                f"Checkout {repo_path} is configured twice: {seen_paths[repo_path]} and {alias}"
+            )
         seen_aliases.add(alias)
+        seen_paths[repo_path] = alias
         ttl = entry.get("activity_ttl_seconds", 0)
         if type(ttl) is not int or ttl < 0:
             raise ValueError(f"Invalid activity_ttl_seconds for {alias}: expected non-negative int")
@@ -1210,6 +1221,12 @@ class ConfigWatcher:
             class _Handler(FileSystemEventHandler):  # type: ignore[misc]
                 def on_modified(self, event: Any) -> None:
                     if Path(event.src_path).resolve() == watcher._config_path.resolve():
+                        watcher._on_config_changed()
+
+                on_created = on_modified
+
+                def on_moved(self, event: Any) -> None:
+                    if Path(event.dest_path).resolve() == watcher._config_path.resolve():
                         watcher._on_config_changed()
 
             handler = _Handler()
