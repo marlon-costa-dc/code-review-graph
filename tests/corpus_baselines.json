@@ -1,0 +1,202 @@
+{
+  "_generated_by": "python -m tests.real_repo_corpus --record",
+  "bands": {
+    "_rationale": "A pinned commit parsed by a fixed build is deterministic, so these bands do not model measurement noise. They model how much intentional change the project may make before the baseline has to be re-recorded. Low factors are tight because losing nodes, files or edges is always a regression; high factors are loose because adding extraction is the normal direction of travel. build_seconds is the exception: wall clock varies with the machine, so its budget is set to catch an algorithmic blow-up, not a slower runner.",
+    "_files_parsed": "The inventory of a fixed commit only moves when the ignore rules or the supported-extension list change. -2% is 'must not lose files'; +25% leaves room for a newly supported extension.",
+    "_total_nodes": "-8% is several hundred nodes on every repo here, far outside any legitimate tidy-up; +40% admits a whole new node kind without a forced re-record but still catches runaway duplication.",
+    "_total_edges": "Wider than nodes in both directions because resolvers routinely trade edges for precision: -10% still means one relationship in ten stopped being recorded.",
+    "_resolved_edge_share": "A floor in percentage points, not a ratio, so a repo that starts near 0.20 and one near 0.60 get the same absolute protection. 5pp is roughly a thousand edges on the larger repos.",
+    "_build_seconds": "max(3x, +20s): 3x catches a quadratic resolver; the +20s term keeps the sub-2-second repos from failing on scheduler noise.",
+    "files_parsed_low": 0.98,
+    "files_parsed_high": 1.25,
+    "total_nodes_low": 0.92,
+    "total_nodes_high": 1.4,
+    "total_edges_low": 0.9,
+    "total_edges_high": 1.5,
+    "file_nodes_low": 0.98,
+    "file_nodes_high": 1.25,
+    "resolved_edge_share_drop": 0.05,
+    "imports_resolved_share_drop": 0.05,
+    "build_seconds_multiplier": 3.0,
+    "build_seconds_floor": 20.0
+  },
+  "repos": {
+    "fastapi": {
+      "repo": "fastapi",
+      "language": "python",
+      "commit": "22381558446c5d1ac376680a6581dd63b3a04119",
+      "files_parsed": 1182,
+      "parse_errors": 0,
+      "files_without_nodes": 0,
+      "total_nodes": 10804,
+      "total_edges": 36969,
+      "file_nodes": 1182,
+      "resolved_edge_share": 0.5684,
+      "imports_resolved_share": 0.4691,
+      "dangling_contains_edges": 0,
+      "control_char_names": 0,
+      "build_seconds": 5.45,
+      "languages": [
+        "bash",
+        "html",
+        "javascript",
+        "python",
+        "yaml"
+      ]
+    },
+    "gin": {
+      "repo": "gin",
+      "language": "go",
+      "commit": "5c00df8afadd06cc5be530dde00fe6d9fa4a2e4a",
+      "files_parsed": 109,
+      "parse_errors": 0,
+      "files_without_nodes": 0,
+      "total_nodes": 1870,
+      "total_edges": 17530,
+      "file_nodes": 109,
+      "resolved_edge_share": 0.5216,
+      "imports_resolved_share": 0.0,
+      "dangling_contains_edges": 1,
+      "control_char_names": 0,
+      "build_seconds": 2.5,
+      "languages": [
+        "go",
+        "yaml"
+      ]
+    },
+    "zod": {
+      "repo": "zod",
+      "language": "typescript",
+      "commit": "59bbc03e10c636b9eb3c393dfeb552819774ec21",
+      "files_parsed": 577,
+      "parse_errors": 0,
+      "files_without_nodes": 0,
+      "total_nodes": 8629,
+      "total_edges": 99923,
+      "file_nodes": 577,
+      "resolved_edge_share": 0.5367,
+      "imports_resolved_share": 0.6553,
+      "dangling_contains_edges": 0,
+      "control_char_names": 0,
+      "build_seconds": 13.9,
+      "languages": [
+        "bash",
+        "html",
+        "javascript",
+        "json",
+        "tsx",
+        "typescript",
+        "yaml"
+      ]
+    },
+    "gson": {
+      "repo": "gson",
+      "language": "java",
+      "commit": "854c8255b625cf1e13c701a83ea9ccb4caaa576a",
+      "files_parsed": 273,
+      "parse_errors": 0,
+      "files_without_nodes": 0,
+      "total_nodes": 4736,
+      "total_edges": 47834,
+      "file_nodes": 273,
+      "resolved_edge_share": 0.6223,
+      "imports_resolved_share": 0.3407,
+      "dangling_contains_edges": 0,
+      "control_char_names": 0,
+      "build_seconds": 10.75,
+      "languages": [
+        "java",
+        "json",
+        "yaml"
+      ]
+    },
+    "newtonsoft-json": {
+      "repo": "newtonsoft-json",
+      "language": "csharp",
+      "commit": "09bb545d72969ad7fb4ea07db0d5c34f4fc07877",
+      "files_parsed": 977,
+      "parse_errors": 0,
+      "files_without_nodes": 0,
+      "total_nodes": 10491,
+      "total_edges": 76920,
+      "file_nodes": 977,
+      "resolved_edge_share": 0.5286,
+      "imports_resolved_share": 0.0,
+      "dangling_contains_edges": 0,
+      "control_char_names": 0,
+      "build_seconds": 20.57,
+      "languages": [
+        "csharp",
+        "json",
+        "powershell",
+        "yaml"
+      ]
+    },
+    "ripgrep": {
+      "repo": "ripgrep",
+      "language": "rust",
+      "commit": "3fce3b5bb0236da2df6d99672afb8a719642eca7",
+      "files_parsed": 125,
+      "parse_errors": 0,
+      "files_without_nodes": 0,
+      "total_nodes": 3755,
+      "total_edges": 29431,
+      "file_nodes": 125,
+      "resolved_edge_share": 0.4705,
+      "imports_resolved_share": 0.2281,
+      "dangling_contains_edges": 17,
+      "control_char_names": 0,
+      "build_seconds": 3.52,
+      "languages": [
+        "bash",
+        "lua",
+        "python",
+        "ruby",
+        "rust",
+        "yaml"
+      ]
+    },
+    "sinatra": {
+      "repo": "sinatra",
+      "language": "ruby",
+      "commit": "cb22afd7902b566b6eaba6c4ea89739494a65d12",
+      "files_parsed": 159,
+      "parse_errors": 0,
+      "files_without_nodes": 0,
+      "total_nodes": 3268,
+      "total_edges": 24701,
+      "file_nodes": 159,
+      "resolved_edge_share": 0.558,
+      "imports_resolved_share": 0.3138,
+      "dangling_contains_edges": 0,
+      "control_char_names": 0,
+      "build_seconds": 2.14,
+      "languages": [
+        "liquid",
+        "ruby",
+        "yaml"
+      ]
+    },
+    "guzzle": {
+      "repo": "guzzle",
+      "language": "php",
+      "commit": "93939470950a9b11e2e84204166ef5e048c55fe4",
+      "files_parsed": 145,
+      "parse_errors": 0,
+      "files_without_nodes": 0,
+      "total_nodes": 3451,
+      "total_edges": 43658,
+      "file_nodes": 145,
+      "resolved_edge_share": 0.5769,
+      "imports_resolved_share": 0.4505,
+      "dangling_contains_edges": 0,
+      "control_char_names": 0,
+      "build_seconds": 6.45,
+      "languages": [
+        "json",
+        "php",
+        "yaml"
+      ]
+    }
+  }
+}

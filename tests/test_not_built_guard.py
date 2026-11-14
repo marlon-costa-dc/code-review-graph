@@ -212,7 +212,11 @@ def test_semantic_search_built_no_match_is_not_guarded(tmp_path):
 
 
 def test_semantic_search_without_embeddings_reports_lexical_mode(tmp_path):
+    from code_review_graph.search import rebuild_fts_index
+
     _make_built_repo(tmp_path)
+    with GraphStore(tmp_path / ".code-review-graph" / "graph.db") as store:
+        rebuild_fts_index(store)
     result = semantic_search_nodes("hello", repo_root=str(tmp_path))
     assert result["status"] == "ok"
     assert result["search_mode"] == "fts"

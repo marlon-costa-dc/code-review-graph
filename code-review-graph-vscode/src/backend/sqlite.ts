@@ -182,8 +182,9 @@ export class SqliteReader {
   }
 
   constructor(dbPath: string) {
+    // The Python side sets WAL mode. A read-only open cannot change the
+    // journal mode, and trying fails with SQLITE_READONLY.
     this.db = new Database(dbPath, { readonly: true });
-    this.db.pragma('journal_mode = WAL');
     this.db.pragma('busy_timeout = 5000');
   }
 
@@ -212,7 +213,7 @@ export class SqliteReader {
         if (row) {
           const version = parseInt(row.value, 10);
           // Must match LATEST_VERSION in code_review_graph/migrations.py
-          const SUPPORTED_SCHEMA_VERSION = 10;
+          const SUPPORTED_SCHEMA_VERSION = 15;
           if (!isNaN(version) && version > SUPPORTED_SCHEMA_VERSION) {
             return `Database was created with a newer version (schema v${version}). Update the extension.`;
           }

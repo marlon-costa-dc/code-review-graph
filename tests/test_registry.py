@@ -1,11 +1,24 @@
 """Tests for multi-repo registry and connection pool."""
 
+import asyncio
+import json
+import multiprocessing
 import sqlite3
 import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from code_review_graph.registry import ConnectionPool, Registry, resolve_repo
+from code_review_graph.tools.registry_tools import _echoed, _select_repos
+
+
+def _register_after_barrier(registry_path, repo, ready):
+    """Use independent public registry instances before either process writes."""
+    registry = Registry(path=registry_path)
+    ready.wait(timeout=20)
+    registry.register(str(repo), data_dir=str(repo / "graph-data"))
 
 
 class TestRegistry:
@@ -128,6 +141,107 @@ class TestRegistry:
         repos = registry2.list_repos()
         assert len(repos) == 1
         assert repos[0]["alias"] == "persistent"
+
+    def test_existing_instances_preserve_each_others_registrations(self):
+        """An instance created earlier must refresh before writing or reading."""
+        second = Registry(path=self.registry_path)
+        self.registry.register(str(self.repo1), alias="first")
+        second.register(str(self.repo2), alias="second")
+
+        expected = {str(self.repo1.resolve()), str(self.repo2.resolve())}
+        assert {row["path"] for row in self.registry.list_repos()} == expected
+        assert {row["path"] for row in second.list_repos()} == expected
+
+    def test_processes_preserve_all_external_data_directories(self):
+        """Concurrent builds must not lose another checkout's registry entry."""
+        context = multiprocessing.get_context("spawn")
+        repositories = (self.repo1, self.repo2)
+        ready = context.Barrier(len(repositories))
+        processes = [
+            context.Process(
+                target=_register_after_barrier,
+                args=(self.registry_path, repo, ready),
+            )
+            for repo in repositories
+        ]
+        started = []
+        try:
+            for process in processes:
+                process.start()
+                started.append(process)
+            for process in started:
+                process.join(timeout=25)
+                assert process.exitcode == 0
+        finally:
+            for process in started:
+                if process.is_alive():
+                    process.terminate()
+                process.join(timeout=5)
+
+        registry = Registry(path=self.registry_path)
+        assert {
+            row["path"]: row["data_dir"] for row in registry.list_repos()
+        } == {
+            str(repo.resolve()): str((repo / "graph-data").resolve())
+            for repo in repositories
+        }
+
+    def test_corrupt_registry_is_not_replaced(self):
+        """A corrupt file must fail before any registration can discard it."""
+        import pytest
+
+        original = b'{"repos": [invalid]}\n'
+        self.registry_path.write_bytes(original)
+        with pytest.raises(json.JSONDecodeError):
+            Registry(path=self.registry_path)
+        assert self.registry_path.read_bytes() == original
+
+    def test_existing_instance_does_not_overwrite_corrupt_registry(self):
+        """Reload errors must escape before an existing instance can write."""
+        original = b'{"repos": [invalid]}\n'
+        self.registry_path.write_bytes(original)
+
+        with pytest.raises(json.JSONDecodeError):
+            self.registry.register(str(self.repo1), alias="must-not-write")
+
+        assert self.registry_path.read_bytes() == original
+
+    def test_unchanged_registration_preserves_file_identity(self):
+        """Repeating the same registration must leave the published file alone."""
+        self.registry.register(str(self.repo1), alias="same")
+        before = self.registry_path.stat()
+        original = self.registry_path.read_bytes()
+
+        self.registry.register(str(self.repo1), alias="same")
+
+        after = self.registry_path.stat()
+        assert self.registry_path.read_bytes() == original
+        assert (after.st_dev, after.st_ino, after.st_mtime_ns) == (
+            before.st_dev, before.st_ino, before.st_mtime_ns
+        )
+
+    @pytest.mark.parametrize("create", [False, True])
+    def test_corrupt_registry_does_not_select_another_graph(
+        self, tmp_path, monkeypatch, create
+    ):
+        """A broken registry must not redirect graph consumers to another path."""
+        from code_review_graph.incremental import get_data_dir
+
+        registry_home = tmp_path / "registry-home"
+        registry_home.mkdir()
+        registry_path = registry_home / "registry.json"
+        original = b'{"repos": [invalid]}\n'
+        registry_path.write_bytes(original)
+        alternative = tmp_path / "alternative"
+        monkeypatch.setenv("CRG_HOME", str(registry_home))
+        monkeypatch.setenv("CRG_DATA_DIR", str(alternative))
+
+        with pytest.raises(json.JSONDecodeError):
+            get_data_dir(self.repo1, create=create)
+
+        assert registry_path.read_bytes() == original
+        assert not alternative.exists()
+        assert not (self.repo1 / ".code-review-graph").exists()
 
     def test_resolve_by_alias(self):
         """resolve_repo resolves alias to path."""
@@ -314,6 +428,309 @@ class TestCrossRepoSearch:
         ]
         assert result["summary"] == "Found 4 result(s) across 2 repo(s) for 'splash'"
         assert [call.kwargs["limit"] for call in mock_search.call_args_list] == [2, 2]
+        assert "unknown" not in result
+
+    def _three_repo_registry(self, tmp_path):
+        """Three registered repos, one of them addressed only by folder name."""
+        entries = []
+        for folder, alias in (("android", "android"), ("ios", "ios"), ("web", None)):
+            repo = tmp_path / folder
+            repo.mkdir()
+            db = tmp_path / f"{folder}.db"
+            db.touch()
+            entry = {"path": str(repo)}
+            if alias:
+                entry["alias"] = alias
+            entries.append((entry, db))
+        return entries
+
+    def test_cross_repo_search_repos_limits_the_registry_fanout(self, tmp_path):
+        """``repos`` searches only the named repos, by alias or folder name."""
+        from code_review_graph.tools import cross_repo_search_func
+
+        entries = self._three_repo_registry(tmp_path)
+        ios_results = [{"name": "SplashViewController", "score": 3.0}]
+        web_results = [{"name": "SplashBanner", "score": 0.5}]
+
+        with (
+            patch("code_review_graph.registry.Registry") as mock_registry_cls,
+            patch(
+                "code_review_graph.tools.registry_tools.get_db_path",
+                side_effect=[entries[1][1], entries[2][1]],
+            ),
+            patch("code_review_graph.tools.registry_tools.GraphStore") as mock_store_cls,
+            patch(
+                "code_review_graph.tools.registry_tools.hybrid_search",
+                side_effect=[ios_results, web_results],
+            ) as mock_search,
+        ):
+            mock_registry_cls.return_value.list_repos.return_value = [
+                entry for entry, _ in entries
+            ]
+            mock_store_cls.side_effect = [MagicMock(), MagicMock()]
+
+            result = cross_repo_search_func(query="splash", repos=["web", "ios"])
+
+        # Only the two named repos are opened at all: android never reaches search.
+        assert mock_search.call_count == 2
+        assert result["repos_searched"] == ["ios", "web"]
+        assert [item["repo"] for item in result["results"]] == ["ios", "web"]
+        assert result["unknown"] == []
+
+    def test_cross_repo_search_reports_names_that_match_no_repo(self, tmp_path):
+        """Unknown names are reported, not silently dropped."""
+        from code_review_graph.tools import cross_repo_search_func
+
+        entries = self._three_repo_registry(tmp_path)
+
+        with (
+            patch("code_review_graph.registry.Registry") as mock_registry_cls,
+            patch(
+                "code_review_graph.tools.registry_tools.get_db_path",
+                side_effect=[entries[0][1]],
+            ),
+            patch("code_review_graph.tools.registry_tools.GraphStore") as mock_store_cls,
+            patch(
+                "code_review_graph.tools.registry_tools.hybrid_search",
+                side_effect=[[{"name": "Splash", "score": 0.03}]],
+            ),
+        ):
+            mock_registry_cls.return_value.list_repos.return_value = [
+                entry for entry, _ in entries
+            ]
+            mock_store_cls.side_effect = [MagicMock()]
+
+            result = cross_repo_search_func(
+                query="splash", repos=["android", "desktop"]
+            )
+
+        assert result["status"] == "ok"
+        assert result["repos_searched"] == ["android"]
+        assert result["unknown"] == ["desktop"]
+
+    def test_cross_repo_search_repos_matching_nothing_searches_nothing(self, tmp_path):
+        """A selection that matches no entry returns empty, never the whole registry."""
+        from code_review_graph.tools import cross_repo_search_func
+
+        entries = self._three_repo_registry(tmp_path)
+
+        with (
+            patch("code_review_graph.registry.Registry") as mock_registry_cls,
+            patch(
+                "code_review_graph.tools.registry_tools.hybrid_search"
+            ) as mock_search,
+        ):
+            mock_registry_cls.return_value.list_repos.return_value = [
+                entry for entry, _ in entries
+            ]
+
+            result = cross_repo_search_func(query="splash", repos=["desktop"])
+
+        assert result["status"] == "ok"
+        assert result["results"] == []
+        assert result["repos_searched"] == []
+        assert result["unknown"] == ["desktop"]
+        mock_search.assert_not_called()
+
+    def test_cross_repo_search_repos_cannot_reorder_the_merge(self, tmp_path):
+        """Selection order does not change the registry-order tie-breaker."""
+        from code_review_graph.tools import cross_repo_search_func
+
+        entries = self._three_repo_registry(tmp_path)
+        android_results = [{"name": "Splash", "score": 0.03}]
+        ios_results = [{"name": "SplashViewController", "score": 3.0}]
+
+        with (
+            patch("code_review_graph.registry.Registry") as mock_registry_cls,
+            patch(
+                "code_review_graph.tools.registry_tools.get_db_path",
+                side_effect=[entries[0][1], entries[1][1]],
+            ),
+            patch("code_review_graph.tools.registry_tools.GraphStore") as mock_store_cls,
+            patch(
+                "code_review_graph.tools.registry_tools.hybrid_search",
+                side_effect=[android_results, ios_results],
+            ),
+        ):
+            mock_registry_cls.return_value.list_repos.return_value = [
+                entry for entry, _ in entries
+            ]
+            mock_store_cls.side_effect = [MagicMock(), MagicMock()]
+
+            result = cross_repo_search_func(query="splash", repos=["ios", "android"])
+
+        assert [item["repo"] for item in result["results"]] == ["android", "ios"]
+
+    def test_cross_repo_search_tool_forwards_repo_selection(self):
+        """The MCP tool passes ``repos`` through, and defaults it to None."""
+        from code_review_graph import main as crg_main
+        from code_review_graph.main import cross_repo_search_tool
+
+        with patch.object(
+            crg_main, "cross_repo_search_func", return_value={"status": "ok"}
+        ) as mock_func:
+            underlying = (
+                getattr(cross_repo_search_tool, "fn", None) or cross_repo_search_tool
+            )
+            asyncio.run(underlying(query="splash", repos=["android"]))
+            asyncio.run(underlying(query="splash"))
+
+        forwarded = [call.kwargs["repos"] for call in mock_func.call_args_list]
+        assert forwarded == [["android"], None]
+
+
+class TestCrossRepoSearchEchoBounds:
+    """The caller-supplied ``repos`` echo is bounded like every other list."""
+
+    ENTRIES = [{"path": "/src/android", "alias": "droid"}]
+
+    def _run(self, names):
+        from code_review_graph.tools import cross_repo_search_func
+
+        with patch("code_review_graph.registry.Registry") as mock_registry_cls:
+            mock_registry_cls.return_value.list_repos.return_value = self.ENTRIES
+            return cross_repo_search_func(query="splash", repos=names)
+
+    def test_unknown_list_is_capped_and_reports_the_real_total(self):
+        result = self._run(["nope%d" % i for i in range(500)])
+
+        assert len(result["unknown"]) == 20
+        assert result["unknown_total"] == 500
+        assert result["unknown_truncated"] is True
+
+    def test_summary_carries_a_count_not_the_caller_s_names(self):
+        result = self._run(["z" * 500] * 100)
+
+        assert "z" * 500 not in result["summary"]
+        assert "100 name(s)" in result["summary"]
+
+    def test_echoed_names_are_sanitised_like_every_other_name(self):
+        result = self._run(["ev" + chr(0) + "il" + chr(7)])
+
+        assert result["unknown"] == ["evil"]
+
+    def test_a_dropped_name_reaches_the_summary_of_a_partial_match(self, tmp_path):
+        """The partial branch says so too, not only the all-unknown branch."""
+        from code_review_graph.tools import cross_repo_search_func
+
+        repo = tmp_path / "android"
+        repo.mkdir()
+        db = tmp_path / "android.db"
+        db.touch()
+
+        with (
+            patch("code_review_graph.registry.Registry") as mock_registry_cls,
+            patch(
+                "code_review_graph.tools.registry_tools.get_db_path",
+                side_effect=[db],
+            ),
+            patch("code_review_graph.tools.registry_tools.GraphStore") as mock_store_cls,
+            patch(
+                "code_review_graph.tools.registry_tools.hybrid_search",
+                side_effect=[[{"name": "Splash", "score": 0.03}]],
+            ),
+        ):
+            mock_registry_cls.return_value.list_repos.return_value = [
+                {"path": str(repo), "alias": "droid"},
+            ]
+            mock_store_cls.side_effect = [MagicMock()]
+
+            result = cross_repo_search_func(
+                query="splash", repos=["droid", "nope"]
+            )
+
+        assert result["unknown"] == ["nope"]
+        assert "1 name(s) matched no repository" in result["summary"]
+
+
+class TestEchoedNames:
+    """Direct tests for the bound-and-sanitise helper behind the name echoes."""
+
+    def test_echoed_caps_the_list_and_reports_the_real_total(self):
+        shown, total, truncated = _echoed(["n%d" % i for i in range(100)])
+
+        assert len(shown) == 20
+        assert total == 100
+        assert truncated is True
+
+    def test_echoed_leaves_a_short_list_whole(self):
+        shown, total, truncated = _echoed(["a", "b"])
+
+        assert shown == ["a", "b"]
+        assert total == 2
+        assert truncated is False
+
+    def test_echoed_strips_control_characters_and_caps_length(self):
+        shown, _, _ = _echoed([chr(0) + "ev" + chr(7) + "il", "z" * 500])
+
+        assert shown[0] == "evil"
+        assert len(shown[1]) == 256
+
+
+class TestSelectRepos:
+    """Direct tests for the registry selection helper behind ``repos``."""
+
+    ENTRIES = [
+        {"path": "/src/android", "alias": "droid"},
+        {"path": "/src/ios"},
+        {"path": "/src/web", "alias": "frontend"},
+    ]
+
+    def test_select_repos_matches_alias_then_folder_name(self):
+        selected, unknown, ambiguous = _select_repos(self.ENTRIES, ["droid", "ios"])
+
+        assert [entry["path"] for entry in selected] == ["/src/android", "/src/ios"]
+        assert unknown == []
+        assert ambiguous == []
+
+    def test_select_repos_keeps_registry_order(self):
+        selected, _, _ = _select_repos(self.ENTRIES, ["frontend", "droid"])
+
+        assert [entry["path"] for entry in selected] == ["/src/android", "/src/web"]
+
+    def test_select_repos_reports_unknown_names(self):
+        selected, unknown, _ = _select_repos(
+            self.ENTRIES, ["droid", "desktop", "tv"]
+        )
+
+        assert [entry["path"] for entry in selected] == ["/src/android"]
+        assert unknown == ["desktop", "tv"]
+
+    def test_select_repos_deduplicates_alias_and_folder_of_one_repo(self):
+        """A repo named twice, once by alias and once by folder, is searched once."""
+        selected, unknown, _ = _select_repos(self.ENTRIES, ["droid", "android"])
+
+        assert [entry["path"] for entry in selected] == ["/src/android"]
+        assert unknown == []
+
+    def test_select_repos_selects_every_repo_sharing_a_folder_name(self):
+        """Sibling checkouts with one folder name are all searched, and flagged."""
+        entries = [
+            {"path": "/work/acme/api", "alias": "acme"},
+            {"path": "/work/beta/api", "alias": "beta"},
+        ]
+
+        selected, unknown, ambiguous = _select_repos(entries, ["api"])
+
+        assert [entry["path"] for entry in selected] == [
+            "/work/acme/api",
+            "/work/beta/api",
+        ]
+        assert unknown == []
+        assert ambiguous == ["api"]
+
+    def test_select_repos_prefers_an_explicit_alias_over_a_folder_name(self):
+        """An alias beats another entry's incidental folder name of the same text."""
+        entries = [
+            {"path": "/a/web"},
+            {"path": "/b/frontend", "alias": "web"},
+        ]
+
+        selected, unknown, ambiguous = _select_repos(entries, ["web"])
+
+        assert [entry["path"] for entry in selected] == ["/b/frontend"]
+        assert unknown == []
+        assert ambiguous == []
 
 
 class TestSetDataDir:

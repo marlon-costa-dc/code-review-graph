@@ -10,6 +10,7 @@ import ast
 import hashlib
 import html
 import importlib
+import importlib.util
 import json
 import logging
 import math
@@ -18,36 +19,45 @@ import re
 import subprocess
 import sys
 import threading
-from bisect import bisect_right
+from bisect import bisect_left, bisect_right
+from collections import deque
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path, PurePath
 from typing import Any, NamedTuple, Optional
 
-if sys.version_info >= (3, 11):
+try:
     import tomllib
-else:
-    import tomli as tomllib
+except ModuleNotFoundError:  # pragma: no cover - Python 3.10
+    import tomli as tomllib  # type: ignore[import-not-found,no-redef]
+
+import yaml as _yaml  # type: ignore[import-untyped]
+from yaml import MappingNode as _YamlMapping
+from yaml import ScalarNode as _YamlScalar
+from yaml import SequenceNode as _YamlSequence
+from yaml.events import AliasEvent as _YamlAliasEvent  # type: ignore[import-untyped]
 
 from .config_keys import is_spring_config_path, normalize_spring_config_key
+from .constants import (
+    IMPORT_CONTEXT_DEFERRED,
+    IMPORT_CONTEXT_KEY,
+    IMPORT_CONTEXT_PARENT_PACKAGE,
+    IMPORT_CONTEXT_TYPE_ONLY,
+    IMPORT_SCOPE_KEY,
+    IMPORT_SCOPE_PACKAGE,
+    IMPORT_SCOPE_TREE,
+    normalize_file_path,
+    release_os_memory,
+)
 from .custom_languages import CustomLanguage, load_custom_languages
-
-try:
-    import yaml as _yaml
-    from yaml import MappingNode as _YamlMapping
-    from yaml import Node as _YamlNode
-    from yaml import ScalarNode as _YamlScalar
-    from yaml import SequenceNode as _YamlSequence
-except ImportError:
-    _yaml = None
-    _YamlMapping = _YamlNode = _YamlSequence = _YamlScalar = None
-
+from .npm_alias_resolver import NpmAliasResolver
 from .tsconfig_resolver import TsconfigResolver
+from .workspace_resolver import WorkspaceResolver
 
 
 class CellInfo(NamedTuple):
     """Represents a single cell in a notebook with its language."""
-
     cell_index: int
     language: str
     source: str
@@ -74,12 +84,93 @@ _PYTHON_STAR_CACHE_MAX = 15_000
 _PYTHON_STAR_EXPORT_CACHE: dict[tuple[str, int, int], dict[str, str]] = {}
 _PYTHON_STAR_EXPORT_CACHE_LOCK = threading.RLock()
 
+# ``{(module file, mtime, size): dotted module it installs as
+# sys.modules[__name__], or None}``. Process-wide like the star-export cache,
+# so parse workers and concurrent parsers read each module for this at most
+# once. See :meth:`CodeParser._python_module_alias`.
+_PYTHON_MODULE_ALIAS_CACHE: dict[tuple[str, int, int], Optional[str]] = {}
+_PYTHON_MODULE_ALIAS_CACHE_LOCK = threading.Lock()
+
+# ``{module file: {top-level def name: return annotation text}}``, keyed by
+# the module's mtime and size the way the star-export cache is. Only the text
+# of an annotation the module actually wrote is stored; nothing is inferred
+# from a function body.
+_PYTHON_RETURN_ANNOTATION_CACHE: dict[tuple[str, int, int], dict[str, str]] = {}
+_PYTHON_RETURN_ANNOTATION_CACHE_LOCK = threading.RLock()
+_PYTHON_PROPERTY_RETURN_ANNOTATION_CACHE: dict[
+    tuple[str, int, int], dict[tuple[str, str], str],
+] = {}
+_PYTHON_MODULE_CLASS_IDENTITY_CACHE: dict[
+    tuple[str, int, int], dict[str, tuple[str, str]],
+] = {}
+_PYTHON_MODULE_CLASS_IDENTITY_CACHE_LOCK = threading.RLock()
+
+# Marker separating expression-receiver evidence from name-receiver evidence
+# in the receiver-evidence map. ``\x00`` cannot occur in a Python identifier,
+# so the two key spaces cannot collide.
+_PY_EXPR_RECEIVER_KEY = "\x00expr:"
+_PY_CLASS_IDENTITY_PREFIX = "\x00python-class\x00"
+
+_PY_TUPLE_ANNOTATION_NAMES = frozenset({"Tuple", "tuple"})
+_PY_TARGET_PATTERN_TYPES = frozenset({
+    # ``a, b = ...`` parses as a pattern; ``with f() as (a, b)`` spells the
+    # same target as an ordinary tuple.
+    "list", "list_pattern", "pattern_list", "tuple", "tuple_pattern",
+})
+_PY_SPLAT_PATTERN_TYPES = frozenset({"list_splat", "list_splat_pattern"})
+
+
+def _python_qualified_class_identity(file_path: str, class_name: str) -> str:
+    """Keep a class's defining module attached to its receiver evidence."""
+    return f"{_PY_CLASS_IDENTITY_PREFIX}{file_path}\x00{class_name}"
+
+
+def _python_split_class_identity(
+    identity: str,
+) -> Optional[tuple[str, str]]:
+    if not identity.startswith(_PY_CLASS_IDENTITY_PREFIX):
+        return None
+    file_path, separator, class_name = identity[
+        len(_PY_CLASS_IDENTITY_PREFIX):
+    ].partition("\x00")
+    if not separator or not file_path or not class_name:
+        return None
+    return file_path, class_name
+
+
+class _PyReceiverContext(NamedTuple):
+    """Everything one Python file says about the names it binds.
+
+    Read-only for the duration of a parse: the declaration scan fills it in
+    once, then the scope walk consults it. ``symbol_origins`` is the only
+    field that can lead outside the file, and it leads only to a module the
+    file's own ``from`` statement names — never to a guess.
+    """
+
+    file_path: str
+    class_names: frozenset[str]
+    imported_names: frozenset[str]
+    module_bindings: dict[str, set[str]]
+    symbol_origins: dict[str, str]
+    symbol_names: dict[str, str]
+    local_returns: dict[str, str]
+    property_returns: dict[tuple[str, str], str]
+
+
+class _NodeGroup(NamedTuple):
+    """A stand-in parent for some of a tree-sitter node's children.
+
+    ``CodeParser._extract_from_tree`` only reads its root's ``children``, so a
+    group lets it visit a chosen subset exactly as a walk over the real parent
+    would have visited them.
+    """
+
+    children: list
+
 
 @lru_cache(maxsize=512)
 def _read_cargo_manifest(
-    manifest_path: str,
-    _mtime_ns: int,
-    _size: int,
+    manifest_path: str, _mtime_ns: int, _size: int,
 ) -> dict[str, Any]:
     """Read one Cargo manifest, keyed by immutable file identity metadata."""
     try:
@@ -106,39 +197,91 @@ class _PythonScopeBindingVisitor(ast.NodeVisitor):
     def __init__(self) -> None:
         self.names: set[str] = set()
 
-    def visit_Name(self, node: ast.Name) -> None:
+    def visit_Name(self, node: ast.Name) -> None:  # noqa: N802
         if isinstance(node.ctx, (ast.Store, ast.Del)):
             self.names.add(node.id)
 
-    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:  # noqa: N802
         self.names.add(node.name)
 
-    def visit_AsyncFunctionDef(
+    def visit_AsyncFunctionDef(  # noqa: N802
         self,
         node: ast.AsyncFunctionDef,
     ) -> None:
         self.names.add(node.name)
 
-    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:  # noqa: N802
         self.names.add(node.name)
 
-    def visit_Lambda(self, node: ast.Lambda) -> None:
+    def visit_Lambda(self, node: ast.Lambda) -> None:  # noqa: N802
         return
 
-    def visit_Import(self, node: ast.Import) -> None:
+    def visit_Import(self, node: ast.Import) -> None:  # noqa: N802
         for alias in node.names:
             self.names.add(alias.asname or alias.name.split(".", 1)[0])
 
-    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:  # noqa: N802
         for alias in node.names:
             if alias.name != "*":
                 self.names.add(alias.asname or alias.name)
+
+    def visit_Global(self, node: ast.Global) -> None:  # noqa: N802
+        self.names.update(node.names)
+
+def _python_function_scope_bindings(
+    source: bytes,
+) -> dict[tuple[int, int], tuple[frozenset[str], frozenset[str]]]:
+    """Return parameter and local names for each Python function position."""
+    try:
+        tree = ast.parse(source.decode("utf-8"))
+    except (SyntaxError, UnicodeDecodeError, ValueError):
+        return {}
+    scopes: dict[
+        tuple[int, int], tuple[frozenset[str], frozenset[str]],
+    ] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        arguments = node.args
+        parameter_names = {
+            argument.arg
+            for argument in (
+                *arguments.posonlyargs,
+                *arguments.args,
+                *arguments.kwonlyargs,
+            )
+        }
+        if arguments.vararg is not None:
+            parameter_names.add(arguments.vararg.arg)
+        if arguments.kwarg is not None:
+            parameter_names.add(arguments.kwarg.arg)
+        bindings = _PythonScopeBindingVisitor()
+        for statement in node.body:
+            bindings.visit(statement)
+        bindings.names.update(parameter_names)
+        scopes[(node.lineno, node.col_offset)] = (
+            frozenset(parameter_names), frozenset(bindings.names),
+        )
+    return scopes
 
 
 def _python_type_checking_aliases(
     tree: ast.Module,
 ) -> tuple[frozenset[str], frozenset[str]]:
     """Return unshadowed aliases for ``typing.TYPE_CHECKING``."""
+    has_typing_import = False
+    for statement in tree.body:
+        if isinstance(statement, ast.Import):
+            if any(alias.name == "typing" for alias in statement.names):
+                has_typing_import = True
+                break
+        elif isinstance(statement, ast.ImportFrom) and statement.module == "typing":
+            if any(alias.name == "TYPE_CHECKING" for alias in statement.names):
+                has_typing_import = True
+                break
+    if not has_typing_import:
+        return frozenset(), frozenset()
+
     names: set[str] = set()
     modules: set[str] = set()
     shadowed: set[str] = set()
@@ -208,8 +351,16 @@ def _python_static_truth(
     return None
 
 
+_TRY_STMT_TYPES: tuple[type[ast.AST], ...] = (
+    (ast.Try, ast.TryStar) if hasattr(ast, "TryStar") else (ast.Try,)
+)
+_MATCH_STMT_TYPES: tuple[type[ast.AST], ...] = (
+    (ast.Match,) if hasattr(ast, "Match") else ()
+)
+
+
 class _PythonUnreachableCallVisitor(ast.NodeVisitor):
-    """Collect calls inside branches whose condition is statically false."""
+    """Collect calls and attribute loads in statically unreachable branches."""
 
     def __init__(
         self,
@@ -221,13 +372,22 @@ class _PythonUnreachableCallVisitor(ast.NodeVisitor):
         self._type_checking_names = type_checking_names
         self._typing_modules = typing_modules
 
-    def visit_Call(self, node: ast.Call) -> None:
+    def visit_Module(self, node: ast.Module) -> None:  # noqa: N802
+        self._visit_statements(node.body, dead=False)
+
+    def visit_Call(self, node: ast.Call) -> None:  # noqa: N802
         if self._dead:
             self.positions.add((node.lineno, node.col_offset))
         self.generic_visit(node)
 
-    def visit_If(self, node: ast.If) -> None:
-        self.visit(node.test)
+    def visit_Attribute(self, node: ast.Attribute) -> None:  # noqa: N802
+        if self._dead:
+            self.positions.add((node.lineno, node.col_offset))
+        self.generic_visit(node)
+
+    def visit_If(self, node: ast.If) -> None:  # noqa: N802
+        if self._dead:
+            self.visit(node.test)
         truth = _python_static_truth(
             node.test,
             self._type_checking_names,
@@ -236,30 +396,32 @@ class _PythonUnreachableCallVisitor(ast.NodeVisitor):
         self._visit_statements(node.body, dead=truth is False)
         self._visit_statements(node.orelse, dead=truth is True)
 
-    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:  # noqa: N802
         self._visit_function(node)
 
-    def visit_AsyncFunctionDef(
+    def visit_AsyncFunctionDef(  # noqa: N802
         self,
         node: ast.AsyncFunctionDef,
     ) -> None:
         self._visit_function(node)
 
-    def visit_ClassDef(self, node: ast.ClassDef) -> None:
-        for decorator in node.decorator_list:
-            self.visit(decorator)
-        for base in node.bases:
-            self.visit(base)
-        for keyword in node.keywords:
-            self.visit(keyword.value)
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:  # noqa: N802
+        if self._dead:
+            for decorator in node.decorator_list:
+                self.visit(decorator)
+            for base in node.bases:
+                self.visit(base)
+            for keyword in node.keywords:
+                self.visit(keyword.value)
 
-        bindings = _PythonScopeBindingVisitor()
-        for statement in node.body:
-            bindings.visit(statement)
         outer_names = self._type_checking_names
         outer_modules = self._typing_modules
-        self._type_checking_names = outer_names - bindings.names
-        self._typing_modules = outer_modules - bindings.names
+        if outer_names or outer_modules:
+            bindings = _PythonScopeBindingVisitor()
+            for statement in node.body:
+                bindings.visit(statement)
+            self._type_checking_names = outer_names - bindings.names
+            self._typing_modules = outer_modules - bindings.names
         self._visit_statements(node.body, dead=False)
         self._type_checking_names = outer_names
         self._typing_modules = outer_modules
@@ -268,37 +430,49 @@ class _PythonUnreachableCallVisitor(ast.NodeVisitor):
         self,
         node: ast.FunctionDef | ast.AsyncFunctionDef,
     ) -> None:
-        for decorator in node.decorator_list:
-            self.visit(decorator)
-        for default in (*node.args.defaults, *node.args.kw_defaults):
-            if default is not None:
-                self.visit(default)
-        all_args = (
-            *node.args.posonlyargs,
-            *node.args.args,
-            *node.args.kwonlyargs,
-        )
-        for argument in all_args:
-            if argument.annotation is not None:
-                self.visit(argument.annotation)
-        for optional_argument in (node.args.vararg, node.args.kwarg):
-            if optional_argument is not None and optional_argument.annotation is not None:
-                self.visit(optional_argument.annotation)
-        if node.returns is not None:
-            self.visit(node.returns)
-
-        bindings = _PythonScopeBindingVisitor()
-        for statement in node.body:
-            bindings.visit(statement)
-        bindings.names.update(argument.arg for argument in all_args)
-        bindings.names.update(
-            argument.arg for argument in (node.args.vararg, node.args.kwarg) if argument is not None
-        )
+        if self._dead:
+            for decorator in node.decorator_list:
+                self.visit(decorator)
+            for default in (*node.args.defaults, *node.args.kw_defaults):
+                if default is not None:
+                    self.visit(default)
+            all_args = (
+                *node.args.posonlyargs,
+                *node.args.args,
+                *node.args.kwonlyargs,
+            )
+            for argument in all_args:
+                if argument.annotation is not None:
+                    self.visit(argument.annotation)
+            for optional_argument in (node.args.vararg, node.args.kwarg):
+                if (
+                    optional_argument is not None
+                    and optional_argument.annotation is not None
+                ):
+                    self.visit(optional_argument.annotation)
+            if node.returns is not None:
+                self.visit(node.returns)
+        else:
+            all_args = (
+                *node.args.posonlyargs,
+                *node.args.args,
+                *node.args.kwonlyargs,
+            )
 
         outer_names = self._type_checking_names
         outer_modules = self._typing_modules
-        self._type_checking_names = outer_names - bindings.names
-        self._typing_modules = outer_modules - bindings.names
+        if outer_names or outer_modules:
+            bindings = _PythonScopeBindingVisitor()
+            for statement in node.body:
+                bindings.visit(statement)
+            bindings.names.update(argument.arg for argument in all_args)
+            bindings.names.update(
+                argument.arg
+                for argument in (node.args.vararg, node.args.kwarg)
+                if argument is not None
+            )
+            self._type_checking_names = outer_names - bindings.names
+            self._typing_modules = outer_modules - bindings.names
         self._visit_statements(node.body, dead=False)
         self._type_checking_names = outer_names
         self._typing_modules = outer_modules
@@ -310,9 +484,43 @@ class _PythonUnreachableCallVisitor(ast.NodeVisitor):
         dead: bool,
     ) -> None:
         outer_dead = self._dead
-        self._dead = outer_dead or dead
-        for statement in statements:
-            self.visit(statement)
+        is_dead = outer_dead or dead
+        self._dead = is_dead
+        if is_dead:
+            for statement in statements:
+                self.visit(statement)
+        else:
+            for statement in statements:
+                if isinstance(
+                    statement,
+                    (ast.If, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef),
+                ):
+                    self.visit(statement)
+                elif isinstance(statement, (ast.For, ast.AsyncFor, ast.While)):
+                    self._visit_statements(statement.body, dead=False)
+                    if statement.orelse:
+                        self._visit_statements(statement.orelse, dead=False)
+                elif isinstance(statement, (ast.With, ast.AsyncWith)):
+                    self._visit_statements(statement.body, dead=False)
+                elif isinstance(statement, _TRY_STMT_TYPES):
+                    try_body = getattr(statement, "body", None)
+                    if try_body:
+                        self._visit_statements(try_body, dead=False)
+                    for handler in getattr(statement, "handlers", ()):
+                        handler_body = getattr(handler, "body", None)
+                        if handler_body:
+                            self._visit_statements(handler_body, dead=False)
+                    try_orelse = getattr(statement, "orelse", None)
+                    if try_orelse:
+                        self._visit_statements(try_orelse, dead=False)
+                    try_finalbody = getattr(statement, "finalbody", None)
+                    if try_finalbody:
+                        self._visit_statements(try_finalbody, dead=False)
+                elif _MATCH_STMT_TYPES and isinstance(statement, _MATCH_STMT_TYPES):
+                    for case in getattr(statement, "cases", ()):
+                        case_body = getattr(case, "body", None)
+                        if case_body:
+                            self._visit_statements(case_body, dead=False)
         self._dead = outer_dead
 
 
@@ -320,7 +528,7 @@ class _PythonUnreachableCallVisitor(ast.NodeVisitor):
 def _python_unreachable_call_positions(
     source: bytes,
 ) -> frozenset[tuple[int, int]]:
-    """Return one-based line/byte-column positions of proven-dead calls."""
+    """Return positions of calls and attribute loads in proven-dead branches."""
     try:
         tree = ast.parse(source.decode("utf-8"))
     except (SyntaxError, UnicodeDecodeError, ValueError):
@@ -328,6 +536,46 @@ def _python_unreachable_call_positions(
     type_checking_names, typing_modules = _python_type_checking_aliases(tree)
     visitor = _PythonUnreachableCallVisitor(
         type_checking_names,
+        typing_modules,
+    )
+    visitor.visit(tree)
+    return frozenset(visitor.positions)
+
+
+class _PythonUnreachableImportVisitor(_PythonUnreachableCallVisitor):
+    """Collect import statements in proven-dead branches, not calls."""
+
+    def visit_Call(self, node: ast.Call) -> None:  # noqa: N802
+        self.generic_visit(node)
+
+    def visit_Attribute(self, node: ast.Attribute) -> None:  # noqa: N802
+        self.generic_visit(node)
+
+    def visit_Import(self, node: ast.Import) -> None:  # noqa: N802
+        if self._dead:
+            self.positions.add((node.lineno, node.col_offset))
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:  # noqa: N802
+        if self._dead:
+            self.positions.add((node.lineno, node.col_offset))
+
+
+@lru_cache(maxsize=128)
+def _python_unreachable_import_positions(
+    source: bytes,
+) -> frozenset[tuple[int, int]]:
+    """Return positions of imports that never run, such as under ``if TYPE_CHECKING``.
+
+    A bare ``TYPE_CHECKING`` counts whatever it is bound to: type checkers read
+    any name spelled so as true, which is what ``TYPE_CHECKING = False`` relies on.
+    """
+    try:
+        tree = ast.parse(source.decode("utf-8"))
+    except (SyntaxError, UnicodeDecodeError, ValueError):
+        return frozenset()
+    type_checking_names, typing_modules = _python_type_checking_aliases(tree)
+    visitor = _PythonUnreachableImportVisitor(
+        type_checking_names | {"TYPE_CHECKING"},
         typing_modules,
     )
     visitor.visit(tree)
@@ -342,6 +590,8 @@ def _python_unreachable_call_positions(
 # walking the tree-sitter ancestor chain of a call node:
 #
 #   * Go / TypeScript / JavaScript:  ``if false { ... }`` / ``if (0) { ... }``
+#   * Rust:                          ``if false { ... }`` (an if_expression,
+#                                    whose false is a boolean_literal)
 #   * C / C++:                       ``#if 0`` / ``#elif 0`` preprocessor blocks
 #
 # Only the consequence (true branch) is dead; ``else`` / ``#else`` / ``#elif``
@@ -386,13 +636,44 @@ def _is_statically_false_condition(cond) -> bool:
     return False
 
 
+def _is_static_dead_guard_child(parent, child) -> bool:
+    """Return whether *child* enters a statically-dead branch of *parent*."""
+    if parent.type == "if_statement":
+        condition = parent.child_by_field_name("condition")
+        consequence = parent.child_by_field_name("consequence")
+        return (
+            condition is not None
+            and consequence is not None
+            and _is_statically_false_condition(condition)
+            and child.start_byte == consequence.start_byte
+            and child.end_byte == consequence.end_byte
+        )
+
+    if parent.type in ("preproc_if", "preproc_elif"):
+        condition = parent.child_by_field_name("condition")
+        if (
+            condition is None
+            or condition.type != "number_literal"
+            or condition.text != b"0"
+        ):
+            return False
+        alternative = parent.child_by_field_name("alternative")
+        return not (
+            alternative is not None
+            and child.start_byte == alternative.start_byte
+            and child.end_byte == alternative.end_byte
+        )
+
+    return False
+
+
 def _is_in_static_dead_guard(node) -> bool:
     """Return True if *node* sits in a statically-dead branch (non-Python).
 
-    Two independent ancestor walks:
+    Walk the ancestor chain once, checking each parent-child edge:
 
-    * A walk for Go / TS / JS ``if false`` / ``if (0)``.
-    * A walk for C/C++ ``#if 0`` / ``#elif 0``.
+    * Go / TS / JS ``if false`` / ``if (0)``.
+    * C/C++ ``#if 0`` / ``#elif 0``.
 
     Neither walk stops at a function or class boundary. A declaration
     nested inside a dead branch is never evaluated, so calls in its body
@@ -401,78 +682,65 @@ def _is_in_static_dead_guard(node) -> bool:
     JS/TS class declarations are not hoisted, so there is no reachable
     symbol to preserve either.
     """
-    # Go / TS / JS: ``if`` with a statically-false condition.
+    child = node
+    parent = child.parent
+    while parent is not None:
+        if _is_static_dead_guard_child(parent, child):
+            return True
+        child = parent
+        parent = parent.parent
+    return False
+
+
+def _is_in_rust_dead_guard(node) -> bool:
+    """Return True if *node* sits in the consequence of a Rust ``if false``.
+
+    Rust's if is an ``if_expression`` and its false is a ``boolean_literal``.
+    Both are shared with Kotlin and Scala, where ``if (false)`` is kept, so
+    this walk is only called for Rust. The else branch and ``if true`` stay
+    live, and only a literal ``false`` counts: ``false && false`` does not.
+
+    The walk ends at an ``impl_item``. Rust impl blocks are non-local: one
+    written inside a branch still applies to the type, so its methods and
+    associated consts are reached from outside that branch, and their callees
+    are live. Inheriting the guard from the declaration dropped those edges and
+    reported real targets as dead code, which is worse than keeping a call that
+    never runs. Everything else the branch encloses stays dead: a local ``fn``,
+    ``mod`` or ``trait`` is scoped to the block, so a call in its body is
+    unreachable. Guards written inside a body are still found, because the
+    walk reaches them before the item boundary.
+    """
     cursor = node.parent
     while cursor is not None:
-        node_type = cursor.type
-        if node_type == "if_statement":
+        if cursor.type == "impl_item":
+            return False
+        if cursor.type == "if_expression":
             condition = cursor.child_by_field_name("condition")
             consequence = cursor.child_by_field_name("consequence")
+            while condition is not None and condition.type == "parenthesized_expression":
+                condition = next(
+                    (child for child in condition.children if child.is_named), None
+                )
             if (
                 condition is not None
                 and consequence is not None
-                and _is_statically_false_condition(condition)
+                and condition.type == "boolean_literal"
+                and condition.text == b"false"
                 and _node_is_in_child(node, consequence)
             ):
                 return True
         cursor = cursor.parent
-
-    # C / C++: ``#if 0`` / ``#elif 0`` preprocessor block.
-    preproc = node.parent
-    while preproc is not None:
-        if preproc.type in ("preproc_if", "preproc_elif"):
-            condition = preproc.child_by_field_name("condition")
-            if (
-                condition is not None
-                and condition.type == "number_literal"
-                and condition.text == b"0"
-            ):
-                alternative = preproc.child_by_field_name("alternative")
-                if not (alternative is not None and _node_is_in_child(node, alternative)):
-                    return True
-        preproc = preproc.parent
-
     return False
 
 
 # SQL keywords that can appear after FROM/JOIN but are NOT table names.
-_SQL_KEYWORDS: frozenset[str] = frozenset(
-    {
-        "SELECT",
-        "WHERE",
-        "GROUP",
-        "ORDER",
-        "HAVING",
-        "LIMIT",
-        "OFFSET",
-        "UNION",
-        "INTERSECT",
-        "EXCEPT",
-        "AS",
-        "ON",
-        "USING",
-        "SET",
-        "VALUES",
-        "DEFAULT",
-        "NULL",
-        "TRUE",
-        "FALSE",
-        "INNER",
-        "OUTER",
-        "LEFT",
-        "RIGHT",
-        "FULL",
-        "CROSS",
-        "NATURAL",
-        "LATERAL",
-        "RECURSIVE",
-        "ONLY",
-        "WITH",
-        "IF",
-        "NOT",
-        "EXISTS",
-    }
-)
+_SQL_KEYWORDS: frozenset[str] = frozenset({
+    "SELECT", "WHERE", "GROUP", "ORDER", "HAVING", "LIMIT", "OFFSET",
+    "UNION", "INTERSECT", "EXCEPT", "AS", "ON", "USING", "SET",
+    "VALUES", "DEFAULT", "NULL", "TRUE", "FALSE",
+    "INNER", "OUTER", "LEFT", "RIGHT", "FULL", "CROSS", "NATURAL",
+    "LATERAL", "RECURSIVE", "ONLY", "WITH", "IF", "NOT", "EXISTS",
+})
 
 logger = logging.getLogger(__name__)
 
@@ -480,6 +748,7 @@ _DEFAULT_PARSER_LOAD_TIMEOUT_SECONDS = 5.0
 _PARSER_PROBE_RESULTS: dict[str, bool] = {}
 _PARSER_PROBE_FAILURE_DETAILS: dict[str, str] = {}
 _PARSER_PROBE_LOCK = threading.Lock()
+_PARSER_PROBE_GRAMMAR_LOCKS: dict[str, threading.Lock] = {}
 _EXPECTED_PARSER_LOAD_ERRORS = (ImportError, LookupError, OSError, ValueError)
 
 
@@ -498,9 +767,67 @@ def _parser_load_timeout_seconds() -> float:
     return timeout
 
 
+def _parser_probe_env() -> dict[str, str]:
+    """Build the environment for a disposable grammar-load probe.
+
+    The probe runs in a child interpreter so a hanging or crashing native
+    grammar cannot take down the parent. The child must still be able to
+    import the same ``tree_sitter_language_pack`` the parent can see
+    (venv site-packages, ``pip install --user``, or a non-standard
+    ``sys.path`` entry). Isolated mode (``python -I``) is intentionally
+    avoided for this reason (#760, #807).
+    """
+    env = os.environ.copy()
+    try:
+        spec = importlib.util.find_spec("tree_sitter_language_pack")
+    except (ImportError, OSError, ValueError):
+        return env
+    module_file = spec.origin if spec is not None else None
+    if not module_file:
+        return env
+    pack_parent = str(Path(module_file).resolve().parent.parent)
+    existing = env.get("PYTHONPATH", "")
+    parts = [part for part in existing.split(os.pathsep) if part]
+    if pack_parent not in parts:
+        env["PYTHONPATH"] = (
+            os.pathsep.join([pack_parent, *parts]) if parts else pack_parent
+        )
+    return env
+
+
+def _install_hint_for_probe_failure(detail: str) -> str | None:
+    """Return installable guidance for common probe failure modes."""
+    lowered = detail.lower()
+    if "tree_sitter_language_pack" in lowered and (
+        "modulenotfounderror" in lowered
+        or "no module named" in lowered
+        or "import error" in lowered
+        or "importerror" in lowered
+    ):
+        return (
+            "Install tree-sitter-language-pack for the same Python that runs "
+            "code-review-graph: pip install 'tree-sitter-language-pack>=0.3.0,<1'"
+        )
+    if (
+        "could not find language library" in lowered
+        or "lookuperror" in lowered
+    ):
+        return (
+            "This grammar may be missing from the installed "
+            "tree-sitter-language-pack; upgrade it "
+            "(pip install -U 'tree-sitter-language-pack>=0.3.0,<1') "
+            "or rebuild its native extensions"
+        )
+    return None
+
+
 def _run_parser_load_probe(grammar: str, timeout_seconds: float) -> bool:
     """Probe one native grammar in a disposable interpreter process."""
-    code = "from tree_sitter_language_pack import get_parser\nimport sys\nget_parser(sys.argv[1])\n"
+    code = (
+        "from tree_sitter_language_pack import get_parser\n"
+        "import sys\n"
+        "get_parser(sys.argv[1])\n"
+    )
     try:
         completed = subprocess.run(
             [sys.executable, "-c", code, grammar],
@@ -509,6 +836,7 @@ def _run_parser_load_probe(grammar: str, timeout_seconds: float) -> bool:
             stderr=subprocess.PIPE,
             timeout=timeout_seconds,
             check=False,
+            env=_parser_probe_env(),
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         _PARSER_PROBE_FAILURE_DETAILS[grammar] = str(exc)
@@ -537,25 +865,49 @@ def _parser_load_probe_succeeds(
 ) -> bool:
     """Return a process-cached result for one bounded grammar probe.
 
-    The lock deliberately covers the subprocess call: parallel parser users
-    must not start duplicate probes for the same grammar while the first one
-    is still running.
+    A per-grammar lock covers the subprocess call so parallel parser users
+    never start duplicate probes for the same grammar while distinct grammars
+    can probe concurrently.
     """
     with _PARSER_PROBE_LOCK:
         cached = _PARSER_PROBE_RESULTS.get(grammar)
         if cached is not None:
             return cached
-        timeout = _parser_load_timeout_seconds() if timeout_seconds is None else timeout_seconds
+        grammar_lock = _PARSER_PROBE_GRAMMAR_LOCKS.get(grammar)
+        if grammar_lock is None:
+            grammar_lock = threading.Lock()
+            _PARSER_PROBE_GRAMMAR_LOCKS[grammar] = grammar_lock
+
+    with grammar_lock:
+        with _PARSER_PROBE_LOCK:
+            cached = _PARSER_PROBE_RESULTS.get(grammar)
+            if cached is not None:
+                return cached
+        timeout = (
+            _parser_load_timeout_seconds()
+            if timeout_seconds is None
+            else timeout_seconds
+        )
         result = _run_parser_load_probe(grammar, timeout)
-        _PARSER_PROBE_RESULTS[grammar] = result
+        with _PARSER_PROBE_LOCK:
+            _PARSER_PROBE_RESULTS[grammar] = result
+            detail = _PARSER_PROBE_FAILURE_DETAILS.get(grammar) if not result else None
         if not result:
-            detail = _PARSER_PROBE_FAILURE_DETAILS.get(grammar)
             if detail:
-                logger.warning(
-                    "Skipping unavailable tree-sitter parser for %s: %s",
-                    grammar,
-                    detail,
-                )
+                hint = _install_hint_for_probe_failure(detail)
+                if hint:
+                    logger.warning(
+                        "Skipping unavailable tree-sitter parser for %s: %s. %s",
+                        grammar,
+                        detail,
+                        hint,
+                    )
+                else:
+                    logger.warning(
+                        "Skipping unavailable tree-sitter parser for %s: %s",
+                        grammar,
+                        detail,
+                    )
             else:
                 logger.warning(
                     "Skipping unavailable tree-sitter parser for %s",
@@ -575,6 +927,7 @@ def _clear_parser_probe_cache() -> None:
     with _PARSER_PROBE_LOCK:
         _PARSER_PROBE_RESULTS.clear()
         _PARSER_PROBE_FAILURE_DETAILS.clear()
+        _PARSER_PROBE_GRAMMAR_LOCKS.clear()
 
 
 def _load_tree_sitter_parser(grammar: str):
@@ -583,7 +936,7 @@ def _load_tree_sitter_parser(grammar: str):
         return None
     try:
         language_pack = importlib.import_module("tree_sitter_language_pack")
-        return language_pack.get_parser(grammar)
+        return language_pack.get_parser(grammar)  # type: ignore[attr-defined]
     except _EXPECTED_PARSER_LOAD_ERRORS as exc:
         _mark_parser_unavailable(grammar)
         logger.debug("tree-sitter parser unavailable for %s: %s", grammar, exc)
@@ -591,6 +944,151 @@ def _load_tree_sitter_parser(grammar: str):
 
 
 _PhpPsr4Mappings = tuple[tuple[str, tuple[str, ...]], ...]
+
+
+class _ImportSpec(NamedTuple):
+    """One import statement: its module string, its own line, and its form.
+
+    ``line`` is the line of the individual specifier, not of the statement
+    that encloses it: every spec in a Go ``import ( ... )`` block used to be
+    stamped with the line of the ``import (`` token.
+
+    ``form`` carries the language keyword when identical module strings
+    resolve by different algorithms depending on it. Ruby needs it --
+    ``require "x"`` searches the load paths while ``require_relative "x"``
+    searches the requiring file's own directory -- and it is part of the
+    resolution cache key. ``None`` for the languages with a single form.
+
+    ``context`` says when the import does not run as the file loads. See
+    ``IMPORT_CONTEXT_KEY``. ``None`` means it does.
+    """
+
+    module: str
+    line: int
+    form: Optional[str] = None
+    context: Optional[str] = None
+
+
+class _GoModule(NamedTuple):
+    """One ``go.mod``: its directory, the module path it declares, and the
+    ``replace`` directives that redirect a module prefix to a local path."""
+
+    root: Path
+    path: str
+    replacements: tuple[tuple[str, str], ...]
+
+
+# ``module github.com/cli/cli/v2`` -- the anchor that tells this repository's
+# own packages from its dependencies. go.mod also allows the legacy quoted
+# spelling.
+_GO_MODULE_LINE_RE = re.compile(r'^\s*module\s+"?([^\s"]+)"?\s*(?://.*)?$')
+# ``old [vX] => ./local [vX]`` inside or outside a ``replace ( ... )`` block.
+_GO_REPLACE_LINE_RE = re.compile(
+    r"^\s*(?:replace\s+)?([^\s=>]+)(?:\s+v\S+)?\s*=>\s*(\S+)(?:\s+v\S+)?"
+    r"\s*(?://.*)?$",
+)
+# ``s.require_paths = ["lib"]`` / ``s.require_paths = %w[lib ext]`` /
+# ``s.require_path = "lib"`` -- a gem's load roots, declared in its gemspec.
+_RUBY_REQUIRE_PATHS_RE = re.compile(
+    r"""require_paths?\s*=\s*(?:\[([^\]]*)\]|%w[\[({]([^\])}]*)[\])}]|(['"])([^'"]+)\3)""",
+)
+# ``$LOAD_PATH.unshift File.expand_path("../lib", __FILE__)`` and the ``$:``
+# spelling, with or without parentheses.
+_RUBY_LOAD_PATH_RE = re.compile(
+    r"""(?:\$LOAD_PATH|\$:)\s*(?:\.unshift|\.push|<<)\s*\(?\s*"""
+    r"""(?:File\.expand_path\(\s*)?(['"])([^'"]+)\1\s*(?:,\s*(__dir__|__FILE__))?""",
+)
+# Ruby methods that name a file to load. Matching the METHOD, not the text,
+# is what keeps `raise "... are required."` out of the import graph.
+_RUBY_IMPORT_METHODS = frozenset({
+    "require", "require_relative", "load", "autoload", "require_all",
+})
+# `autoload :Const, "path"` names the path second; every other form first.
+_RUBY_IMPORT_PATH_ARGUMENT = {"autoload": 1}
+# Bound the manifest scans: a go.mod or gemspec beyond this is not shaped
+# like one.
+_GO_MOD_MAX_LINES = 2_000
+
+
+@lru_cache(maxsize=256)
+def _read_go_mod(
+    go_mod_path: str,
+    _mtime_ns: int,
+    _size: int,
+) -> tuple[str, tuple[tuple[str, str], ...]]:
+    """Read the module path and local ``replace`` targets from one go.mod.
+
+    The declared module path is the only thing that tells this repository's
+    own packages (``github.com/cli/cli/v2/pkg/cmdutil``) from a dependency
+    (``github.com/spf13/cobra``), so without it there is no anchor to
+    resolve from. Cached on (path, mtime, size) like the composer.json
+    reader, so a whole-repository build reads each go.mod once.
+
+    Returns ``("", ())`` when the file is unreadable or declares no module.
+    """
+    try:
+        text = Path(go_mod_path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return "", ()
+    module_path = ""
+    replacements: list[tuple[str, str]] = []
+    in_replace_block = False
+    for raw_line in text.splitlines()[:_GO_MOD_MAX_LINES]:
+        line = raw_line.strip()
+        if not line or line.startswith("//"):
+            continue
+        if not module_path:
+            match = _GO_MODULE_LINE_RE.match(raw_line)
+            if match:
+                module_path = match.group(1)
+                continue
+        if line.startswith("replace") and line.endswith("("):
+            in_replace_block = True
+            continue
+        if in_replace_block and line == ")":
+            in_replace_block = False
+            continue
+        if "=>" not in line or not (in_replace_block or line.startswith("replace")):
+            continue
+        match = _GO_REPLACE_LINE_RE.match(raw_line)
+        if match is None:
+            continue
+        old, new = match.group(1), match.group(2)
+        # Only a local directory replacement points at code in this
+        # repository; ``=> github.com/other/mod v1.2.3`` is still a download.
+        if new.startswith(("./", "../", "/")) or new in (".", ".."):
+            replacements.append((old, new))
+    # Longest prefix first, so ``example.com/a/b`` wins over ``example.com/a``.
+    replacements.sort(key=lambda item: len(item[0]), reverse=True)
+    return module_path, tuple(replacements)
+
+
+@lru_cache(maxsize=64)
+def _read_gemspec_require_paths(
+    gemspec_path: str,
+    _mtime_ns: int,
+    _size: int,
+) -> tuple[str, ...]:
+    """Read ``require_paths`` from one .gemspec.
+
+    A gemspec that declares none still has load roots: RubyGems defaults
+    ``require_paths`` to ``["lib"]``, which is what jekyll, rubocop and most
+    gems rely on.
+    """
+    try:
+        text = Path(gemspec_path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ()
+    match = _RUBY_REQUIRE_PATHS_RE.search(text)
+    if match is None:
+        return ("lib",)
+    bracketed, word_array, _quote, single = match.groups()
+    if single:
+        return (single,)
+    if word_array is not None:
+        return tuple(word for word in word_array.split() if word)
+    values = tuple(re.findall(r"""['"]([^'"]+)['"]""", bracketed or ""))
+    return values or ("lib",)
 
 
 def _path_is_within(path: Path, root: Path) -> bool:
@@ -634,10 +1132,8 @@ def _read_php_composer_psr4(
                 continue
             prefix = raw_prefix.lstrip("\\").rstrip("\\")
             candidate_paths = (
-                [raw_paths]
-                if isinstance(raw_paths, str)
-                else raw_paths
-                if isinstance(raw_paths, list)
+                [raw_paths] if isinstance(raw_paths, str)
+                else raw_paths if isinstance(raw_paths, list)
                 else []
             )
             destinations = combined.setdefault(prefix, [])
@@ -667,23 +1163,6 @@ def _read_php_composer_psr4(
 # ---------------------------------------------------------------------------
 # Data models for extracted entities
 # ---------------------------------------------------------------------------
-
-
-def normalize_file_path(path: "str | PurePath") -> str:
-    """Return *path* as a forward-slash (POSIX) string for graph identity.
-
-    ``file_path`` values and the path component of qualified names are graph
-    identity: they must be separator-stable across operating systems so a
-    graph built on Windows produces the same identifiers as one built on
-    Linux/macOS, and so consumers that reconstruct identifiers from ``Path``
-    objects always agree with the parser. See issue #774.
-
-    Only apply this to file *paths* — never to symbol names: PHP namespace
-    identifiers (``App\\Domain\\Job``) legitimately contain backslashes.
-    """
-    if isinstance(path, PurePath):
-        return path.as_posix()
-    return str(path).replace("\\", "/")
 
 
 @dataclass
@@ -737,6 +1216,8 @@ EXTENSION_TO_LANGUAGE: dict[str, str] = {
     ".js": "javascript",
     ".jsx": "javascript",
     ".ts": "typescript",
+    ".mts": "typescript",
+    ".cts": "typescript",
     ".tsx": "tsx",
     ".go": "go",
     ".rs": "rust",
@@ -751,14 +1232,18 @@ EXTENSION_TO_LANGUAGE: dict[str, str] = {
     ".hpp": "cpp",
     ".hh": "cpp",
     ".kt": "kotlin",
+    ".kts": "kotlin",
     ".swift": "swift",
     ".php": "php",
     ".scala": "scala",
     ".sol": "solidity",
     ".vue": "vue",
+    ".html": "html",
+    ".htm": "html",
     ".dart": "dart",
     ".r": "r",  # .lower() in detect_language handles .R → .r
     ".mjs": "javascript",
+    ".cjs": "javascript",
     ".astro": "typescript",
     ".pl": "perl",
     ".pm": "perl",
@@ -797,34 +1282,71 @@ EXTENSION_TO_LANGUAGE: dict[str, str] = {
     # Keep the fallback deliberately structural and repository-local.
     ".vb": "vbnet",
     ".sql": "sql",
+    # Oracle PL/SQL source files. tree-sitter-sql has no PL/SQL grammar, so
+    # these route through the same "sql" dispatch as .sql and are handled by
+    # the PL/SQL-aware regex fallbacks in _parse_sql (packages, package
+    # bodies, triggers, and nested procedures/functions).
+    ".pls": "sql",
+    ".plb": "sql",
+    ".pks": "sql",
+    ".pkb": "sql",
+    ".pck": "sql",
+    ".prc": "sql",
+    ".fnc": "sql",
+    ".trg": "sql",
     ".tf": "hcl",
     ".hcl": "hcl",
     ".properties": "properties",
+    ".xsl": "xslt",
+    ".xslt": "xslt",
     ".yml": "yaml",
     ".yaml": "yaml",
+    ".json": "json",
+    ".robot": "robot",
+    ".resource": "robot",
+    ".liquid": "liquid",
 }
 
 # ``.h`` is shared by C and C++. Keep C as the extension default, then promote
 # a header only when the C++ grammar finds syntax that C cannot express. Weak
 # compatibility markers such as ``__cplusplus`` and ``extern "C"`` are
 # deliberately excluded because they are common in otherwise-C headers.
-_CPP_HEADER_EVIDENCE_TYPES = frozenset(
-    {
-        "access_specifier",
-        "alias_declaration",
-        "base_class_clause",
-        "class_specifier",
-        "concept_definition",
-        "lambda_expression",
-        "namespace_definition",
-        "noexcept",
-        "template_declaration",
-        "trailing_return_type",
-        "using_declaration",
-    }
-)
+_CPP_HEADER_EVIDENCE_TYPES = frozenset({
+    "access_specifier",
+    "alias_declaration",
+    "base_class_clause",
+    "class_specifier",
+    "concept_definition",
+    "lambda_expression",
+    "namespace_definition",
+    "noexcept",
+    "template_declaration",
+    "trailing_return_type",
+    "using_declaration",
+})
 
 _CPP_HEADER_EVIDENCE_QUALIFIERS = frozenset({b"consteval", b"constinit"})
+
+# Comments and literals can hold any word, so they are blanked before the scan.
+_CPP_HEADER_NON_CODE_RE = re.compile(
+    rb"""/\*.*?(?:\*/|\Z)|//[^\n]*|"(?:[^"\\\n]|\\.)*"|'(?:[^'\\\n]|\\.)*'""",
+    re.DOTALL,
+)
+
+# Text every shape above needs. It decides only whether to run the C++ parse, and
+# the tree check still has the last word, so it may match too much but must never
+# miss. Keep it a superset of _CPP_HEADER_EVIDENCE_TYPES (Q_SIGNALS masks to
+# ``public``). Base clauses and lambdas have no keyword: a base clause is a colon
+# after ``struct`` or ``union``, and a capture list is a ``]`` not followed by what
+# ends a C subscript. The gaps are capped so repeated keywords stay linear.
+_CPP_HEADER_TEXT_EVIDENCE_RE = re.compile(
+    rb"\b(?:class|namespace|template|concept|using|public|private|protected"
+    rb"|constexpr|noexcept|consteval|constinit|Q_SIGNALS)\b"
+    rb"|::|->"
+    rb"|\benum\b[^;{}]{0,1024}\bstruct\b"
+    rb"|\b(?:struct|union)\b[^;{}]{0,1024}:"
+    rb"|\]\s*(?:\[\[|[^\s;,)=\[\].+\-*/%&|^!?:>])",
+)
 
 _CPP_QT_STRUCTURAL_MACRO_REPLACEMENTS = {
     b"QT_BEGIN_NAMESPACE": b" " * len(b"QT_BEGIN_NAMESPACE"),
@@ -875,137 +1397,47 @@ _SHEBANG_PROBE_BYTES = 256
 # ---------------------------------------------------------------------------
 
 # Path components that strongly suggest an Ansible project layout
-_ANSIBLE_PATH_COMPONENTS: frozenset[str] = frozenset(
-    {
-        "playbooks",
-        "roles",
-        "tasks",
-        "handlers",
-        "group_vars",
-        "host_vars",
-    }
-)
+_ANSIBLE_PATH_COMPONENTS: frozenset[str] = frozenset({
+    "playbooks", "roles", "tasks", "handlers", "group_vars", "host_vars",
+})
 
 # Common top-level playbook filenames (still require content confirmation)
-_ANSIBLE_PLAYBOOK_NAMES: frozenset[str] = frozenset(
-    {
-        "site.yml",
-        "site.yaml",
-        "main.yml",
-        "main.yaml",
-        "install.yml",
-        "install.yaml",
-        "deploy.yml",
-        "deploy.yaml",
-    }
-)
+_ANSIBLE_PLAYBOOK_NAMES: frozenset[str] = frozenset({
+    "site.yml", "site.yaml", "main.yml", "main.yaml",
+    "install.yml", "install.yaml", "deploy.yml", "deploy.yaml",
+})
 
 # Play-level keys that are ONLY valid in Ansible plays.
 # `hosts:` alone is not sufficient to identify a play — require at least one of these.
-_ANSIBLE_PLAY_KEYS: frozenset[str] = frozenset(
-    {
-        "tasks",
-        "handlers",
-        "pre_tasks",
-        "post_tasks",
-        "roles",
-        "gather_facts",
-        "become",
-        "become_user",
-        "become_method",
-        "serial",
-        "strategy",
-        "vars_files",
-        "vars_prompt",
-        "any_errors_fatal",
-        "max_fail_percentage",
-        "ignore_errors",
-    }
-)
+_ANSIBLE_PLAY_KEYS: frozenset[str] = frozenset({
+    "tasks", "handlers", "pre_tasks", "post_tasks", "roles",
+    "gather_facts", "become", "become_user", "become_method",
+    "serial", "strategy", "vars_files", "vars_prompt",
+    "any_errors_fatal", "max_fail_percentage", "ignore_errors",
+})
 
 # Bare module names for content sniffing; also used after FQCN prefix strip
-_ANSIBLE_MODULE_KEYS: frozenset[str] = frozenset(
-    {
-        "apt",
-        "yum",
-        "dnf",
-        "package",
-        "pip",
-        "copy",
-        "template",
-        "file",
-        "service",
-        "systemd",
-        "command",
-        "shell",
-        "raw",
-        "git",
-        "user",
-        "stat",
-        "include_tasks",
-        "import_tasks",
-        "include_role",
-        "import_role",
-        "set_fact",
-        "debug",
-        "fail",
-        "assert",
-        "wait_for",
-        "pause",
-        "lineinfile",
-        "blockinfile",
-        "get_url",
-        "uri",
-        "unarchive",
-        "add_host",
-        "group_by",
-        "include_vars",
-    }
-)
+_ANSIBLE_MODULE_KEYS: frozenset[str] = frozenset({
+    "apt", "yum", "dnf", "package", "pip", "copy", "template", "file",
+    "service", "systemd", "command", "shell", "raw", "git", "user", "stat",
+    "include_tasks", "import_tasks", "include_role", "import_role",
+    "set_fact", "debug", "fail", "assert", "wait_for", "pause",
+    "lineinfile", "blockinfile", "get_url", "uri", "unarchive",
+    "add_host", "group_by", "include_vars",
+})
 
 # Task mapping keys that are metadata, NOT module invocations
-_TASK_META_KEYS: frozenset[str] = frozenset(
-    {
-        "name",
-        "when",
-        "loop",
-        "loop_control",
-        "with_items",
-        "with_first_found",
-        "with_fileglob",
-        "with_dict",
-        "with_subelements",
-        "with_nested",
-        "with_sequence",
-        "with_indexed_items",
-        "register",
-        "notify",
-        "tags",
-        "become",
-        "become_user",
-        "become_method",
-        "ignore_errors",
-        "vars",
-        "no_log",
-        "check_mode",
-        "environment",
-        "any_errors_fatal",
-        "run_once",
-        "delegate_to",
-        "delegate_facts",
-        "block",
-        "rescue",
-        "always",
-        "changed_when",
-        "failed_when",
-        "retries",
-        "delay",
-        "until",
-        "listen",
-        "connection",
-        "timeout",
-    }
-)
+_TASK_META_KEYS: frozenset[str] = frozenset({
+    "name", "when", "loop", "loop_control",
+    "with_items", "with_first_found", "with_fileglob", "with_dict",
+    "with_subelements", "with_nested", "with_sequence", "with_indexed_items",
+    "register", "notify", "tags", "become", "become_user", "become_method",
+    "ignore_errors", "vars", "no_log", "check_mode", "environment",
+    "any_errors_fatal", "run_once", "delegate_to", "delegate_facts",
+    "block", "rescue", "always",
+    "changed_when", "failed_when", "retries", "delay", "until",
+    "listen", "connection", "timeout",
+})
 
 # Tree-sitter node type mappings per language
 # Maps (language) -> dict of semantic role -> list of TS node types
@@ -1018,18 +1450,12 @@ _CLASS_TYPES: dict[str, list[str]] = {
     # *.d.ts) contributes zero symbol nodes and its blast radius collapses to
     # whole-file IMPORTS_FROM fan-out. See: #737
     "typescript": [
-        "class_declaration",
-        "class",
-        "interface_declaration",
-        "type_alias_declaration",
-        "enum_declaration",
+        "class_declaration", "abstract_class_declaration", "class",
+        "interface_declaration", "type_alias_declaration", "enum_declaration",
     ],
     "tsx": [
-        "class_declaration",
-        "class",
-        "interface_declaration",
-        "type_alias_declaration",
-        "enum_declaration",
+        "class_declaration", "abstract_class_declaration", "class",
+        "interface_declaration", "type_alias_declaration", "enum_declaration",
     ],
     "go": ["type_declaration"],
     # impl_item is a scope for methods, not a second type definition. It is
@@ -1039,46 +1465,32 @@ _CLASS_TYPES: dict[str, list[str]] = {
     "c": ["struct_specifier", "type_definition"],
     "cpp": ["class_specifier", "struct_specifier"],
     "csharp": [
-        "class_declaration",
-        "interface_declaration",
-        "enum_declaration",
-        "struct_declaration",
+        "class_declaration", "interface_declaration",
+        "enum_declaration", "struct_declaration",
         "record_declaration",
-        "record_struct_declaration",
     ],
     "ruby": ["class", "module"],
     "r": [],  # Classes detected via call pattern-matching, not AST node types
     "perl": ["package_statement", "class_statement", "role_statement"],
     "kotlin": ["class_declaration", "object_declaration"],
-    "swift": ["class_declaration", "struct_declaration", "protocol_declaration"],
+    "swift": ["class_declaration", "protocol_declaration"],
     "php": [
-        "class_declaration",
-        "interface_declaration",
-        "trait_declaration",
-        "enum_declaration",
+        "class_declaration", "interface_declaration",
+        "trait_declaration", "enum_declaration",
     ],
     "scala": [
-        "class_definition",
-        "trait_definition",
-        "object_definition",
-        "enum_definition",
+        "class_definition", "trait_definition", "object_definition", "enum_definition",
     ],
     "solidity": [
-        "contract_declaration",
-        "interface_declaration",
-        "library_declaration",
-        "struct_declaration",
-        "enum_declaration",
-        "error_declaration",
+        "contract_declaration", "interface_declaration", "library_declaration",
+        "struct_declaration", "enum_declaration", "error_declaration",
         "user_defined_type_definition",
     ],
     "dart": ["class_definition", "mixin_declaration", "enum_declaration"],
     "lua": [],  # Lua has no class keyword; table-based OOP handled via constructs handler
     "luau": ["type_definition"],  # Luau type aliases; table-based OOP via constructs handler
     "objc": [
-        "class_interface",
-        "class_implementation",
-        "category_interface",
+        "class_interface", "class_implementation",
         "protocol_declaration",
     ],
     "bash": [],  # Shell has no classes
@@ -1095,9 +1507,7 @@ _CLASS_TYPES: dict[str, list[str]] = {
     "zig": [],
     "powershell": ["class_statement"],
     "julia": [
-        "struct_definition",
-        "abstract_definition",
-        "module_definition",
+        "struct_definition", "abstract_definition", "module_definition",
     ],
     "verilog": [
         "module_declaration",
@@ -1108,7 +1518,8 @@ _CLASS_TYPES: dict[str, list[str]] = {
     # GDScript: inner classes use ``class Name:`` (class_definition); the
     # file-level ``class_name Name`` gives the script itself an identity.
     "gdscript": ["class_definition", "class_name_statement"],
-    # SQL: CREATE TABLE / CREATE VIEW are handled via _parse_sql dispatch.
+    # SQL: CREATE TABLE / CREATE VIEW / CREATE PACKAGE (Oracle PL/SQL) are
+    # handled via _parse_sql dispatch.
     "sql": [],
     # HCL/Terraform: all constructs are blocks; dispatched via
     # _extract_hcl_constructs.
@@ -1118,31 +1529,39 @@ _CLASS_TYPES: dict[str, list[str]] = {
 # TS/TSX heritage clauses. Classes wrap theirs in class_heritage; interfaces use
 # extends_type_clause. A type_identifier inside one is already covered by an
 # INHERITS edge, so it must not also emit REFERENCES.
-_TS_HERITAGE_CLAUSES = frozenset(
-    {
-        "extends_clause",
-        "implements_clause",
-        "extends_type_clause",
-    }
-)
+_TS_HERITAGE_CLAUSES = frozenset({
+    "extends_clause", "implements_clause", "extends_type_clause",
+})
 
 # TS/TSX declarations whose ``name`` field is a type_identifier. That occurrence
 # is the definition site, not a use of the type.
-_TS_TYPE_DECLARATIONS = frozenset(
-    {
-        "class_declaration",
-        "abstract_class_declaration",
-        "interface_declaration",
-        "type_alias_declaration",
-        "enum_declaration",
-    }
-)
+_TS_TYPE_DECLARATIONS = frozenset({
+    "class_declaration", "abstract_class_declaration", "interface_declaration",
+    "type_alias_declaration", "enum_declaration",
+})
 
 _FUNCTION_TYPES: dict[str, list[str]] = {
     "python": ["function_definition"],
-    "javascript": ["function_declaration", "method_definition", "arrow_function"],
-    "typescript": ["function_declaration", "method_definition", "arrow_function"],
-    "tsx": ["function_declaration", "method_definition", "arrow_function"],
+    "javascript": [
+        "function_declaration",
+        "generator_function_declaration",
+        "method_definition",
+        "arrow_function",
+    ],
+    "typescript": [
+        "function_declaration",
+        "generator_function_declaration",
+        "method_definition",
+        "abstract_method_signature",
+        "arrow_function",
+    ],
+    "tsx": [
+        "function_declaration",
+        "generator_function_declaration",
+        "method_definition",
+        "abstract_method_signature",
+        "arrow_function",
+    ],
     "go": ["function_declaration", "method_declaration"],
     "rust": ["function_item", "function_signature_item"],
     "java": ["method_declaration", "constructor_declaration"],
@@ -1170,11 +1589,8 @@ _FUNCTION_TYPES: dict[str, list[str]] = {
     # as Function nodes (public ones auto-generate getters) and distinguished
     # via extra["solidity_kind"].
     "solidity": [
-        "function_definition",
-        "constructor_definition",
-        "modifier_definition",
-        "event_definition",
-        "fallback_receive_definition",
+        "function_definition", "constructor_definition", "modifier_definition",
+        "event_definition", "fallback_receive_definition",
     ],
     # Dart: function_signature covers both top-level functions and class methods
     # (class methods appear as method_signature > function_signature pairs;
@@ -1199,7 +1615,7 @@ _FUNCTION_TYPES: dict[str, list[str]] = {
     # walker can't bridge the FnProto signature to its sibling Block body,
     # so the whole thing is dispatched via _extract_zig_constructs.
     "zig": [],
-    "powershell": ["function_statement"],
+    "powershell": ["function_statement", "class_method_definition"],
     # Julia: short-form functions `f(x) = expr` parse as `assignment` nodes
     # (not a dedicated definition node) and are handled in
     # _extract_julia_constructs.
@@ -1210,7 +1626,9 @@ _FUNCTION_TYPES: dict[str, list[str]] = {
     "verilog": ["task_declaration", "function_declaration", "always_construct"],
     # GDScript: ``func name(args) -> ReturnType:`` — includes ``static func``.
     "gdscript": ["function_definition"],
-    # SQL: CREATE FUNCTION / CREATE PROCEDURE handled via _parse_sql dispatch.
+    # SQL: CREATE FUNCTION / CREATE PROCEDURE / CREATE TRIGGER and PL/SQL
+    # procedures/functions nested in a PACKAGE BODY are handled via
+    # _parse_sql dispatch.
     "sql": [],
     # HCL/Terraform: dispatched via _extract_hcl_constructs.
     "hcl": [],
@@ -1232,7 +1650,13 @@ _IMPORT_TYPES: dict[str, list[str]] = {
     "perl": ["use_statement", "require_expression"],
     "kotlin": ["import_header"],
     "swift": ["import_declaration"],
-    "php": ["namespace_use_declaration"],
+    "php": [
+        "namespace_use_declaration",
+        "include_expression",
+        "include_once_expression",
+        "require_expression",
+        "require_once_expression",
+    ],
     "scala": ["import_declaration"],
     "solidity": ["import_directive"],
     # Dart: import_or_export wraps library_import > import_specification > configurable_uri
@@ -1283,11 +1707,10 @@ _CALL_TYPES: dict[str, list[str]] = {
     "c": ["call_expression"],
     "cpp": ["call_expression"],
     "csharp": ["invocation_expression", "object_creation_expression"],
-    "ruby": ["call", "method_call"],
+    "ruby": ["call"],
     "r": ["call"],
     "perl": [
-        "function_call_expression",
-        "method_call_expression",
+        "function_call_expression", "method_call_expression",
         "ambiguous_function_call_expression",
     ],
     "kotlin": ["call_expression"],
@@ -1320,7 +1743,7 @@ _CALL_TYPES: dict[str, list[str]] = {
     # SuffixExpr); calls are walked explicitly in
     # _extract_zig_calls_in_subtree from inside function bodies.
     "zig": [],
-    "powershell": ["command_expression"],
+    "powershell": ["command"],
     "julia": [
         "call_expression",
         "broadcast_call_expression",
@@ -1336,7 +1759,9 @@ _CALL_TYPES: dict[str, list[str]] = {
     # GDScript: bare calls produce ``call``; ``obj.method()`` is an
     # ``attribute`` node whose right-hand side is an ``attribute_call``.
     "gdscript": ["call", "attribute_call"],
-    # SQL: no call edges extracted (grammar too unreliable for procedure calls).
+    # SQL: no CALLS edges from the tree-sitter grammar (too unreliable for
+    # procedure calls); PL/SQL call edges are extracted separately via regex
+    # in _parse_sql for CREATE PROCEDURE/FUNCTION/TRIGGER/PACKAGE BODY bodies.
     "sql": [],
     # HCL/Terraform: resource references dispatched via _extract_hcl_constructs.
     "hcl": [],
@@ -1368,126 +1793,161 @@ _TEST_PATTERNS = [
     re.compile(r"_spec$"),
 ]
 
-_TEST_FILE_PATTERNS = [
-    re.compile(r"test_.*\.py$"),
-    re.compile(r".*_test\.py$"),
-    re.compile(r".*\.test\.[jt]sx?$"),
-    re.compile(r".*\.spec\.[jt]sx?$"),
-    re.compile(r".*_test\.go$"),
-    re.compile(r"[\\/]tests?[\\/]"),
-    re.compile(r"[\\/]__tests__[\\/]"),
-    re.compile(r".*_test\.dart$"),
-    re.compile(r"test[_-].*\.[rR]$"),
-    re.compile(r"tests/testthat/"),
-    re.compile(r".*Test\.kt$"),
-    re.compile(r".*Test\.java$"),
-    re.compile(r".*_test\.resi?$"),
-    re.compile(r".*\.test\.resi?$"),
-    re.compile(r"test/runtests\.jl$"),
-    re.compile(r"test/.*\.jl$"),
+# Path separator or start of the repository-relative path.  Directory and
+# stem patterns anchor on it so "src/latest/" is not read as a "test/"
+# directory and "contests/" is not read as "tests/".  Both separators are
+# accepted: the graph stores POSIX paths, but callers pass native ones.
+_SEP = r"(?:^|[\\/])"
+
+# Absolute-path shapes, tested against the POSIX-normalised spelling: a
+# leading slash, a Windows drive letter, or a UNC share.
+_ABSOLUTE_PATH_RE = re.compile(r"^(?:/|[A-Za-z]:/|//)")
+
+# Directory conventions.  These are matched against the path RELATIVE to the
+# repository root, never against the absolute path the graph stores: the
+# directories ABOVE a checkout are not part of the project, so a repository
+# cloned into a CI workspace named "test" would otherwise have every one of
+# its production symbols classified as test code.
+_TEST_DIR_PATTERNS = [
+    # Python ``tests/``, Go and Rust ``tests/``, Java/Kotlin ``src/test/``.
+    # The singular ``test/`` is handled separately below so a library that
+    # ships a ``test`` subpackage keeps its production status.
+    re.compile(_SEP + r"tests[\\/]"),
+    re.compile(_SEP + r"__tests__[\\/]"),
+    re.compile(_SEP + r"e2e[_-]?tests?[\\/]"),
+    re.compile(_SEP + r"testthat[\\/]"),
+    # Ruby RSpec.  The directory name alone is not evidence: "spec/" and
+    # "specs/" just as often hold design documents or generated API specs,
+    # which are production artefacts.  Require a Ruby source file under it.
+    re.compile(_SEP + r"specs?[\\/].*\.(?:rb|rake)$"),
 ]
 
-_TEST_RUNNER_NAMES = frozenset(
-    {
-        "describe",
-        "it",
-        "test",
-        "beforeEach",
-        "afterEach",
-        "beforeAll",
-        "afterAll",
-        # Mocha TDD interface: `suite` is the describe-equivalent.
-        # `test`, the it-equivalent, is already covered above.
-        "suite",
-    }
-)
+# The singular ``test/`` directory, kept out of the list above so the
+# shipped-package exception in :func:`_is_shipped_test_package` applies to it
+# alone.
+_SINGULAR_TEST_DIR_RE = re.compile(_SEP + r"test[\\/]")
+
+# Directories that hold helpers *for* tests.  Ambiguous on purpose: a shared
+# library published from ``test-utils/`` is production code with a public API,
+# so this is opt-in (``include_helper_dirs``) rather than part of the default
+# answer.  Only dead-code detection asks for it, where a false "dead" report
+# costs a reviewer more than a missed one.  See :func:`is_test_file`.
+_TEST_HELPER_DIR_PATTERNS = [
+    re.compile(_SEP + r"test[_-]utils?[\\/]"),
+]
+
+# Filename conventions.  Matched against the basename alone, so they hold
+# whatever the repository root is.
+_STORYBOOK_FILE_RE = re.compile(r"\.stories\.[jt]sx?$")
+_TEST_NAME_PATTERNS = [
+    # Python: pytest/unittest stems plus conftest, which holds fixtures.
+    re.compile(r"^test_.*\.py$"),
+    re.compile(r"_test\.py$"),
+    re.compile(r"^conftest\.py$"),
+    # JavaScript / TypeScript.
+    re.compile(r"\.(?:test|spec)\.[cm]?[jt]sx?$"),
+    # Storybook CSF files demonstrate components; they are not production callers.
+    _STORYBOOK_FILE_RE,
+    # Go.
+    re.compile(r"_test\.go$"),
+    # Ruby.
+    re.compile(r"_(?:test|spec)\.rb$"),
+    # Java / Kotlin / Scala / Groovy, C#, PHP (PHPUnit).  The character
+    # before "Test" must be lowercase or a digit so the suffix is a class
+    # name boundary rather than a substring: "ABTest.php" is an A/B testing
+    # feature, not a test for a class named "AB".  Acronym-prefixed suites
+    # such as "APITest.java" are caught by the test-directory rule instead.
+    re.compile(r"[a-z0-9]Tests?\.(?:java|kt|kts|scala|groovy)$"),
+    re.compile(r"[a-z0-9]Tests?\.cs$"),
+    re.compile(r"[a-z0-9]Test\.php$"),
+    # Dart.
+    re.compile(r"_test\.dart$"),
+    # R.
+    re.compile(r"^test[_-].*\.[rR]$"),
+    # PowerShell (Pester).
+    re.compile(r"\.tests\.ps1$", re.IGNORECASE),
+    # ReScript.
+    re.compile(r"[_.]test\.resi?$"),
+    # Julia.
+    re.compile(r"^runtests\.jl$"),
+]
+
+_TEST_RUNNER_NAMES = frozenset({
+    "describe", "it", "test", "beforeEach", "afterEach",
+    "beforeAll", "afterAll",
+    # Mocha TDD interface: `suite` is the describe-equivalent.
+    # `test`, the it-equivalent, is already covered above.
+    "suite",
+})
+
+# Ruby block-style tests: Minitest::Spec, RSpec and ActiveSupport::TestCase.
+# ``before``, ``let`` and ``setup`` count because the calls written in them run
+# for the tests beside them, and the file has no other node to credit them to.
+_RUBY_TEST_BLOCK_NAMES = frozenset({
+    "describe", "context", "it", "specify", "example", "test",
+    "feature", "scenario", "shared_examples", "shared_context",
+    "before", "after", "around", "setup", "teardown",
+    "let", "let!", "subject", "subject!",
+})
+_RUBY_MEMO_BLOCK_NAMES = frozenset({"let", "let!", "subject", "subject!"})
+_RUBY_DESCRIBING_BLOCK_NAMES = frozenset({"describe", "context"})
+_RUBY_CONSTANT_PATH_RE = re.compile(r"^[A-Z]\w*(?:\.[A-Z]\w*)*$")
+#: A Ruby constant as written, with the modules around it, innermost first.
+_RubyClassRef = tuple[str, tuple[str, ...]]
+#: ``com.acme.Cart``: a Java type written with its package.
+_JAVA_PACKAGE_QUALIFIED_TYPE = re.compile(r"(?:[a-z_$][\w$]*\.)+[A-Z][\w$]*")
 
 # Annotations/decorators that mark test methods (JUnit, TestNG, etc.)
-_TEST_ANNOTATIONS = frozenset(
-    {
-        "Test",
-        "ParameterizedTest",
-        "RepeatedTest",
-        "TestFactory",
-        "org.junit.Test",
-        "org.junit.jupiter.api.Test",
-        # Rust: built-in `#[test]` plus common async-runtime + framework
-        # variants. Stripped of the `#[ ]` wrapper before lookup.
-        "test",
-        "tokio::test",
-        "async_std::test",
-        "rstest",
-        "rstest::rstest",
-        "proptest",
-    }
-)
+_TEST_ANNOTATIONS = frozenset({
+    "Test", "ParameterizedTest", "RepeatedTest", "TestFactory",
+    "org.junit.Test", "org.junit.jupiter.api.Test",
+    # Rust: built-in `#[test]` plus common async-runtime + framework
+    # variants. Stripped of the `#[ ]` wrapper before lookup.
+    "test", "tokio::test", "async_std::test",
+    "rstest", "rstest::rstest", "proptest",
+})
 
 # Spring stereotype annotations that mark classes as managed beans
-_SPRING_STEREOTYPE_ANNOTATIONS = frozenset(
-    {
-        "Component",
-        "Service",
-        "Repository",
-        "Controller",
-        "RestController",
-        "Configuration",
-        "Indexed",
-        "ControllerAdvice",
-        "RestControllerAdvice",
-        "EventListener",
-    }
-)
+_SPRING_STEREOTYPE_ANNOTATIONS = frozenset({
+    "Component", "Service", "Repository", "Controller", "RestController",
+    "Configuration", "Indexed", "ControllerAdvice", "RestControllerAdvice",
+    "EventListener",
+})
 
 # Spring DI injection annotations (field/setter/constructor-level)
-_SPRING_INJECT_ANNOTATIONS = frozenset(
-    {
-        "Autowired",
-        "Inject",
-        "Resource",
-    }
-)
+_SPRING_INJECT_ANNOTATIONS = frozenset({
+    "Autowired", "Inject", "Resource",
+})
 _SPRING_PLACEHOLDER_RE = re.compile(r"\$\{([^{}]+)\}")
 
 # Temporal workflow/activity interface markers
-_TEMPORAL_INTERFACE_ANNOTATIONS = frozenset(
-    {
-        "WorkflowInterface",
-        "ActivityInterface",
-    }
-)
+_TEMPORAL_INTERFACE_ANNOTATIONS = frozenset({
+    "WorkflowInterface", "ActivityInterface",
+})
 
 # Temporal method-level markers
-_TEMPORAL_METHOD_ANNOTATIONS = frozenset(
-    {
-        "WorkflowMethod",
-        "ActivityMethod",
-        "SignalMethod",
-        "QueryMethod",
-    }
-)
+_TEMPORAL_METHOD_ANNOTATIONS = frozenset({
+    "WorkflowMethod", "ActivityMethod", "SignalMethod", "QueryMethod",
+})
 
 # Kafka consumer annotations (annotation-based pattern)
 _KAFKA_LISTENER_ANNOTATIONS = frozenset({"KafkaListener", "KafkaHandler"})
 
 # Kafka consumer field types (reactive / imperative)
-_KAFKA_CONSUMER_TYPES = frozenset(
-    {
-        "KafkaReceiver",
-        "ReactiveKafkaConsumerTemplate",
-        "MessageListenerContainer",
-        "ConcurrentMessageListenerContainer",
-    }
-)
+_KAFKA_CONSUMER_TYPES = frozenset({
+    "KafkaReceiver",
+    "ReactiveKafkaConsumerTemplate",
+    "MessageListenerContainer",
+    "ConcurrentMessageListenerContainer",
+})
 
 # Kafka producer field types
-_KAFKA_PRODUCER_TYPES = frozenset(
-    {
-        "KafkaTemplate",
-        "KafkaOperations",
-        "ReactiveKafkaProducerTemplate",
-        "KafkaSender",
-    }
-)
+_KAFKA_PRODUCER_TYPES = frozenset({
+    "KafkaTemplate",
+    "KafkaOperations",
+    "ReactiveKafkaProducerTemplate",
+    "KafkaSender",
+})
 
 # Spring scheduling annotations. ``Scheduled`` is repeatable; ``Schedules``
 # is its explicit Java container form.
@@ -1496,8 +1956,38 @@ _SPRING_SCHEDULED_ANNOTATIONS = frozenset({"Scheduled", "Schedules"})
 _SPRING_EVENT_LISTENER_ANNOTATIONS = frozenset({"EventListener"})
 _SPRING_EVENT_PUBLISH_METHODS = frozenset({"publishEvent"})
 _JAVA_PACKAGE_KEY = "__crg_java_package__"
+_JAVA_WILDCARD_KEY = "__crg_java_wildcard__"
 _SPRING_REQUEST_PREFIX_KEY = "__crg_spring_request_prefix__:"
 _JS_IMPORT_ORIGINAL_PREFIX_KEY = "__crg_js_import_original__:"
+# Marks a Python local name bound to a MODULE rather than to a symbol inside
+# one (``from . import cli``). The value is that module's file; a reference to
+# the name belongs to the file node, not to ``<file>::<name>``.
+_PY_MODULE_BINDING_KEY = "__crg_py_module_binding__:"
+# Marks an item defined in a Rust ``mod name { ... }`` written inline in the
+# file, as ``<key>name::item``. Its items are named after the file, so
+# ``name::item()`` means ``<file>::item``. A name the module only re-exports
+# with ``pub use`` is not one of them.
+_RUST_INLINE_MODULE_KEY = "__crg_rust_inline_module__:"
+# Value syntax that pins a Python name to a builtin container or scalar. A
+# method called on such a name can never belong to a repository node, so the
+# resolver must not attribute it to one. Derived from the literal grammar, not
+# from a list of method names.
+_PY_LITERAL_VALUE_TYPES = frozenset({
+    "concatenated_string",
+    "dictionary",
+    "dictionary_comprehension",
+    "false",
+    "float",
+    "generator_expression",
+    "integer",
+    "list",
+    "list_comprehension",
+    "set",
+    "set_comprehension",
+    "string",
+    "true",
+    "tuple",
+})
 _SPRING_REQUEST_MAPPINGS = {
     "DeleteMapping": ("DELETE",),
     "GetMapping": ("GET",),
@@ -1507,19 +1997,9 @@ _SPRING_REQUEST_MAPPINGS = {
     "RequestMapping": (),
 }
 _SPRING_WEBFLUX_HTTP_VERBS = frozenset({"DELETE", "GET", "PATCH", "POST", "PUT"})
-_HTTP_REQUEST_METHODS = frozenset(
-    {
-        "CONNECT",
-        "DELETE",
-        "GET",
-        "HEAD",
-        "OPTIONS",
-        "PATCH",
-        "POST",
-        "PUT",
-        "TRACE",
-    }
-)
+_HTTP_REQUEST_METHODS = frozenset({
+    "CONNECT", "DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT", "TRACE",
+})
 
 
 # ---------------------------------------------------------------------------
@@ -1560,8 +2040,7 @@ _VBNET_NAMESPACE_RE = re.compile(
     re.IGNORECASE,
 )
 _VBNET_END_NAMESPACE_RE = re.compile(
-    r"^\s*End\s+Namespace\b",
-    re.IGNORECASE,
+    r"^\s*End\s+Namespace\b", re.IGNORECASE,
 )
 _VBNET_TYPE_RE = re.compile(
     rf"^\s*{_VBNET_MODIFIER_RE}"
@@ -1585,8 +2064,7 @@ _VBNET_OPERATOR_RE = re.compile(
     re.IGNORECASE,
 )
 _VBNET_END_MEMBER_RE = re.compile(
-    r"^\s*End\s+(Function|Sub|Property|Operator)\b",
-    re.IGNORECASE,
+    r"^\s*End\s+(Function|Sub|Property|Operator)\b", re.IGNORECASE,
 )
 _VBNET_INHERITS_RE = re.compile(r"\bInherits\s+(.+?)\s*$", re.IGNORECASE)
 _VBNET_IMPLEMENTS_RE = re.compile(r"\bImplements\s+(.+?)\s*$", re.IGNORECASE)
@@ -1599,83 +2077,19 @@ _VBNET_CALL_RE = re.compile(
     re.IGNORECASE,
 )
 
-_VBNET_CALL_KEYWORDS = frozenset(
-    {
-        "addhandler",
-        "and",
-        "andalso",
-        "as",
-        "call",
-        "case",
-        "catch",
-        "class",
-        "cobj",
-        "continue",
-        "ctype",
-        "directcast",
-        "do",
-        "each",
-        "else",
-        "elseif",
-        "end",
-        "enum",
-        "erase",
-        "error",
-        "event",
-        "exit",
-        "finally",
-        "for",
-        "function",
-        "get",
-        "gettype",
-        "getxmlnamespace",
-        "global",
-        "gosub",
-        "goto",
-        "if",
-        "implements",
-        "imports",
-        "inherits",
-        "interface",
-        "loop",
-        "module",
-        "mustinherit",
-        "new",
-        "next",
-        "not",
-        "nothing",
-        "operator",
-        "option",
-        "or",
-        "orelse",
-        "property",
-        "raiseevent",
-        "redim",
-        "rem",
-        "removehandler",
-        "resume",
-        "return",
-        "select",
-        "set",
-        "step",
-        "stop",
-        "structure",
-        "sub",
-        "synclock",
-        "then",
-        "throw",
-        "to",
-        "try",
-        "typeof",
-        "until",
-        "using",
-        "when",
-        "while",
-        "with",
-        "withevents",
-        "xor",
-    }
-)
+_VBNET_CALL_KEYWORDS = frozenset({
+    "addhandler", "and", "andalso", "as", "call", "case", "catch",
+    "class", "cobj", "continue", "ctype", "directcast", "do", "each",
+    "else", "elseif", "end", "enum", "erase", "error", "event", "exit",
+    "finally", "for", "function", "get", "gettype", "getxmlnamespace",
+    "global", "gosub", "goto", "if", "implements", "imports", "inherits",
+    "interface", "loop", "module", "mustinherit", "new", "next", "not",
+    "nothing", "operator", "option", "or", "orelse", "property",
+    "raiseevent", "redim", "rem", "removehandler", "resume", "return",
+    "select", "set", "step", "stop", "structure", "sub", "synclock",
+    "then", "throw", "to", "try", "typeof", "until", "using", "when",
+    "while", "with", "withevents", "xor",
+})
 
 
 def _vbnet_normalize_name(value: str) -> str:
@@ -1691,7 +2105,7 @@ def _strip_vbnet_noise(text: str) -> str:
     cleaned_lines: list[str] = []
     for raw_line in text.splitlines(keepends=True):
         line = raw_line.rstrip("\r\n")
-        ending = raw_line[len(line) :]
+        ending = raw_line[len(line):]
         if re.match(r"^\s*Rem\b", line, re.IGNORECASE):
             cleaned_lines.append(" " * len(line) + ending)
             continue
@@ -1757,7 +2171,7 @@ def _vbnet_parenthesized(text: str, start: int) -> tuple[str, int] | None:
         elif text[index] == ")":
             depth -= 1
             if depth == 0:
-                return text[start + 1 : index], index + 1
+                return text[start + 1:index], index + 1
     return None
 
 
@@ -1787,7 +2201,9 @@ def _vbnet_type_parameters(rest: str) -> tuple[list[str], str]:
         return [], rest
     content, end = group
     params = [
-        part.strip().split()[0] for part in _vbnet_split_top_level(content[3:]) if part.strip()
+        part.strip().split()[0]
+        for part in _vbnet_split_top_level(content[3:])
+        if part.strip()
     ]
     return params, tail[end:]
 
@@ -1915,47 +2331,13 @@ _RESCRIPT_CALL_RE = re.compile(
 
 # Reserved words + syntactic noise that should never be treated as names
 # or as call targets.
-_RESCRIPT_KEYWORDS = frozenset(
-    {
-        "let",
-        "rec",
-        "and",
-        "type",
-        "module",
-        "open",
-        "include",
-        "external",
-        "if",
-        "else",
-        "switch",
-        "when",
-        "match",
-        "fun",
-        "true",
-        "false",
-        "for",
-        "while",
-        "mutable",
-        "try",
-        "catch",
-        "throw",
-        "assert",
-        "lazy",
-        "do",
-        "in",
-        "of",
-        "as",
-        "exception",
-        "private",
-        "constraint",
-        "with",
-        "downto",
-        "to",
-        "unpack",
-        "async",
-        "await",
-    }
-)
+_RESCRIPT_KEYWORDS = frozenset({
+    "let", "rec", "and", "type", "module", "open", "include", "external",
+    "if", "else", "switch", "when", "match", "fun", "true", "false",
+    "for", "while", "mutable", "try", "catch", "throw", "assert",
+    "lazy", "do", "in", "of", "as", "exception", "private",
+    "constraint", "with", "downto", "to", "unpack", "async", "await",
+})
 
 
 def _strip_rescript_noise(text: str) -> str:
@@ -2054,7 +2436,9 @@ def _scan_rescript_modules(cleaned: str, offset_to_line) -> list[dict]:
     # Module aliases (`module X = Foo.Bar`) also match _RESCRIPT_MODULE_RE but
     # have no brace body — skip them here to avoid the greedy `{`-scanner
     # swallowing the next unrelated block (e.g. a `let` body).
-    alias_starts = {m.start() for m in _RESCRIPT_MODULE_ALIAS_RE.finditer(cleaned)}
+    alias_starts = {
+        m.start() for m in _RESCRIPT_MODULE_ALIAS_RE.finditer(cleaned)
+    }
     for match in _RESCRIPT_MODULE_RE.finditer(cleaned):
         if match.start() in alias_starts:
             continue
@@ -2067,7 +2451,7 @@ def _scan_rescript_modules(cleaned: str, offset_to_line) -> list[dict]:
         brace_open = cleaned.find("{", match.end())
         if brace_open == -1:
             continue
-        between = cleaned[match.end() : brace_open]
+        between = cleaned[match.end():brace_open]
         if re.search(
             r"(?:^|\s)(?:let|type|module|external|and)\s",
             between,
@@ -2084,17 +2468,15 @@ def _scan_rescript_modules(cleaned: str, offset_to_line) -> list[dict]:
                 depth -= 1
             j += 1
         brace_close = j - 1 if depth == 0 else n - 1
-        modules.append(
-            {
-                "name": name,
-                "start_off": header_start,
-                "end_off": brace_close,
-                "body_start_off": brace_open + 1,
-                "start_line": offset_to_line(header_start),
-                "end_line": offset_to_line(brace_close),
-                "parent": None,
-            }
-        )
+        modules.append({
+            "name": name,
+            "start_off": header_start,
+            "end_off": brace_close,
+            "body_start_off": brace_open + 1,
+            "start_line": offset_to_line(header_start),
+            "end_line": offset_to_line(brace_close),
+            "parent": None,
+        })
 
     # Parent = innermost strictly-containing module.
     for i, m in enumerate(modules):
@@ -2114,21 +2496,214 @@ def _scan_rescript_modules(cleaned: str, offset_to_line) -> list[dict]:
     return modules
 
 
-def _is_test_file(path: str) -> bool:
-    return any(p.search(path) for p in _TEST_FILE_PATTERNS)
+@lru_cache(maxsize=64)
+def _repo_root_prefixes(repo_root: str) -> tuple[str, ...]:
+    """Return the POSIX spellings a path under *repo_root* may start with.
+
+    Both the spelling the caller gave and its symlink-resolved form are
+    returned: ``/tmp`` and ``/private/tmp`` name the same directory on macOS,
+    and a graph built through one spelling is often queried through the other.
+    """
+    root = normalize_file_path(repo_root).rstrip("/")
+    if not root:
+        return ()
+    prefixes = [root]
+    try:
+        resolved = normalize_file_path(Path(repo_root).resolve()).rstrip("/")
+    except (OSError, ValueError, RuntimeError):
+        resolved = ""
+    if resolved and resolved not in prefixes:
+        prefixes.append(resolved)
+    return tuple(prefixes)
+
+
+@lru_cache(maxsize=2048)
+def _resolved_dir(directory: str) -> str:
+    """Symlink-resolved POSIX spelling of *directory*, or "" if unresolvable."""
+    try:
+        return normalize_file_path(Path(directory).resolve())
+    except (OSError, ValueError, RuntimeError):
+        return ""
+
+
+def _strip_prefix(normalized: str, root: str) -> Optional[str]:
+    if normalized == root:
+        return ""
+    if normalized.startswith(root + "/"):
+        return normalized[len(root) + 1:]
+    # macOS and Windows filesystems are case-insensitive by default, so the
+    # stored path and the configured root can differ only in case.
+    if normalized.lower().startswith(root.lower() + "/"):
+        return normalized[len(root) + 1:]
+    return None
+
+
+def _repo_relative_path(
+    normalized: str, repo_root: "str | PurePath | None",
+) -> Optional[str]:
+    """Return *normalized* relative to *repo_root*, or ``None`` if unknowable.
+
+    ``None`` means "this path cannot be placed inside a repository", which
+    happens in exactly two ways: the path is absolute and no root was given,
+    or it is absolute and lies outside the root (a dependency, a generated
+    file, a stale row from another checkout).  Callers must not fall back to
+    the absolute path in that case — see :func:`is_test_file`.
+    """
+    if not _ABSOLUTE_PATH_RE.match(normalized):
+        # Already relative; by convention that is relative to the repo root.
+        return normalized
+    if repo_root is None:
+        return None
+    prefixes = _repo_root_prefixes(str(repo_root))
+    for root in prefixes:
+        relative = _strip_prefix(normalized, root)
+        if relative is not None:
+            return relative
+    # The two spellings can still name the same directory: ``/tmp`` and
+    # ``/private/tmp`` on macOS, or a checkout reached through a symlink.
+    # Resolving the path's own directory (cached, so once per directory) is
+    # the last attempt before giving up.
+    directory, _, name = normalized.rpartition("/")
+    resolved = _resolved_dir(directory) if directory else ""
+    if resolved and resolved != directory:
+        candidate = f"{resolved}/{name}"
+        for root in prefixes:
+            relative = _strip_prefix(candidate, root)
+            if relative is not None:
+                return relative
+    return None
+
+
+@lru_cache(maxsize=256)
+def _is_python_package_dir(directory: str) -> bool:
+    """Whether *directory* is an importable Python package (has __init__.py)."""
+    try:
+        return os.path.isfile(os.path.join(directory, "__init__.py"))
+    except (OSError, ValueError):
+        return False
+
+
+def _is_shipped_test_package(
+    normalized: str, relative: str, repo_root: "str | PurePath | None",
+) -> bool:
+    """Whether the singular ``test/`` directory in *relative* is shipped code.
+
+    ``django/test/client.py`` is production code: ``django/test/`` carries an
+    ``__init__.py`` and sits inside the ``django`` package, so users import it
+    as ``django.test``.  A top-level ``test/`` directory in an application is
+    not shipped — its parent is the repository root, which is not a package —
+    and neither is a ``test/`` directory holding a test-named module, which
+    the filename rules have already claimed before this is reached.
+
+    Returns False whenever the directories cannot be inspected (a relative
+    path with no root, a graph queried away from its checkout, a deleted
+    file), which keeps the conservative answer: the file stays test code.
+    """
+    if not relative.endswith(".py"):
+        return False
+    segments = relative.split("/")
+    dirs = segments[:-1]
+    try:
+        # The innermost "test" directory decides; anything under it inherits.
+        index = len(dirs) - 1 - dirs[::-1].index("test")
+    except ValueError:
+        return False
+    if index == 0:
+        # Top-level test/: its parent is the repository root, not a package.
+        return False
+    # The directories are read off disk, so they need a filesystem path. A
+    # relative input only has one when the caller gave the root; guessing
+    # against the working directory would make the answer depend on where
+    # the process happens to be running.
+    if len(normalized) > len(relative) and normalized.endswith(relative):
+        prefix = normalized[: len(normalized) - len(relative)]
+    elif repo_root is not None:
+        prefix = normalize_file_path(repo_root).rstrip("/") + "/"
+    else:
+        return False
+    test_dir = prefix + "/".join(dirs[: index + 1])
+    parent_dir = prefix + "/".join(dirs[:index])
+    return _is_python_package_dir(test_dir) and _is_python_package_dir(parent_dir)
+
+
+def repo_relative_path(
+    path: "str | PurePath", repo_root: "str | PurePath | None" = None,
+) -> Optional[str]:
+    """Return *path* as a POSIX path inside *repo_root*, or ``None``.
+
+    ``None`` says the path cannot be placed inside the repository — it is
+    absolute and either no root was given or it lies outside that root.  Any
+    rule that reads meaning from a directory name (``tests/``, a package
+    directory matched against an import specifier) needs this: the
+    directories above a checkout belong to whoever cloned it, not to the
+    project, and reading them as project structure is how a CI workspace
+    named "test" silences an entire report.  See #1023.
+    """
+    return _repo_relative_path(normalize_file_path(path), repo_root)
+
+
+def is_test_file(
+    path: "str | PurePath",
+    repo_root: "str | PurePath | None" = None,
+    *,
+    include_helper_dirs: bool = False,
+) -> bool:
+    """Return whether *path* holds test code.
+
+    Everything in a test file is test code: the test functions, the classes
+    that group them, the fixtures and the private helpers they call.  Callers
+    outside the parser use this to keep test-file symbols out of reports about
+    production code.
+
+    *repo_root* is required to answer directory conventions such as ``tests/``
+    for an absolute path, because those directories must be inside the project.
+    The graph stores absolute paths, so without a root a repository checked
+    out under a directory named ``test`` (a CI workspace, a job directory)
+    would have every production symbol classified as test code and the
+    untested-code report would go silent.  When the root is unknown, or the
+    path lies outside it, only the filename conventions apply; that under-
+    reports test files but never hides a production gap.
+
+    *include_helper_dirs* additionally claims ``test-utils/`` and
+    ``test_utils/``.  Those directories are genuinely ambiguous — shared
+    libraries are published from them — so only dead-code detection opts in,
+    where over-suppressing costs less than a false "dead" report.
+    """
+    normalized = normalize_file_path(path)
+    basename = normalized.rsplit("/", 1)[-1]
+    if any(p.search(basename) for p in _TEST_NAME_PATTERNS):
+        return True
+
+    relative = _repo_relative_path(normalized, repo_root)
+    if relative is None:
+        return False
+    if any(p.search(relative) for p in _TEST_DIR_PATTERNS):
+        return True
+    if include_helper_dirs and any(
+        p.search(relative) for p in _TEST_HELPER_DIR_PATTERNS
+    ):
+        return True
+    if _SINGULAR_TEST_DIR_RE.search(relative):
+        return not _is_shipped_test_package(normalized, relative, repo_root)
+    return False
+
+
+# Historical private spelling, kept because other modules import it.
+_is_test_file = is_test_file
 
 
 def _is_test_function(
     name: str,
     file_path: str,
     decorators: tuple[str, ...] = (),
+    repo_root: "str | PurePath | None" = None,
 ) -> bool:
     """A function is a test if its name matches test patterns, it lives
     in a test file and has a test-runner name, or it has a @Test annotation.
     """
     if any(p.search(name) for p in _TEST_PATTERNS):
         return True
-    if _is_test_file(file_path) and name in _TEST_RUNNER_NAMES:
+    if is_test_file(file_path, repo_root) and name in _TEST_RUNNER_NAMES:
         return True
     if decorators and any(d in _TEST_ANNOTATIONS for d in decorators):
         return True
@@ -2140,21 +2715,17 @@ def _is_test_function(
 # semantic-search input bounded even when a source file contains a very long
 # API reference as its docstring.
 _MAX_DOCSTRING_CHARS = 400
-_DOC_COMMENT_NODE_TYPES = frozenset(
-    {
-        "comment",
-        "block_comment",
-        "line_comment",
-        "doc_comment",
-    }
-)
+_DOC_COMMENT_NODE_TYPES = frozenset({
+    "comment",
+    "block_comment",
+    "line_comment",
+    "doc_comment",
+})
 _DOC_COMMENT_SKIP_TYPES = frozenset({"attribute_item", "decorator"})
-_DOC_COMMENT_WRAPPER_TYPES = frozenset(
-    {
-        "export_statement",
-        "template_declaration",
-    }
-)
+_DOC_COMMENT_WRAPPER_TYPES = frozenset({
+    "export_statement",
+    "template_declaration",
+})
 _CSHARP_SUMMARY_RE = re.compile(
     r"<summary(?:\s[^>]*)?>(.*?)</summary\s*>",
     re.IGNORECASE | re.DOTALL,
@@ -2292,18 +2863,17 @@ def _php_attribute_aliases(node) -> dict[str, str]:
                     (
                         child
                         for child in current.children
-                        if child.type in ("name", "qualified_name") and child != alias
+                        if child.type in ("name", "qualified_name")
+                        and child != alias
                     ),
                     None,
                 )
                 if target is not None:
                     alias_text = alias.text.decode(
-                        "utf-8",
-                        errors="replace",
+                        "utf-8", errors="replace",
                     ).strip()
                     target_text = target.text.decode(
-                        "utf-8",
-                        errors="replace",
+                        "utf-8", errors="replace",
                     ).strip()
                     if current.parent.type == "namespace_use_group":
                         declaration = current.parent.parent
@@ -2317,8 +2887,7 @@ def _php_attribute_aliases(node) -> dict[str, str]:
                         )
                         if prefix is not None:
                             prefix_text = prefix.text.decode(
-                                "utf-8",
-                                errors="replace",
+                                "utf-8", errors="replace",
                             ).strip()
                             target_text = f"{prefix_text}\\{target_text}"
                     normalized_target = target_text.lstrip("\\").casefold()
@@ -2350,8 +2919,7 @@ def _php_attribute_names(node) -> list[str]:
                 for ident in attr.children:
                     if ident.type in ("name", "qualified_name"):
                         raw_name = ident.text.decode(
-                            "utf-8",
-                            errors="replace",
+                            "utf-8", errors="replace",
                         ).strip()
                         normalized = raw_name.lstrip("\\")
                         if normalized.casefold() == _PHPUNIT_TEST_ATTRIBUTE:
@@ -2386,6 +2954,105 @@ def _php_docblock_marks_test(node) -> bool:
     )
 
 
+# Languages with their own rule for nested member scopes: Python and C++ keep
+# leaf spellings, Julia joins its own way, and the namespace-aware pass binds
+# C# calls (#934, #964). Every other language keeps the full scope chain.
+_SEPARATE_SCOPE_RULE_LANGUAGES = frozenset({"python", "cpp", "julia", "csharp"})
+
+
+def _nested_import_chain(module: str, resolved: str, symbol: str) -> str:
+    """Return the in-file scope chain a JVM import of a nested class names.
+
+    ``import app.Outer.Inner`` resolves to ``app/Outer.java``; the class it
+    names is ``Outer.Inner`` there, and its members carry that whole chain
+    (#934). Any other import keeps *symbol* unchanged.
+    """
+    parts = module.split(".")
+    if len(parts) < 2 or parts[-1] != symbol:
+        return symbol
+    stem = Path(resolved).stem
+    for index in range(len(parts) - 2, -1, -1):
+        if parts[index] == stem:
+            return ".".join(parts[index:])
+    return symbol
+
+
+class _OuterBinding(str):
+    """A C# binding declared *levels* containing types out from its use.
+
+    A field of ``Outer`` used inside ``Outer.Inner`` names its type from
+    ``Outer``, where an ``Inner.Service`` cannot shadow it. The value is still
+    the type text, so every other consumer reads it as a plain string.
+    """
+
+    levels: int
+
+    def __new__(cls, value: str, levels: int) -> "_OuterBinding":
+        binding = super().__new__(cls, value)
+        binding.levels = levels
+        return binding
+
+
+def _csharp_name(node) -> str:
+    """Read a C# name without folding trivia into its identity."""
+    parts = []
+    pending = [node] if node is not None else []
+    while pending:
+        current = pending.pop()
+        if current.type == "comment":
+            continue
+        if current.children:
+            pending.extend(reversed(current.children))
+        else:
+            parts.append(current.text.decode("utf-8", errors="replace").removeprefix("@"))
+    return "".join(parts)
+
+
+def _csharp_namespace_context(node) -> list[tuple[str, int]]:
+    """Innermost namespace body first; byte offsets distinguish reopened bodies.
+
+    Some grammar versions put file-scoped namespace members beside the
+    declaration rather than underneath it. Its scope still extends to EOF.
+    The compilation unit has scope -1, distinct from a namespace at byte 0.
+    """
+    declarations = []
+    current = node.parent
+    while current is not None:
+        if current.type in ("namespace_declaration", "file_scoped_namespace_declaration"):
+            declarations.append(current)
+        if current.parent is None and not declarations:
+            for child in current.named_children:
+                if child.start_byte >= node.start_byte:
+                    break
+                if child.type == "file_scoped_namespace_declaration":
+                    declarations.append(child)
+                    break
+                if child.type in _CLASS_TYPES["csharp"] or child.type == "namespace_declaration":
+                    break
+        current = current.parent
+    scopes = [("", -1)]
+    namespace = ""
+    for declaration in reversed(declarations):
+        name = _csharp_name(declaration.child_by_field_name("name"))
+        namespace = f"{namespace}.{name}" if namespace else name
+        scopes.append((namespace, declaration.start_byte))
+    return list(reversed(scopes))
+
+
+def _php_namespaces(root_node) -> list[str]:
+    """Namespaces a PHP file declares at its top level, in source order."""
+    namespaces: list[str] = []
+    for child in root_node.children:
+        if child.type != "namespace_definition":
+            continue
+        for part in child.children:
+            if part.type == "namespace_name":
+                name = part.text.decode("utf-8", errors="replace").strip("\\")
+                if name and name not in namespaces:
+                    namespaces.append(name)
+    return namespaces
+
+
 def _csharp_namespaces(root_node) -> list[str]:
     """Return all namespaces declared in a C# compilation unit.
 
@@ -2395,25 +3062,29 @@ def _csharp_namespaces(root_node) -> list[str]:
     See: #310
     """
     namespaces: list[str] = []
-    stack = [(root_node, None)]
+    stack = [(root_node, "")]
 
     while stack:
         node, parent_namespace = stack.pop()
         current_namespace = parent_namespace
         if node.type in (
-            "namespace_declaration",
-            "file_scoped_namespace_declaration",
+            "namespace_declaration", "file_scoped_namespace_declaration",
         ):
             for c in node.children:
                 if c.type in ("qualified_name", "identifier"):
-                    text = c.text.decode("utf-8", errors="replace").strip()
+                    text = _csharp_name(c)
                     if text:
                         current_namespace = (
-                            f"{parent_namespace}.{text}" if parent_namespace else text
+                            f"{parent_namespace}.{text}"
+                            if parent_namespace
+                            else text
                         )
                         namespaces.append(current_namespace)
                     break
-        stack.extend((child, current_namespace) for child in reversed(node.children))
+        stack.extend(
+            (child, current_namespace)
+            for child in reversed(node.children)
+        )
     return namespaces
 
 
@@ -2425,7 +3096,6 @@ def file_hash(path: Path) -> str:
 # ---------------------------------------------------------------------------
 # HCL / Terraform helpers (module-level; no self needed)
 # ---------------------------------------------------------------------------
-
 
 def _hcl_text(node) -> str:
     """Decode tree-sitter node bytes to a string."""
@@ -2450,25 +3120,24 @@ def _hcl_block_name(prefix: str, labels: list[str], n_labels: int) -> Optional[s
 # built-in namespace objects (path, terraform) are also included so that
 # expressions like ``each.value.id`` or ``terraform.workspace`` do not
 # generate spurious REFERENCES edges.
-_HCL_REF_PREFIXES: frozenset[str] = frozenset(
-    {
-        "var",
-        "module",
-        "local",
-        "data",
-        # block-local meta-argument iterators
-        "each",
-        "count",
-        "self",
-        # built-in namespace objects
-        "path",
-        "terraform",
-    }
-)
+_HCL_REF_PREFIXES: frozenset[str] = frozenset({
+    "var", "module", "local", "data",
+    # block-local meta-argument iterators
+    "each", "count", "self",
+    # built-in namespace objects
+    "path", "terraform",
+})
 
 
-def _hcl_ref_target(root: str, attrs: list[str]) -> Optional[str]:
+def _hcl_ref_target(
+    root: str, attrs: list[str], *, provider: bool = False,
+) -> Optional[str]:
     """Map a ``variable_expr.get_attr*`` chain to its canonical graph name."""
+    # Provider meta-arguments use the provider namespace even when a local
+    # provider name collides with an expression root such as "local".
+    # Only the block-local iterators cannot be a provider's local name.
+    if provider and root not in {"each", "count", "self"}:
+        return ".".join(["provider", root] + attrs[:1])
     if root == "var" and attrs:
         return f"var.{attrs[0]}"
     if root == "module" and attrs:
@@ -2511,31 +3180,16 @@ def _hcl_variable_refs(expr_node):
 # inside calls like ``length(var.x)`` are extracted.
 # ``quoted_template`` / ``template_interpolation`` ensure that variable
 # references inside ``"${var.x}"`` template strings are extracted.
-_HCL_RECURSE_TYPES: frozenset[str] = frozenset(
-    {
-        "expression",
-        "body",
-        "block",
-        "attribute",
-        "tuple",
-        "object",
-        "object_elem",
-        "collection_value",
-        "template_expr",
-        "for_expr",
-        "for_tuple_expr",
-        "for_object_expr",
-        "for_intro",
-        "for_cond",
-        "conditional",
-        # variable refs inside function call arguments, e.g. length(var.x)
-        "function_call",
-        "function_arguments",
-        # variable refs inside template string interpolations, e.g. "${var.x}"
-        "quoted_template",
-        "template_interpolation",
-    }
-)
+_HCL_RECURSE_TYPES: frozenset[str] = frozenset({
+    "expression", "body", "block", "attribute", "tuple",
+    "object", "object_elem", "collection_value",
+    "template_expr", "for_expr", "for_tuple_expr", "for_object_expr",
+    "for_intro", "for_cond", "conditional",
+    # variable refs inside function call arguments, e.g. length(var.x)
+    "function_call", "function_arguments",
+    # variable refs inside template string interpolations, e.g. "${var.x}"
+    "quoted_template", "template_interpolation",
+})
 
 
 def _hcl_for_iterator_names(for_expr_node) -> frozenset[str]:
@@ -2545,7 +3199,9 @@ def _hcl_for_iterator_names(for_expr_node) -> frozenset[str]:
         current = stack.pop()
         if current.type == "for_intro":
             return frozenset(
-                _hcl_text(child) for child in current.children if child.type == "identifier"
+                _hcl_text(child)
+                for child in current.children
+                if child.type == "identifier"
             )
         stack.extend(reversed(current.children))
     return frozenset()
@@ -2603,11 +3259,11 @@ def _hcl_dynamic_iterator_name(block_node) -> Optional[str]:
 # Dispatch table: block_type → (graph_kind, name_prefix, n_labels, emit_refs)
 # "terraform" and unknown types are absent so they are silently skipped.
 _HCL_BLOCK_CFG: dict[str, tuple[str, str, int, bool]] = {
-    "resource": ("Class", "resource", 2, True),
-    "data": ("Class", "data", 2, True),
-    "module": ("Class", "module", 1, True),
-    "variable": ("Function", "var", 1, False),
-    "output": ("Function", "output", 1, True),
+    "resource": ("Class",    "resource", 2, True),
+    "data":     ("Class",    "data",     2, True),
+    "module":   ("Class",    "module",   1, True),
+    "variable": ("Function", "var",      1, False),
+    "output":   ("Function", "output",   1, True),
     "provider": ("Function", "provider", 1, True),
 }
 
@@ -2649,7 +3305,8 @@ def _is_ansible_content(source: bytes) -> bool:
     has_import_pb = bool(re.search(r"^\s+import_playbook\s*:", text, re.MULTILINE))
     has_name = bool(re.search(r"^\s+-?\s*name\s*:", text, re.MULTILINE))
     has_module = any(
-        re.search(rf"^\s+{re.escape(k)}\s*:", text, re.MULTILINE) for k in _ANSIBLE_MODULE_KEYS
+        re.search(rf"^\s+{re.escape(k)}\s*:", text, re.MULTILINE)
+        for k in _ANSIBLE_MODULE_KEYS
     ) or bool(re.search(r"^\s+ansible\.\w+\.\w+\s*:", text, re.MULTILINE))
     return has_hosts or has_import_pb or has_tasks or has_handlers or (has_name and has_module)
 
@@ -2679,25 +3336,417 @@ def _ansible_fqcn_short(key: str) -> str:
     return key.rsplit(".", 1)[-1]
 
 
-def _yaml_line(node: _YamlNode) -> int:
-    return node.start_mark.line + 1
+def _yaml_line(node: object) -> int:
+    return node.start_mark.line + 1  # type: ignore[attr-defined]
 
 
-def _yaml_end_line(node: _YamlNode) -> int:
-    return node.end_mark.line + 1
+def _yaml_end_line(node: object) -> int:
+    """Return the last source line of *node*, 1-based and inclusive.
+
+    A block collection or block scalar ends at the next token, so its end mark
+    sits on the line of whatever follows, which may be a sibling key. When only
+    indentation comes before the mark on that line, the node ended earlier: on
+    the last line before it that is not blank.
+    """
+    mark = node.end_mark  # type: ignore[attr-defined]
+    buffer, line_start = mark.buffer, mark.pointer - mark.column
+    if buffer is None or buffer[line_start:mark.pointer].strip():
+        return mark.line + 1
+    line = mark.line
+    while line > 1:
+        previous = buffer.rfind("\n", 0, line_start - 1) + 1
+        if buffer[previous:line_start].strip():
+            break
+        line_start = previous
+        line -= 1
+    return max(line, 1)
 
 
-def _yaml_get_key(mapping_node: _YamlMapping, key: str) -> Optional[_YamlNode]:
-    for k_node, v_node in mapping_node.value:
+def _yaml_get_key(mapping_node: object, key: str) -> Optional[object]:
+    for k_node, v_node in mapping_node.value:  # type: ignore[attr-defined]
         if isinstance(k_node, _YamlScalar) and k_node.value == key:
             return v_node
     return None
 
 
+_JSON_VALUE_TYPES = {
+    "array": "array",
+    "false": "boolean",
+    "null": "null",
+    "number": "number",
+    "object": "object",
+    "string": "string",
+    "true": "boolean",
+}
+# Folders whose JSON is data for a test, a demo or the docs, not settings for
+# the project. On vega, ``docs/`` alone held 168 example specs and data sets
+# that would have become 12,725 paths.
+_JSON_DATA_DIR_NAMES = frozenset({
+    "__fixtures__",
+    "__mocks__",
+    "__snapshots__",
+    "data",
+    "datasets",
+    "demo",
+    "demos",
+    "doc",
+    "docs",
+    "example",
+    "examples",
+    "fixtures",
+    "mocks",
+    "sample",
+    "samples",
+    "snapshots",
+    "test-data",
+    "test_data",
+    "testdata",
+})
+
+
+def _is_storable_key(key: str) -> bool:
+    """Whether SQLite can store *key*: an escaped lone surrogate is not UTF-8."""
+    try:
+        key.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+def _json_key(key_node: Any) -> Optional[str]:
+    """Return a key's text with its escapes read, or None if it cannot be a path."""
+    if key_node is None or key_node.type != "string":
+        return None
+    raw = key_node.text.decode("utf-8", errors="replace")
+    try:
+        key = json.loads(raw)
+    except ValueError:
+        key = raw[1:-1]
+    return key if isinstance(key, str) and _is_storable_key(key) else None
+
+
 def _yaml_scalar(node: object) -> Optional[str]:
     if isinstance(node, _YamlScalar):
-        return node.value
+        return node.value  # type: ignore[attr-defined]
     return None
+
+
+# Elements that make a ``DocSection`` when they carry an id. Headings stay out:
+# nested inside a section they add a second node for the same place.
+_HTML_SECTION_TAGS = frozenset({"article", "div", "section"})
+_HTML_HEADING_TAGS = frozenset({"h1", "h2", "h3", "h4", "h5", "h6"})
+_HTML_TEMPLATE_MARKERS = ("{{", "{%", "<%", "${")
+# The ``type`` values of a script a browser runs. Anything else holds data
+# (``application/json``) or text for a template engine (``text/x-template``).
+_HTML_JAVASCRIPT_TYPES = frozenset({
+    "",
+    "application/ecmascript",
+    "application/javascript",
+    "application/x-javascript",
+    "module",
+    "text/babel",
+    "text/ecmascript",
+    "text/javascript",
+    "text/jsx",
+})
+_HTML_TYPESCRIPT_TYPES = frozenset({"application/typescript", "text/typescript"})
+
+
+def _html_start_tag(element: Any) -> Any:
+    """Return the opening tag of an element, if the page has one."""
+    for child in element.children:
+        if child.type in ("start_tag", "self_closing_tag"):
+            return child
+    return None
+
+
+def _html_tag_name(start_tag: Any) -> str:
+    for child in start_tag.children:
+        if child.type == "tag_name":
+            return child.text.decode("utf-8", errors="replace").lower()
+    return ""
+
+
+def _html_attributes(start_tag: Any) -> dict[str, str]:
+    """Read a tag's attributes. HTML names ignore case; the first one wins."""
+    attributes: dict[str, str] = {}
+    for attribute in start_tag.children:
+        if attribute.type != "attribute":
+            continue
+        name = ""
+        value = ""
+        for part in attribute.children:
+            if part.type == "attribute_name":
+                name = part.text.decode("utf-8", errors="replace").lower()
+            elif part.type == "attribute_value":
+                value = part.text.decode("utf-8", errors="replace")
+            elif part.type == "quoted_attribute_value":
+                for inner in part.children:
+                    if inner.type == "attribute_value":
+                        value = inner.text.decode("utf-8", errors="replace")
+        if name and name not in attributes:
+            attributes[name] = html.unescape(value)
+    return attributes
+
+
+def _html_script_language(attributes: dict[str, str]) -> Optional[str]:
+    """Return the grammar for a script's text, or None when it holds data."""
+    if attributes.get("lang", "").strip().lower() in ("ts", "typescript"):
+        return "typescript"
+    script_type = attributes.get("type", "").split(";")[0].strip().lower()
+    if script_type in _HTML_TYPESCRIPT_TYPES:
+        return "typescript"
+    return "javascript" if script_type in _HTML_JAVASCRIPT_TYPES else None
+
+
+def _html_is_local_src(src: str) -> bool:
+    """Whether a script's ``src`` names a file, not a URL or a template."""
+    if not src or src.startswith("//") or re.match(r"[A-Za-z][A-Za-z0-9+.-]*:", src):
+        return False
+    return not any(marker in src for marker in _HTML_TEMPLATE_MARKERS)
+
+
+def _html_first_heading(element: Any, max_chars: int) -> Optional[str]:
+    """Return a section's first heading, in its own words and capped.
+
+    A nested section keeps its heading to itself. The prose is left out on
+    purpose: this is a label for finding the section, not its content.
+    """
+    stack = list(reversed(element.children))
+    while stack:
+        node = stack.pop()
+        if node.type != "element":
+            continue
+        start_tag = _html_start_tag(node)
+        tag = _html_tag_name(start_tag) if start_tag is not None else ""
+        if tag in _HTML_HEADING_TAGS:
+            # Entities are leaves of their own: ``Caf&eacute;`` is two pieces
+            # with no gap between them, so pieces join with a space only where
+            # the page had one or a tag.
+            pieces: list[str] = []
+            last_end: Optional[int] = None
+            parts = list(reversed(node.children))
+            while parts:
+                part = parts.pop()
+                if part.type in ("text", "entity"):
+                    if last_end is not None and part.start_byte != last_end:
+                        pieces.append(" ")
+                    pieces.append(part.text.decode("utf-8", errors="replace"))
+                    last_end = part.end_byte
+                else:
+                    parts.extend(reversed(part.children))
+            heading = " ".join(html.unescape("".join(pieces)).split())
+            return heading[:max_chars] or None
+        if tag in _HTML_SECTION_TAGS and start_tag is not None and (
+            _html_attributes(start_tag).get("id", "").strip()
+        ):
+            continue
+        stack.extend(reversed(node.children))
+    return None
+_XSLT_NAMESPACE = "http://www.w3.org/1999/XSL/Transform"
+# One step of a select or match pattern that names what it reaches. ``*``, ``.``,
+# ``node()``, ``$var`` and ``key(...)`` do not, so they cannot be linked.
+_XSLT_NAMED_STEP_RE = re.compile(r"@?[^\W\d][\w.-]*(?::[^\W\d][\w.-]*)?")
+
+
+def _xml_name(element: Any) -> str:
+    """Return an element's tag name as written, prefix included."""
+    for child in element.children:
+        if child.type in ("STag", "EmptyElemTag"):
+            for part in child.children:
+                if part.type == "Name":
+                    return part.text.decode("utf-8", errors="replace")
+    return ""
+
+
+def _xml_attributes(element: Any) -> dict[str, str]:
+    """Read an element's attributes with entities such as ``&gt;`` decoded."""
+    attributes: dict[str, str] = {}
+    for child in element.children:
+        if child.type not in ("STag", "EmptyElemTag"):
+            continue
+        for attribute in child.children:
+            if attribute.type != "Attribute":
+                continue
+            name = value = ""
+            for part in attribute.children:
+                if part.type == "Name":
+                    name = part.text.decode("utf-8", errors="replace")
+                elif part.type == "AttValue":
+                    value = part.text.decode("utf-8", errors="replace")[1:-1]
+            if name and name not in attributes:
+                attributes[name] = html.unescape(value)
+    return attributes
+
+
+def _xml_scope(element: Any, parent: dict[str, str]) -> dict[str, str]:
+    """The namespaces in scope on *element*: its parent's, plus what it declares.
+
+    The default namespace is keyed by the empty prefix.
+    """
+    declared = {
+        name[len("xmlns:"):] if name.startswith("xmlns:") else "": value
+        for name, value in _xml_attributes(element).items()
+        if name == "xmlns" or name.startswith("xmlns:")
+    }
+    return {**parent, **declared} if declared else parent
+
+
+def _xslt_local_name(element: Any, scope: dict[str, str]) -> str:
+    """The local name of an XSLT element, or "" when it is in another namespace."""
+    prefix, _, local = _xml_name(element).rpartition(":")
+    return local if scope.get(prefix) == _XSLT_NAMESPACE else ""
+
+
+def _xml_child_elements(element: Any) -> list[Any]:
+    """Return the elements directly inside *element*, in document order."""
+    children: list[Any] = []
+    for child in element.children:
+        if child.type == "element":
+            children.append(child)
+        elif child.type == "content":
+            children.extend(c for c in child.children if c.type == "element")
+    return children
+
+
+def _xslt_split(expression: str, separator: str) -> list[str]:
+    """Split an XPath expression where *separator* is not inside ``[]`` or ``()``."""
+    parts: list[str] = []
+    depth = 0
+    quote = ""
+    current: list[str] = []
+    for char in expression:
+        if quote:
+            quote = "" if char == quote else quote
+        elif char in "'\"":
+            quote = char
+        elif char in "[(":
+            depth += 1
+        elif char in "])":
+            depth -= 1
+        elif char == separator and depth == 0:
+            parts.append("".join(current))
+            current = []
+            continue
+        current.append(char)
+    parts.append("".join(current))
+    return parts
+
+
+def _xslt_named_steps(expression: str) -> set[str]:
+    """Return the names an expression ends on, one for each ``|`` alternative.
+
+    A predicate narrows a match without changing what it names, so ``a/b[1]``
+    ends on ``b``. An alternative with no name to read makes the whole answer
+    empty: linking only the readable half would pass off a guess as the answer.
+    """
+    steps: set[str] = set()
+    for alternative in _xslt_split(expression, "|"):
+        last = _xslt_split(alternative, "/")[-1].strip()
+        last = last.split("[", 1)[0].strip()
+        if last.startswith("child::"):
+            last = last[len("child::"):]
+        if not _XSLT_NAMED_STEP_RE.fullmatch(last):
+            return set()
+        steps.add(last)
+    return steps
+
+
+@dataclass
+class _XsltTemplate:
+    """One top-level template or function, as read before its body is walked."""
+
+    element: Any
+    scope: dict[str, str]
+    node: NodeInfo
+    qualified: str
+    modes: set[str]
+    steps: set[str]
+
+    @property
+    def matches(self) -> bool:
+        """Can the processor pick it by its ``match``, whether or not it has a name?"""
+        return self.node.extra["xslt_kind"] != "function" and "match" in self.node.extra
+
+
+_YAML_SIMPLE_PATH_SEGMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]*$")
+
+# Folders that hold translations. ``lang`` and ``languages`` are left out on
+# purpose: they hold programming-language settings as often as translations.
+_LOCALE_DIR_NAMES = frozenset({"i18n", "l10n", "locale", "locales", "translations"})
+
+_LANGUAGE_TAG_RE = re.compile(r"([a-z]{2,3})(?:[-_@][a-z0-9]{2,8})*")
+
+# ISO 639-1, then the three-letter codes translation projects commonly use. Any
+# other three letters are not trusted: ``api.yml`` and ``web.yml`` fit the shape.
+_LANGUAGE_CODES = frozenset((
+    "aa ab ae af ak am an ar as av ay az ba be bg bh bi bm bn bo br bs ca ce ch "
+    "co cr cs cu cv cy da de dv dz ee el en eo es et eu fa ff fi fj fo fr fy ga "
+    "gd gl gn gu gv ha he hi ho hr ht hu hy hz ia id ie ig ii ik io is it iu ja "
+    "jv ka kg ki kj kk kl km kn ko kr ks ku kv kw ky la lb lg li ln lo lt lu lv "
+    "mg mh mi mk ml mn mr ms mt my na nb nd ne ng nl nn no nr nv ny oc oj om or "
+    "os pa pi pl ps pt qu rm rn ro ru rw sa sc sd se sg si sk sl sm sn so sq sr "
+    "ss st su sv sw ta te tg th ti tk tl tn to tr ts tt tw ty ug uk ur uz ve vi "
+    "vo wa wo xh yi yo za zh zu "
+    "ast ceb ckb fil gsw haw hsb kab kmr nds sco szl tok tzl yue zgh"
+).split())
+
+
+def _yaml_path_child(prefix: str, segment: str) -> str:
+    """Append a mapping key to a path without making dotted keys ambiguous."""
+    if _YAML_SIMPLE_PATH_SEGMENT.fullmatch(segment):
+        return f"{prefix}.{segment}" if prefix else segment
+    quoted = json.dumps(segment, ensure_ascii=False)
+    return f"{prefix}[{quoted}]" if prefix else f"[{quoted}]"
+
+
+def _yaml_value_type(node: object) -> str:
+    """Return a bounded structural/scalar type label without exposing its value."""
+    if isinstance(node, _YamlMapping):
+        return "mapping"
+    if isinstance(node, _YamlSequence):
+        return "sequence"
+    tag = str(getattr(node, "tag", ""))
+    scalar_type = tag.rsplit(":", 1)[-1]
+    if scalar_type in {"binary", "bool", "float", "int", "null", "str", "timestamp"}:
+        return scalar_type
+    return "scalar"
+
+
+def _is_language_tag(text: str) -> bool:
+    """Whether *text* is a language tag such as ``en``, ``pt-BR`` or ``zh_Hans``."""
+    match = _LANGUAGE_TAG_RE.fullmatch(text.lower())
+    return match is not None and match.group(1) in _LANGUAGE_CODES
+
+
+def _is_locale_yaml(path: "str | PurePath", repo_root: "str | PurePath | None") -> bool:
+    """Whether *path* is a translation file, judged inside the repository.
+
+    A translation catalogue repeats the same keys once per language, so it adds
+    thousands of paths that say nothing about the code. It takes two pieces of
+    evidence to call a file one. A translation folder alone is not enough
+    (``locales/deploy.yml``), and neither is the name alone: ``config/en.yml``
+    could be anything, and ``it.yml`` or ``no.yml`` are ordinary words. A file
+    this misses keeps its paths, which costs some noise; a false match would
+    lose real config, so doubtful files stay indexed.
+
+    The folders above a checkout belong to whoever cloned it, so an absolute
+    path with no root to read it against is never called a translation file.
+    A relative path is already read as relative to the root, as everywhere else.
+    """
+    relative = repo_relative_path(path, repo_root)
+    if relative is None:
+        return False
+    *folders, filename = relative.lower().split("/")
+    names = [folder.lstrip("_") for folder in folders]
+    if not _LOCALE_DIR_NAMES.intersection(names):
+        return False
+    if any(_is_language_tag(part) for part in filename.split(".")[:-1]):
+        return True
+    return any(
+        parent in _LOCALE_DIR_NAMES and _is_language_tag(child)
+        for parent, child in zip(names, names[1:])
+    )
 
 
 def _ansible_is_play_item(item: object) -> bool:
@@ -2713,64 +3762,121 @@ def _ansible_is_play_item(item: object) -> bool:
         return False
     keys: set[Optional[str]] = {
         _yaml_scalar(k)
-        for k, _ in item.value
+        for k, _ in item.value  # type: ignore[attr-defined]
         if isinstance(k, _YamlScalar)
     }
     if "import_playbook" in keys:
         return True
     return "hosts" in keys and bool(keys & _ANSIBLE_PLAY_KEYS)
 
-
 # ---------------------------------------------------------------------------
 # Parser
 # ---------------------------------------------------------------------------
+
+
+# Numeric endpoints accepted in PowerShell range expressions. Match the entire
+# literal so command names such as 1..3.ps1 and malformed suffixes stay calls.
+# https://learn.microsoft.com/powershell/module/microsoft.powershell.core/about/about_numeric_literals
+_POWERSHELL_NUMBER_PATTERN = (
+    r"[+-]?(?:(?:0x[0-9a-f]+|0b[01]+)(?:u[ysl]?|[ysln])?"
+    r"|\d+(?:u[ysl]?|[yslnd])?"
+    r"|(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?d?)(?:[kmgtp]b)?"
+)
+# The right side can also be a variable or, with nothing after the dots in the
+# command name, a parenthesised expression: 1..$n, 1..$a.Count, 0..($n - 1).
+_POWERSHELL_RANGE_RE = re.compile(
+    rf"{_POWERSHELL_NUMBER_PATTERN}\.\.(?:{_POWERSHELL_NUMBER_PATTERN}|\$.*)?",
+    re.IGNORECASE,
+)
+# function script:Get-Thing defines Get-Thing; callers do not write the scope.
+_POWERSHELL_SCOPE_RE = re.compile(r"^(?:global|local|private|script):", re.IGNORECASE)
 
 
 class CodeParser:
     """Parses source files using Tree-sitter and extracts structural information."""
 
     _MODULE_CACHE_MAX = 15_000  # Evict cache to cap memory on huge monorepos
+    _MAX_HTML_BYTES = 2_097_152
+    _MAX_HTML_SECTIONS = 500
+    _MAX_HTML_HEADING_CHARS = 200
+    _MAX_XSLT_BYTES = 4_194_304
+    _MAX_XSLT_NAME_CHARS = 200
+    _MAX_XSLT_PATTERN_CHARS = 512
+    _MAX_XSLT_MODE_FANOUT = 20
+    _MAX_GENERIC_YAML_BYTES = 1_048_576
+    _MAX_YAML_DEPTH = 100
+    _MAX_YAML_NODES = 10_000
+    _MAX_YAML_PATH_LENGTH = 512
+    _MAX_YAML_OCCURRENCE_SAMPLES = 10_000
+    _MAX_YAML_DUPLICATE_GROUP_SAMPLES = 100
+    _MAX_YAML_DUPLICATE_LINE_SAMPLES = 20
+    _MAX_JSON_BYTES = 262_144
+    _MAX_JSON_DEPTH = 32
+    _MAX_JSON_NODES = 1_000
+    _MAX_JSON_OCCURRENCE_SAMPLES = 50
+    _MAX_JSON_OBJECT_KEYS = 200
+    # Ruby load-root discovery reads a handful of repository-root scripts.
+    _RUBY_MANIFEST_SCAN_MAX = 10
+    _RUBY_MANIFEST_MAX_BYTES = 256 * 1024
     _BLADE_COMMENT_RE = re.compile(r"\{\{--.*?(?:--\}\}|$)", re.DOTALL)
     _BLADE_DIRECTIVE_RE = re.compile(
         r"""(?<!@)@(extends|include|component|livewire)\s*\(\s*(['"])([^'"]+)\2\s*\)""",
     )
+    # Blocks whose body Liquid does not run, plus inline comment tags. ``style``
+    # is left out on purpose: Liquid does run inside it.
+    _LIQUID_LITERAL_RE = re.compile(
+        r"\{%-?\s*(comment|raw|doc|schema|javascript|stylesheet)\s*-?%\}"
+        r".*?\{%-?\s*end\1\s*-?%\}"
+        r"|\{%-?\s*#.*?-?%\}",
+        re.DOTALL,
+    )
+    _LIQUID_TAG_RE = re.compile(
+        r"\{%-?\s*([A-Za-z_][A-Za-z0-9_-]*)(.*?)-?%\}",
+        re.DOTALL,
+    )
+    _LIQUID_OUTPUT_RE = re.compile(r"\{\{-?\s*(.*?)\s*-?\}\}", re.DOTALL)
+    _LIQUID_ASSIGN_RE = re.compile(r"\s*([A-Za-z_][A-Za-z0-9_-]*)\s*=")
+    _LIQUID_TARGET_RE = re.compile(r"\s*(['\"])([^'\"]+)\1")
+    _LIQUID_MAX_OUTPUT_NAME = 120
     _LARAVEL_ROUTE_FACADE = "Illuminate\\Support\\Facades\\Route"
     _LARAVEL_ELOQUENT_MODEL = "Illuminate\\Database\\Eloquent\\Model"
-    _LARAVEL_ROUTE_VERBS = frozenset(
-        {
-            "get",
-            "post",
-            "put",
-            "patch",
-            "delete",
-            "options",
-            "any",
-            "match",
-            "resource",
-            "apiResource",
-        }
-    )
-    _LARAVEL_RELATIONSHIPS = frozenset(
-        {
-            "hasMany",
-            "hasOne",
-            "belongsTo",
-            "belongsToMany",
-            "morphTo",
-            "morphMany",
-            "morphOne",
-            "morphToMany",
-            "morphedByMany",
-            "hasManyThrough",
-            "hasOneThrough",
-        }
-    )
+    _LARAVEL_ROUTE_VERBS = frozenset({
+        "get", "post", "put", "patch", "delete", "options",
+        "any", "match", "resource", "apiResource",
+    })
+    _LARAVEL_RELATIONSHIPS = frozenset({
+        "hasMany", "hasOne", "belongsTo", "belongsToMany",
+        "morphTo", "morphMany", "morphOne", "morphToMany",
+        "morphedByMany", "hasManyThrough", "hasOneThrough",
+    })
 
     def __init__(self, repo_root: Optional[Path] = None) -> None:
         self._repo_root = Path(repo_root).resolve() if repo_root is not None else None
         self._dbt_model_paths_cache: dict[Path, tuple[Path, ...]] = {}
         self._parsers: dict[str, object] = {}
         self._module_file_cache: dict[str, Optional[str]] = {}
+        # Ignore patterns per repository boundary, so a resolver never names
+        # a path the build will not index; see :meth:`_path_is_indexed`.
+        self._ignore_patterns_cache: dict[str, Optional[list[str]]] = {}
+        # Memoised ignore-pattern verdicts. One verdict costs a resolve() and
+        # a walk of every pattern, and a whole-repository build asks about
+        # the same package directory once per import that names it.
+        self._indexed_path_cache: dict[str, bool] = {}
+        # Directory listings for case-exact module lookup; see
+        # :meth:`_file_exists_exact`. Shared by every language resolver.
+        self._dir_entries_cache: dict[str, frozenset[str]] = {}
+        # go.mod discovery, keyed by directory; see :meth:`_go_module_chain`.
+        self._go_module_cache: dict[str, Optional["_GoModule"]] = {}
+        # Ruby load roots, keyed by repository boundary; see
+        # :meth:`_ruby_load_roots`.
+        self._ruby_load_roots_cache: dict[str, tuple[Path, ...]] = {}
+        # (module file, symbol) -> file that really defines the symbol; see
+        # :meth:`_python_reexport_origin`.
+        self._python_reexport_cache: dict[str, str] = {}
+        # Python module file -> file of the module it installs in its place
+        # via ``sys.modules[__name__] = ...`` (None when it is not a shim);
+        # see :meth:`_python_module_alias_target`.
+        self._python_module_alias_cache: dict[str, Optional[str]] = {}
         # Absolute file paths to treat as absent during import resolution.
         # ``forget`` sets this (via :meth:`exclude_files`) so a re-parsed
         # referrer resolves exactly as it would in a build where the forgotten
@@ -2778,10 +3884,20 @@ class CodeParser:
         self._excluded_files: set[str] = set()
         self._export_symbol_cache: dict[str, Optional[str]] = {}
         self._tsconfig_resolver = TsconfigResolver()
+        self._workspace_resolver = WorkspaceResolver(
+            repo_root=self._repo_root, file_exists=self._file_exists_exact,
+        )
+        self._npm_alias_resolver = NpmAliasResolver(
+            self._repo_root,
+            package_resolver=self._workspace_resolver,
+            path_is_indexed=self._npm_alias_path_is_indexed,
+        )
         # Per-parse cache of Dart pubspec root lookups; see #87
         self._dart_pubspec_cache: dict[tuple[str, str], Optional[Path]] = {}
         # Cargo discovery is shared by every Rust import/call in a source file.
-        self._rust_project_cache: dict[str, tuple[Path, Path, Path, dict[str, Path], Path]] = {}
+        self._rust_project_cache: dict[
+            str, tuple[Path, Path, Path, dict[str, Path], Path]
+        ] = {}
         # Config-driven custom languages (.code-review-graph/languages.toml).
         # The built-in tables stay shared module-level constants; only when a
         # repo defines custom languages does this parser switch to merged
@@ -2813,7 +3929,7 @@ class CodeParser:
                 self._import_types[custom.name] = list(custom.import_node_types)
                 self._call_types[custom.name] = list(custom.call_node_types)
 
-    def _get_parser(self, language: str):
+    def _get_parser(self, language: str):  # type: ignore[arg-type]
         if language not in self._parsers:
             # Custom languages map their name onto a packaged grammar.
             custom = self._custom_languages.get(language)
@@ -2823,6 +3939,42 @@ class CodeParser:
                 return None
             self._parsers[language] = parser
         return self._parsers[language]
+
+    def clear_caches(
+        self, include_parsers: bool = False, release_memory: bool = True
+    ) -> None:
+        """Clear per-instance and module-level caches and optionally release free heap pages."""
+        self._dbt_model_paths_cache.clear()
+        self._module_file_cache.clear()
+        self._ignore_patterns_cache.clear()
+        self._indexed_path_cache.clear()
+        self._dir_entries_cache.clear()
+        self._go_module_cache.clear()
+        self._ruby_load_roots_cache.clear()
+        self._python_reexport_cache.clear()
+        self._export_symbol_cache.clear()
+        self._dart_pubspec_cache.clear()
+        self._rust_project_cache.clear()
+        self._tsconfig_resolver = TsconfigResolver()
+        if include_parsers:
+            self._parsers.clear()
+        with _PYTHON_STAR_EXPORT_CACHE_LOCK:
+            _PYTHON_STAR_EXPORT_CACHE.clear()
+        with _PYTHON_RETURN_ANNOTATION_CACHE_LOCK:
+            _PYTHON_RETURN_ANNOTATION_CACHE.clear()
+        for _cached_fn in (
+            _read_cargo_manifest,
+            _python_unreachable_call_positions,
+            _read_go_mod,
+            _read_gemspec_require_paths,
+            _read_php_composer_psr4,
+            _repo_root_prefixes,
+            _resolved_dir,
+            _is_python_package_dir,
+        ):
+            _cached_fn.cache_clear()
+        if release_memory:
+            release_os_memory()
 
     def detect_language(self, path: Path, source: Optional[bytes] = None) -> Optional[str]:
         """Map a file path to its language name.
@@ -2931,6 +4083,16 @@ class CodeParser:
 
         return SHEBANG_INTERPRETER_TO_LANGUAGE.get(interpreter)
 
+    def _is_test_path(self, path: "str | PurePath") -> bool:
+        """Whether *path* holds test code, judged inside this repository.
+
+        Every test-ness question the parser asks goes through here so the
+        repository root is never left out: :func:`is_test_file` reads
+        directory conventions from the path relative to the root, and an
+        absolute path with no root silently loses them.
+        """
+        return is_test_file(path, self._repo_root)
+
     def parse_file(self, path: Path) -> tuple[list[NodeInfo], list[EdgeInfo]]:
         """Parse a single file and return extracted nodes and edges."""
         try:
@@ -2948,6 +4110,24 @@ class CodeParser:
         *source* so the stored file hash always describes the bytes that were
         actually parsed (issue #746).
         """
+        nodes, edges = self._extract_bytes(path, source)
+        # Every node from a test file is test code, whatever its kind: the
+        # test classes, the fixtures and the private helpers as much as the
+        # test functions.  Marking them here rather than at each of the ~40
+        # NodeInfo construction sites is what keeps Class nodes from being
+        # reported as untested production code (issue #1014).  It runs after
+        # extraction so TESTED_BY generation, which keys off the test
+        # functions alone, is unaffected.
+        fallback_path = normalize_file_path(path)
+        for node in nodes:
+            if not node.is_test and self._is_test_path(node.file_path or fallback_path):
+                node.is_test = True
+        return nodes, edges
+
+    def _extract_bytes(
+        self, path: Path, source: bytes,
+    ) -> tuple[list[NodeInfo], list[EdgeInfo]]:
+        """Language dispatch for :meth:`parse_bytes`."""
         language = self.detect_language(path, source)
         if not language:
             return [], []
@@ -2956,20 +4136,23 @@ class CodeParser:
         tree = None
         parse_source = source
         if language == "c" and path.suffix.lower() == ".h":
-            cpp_parser = self._get_parser("cpp")
-            if cpp_parser is not None:
-                cpp_source = self._mask_cpp_qt_macros(source)
-                cpp_tree = cpp_parser.parse(cpp_source)
-                if self._has_cpp_header_evidence(cpp_tree.root_node):
-                    language = "cpp"
-                    parser = cpp_parser
-                    tree = cpp_tree
-                    parse_source = cpp_source
+            if self._has_cpp_header_text_evidence(source):
+                cpp_parser = self._get_parser("cpp")
+                if cpp_parser is not None:
+                    cpp_source = self._mask_cpp_qt_macros(source)
+                    cpp_tree = cpp_parser.parse(cpp_source)
+                    if self._has_cpp_header_evidence(cpp_tree.root_node):
+                        language = "cpp"
+                        parser = cpp_parser
+                        tree = cpp_tree
+                        parse_source = cpp_source
         elif language == "cpp":
             parse_source = self._mask_cpp_qt_macros(source)
 
         if language == "blade":
             return self._parse_blade(path, source)
+        if language == "liquid":
+            return self._parse_liquid(path, source)
 
         # Vue SFCs: parse with vue parser, then delegate script blocks to JS/TS
         if language == "vue":
@@ -2978,6 +4161,13 @@ class CodeParser:
         # Svelte SFCs: same approach as Vue — extract <script> blocks
         if language == "svelte":
             return self._parse_svelte(path, source)
+
+        # HTML pages: inline scripts as code, id-anchored blocks as sections
+        if language == "html":
+            return self._parse_html(path, source)
+        # XSLT: templates as nodes, parsed with the XML grammar
+        if language == "xslt":
+            return self._parse_xslt(path, source)
 
         # Jupyter notebooks: extract code cells and parse as Python
         if language == "notebook":
@@ -3007,15 +4197,21 @@ class CodeParser:
         if language == "rescript":
             return self._parse_rescript(path, source)
 
+        # Robot Framework has no grammar in the bundled language pack.  Parse
+        # its table sections directly so tests, keywords, calls, and resource
+        # dependencies still contribute useful graph structure.
+        if language == "robot":
+            return self._parse_robot(path, source)
+
         # SQL: dedicated parser — tree-sitter for tables/views/functions +
         # regex fallback for CREATE PROCEDURE (unsupported by the grammar).
         if language == "sql":
             return self._parse_sql(path, source)
 
-        # Ansible YAML: path heuristic promoted to "ansible".
+        # Ansible YAML: path heuristic promoted to "ansible". A directory
+        # name alone is not enough evidence; fall back to generic YAML so a
+        # repository's ordinary tasks/*.yml files still get structural nodes.
         if language == "ansible":
-            if _yaml is None:
-                return [], []
             file_type = _ansible_file_type(path)
             # Variable and role-metadata files are identified by Ansible's
             # directory contract. Task/handler paths are not sufficient on
@@ -3023,20 +4219,31 @@ class CodeParser:
             # directory names, so require Ansible content evidence there.
             if file_type in ("vars", "meta") or _is_ansible_content(source):
                 return self._parse_ansible(path, source)
-            return [], []
+            return self._parse_yaml(path, source)
 
         # Spring configuration: only conventional application files reach
         # this branch. Generic YAML and arbitrary .properties files stay out.
         if language == "spring_config":
-            if _yaml is None:
-                return [], []
-            if path.suffix.lower() in (".yaml", ".yml") and _is_ansible_content(source):
+            is_yaml = path.suffix.lower() in (".yaml", ".yml")
+            # ``locales/en/application.yml`` is a catalogue, not Spring config.
+            if is_yaml and _is_locale_yaml(path, self._repo_root):
+                return self._parse_yaml(path, source)
+            if is_yaml and _is_ansible_content(source):
                 return self._parse_ansible(path, source)
-            return self._parse_spring_config(path, source)
+            spring_nodes, spring_edges = self._parse_spring_config(path, source)
+            if spring_nodes or path.suffix.lower() == ".properties":
+                return spring_nodes, spring_edges
+            return self._parse_yaml(path, source)
 
-        # Generic YAML: no tree-sitter grammar bundled; skip.
+        # Generic YAML: index paths and structure while deliberately discarding
+        # scalar values. PyYAML is already a runtime dependency for the
+        # specialised Ansible and Spring parsers.
         if language == "yaml":
-            return [], []
+            return self._parse_yaml(path, source)
+
+        # JSON: the same value-free paths, and data files stay out.
+        if language == "json":
+            return self._parse_json(path, source)
 
         if parser is None:
             parser = self._get_parser(language)
@@ -3050,7 +4257,7 @@ class CodeParser:
         file_path_str = normalize_file_path(path)
 
         # File node
-        test_file = _is_test_file(file_path_str)
+        test_file = self._is_test_path(file_path_str)
         file_extra: dict = {}
         # C#: record the namespace(s) this file declares so query-time
         # fallbacks can resolve namespace-form IMPORTS_FROM targets (from
@@ -3059,30 +4266,31 @@ class CodeParser:
             ns_list = _csharp_namespaces(tree.root_node)
             if ns_list:
                 file_extra["csharp_namespaces"] = ns_list
-        nodes.append(
-            NodeInfo(
-                kind="File",
-                name=file_path_str,
-                file_path=file_path_str,
-                line_start=1,
-                line_end=source.count(b"\n") + 1,
-                language=language,
-                is_test=test_file,
-                extra=file_extra,
-            )
-        )
+        # PHP: a class in the same namespace needs no ``use``, so the namespace
+        # is the evidence for which ``Base`` an ``extends Base`` means.
+        if language == "php":
+            php_namespaces = _php_namespaces(tree.root_node)
+            if php_namespaces:
+                file_extra["php_namespaces"] = php_namespaces
+        nodes.append(NodeInfo(
+            kind="File",
+            name=file_path_str,
+            file_path=file_path_str,
+            line_start=1,
+            line_end=source.count(b"\n") + 1,
+            language=language,
+            is_test=test_file,
+            extra=file_extra,
+        ))
 
         # Pre-scan for import mappings and defined names
         import_map, defined_names = self._collect_file_scope(
-            tree.root_node,
-            language,
-            source,
+            tree.root_node, language, source, file_path_str,
         )
+        self._index_ambiguous_method_scopes(tree.root_node, language, import_map)
         if language == "python":
             self._expand_python_star_imports(
-                tree.root_node,
-                file_path_str,
-                import_map,
+                tree.root_node, file_path_str, import_map,
             )
 
         typed_call_targets = self._collect_typed_call_targets(
@@ -3092,23 +4300,35 @@ class CodeParser:
             import_map,
             defined_names,
         )
+        if language == "python":
+            (
+                python_receiver_evidence,
+                python_property_read_edges,
+            ) = self._collect_python_receiver_evidence(
+                tree.root_node, file_path_str, source,
+            )
+        else:
+            python_receiver_evidence = {}
+            python_property_read_edges = []
 
         # Walk the tree
         self._extract_from_tree(
-            tree.root_node,
-            source,
-            language,
-            file_path_str,
-            nodes,
-            edges,
-            import_map=import_map,
-            defined_names=defined_names,
+            tree.root_node, source, language, file_path_str, nodes, edges,
+            import_map=import_map, defined_names=defined_names,
         )
+
+        if language == "elixir":
+            nodes, edges = self._merge_elixir_clauses(nodes, edges)
+        if language == "ruby" and test_file:
+            edges = self._apply_ruby_test_receivers(
+                edges, self._collect_ruby_test_receivers(tree.root_node),
+            )
 
         if language == "php":
             self._extract_php_laravel_edges(
                 tree.root_node,
                 file_path_str,
+                nodes,
                 edges,
             )
             edges = self._resolve_php_scoped_calls(
@@ -3119,9 +4339,31 @@ class CodeParser:
             )
 
         edges = self._apply_typed_call_targets(edges, typed_call_targets, language)
+        if language == "csharp":
+            for edge in edges:
+                if edge.kind != "CALLS":
+                    continue
+                receiver = edge.extra.get("receiver_scope") or edge.extra.get("receiver")
+                if receiver:
+                    # Distinct receivers on one line must survive edge upsert.
+                    edge.target = f"{receiver}::{edge.target}"
+                edge.extra["csharp_raw_target"] = edge.target
+
+        if language == "python":
+            edges = self._apply_python_receiver_evidence(
+                edges, python_receiver_evidence,
+            )
+            edges.extend(python_property_read_edges)
 
         # Resolve bare call targets to qualified names using same-file definitions
         edges = self._resolve_call_targets(nodes, edges, file_path_str)
+
+        if language == "java":
+            edges = self._qualify_java_same_package_constructors(
+                edges, file_path_str, import_map,
+            )
+            if test_file:
+                edges = self._mark_java_unknown_test_receivers(edges)
 
         # Generate TESTED_BY edges: when a test function calls a production
         # function, create an edge from the production function back to the test.
@@ -3133,26 +4375,28 @@ class CodeParser:
         if test_qnames:
             for edge in list(edges):
                 if edge.kind == "CALLS" and edge.source in test_qnames:
-                    edges.append(
-                        EdgeInfo(
-                            kind="TESTED_BY",
-                            source=edge.target,
-                            target=edge.source,
-                            file_path=edge.file_path,
-                            line=edge.line,
-                            extra=edge.extra.copy(),
-                        )
-                    )
+                    edges.append(EdgeInfo(
+                        kind="TESTED_BY",
+                        source=edge.target,
+                        target=edge.source,
+                        file_path=edge.file_path,
+                        line=edge.line,
+                        extra=edge.extra.copy(),
+                    ))
 
         return nodes, edges
 
     @staticmethod
     def _has_cpp_header_evidence(root) -> bool:
         """Return whether a parsed ``.h`` tree contains C++-only syntax."""
-        pending = [root]
+        # Carry dead-guard state down the tree.  Calling
+        # ``_is_in_static_dead_guard`` for every node repeatedly walks the
+        # nested ``preproc_elif`` chain in large generated headers, making
+        # this scan quadratic in the number of branches.
+        pending = [(root, False)]
         while pending:
-            node = pending.pop()
-            if node.type == "ERROR" or _is_in_static_dead_guard(node):
+            node, in_dead_guard = pending.pop()
+            if node.type == "ERROR" or in_dead_guard:
                 continue
 
             previous = node.prev_named_sibling
@@ -3166,18 +4410,34 @@ class CodeParser:
 
             if node.type in _CPP_HEADER_EVIDENCE_TYPES:
                 return True
-            if node.type == "enum_specifier" and any(
-                child.type in ("class", "struct") for child in node.children
+            if (
+                node.type == "enum_specifier"
+                and any(child.type in ("class", "struct") for child in node.children)
             ):
                 return True
-            if node.type == "type_qualifier" and node.text in _CPP_HEADER_EVIDENCE_QUALIFIERS:
+            if (
+                node.type == "type_qualifier"
+                and node.text in _CPP_HEADER_EVIDENCE_QUALIFIERS
+            ):
                 return True
-            pending.extend(node.named_children)
+            for child in node.named_children:
+                pending.append((
+                    child,
+                    in_dead_guard or _is_static_dead_guard_child(node, child),
+                ))
         return False
+
+    @staticmethod
+    def _has_cpp_header_text_evidence(source: bytes) -> bool:
+        """Cheaply decide whether a C header merits a speculative C++ parse."""
+        code = _CPP_HEADER_NON_CODE_RE.sub(b" ", source)
+        return _CPP_HEADER_TEXT_EVIDENCE_RE.search(code) is not None
 
     @staticmethod
     def _mask_cpp_qt_macros(source: bytes) -> bytes:
         """Shield structural Qt macros without changing byte or line offsets."""
+        if b"Q_" not in source and b"QT_" not in source:
+            return source
         masked = bytearray(source)
         length = len(source)
         index = 0
@@ -3279,9 +4539,11 @@ class CodeParser:
     @classmethod
     def _mask_blade_comments(cls, text: str) -> str:
         """Mask Blade comments while preserving offsets and line numbers."""
-
         def replace_comment(match: re.Match[str]) -> str:
-            return "".join(char if char in "\r\n" else " " for char in match.group(0))
+            return "".join(
+                char if char in "\r\n" else " "
+                for char in match.group(0)
+            )
 
         return cls._BLADE_COMMENT_RE.sub(replace_comment, text)
 
@@ -3302,29 +4564,169 @@ class CodeParser:
                 line_start=1,
                 line_end=source.count(b"\n") + 1,
                 language="blade",
-                is_test=_is_test_file(file_path),
+                is_test=self._is_test_path(file_path),
             ),
         ]
         edges: list[EdgeInfo] = []
         for match in self._BLADE_DIRECTIVE_RE.finditer(masked):
             directive = match.group(1)
             target = match.group(3)
-            edges.append(
-                EdgeInfo(
-                    kind="REFERENCES" if directive == "livewire" else "IMPORTS_FROM",
-                    source=file_path,
-                    target=target,
-                    file_path=file_path,
-                    line=masked.count("\n", 0, match.start()) + 1,
-                    extra={"blade_directive": directive},
-                )
-            )
+            edges.append(EdgeInfo(
+                kind="REFERENCES" if directive == "livewire" else "IMPORTS_FROM",
+                source=file_path,
+                target=target,
+                file_path=file_path,
+                line=masked.count("\n", 0, match.start()) + 1,
+                extra={"blade_directive": directive},
+            ))
         return nodes, edges
 
-    def _parse_vue(
+    @staticmethod
+    def _blank_liquid_span(match: re.Match[str]) -> str:
+        """Blank a span of a template, keeping its offsets and line numbers."""
+        return "".join(
+            character if character in "\r\n" else " "
+            for character in match.group(0)
+        )
+
+    def _liquid_statements(self, masked: str) -> Iterator[tuple[str, str, int]]:
+        """Yield ``(directive, arguments, offset)`` for each Liquid statement.
+
+        Only a statement's first word is its directive, so a quoted value can
+        never read as one. A ``{% liquid %}`` tag holds one statement per line,
+        with ``#`` and ``comment`` lines of its own.
+        """
+        for tag in self._LIQUID_TAG_RE.finditer(masked):
+            if tag.group(1) != "liquid":
+                yield tag.group(1), tag.group(2), tag.start(2)
+                continue
+            offset = tag.start(2)
+            in_comment = False
+            for line in tag.group(2).split("\n"):
+                words = line.split(maxsplit=1)
+                directive = words[0] if words else ""
+                if directive == "comment":
+                    in_comment = True
+                elif directive == "endcomment":
+                    in_comment = False
+                elif directive and not directive.startswith("#") and not in_comment:
+                    yield directive, words[1] if len(words) > 1 else "", offset
+                offset += len(line) + 1
+
+    def _resolve_liquid_snippet(self, path: Path, name: str) -> Optional[str]:
+        """Return the ``snippets/<name>.liquid`` a render or include names.
+
+        A theme keeps its snippets in one folder at its root and can sit anywhere
+        in the repository, so walk up from the template, stopping at the root.
+        """
+        if self._repo_root is None or not path.resolve().is_relative_to(self._repo_root):
+            return None
+        if ".." in Path(name).parts or Path(name).is_absolute():
+            return None
+        filename = name if name.endswith(".liquid") else f"{name}.liquid"
+        directory = path.parent
+        while True:
+            candidate = directory / "snippets" / filename
+            if self._file_exists_exact(candidate):
+                return normalize_file_path(candidate)
+            if directory.resolve() == self._repo_root or directory.parent == directory:
+                return None
+            directory = directory.parent
+
+    def _liquid_output_name(self, expression: str) -> str:
+        """Name an output by what it prints, so the name survives line changes."""
+        if len(expression) <= self._LIQUID_MAX_OUTPUT_NAME:
+            return f"output:{expression}"
+        digest = hashlib.sha256(expression.encode("utf-8")).hexdigest()[:8]
+        return f"output:{expression[:self._LIQUID_MAX_OUTPUT_NAME]}#{digest}"
+
+    def _parse_liquid(
         self,
         path: Path,
         source: bytes,
+    ) -> tuple[list[NodeInfo], list[EdgeInfo]]:
+        """Index Liquid files without requiring a dedicated Tree-sitter grammar.
+
+        A repeated assignment or output is one node with every line in
+        ``extra["lines"]``: names carry no line number, so an edit above them
+        does not rename them, and a second use cannot overwrite the first.
+        """
+        text = source.decode("utf-8", errors="replace")
+        masked = self._LIQUID_LITERAL_RE.sub(self._blank_liquid_span, text)
+        file_path = normalize_file_path(path)
+        nodes = [
+            NodeInfo(
+                kind="File",
+                name=file_path,
+                file_path=file_path,
+                line_start=1,
+                line_end=source.count(b"\n") + 1,
+                language="liquid",
+                is_test=self._is_test_path(file_path),
+            ),
+        ]
+        edges: list[EdgeInfo] = []
+
+        def line_at(offset: int) -> int:
+            return masked.count("\n", 0, offset) + 1
+
+        # name -> (kind, every line, line the first use ends on)
+        children: dict[str, tuple[str, list[int], int]] = {}
+
+        for directive, arguments, offset in self._liquid_statements(masked):
+            if directive == "assign":
+                assign = self._LIQUID_ASSIGN_RE.match(arguments)
+                if assign:
+                    line = line_at(offset)
+                    children.setdefault(assign.group(1), ("Variable", [], line))[1].append(line)
+            elif directive in ("render", "include"):
+                target = self._LIQUID_TARGET_RE.match(arguments)
+                if target:
+                    edges.append(EdgeInfo(
+                        kind="IMPORTS_FROM",
+                        source=file_path,
+                        target=(
+                            self._resolve_liquid_snippet(path, target.group(2))
+                            or target.group(2)
+                        ),
+                        file_path=file_path,
+                        line=line_at(offset),
+                        extra={"liquid_directive": directive},
+                    ))
+
+        # Text inside a tag, such as a quoted value, is not output.
+        for match in self._LIQUID_OUTPUT_RE.finditer(
+            self._LIQUID_TAG_RE.sub(self._blank_liquid_span, masked),
+        ):
+            expression = " ".join(match.group(1).split())
+            if expression:
+                children.setdefault(
+                    self._liquid_output_name(expression),
+                    ("Output", [], line_at(match.end())),
+                )[1].append(line_at(match.start()))
+
+        for name, (kind, lines, line_end) in children.items():
+            nodes.append(NodeInfo(
+                kind=kind,
+                name=name,
+                file_path=file_path,
+                line_start=lines[0],
+                line_end=line_end,
+                language="liquid",
+                extra={"lines": lines} if len(lines) > 1 else {},
+            ))
+            edges.append(EdgeInfo(
+                kind="CONTAINS",
+                source=file_path,
+                target=f"{file_path}::{name}",
+                file_path=file_path,
+                line=lines[0],
+            ))
+
+        return nodes, edges
+
+    def _parse_vue(
+        self, path: Path, source: bytes,
     ) -> tuple[list[NodeInfo], list[EdgeInfo]]:
         """Parse a Vue SFC by extracting <script> blocks and delegating to JS/TS."""
         vue_parser = self._get_parser("vue")
@@ -3333,19 +4735,17 @@ class CodeParser:
 
         tree = vue_parser.parse(source)
         file_path_str = normalize_file_path(path)
-        test_file = _is_test_file(file_path_str)
+        test_file = self._is_test_path(file_path_str)
 
-        all_nodes: list[NodeInfo] = [
-            NodeInfo(
-                kind="File",
-                name=file_path_str,
-                file_path=file_path_str,
-                line_start=1,
-                line_end=source.count(b"\n") + 1,
-                language="vue",
-                is_test=test_file,
-            )
-        ]
+        all_nodes: list[NodeInfo] = [NodeInfo(
+            kind="File",
+            name=file_path_str,
+            file_path=file_path_str,
+            line_start=1,
+            line_end=source.count(b"\n") + 1,
+            language="vue",
+            is_test=test_file,
+        )]
         all_edges: list[EdgeInfo] = []
 
         # Find script_element blocks in the Vue AST
@@ -3375,8 +4775,7 @@ class CodeParser:
                                 for v in a.children:
                                     if v.type == "attribute_value":
                                         attr_value = v.text.decode(
-                                            "utf-8",
-                                            errors="replace",
+                                            "utf-8", errors="replace",
                                         )
                         if attr_name == "lang" and attr_value in ("ts", "typescript"):
                             script_lang = "typescript"
@@ -3396,22 +4795,16 @@ class CodeParser:
 
             # Collect imports and defined names from the script block
             import_map, defined_names = self._collect_file_scope(
-                script_tree.root_node,
-                script_lang,
-                script_source,
+                script_tree.root_node, script_lang, script_source,
+                file_path_str,
             )
 
             nodes: list[NodeInfo] = []
             edges: list[EdgeInfo] = []
             self._extract_from_tree(
-                script_tree.root_node,
-                script_source,
-                script_lang,
-                file_path_str,
-                nodes,
-                edges,
-                import_map=import_map,
-                defined_names=defined_names,
+                script_tree.root_node, script_source, script_lang,
+                file_path_str, nodes, edges,
+                import_map=import_map, defined_names=defined_names,
             )
 
             # Adjust line numbers to account for position within the .vue file
@@ -3434,22 +4827,18 @@ class CodeParser:
                     test_qnames.add(qn)
             for edge in list(all_edges):
                 if edge.kind == "CALLS" and edge.source in test_qnames:
-                    all_edges.append(
-                        EdgeInfo(
-                            kind="TESTED_BY",
-                            source=edge.target,
-                            target=edge.source,
-                            file_path=edge.file_path,
-                            line=edge.line,
-                        )
-                    )
+                    all_edges.append(EdgeInfo(
+                        kind="TESTED_BY",
+                        source=edge.target,
+                        target=edge.source,
+                        file_path=edge.file_path,
+                        line=edge.line,
+                    ))
 
         return all_nodes, all_edges
 
     def _parse_svelte(
-        self,
-        path: Path,
-        source: bytes,
+        self, path: Path, source: bytes,
     ) -> tuple[list[NodeInfo], list[EdgeInfo]]:
         """Parse a Svelte SFC by extracting <script> blocks.
 
@@ -3469,19 +4858,17 @@ class CodeParser:
 
         tree = svelte_parser.parse(source)
         file_path_str = normalize_file_path(path)
-        test_file = _is_test_file(file_path_str)
+        test_file = self._is_test_path(file_path_str)
 
-        all_nodes: list[NodeInfo] = [
-            NodeInfo(
-                kind="File",
-                name=file_path_str,
-                file_path=file_path_str,
-                line_start=1,
-                line_end=source.count(b"\n") + 1,
-                language="svelte",
-                is_test=test_file,
-            )
-        ]
+        all_nodes: list[NodeInfo] = [NodeInfo(
+            kind="File",
+            name=file_path_str,
+            file_path=file_path_str,
+            line_start=1,
+            line_end=source.count(b"\n") + 1,
+            language="svelte",
+            is_test=test_file,
+        )]
         all_edges: list[EdgeInfo] = []
 
         # Walk root children looking for script_element blocks
@@ -3506,8 +4893,7 @@ class CodeParser:
                         for a in attr.children:
                             if a.type == "attribute_name":
                                 attr_name = a.text.decode(
-                                    "utf-8",
-                                    errors="replace",
+                                    "utf-8", errors="replace",
                                 )
                             elif a.type == "quoted_attribute_value":
                                 for v in a.children:
@@ -3516,7 +4902,11 @@ class CodeParser:
                                             "utf-8",
                                             errors="replace",
                                         )
-                        if attr_name == "lang" and attr_value in ("ts", "typescript"):
+                        if (
+                            attr_name == "lang"
+                            and attr_value
+                            in ("ts", "typescript")
+                        ):
                             script_lang = "typescript"
 
             if not raw_text_node:
@@ -3531,20 +4921,15 @@ class CodeParser:
 
             script_tree = script_parser.parse(script_source)
             import_map, defined_names = self._collect_file_scope(
-                script_tree.root_node,
-                script_lang,
-                script_source,
+                script_tree.root_node, script_lang, script_source,
+                file_path_str,
             )
 
             nodes: list[NodeInfo] = []
             edges: list[EdgeInfo] = []
             self._extract_from_tree(
-                script_tree.root_node,
-                script_source,
-                script_lang,
-                file_path_str,
-                nodes,
-                edges,
+                script_tree.root_node, script_source,
+                script_lang, file_path_str, nodes, edges,
                 import_map=import_map,
                 defined_names=defined_names,
             )
@@ -3565,29 +4950,606 @@ class CodeParser:
             for n in all_nodes:
                 if n.is_test:
                     qn = self._qualify(
-                        n.name,
-                        n.file_path,
-                        n.parent_name,
+                        n.name, n.file_path, n.parent_name,
                     )
                     test_qnames.add(qn)
             for edge in list(all_edges):
-                if edge.kind == "CALLS" and edge.source in test_qnames:
-                    all_edges.append(
-                        EdgeInfo(
-                            kind="TESTED_BY",
-                            source=edge.target,
-                            target=edge.source,
-                            file_path=edge.file_path,
-                            line=edge.line,
-                        )
-                    )
+                if (
+                    edge.kind == "CALLS"
+                    and edge.source in test_qnames
+                ):
+                    all_edges.append(EdgeInfo(
+                        kind="TESTED_BY",
+                        source=edge.target,
+                        target=edge.source,
+                        file_path=edge.file_path,
+                        line=edge.line,
+                    ))
 
         return all_nodes, all_edges
 
-    def _parse_notebook(
+    def _parse_html(
+        self, path: Path, source: bytes,
+    ) -> tuple[list[NodeInfo], list[EdgeInfo]]:
+        """Parse a page: its scripts as code and its anchored blocks as sections.
+
+        Scripts go to the JS/TS parsers as Vue and Svelte blocks do. A
+        ``div``, ``section`` or ``article`` with an id becomes a ``DocSection``
+        carrying its anchor and first heading, which is what a query can find:
+        the prose itself is not indexed.
+        """
+        html_parser = self._get_parser("html")
+        if not html_parser:
+            return [], []
+
+        file_path_str = normalize_file_path(path)
+        test_file = self._is_test_path(file_path_str)
+        file_node = NodeInfo(
+            kind="File",
+            name=file_path_str,
+            file_path=file_path_str,
+            line_start=1,
+            line_end=source.count(b"\n") + 1,
+            language="html",
+            is_test=test_file,
+        )
+        if len(source) > self._MAX_HTML_BYTES:
+            # Generated, most likely. The file node keeps it visible to change
+            # detection and listings.
+            file_node.extra["html_truncated"] = True
+            return [file_node], []
+
+        tree = html_parser.parse(source)
+        all_nodes: list[NodeInfo] = [file_node]
+        all_edges: list[EdgeInfo] = []
+        scripts: list[Any] = []
+        sections: dict[str, NodeInfo] = {}
+        handlers: list[tuple[str, str, int]] = []
+
+        # Iterative: page nesting comes from the input, so it has no safe bound.
+        stack = [tree.root_node]
+        while stack:
+            node = stack.pop()
+            if node.type == "script_element":
+                scripts.append(node)
+                continue
+            if node.type == "style_element":
+                continue
+            # An element never closed has no ``element`` node: the grammar
+            # leaves its opening tag directly under the error.
+            if node.type == "element" or (
+                node.type in ("start_tag", "self_closing_tag")
+                and node.parent is not None
+                and node.parent.type == "ERROR"
+            ):
+                start_tag = node if node.type != "element" else _html_start_tag(node)
+                if start_tag is not None:
+                    attributes = _html_attributes(start_tag)
+                    line = start_tag.start_point[0] + 1
+                    for name, value in attributes.items():
+                        if name.startswith("on") and value:
+                            handlers.append((name, value, line))
+                    self._add_html_section(
+                        node, _html_tag_name(start_tag), attributes, file_path_str,
+                        test_file, sections, file_node,
+                    )
+            stack.extend(reversed(node.children))
+
+        for section in sections.values():
+            all_nodes.append(section)
+            all_edges.append(EdgeInfo(
+                kind="CONTAINS",
+                source=file_path_str,
+                target=self._qualify(section.name, file_path_str, None),
+                file_path=file_path_str,
+                line=section.line_start,
+            ))
+
+        classic_nodes = self._extract_html_scripts(
+            scripts, file_path_str, all_nodes, all_edges,
+        )
+
+        # An inline handler is how a page reaches its own functions. Only names
+        # the page defines are linked: ``alert`` and ``obj.run`` say nothing.
+        # A handler runs in global scope, so a module's functions are out of reach.
+        page_functions = {
+            node.name: self._qualify(node.name, file_path_str, None)
+            for node in classic_nodes
+            if node.kind in ("Function", "Test") and not node.parent_name
+        }
+        for event, value, line in handlers if page_functions else []:
+            seen: set[str] = set()
+            for called in self._html_handler_calls(value):
+                if called in page_functions and called not in seen:
+                    seen.add(called)
+                    all_edges.append(EdgeInfo(
+                        kind="CALLS",
+                        source=file_path_str,
+                        target=page_functions[called],
+                        file_path=file_path_str,
+                        line=line,
+                        extra={"html_event": event},
+                    ))
+
+        # Not only on test pages: a ``test_`` function is a test anywhere, as in
+        # a ``.js`` file.
+        test_qnames = {
+            self._qualify(n.name, n.file_path, n.parent_name)
+            for n in all_nodes
+            if n.is_test and n.kind != "File"
+        }
+        if test_qnames:
+            for edge in list(all_edges):
+                if edge.kind == "CALLS" and edge.source in test_qnames:
+                    all_edges.append(EdgeInfo(
+                        kind="TESTED_BY",
+                        source=edge.target,
+                        target=edge.source,
+                        file_path=edge.file_path,
+                        line=edge.line,
+                    ))
+
+        return all_nodes, all_edges
+
+    def _add_html_section(
         self,
-        path: Path,
-        source: bytes,
+        element: Any,
+        tag: str,
+        attributes: dict[str, str],
+        file_path: str,
+        test_file: bool,
+        sections: dict[str, NodeInfo],
+        file_node: NodeInfo,
+    ) -> None:
+        """Record one anchored block. A repeated id keeps the first, as browsers do."""
+        html_id = attributes.get("id", "").strip()
+        if (
+            tag not in _HTML_SECTION_TAGS
+            or not html_id
+            or any(marker in html_id for marker in _HTML_TEMPLATE_MARKERS)
+        ):
+            return
+        name = f"#{html_id}"
+        existing = sections.get(name)
+        if existing is not None:
+            existing.extra["html_id_occurrences"] += 1
+            return
+        if len(sections) >= self._MAX_HTML_SECTIONS:
+            file_node.extra["html_truncated"] = True
+            return
+        extra: dict[str, Any] = {
+            "html_id": html_id,
+            "html_tag": tag,
+            "html_id_occurrences": 1,
+        }
+        heading = _html_first_heading(element, self._MAX_HTML_HEADING_CHARS)
+        if heading:
+            extra["docstring"] = heading
+        sections[name] = NodeInfo(
+            kind="DocSection",
+            name=name,
+            file_path=file_path,
+            line_start=element.start_point[0] + 1,
+            line_end=element.end_point[0] + 1,
+            language="html",
+            is_test=test_file,
+            extra=extra,
+        )
+
+    def _extract_html_scripts(
+        self,
+        scripts: list[Any],
+        file_path: str,
+        all_nodes: list[NodeInfo],
+        all_edges: list[EdgeInfo],
+    ) -> list[NodeInfo]:
+        """Extract a page's scripts, in page order, into the node and edge lists.
+
+        Returns the nodes of the classic scripts: the page's globals.
+        """
+        blocks: list[tuple[Any, bytes, str, int, dict[str, str], set[str], bool]] = []
+        shared_imports: dict[str, str] = {}
+        shared_names: set[str] = set()
+        for script in scripts:
+            start_tag = _html_start_tag(script)
+            attributes = _html_attributes(start_tag) if start_tag is not None else {}
+            if "src" in attributes:
+                # A browser ignores the text of a script that has a ``src``.
+                self._add_html_script_import(
+                    attributes["src"], file_path, script.start_point[0] + 1, all_edges,
+                )
+                continue
+            script_lang = _html_script_language(attributes)
+            raw_text = next(
+                (child for child in script.children if child.type == "raw_text"),
+                None,
+            )
+            if script_lang is None or raw_text is None or not raw_text.text.strip():
+                continue
+            script_parser = self._get_parser(script_lang)
+            if not script_parser:
+                continue
+            script_tree = script_parser.parse(raw_text.text)
+            import_map, defined_names = self._collect_file_scope(
+                script_tree.root_node, script_lang, raw_text.text, file_path,
+            )
+            is_module = attributes.get("type", "").strip().lower() == "module"
+            blocks.append((
+                script_tree.root_node, raw_text.text, script_lang,
+                raw_text.start_point[0], import_map, defined_names, is_module,
+            ))
+            # Classic scripts on a page share one global scope, so a block can
+            # call what another defines. A module's names stay inside it.
+            if not is_module:
+                shared_imports.update(import_map)
+                shared_names |= defined_names
+
+        extracted: list[tuple[list[NodeInfo], list[EdgeInfo], dict[str, str], bool]] = []
+        classic_nodes: list[NodeInfo] = []
+        for root, text, script_lang, line_offset, import_map, defined_names, is_module in blocks:
+            nodes: list[NodeInfo] = []
+            edges: list[EdgeInfo] = []
+            self._extract_from_tree(
+                root, text, script_lang, file_path, nodes, edges,
+                import_map={**shared_imports, **import_map},
+                # A name a module imports shadows a page global of that name.
+                defined_names=(shared_names - import_map.keys()) | defined_names,
+            )
+            for node in nodes:
+                node.line_start += line_offset
+                node.line_end += line_offset
+                node.language = "html"
+            for edge in edges:
+                edge.line += line_offset
+            extracted.append((nodes, edges, import_map, is_module))
+            if not is_module:
+                classic_nodes.extend(nodes)
+
+        # Same-file resolution, as for a script file (``app.handle()`` to the
+        # ``app.handle`` the page assigns), over what each block can see.
+        for nodes, edges, import_map, is_module in extracted:
+            visible = classic_nodes
+            if is_module:
+                visible = nodes + [
+                    node for node in classic_nodes if node.name not in import_map
+                ]
+            all_nodes.extend(nodes)
+            all_edges.extend(self._resolve_call_targets(visible, edges, file_path))
+        return classic_nodes
+
+    def _html_handler_calls(self, handler: str) -> list[str]:
+        """Names an inline handler calls, read with the JavaScript grammar.
+
+        Only a call of a plain name counts: not ``obj.run()``, and nothing in a
+        string or a comment.
+        """
+        js_parser = self._get_parser("javascript")
+        if not js_parser:
+            return []
+        called: list[str] = []
+        stack = [js_parser.parse(handler.encode("utf-8", errors="replace")).root_node]
+        while stack:
+            node = stack.pop()
+            if node.type == "call_expression":
+                function = node.child_by_field_name("function")
+                if function is not None and function.type == "identifier":
+                    called.append(function.text.decode("utf-8", errors="replace"))
+            stack.extend(reversed(node.children))
+        return called
+
+    def _add_html_script_import(
+        self, src: str, file_path: str, line: int, edges: list[EdgeInfo],
+    ) -> None:
+        """Link a page to the script file it loads. URLs and templates say nothing."""
+        src = src.strip()
+        if not _html_is_local_src(src):
+            return
+        relative = src.split("#", 1)[0].split("?", 1)[0]
+        if not relative:
+            return
+        resolved: Optional[str] = None
+        if relative.startswith("/"):
+            if self._repo_root is not None:
+                # As a browser reads the path: ``..`` stops at the root.
+                parts: list[str] = []
+                for part in relative.split("/"):
+                    if part == "..":
+                        if parts:
+                            parts.pop()
+                    elif part not in ("", "."):
+                        parts.append(part)
+                candidate = self._repo_root.joinpath(*parts).resolve()
+                if parts and candidate.is_file():
+                    canonical = normalize_file_path(candidate)
+                    if canonical not in self._excluded_files:
+                        resolved = canonical
+        else:
+            module = relative if relative.startswith(".") else f"./{relative}"
+            resolved = self._resolve_module_to_file(module, file_path, "javascript")
+        edges.append(EdgeInfo(
+            kind="IMPORTS_FROM",
+            source=file_path,
+            target=resolved or relative,
+            file_path=file_path,
+            line=line,
+        ))
+    def _parse_xslt(
+        self, path: Path, source: bytes,
+    ) -> tuple[list[NodeInfo], list[EdgeInfo]]:
+        """Parse a stylesheet into templates and the links between them.
+
+        ``call-template`` and ``xsl:import`` name their target, so those edges
+        are certain. ``apply-templates`` is chosen by the processor from the
+        input document, so it is linked only where a mode or a named step says
+        which templates it can reach. Where nothing does, the graph adds no edge
+        and counts it on the template instead of guessing.
+        """
+        xml_parser = self._get_parser("xml")
+        if not xml_parser:
+            return [], []
+
+        file_path = normalize_file_path(path)
+        file_node = NodeInfo(
+            kind="File",
+            name=file_path,
+            file_path=file_path,
+            line_start=1,
+            line_end=source.count(b"\n") + 1,
+            language="xslt",
+            is_test=self._is_test_path(file_path),
+        )
+        if len(source) > self._MAX_XSLT_BYTES:
+            file_node.extra["xslt_truncated"] = True
+            return [file_node], []
+
+        nodes: list[NodeInfo] = [file_node]
+        edges: list[EdgeInfo] = []
+        root = next(
+            (
+                child
+                for child in xml_parser.parse(source).root_node.children
+                if child.type == "element"
+            ),
+            None,
+        )
+        if root is None:
+            return nodes, edges
+
+        # The prefix is the author's choice, and any element may bind its own,
+        # the default namespace included. Only the namespace makes it XSLT. An
+        # ``xsl`` prefix that nothing declares is still read as XSLT.
+        root_scope = _xml_scope(root, {"xsl": _XSLT_NAMESPACE})
+
+        templates: list[_XsltTemplate] = []
+        seen: set[str] = set()
+        top_level = _xml_child_elements(root)
+        is_stylesheet = _xslt_local_name(root, root_scope) in ("stylesheet", "transform")
+        for element in top_level if is_stylesheet else []:
+            scope = _xml_scope(element, root_scope)
+            local = _xslt_local_name(element, scope)
+            if local in ("import", "include"):
+                self._add_xslt_import(element, local, file_path, edges)
+            elif local in ("template", "function"):
+                template = self._xslt_template(element, local, scope, file_path, seen)
+                if template is not None:
+                    templates.append(template)
+                    nodes.append(template.node)
+                    edges.append(EdgeInfo(
+                        kind="CONTAINS",
+                        source=file_path,
+                        target=template.qualified,
+                        file_path=file_path,
+                        line=template.node.line_start,
+                    ))
+
+        # Built once: per template, it made parsing quadratic in their number.
+        named = {
+            template.node.name: template.qualified
+            for template in templates
+            if template.node.extra["xslt_kind"] == "named_template"
+        }
+        for template in templates:
+            self._walk_xslt_body(
+                template.element, template.scope, template, templates, named,
+                file_path, edges,
+            )
+        if not is_stylesheet:
+            # A simplified stylesheet is one literal element with no templates,
+            # so what it calls can only be called by the file.
+            self._walk_xslt_body(root, root_scope, None, templates, named, file_path, edges)
+        return nodes, edges
+
+    def _add_xslt_import(
+        self, element: Any, how: str, file_path: str, edges: list[EdgeInfo],
+    ) -> None:
+        """Link a stylesheet to the local file it imports or includes."""
+        href = _xml_attributes(element).get("href", "").strip()
+        if not href or re.match(r"[A-Za-z][A-Za-z0-9+.-]*:", href):
+            return
+        target = href
+        candidate = (Path(file_path).parent / href).resolve()
+        if (
+            candidate.is_file()
+            and (self._repo_root is None or _path_is_within(candidate, self._repo_root))
+            and normalize_file_path(candidate) not in self._excluded_files
+        ):
+            target = normalize_file_path(candidate)
+        edges.append(EdgeInfo(
+            kind="IMPORTS_FROM",
+            source=file_path,
+            target=target,
+            file_path=file_path,
+            line=element.start_point[0] + 1,
+            extra={"xslt_import": how},
+        ))
+
+    def _xslt_template(
+        self,
+        element: Any,
+        local_name: str,
+        scope: dict[str, str],
+        file_path: str,
+        seen: set[str],
+    ) -> Optional[_XsltTemplate]:
+        """Read one template or function. Without a name or match it cannot run."""
+        attributes = _xml_attributes(element)
+        declared = " ".join(attributes.get("name", "").split())
+        match = " ".join(attributes.get("match", "").split())
+        mode = " ".join(attributes.get("mode", "").split())
+        if not declared and not match:
+            return None
+
+        extra: dict[str, Any] = {
+            "xslt_kind": (
+                "function" if local_name == "function"
+                else "named_template" if declared
+                else "match_template"
+            ),
+        }
+        if match:
+            extra["match"] = match[: self._MAX_XSLT_PATTERN_CHARS]
+        if mode:
+            extra["mode"] = mode[: self._MAX_XSLT_PATTERN_CHARS]
+        if attributes.get("priority"):
+            extra["priority"] = attributes["priority"][:32]
+
+        name = declared or f"match={match}" + (f" mode={mode}" if mode else "")
+        name = name[: self._MAX_XSLT_NAME_CHARS]
+        params = [
+            _xml_attributes(child).get("name", "")
+            for child in _xml_child_elements(element)
+            if _xslt_local_name(child, _xml_scope(child, scope)) == "param"
+        ]
+
+        # A pattern and mode may repeat under different priorities. Both are
+        # real, so a repeat takes its line into its identity instead of
+        # overwriting the first, and its column too when the line has one.
+        line_start = element.start_point[0] + 1
+        identity = None
+        if name in seen:
+            identity = f"{name}@L{line_start}"
+            if identity in seen:
+                identity = f"{identity}C{element.start_point[1] + 1}"
+        seen.add(identity or name)
+        node = NodeInfo(
+            kind="Function",
+            name=name,
+            file_path=file_path,
+            line_start=line_start,
+            line_end=element.end_point[0] + 1,
+            language="xslt",
+            params=f"({', '.join(params)})" if params else None,
+            extra=extra,
+            identity_name=identity,
+        )
+        return _XsltTemplate(
+            element=element,
+            scope=scope,
+            node=node,
+            qualified=self._qualify(identity or name, file_path, None),
+            modes=set(mode.split()) or {"#default"},
+            steps=_xslt_named_steps(match) if match else set(),
+        )
+
+    def _walk_xslt_body(
+        self,
+        element: Any,
+        scope: dict[str, str],
+        owner: Optional[_XsltTemplate],
+        templates: list[_XsltTemplate],
+        named: dict[str, str],
+        file_path: str,
+        edges: list[EdgeInfo],
+    ) -> None:
+        """Add the calls written inside a template, however deep they sit."""
+        source = owner.qualified if owner is not None else file_path
+        stack = [(child, scope) for child in reversed(_xml_child_elements(element))]
+        while stack:
+            child, parent_scope = stack.pop()
+            child_scope = _xml_scope(child, parent_scope)
+            name = _xslt_local_name(child, child_scope)
+            line = child.start_point[0] + 1
+            if name == "call-template":
+                called = " ".join(_xml_attributes(child).get("name", "").split())
+                if called:
+                    edges.append(EdgeInfo(
+                        kind="CALLS",
+                        source=source,
+                        target=named.get(called, called),
+                        file_path=file_path,
+                        line=line,
+                        extra={"xslt_call": "call-template"},
+                    ))
+            elif name == "apply-templates":
+                self._add_xslt_apply(child, owner, source, templates, file_path, line, edges)
+            stack.extend(
+                (grandchild, child_scope)
+                for grandchild in reversed(_xml_child_elements(child))
+            )
+
+    def _add_xslt_apply(
+        self,
+        element: Any,
+        owner: Optional[_XsltTemplate],
+        source: str,
+        templates: list[_XsltTemplate],
+        file_path: str,
+        line: int,
+        edges: list[EdgeInfo],
+    ) -> None:
+        """Link one ``apply-templates`` to the templates it can be shown to reach."""
+        attributes = _xml_attributes(element)
+        select = " ".join(attributes.get("select", "").split())
+        written_mode = attributes.get("mode", "").strip()
+        modes = {"#default"} if not written_mode else {written_mode}
+        if written_mode == "#current":
+            modes = owner.modes if owner is not None else {"#default"}
+        in_mode = [
+            template for template in templates
+            if template.matches
+            and ("#all" in template.modes or modes & template.modes)
+        ]
+        steps = _xslt_named_steps(select) if select else set()
+        if steps:
+            targets = [template for template in in_mode if steps & template.steps]
+        elif written_mode and written_mode != "#default" and (
+            len(in_mode) <= self._MAX_XSLT_MODE_FANOUT
+        ):
+            targets = in_mode
+        else:
+            targets = []
+
+        extra: dict[str, Any] = {"xslt_call": "apply-templates"}
+        if select:
+            extra["select"] = select[: self._MAX_XSLT_PATTERN_CHARS]
+        shown_mode = " ".join(sorted(modes))
+        if shown_mode != "#default":
+            extra["mode"] = shown_mode[: self._MAX_XSLT_PATTERN_CHARS]
+
+        target_names = [template.qualified for template in targets]
+        if not target_names and steps:
+            # Probably in another stylesheet. A bare name stays marked as a
+            # guess until post-processing finds it in the file or an import.
+            suffix = f" mode={shown_mode}" if shown_mode != "#default" else ""
+            target_names = [f"match={step}{suffix}" for step in sorted(steps)]
+        if not target_names:
+            if owner is not None:
+                owner.node.extra["dynamic_apply_count"] = (
+                    owner.node.extra.get("dynamic_apply_count", 0) + 1
+                )
+            return
+        for target in target_names:
+            edges.append(EdgeInfo(
+                kind="CALLS",
+                source=source,
+                target=target,
+                file_path=file_path,
+                line=line,
+                extra=dict(extra),
+            ))
+
+    def _parse_notebook(
+        self, path: Path, source: bytes,
     ) -> tuple[list[NodeInfo], list[EdgeInfo]]:
         """Parse a Jupyter notebook by extracting code cells."""
         try:
@@ -3644,7 +5606,10 @@ class CodeParser:
 
             # Filter %pip, ! lines from Python/R content (not SQL)
             if cell_lang in ("python", "r"):
-                filtered = [ln for ln in cell_lines if not ln.lstrip().startswith(("%", "!"))]
+                filtered = [
+                    ln for ln in cell_lines
+                    if not ln.lstrip().startswith(("%", "!"))
+                ]
             else:
                 filtered = cell_lines
             if not filtered:
@@ -3655,17 +5620,15 @@ class CodeParser:
 
         if not cells:
             file_path_str = normalize_file_path(path)
-            return [
-                NodeInfo(
-                    kind="File",
-                    name=file_path_str,
-                    file_path=file_path_str,
-                    line_start=1,
-                    line_end=1,
-                    language=kernel_lang,
-                    is_test=_is_test_file(file_path_str),
-                )
-            ], []
+            return [NodeInfo(
+                kind="File",
+                name=file_path_str,
+                file_path=file_path_str,
+                line_start=1,
+                line_end=1,
+                language=kernel_lang,
+                is_test=self._is_test_path(file_path_str),
+            )], []
 
         return self._parse_notebook_cells(path, cells, kernel_lang)
 
@@ -3683,7 +5646,7 @@ class CodeParser:
             default_language: Default language for the File node.
         """
         file_path_str = normalize_file_path(path)
-        test_file = _is_test_file(file_path_str)
+        test_file = self._is_test_path(file_path_str)
 
         # Group cells by language
         lang_cells: dict[str, list[CellInfo]] = {}
@@ -3705,15 +5668,13 @@ class CodeParser:
                 for cell in lang_group:
                     for match in _SQL_TABLE_RE.finditer(cell.source):
                         table_name = match.group(1).replace("`", "")
-                        all_edges.append(
-                            EdgeInfo(
-                                kind="IMPORTS_FROM",
-                                source=file_path_str,
-                                target=table_name,
-                                file_path=file_path_str,
-                                line=1,
-                            )
-                        )
+                        all_edges.append(EdgeInfo(
+                            kind="IMPORTS_FROM",
+                            source=file_path_str,
+                            target=table_name,
+                            file_path=file_path_str,
+                            line=1,
+                        ))
                 continue
 
             if lang not in ("python", "r"):
@@ -3734,17 +5695,13 @@ class CodeParser:
                 cell_line_count = cell.source.count("\n") + (
                     1 if not cell.source.endswith("\n") else 0
                 )
-                cell_offsets.append(
-                    (
-                        cell.cell_index,
-                        current_line,
-                        current_line + cell_line_count - 1,
-                    )
-                )
+                cell_offsets.append((
+                    cell.cell_index, current_line, current_line + cell_line_count - 1,
+                ))
                 code_chunks.append(cell.source)
-                # "\n".join only terminates a cell whose source lacks a final
-                # newline; a cell that already ends in one gains a blank line.
-                current_line += cell_line_count + (1 if cell.source.endswith("\n") else 0)
+                # The separator adds a blank line only if the cell already
+                # ends with a newline.
+                current_line += cell_line_count + int(cell.source.endswith("\n"))
 
             concatenated = "\n".join(code_chunks)
             concat_bytes = concatenated.encode("utf-8")
@@ -3752,25 +5709,16 @@ class CodeParser:
             tree = ts_parser.parse(concat_bytes)
 
             import_map, defined_names = self._collect_file_scope(
-                tree.root_node,
-                lang,
-                concat_bytes,
+                tree.root_node, lang, concat_bytes, file_path_str,
             )
             if lang == "python":
                 self._expand_python_star_imports(
-                    tree.root_node,
-                    file_path_str,
-                    import_map,
+                    tree.root_node, file_path_str, import_map,
                 )
             self._extract_from_tree(
-                tree.root_node,
-                concat_bytes,
-                lang,
-                file_path_str,
-                all_nodes,
-                all_edges,
-                import_map=import_map,
-                defined_names=defined_names,
+                tree.root_node, concat_bytes, lang,
+                file_path_str, all_nodes, all_edges,
+                import_map=import_map, defined_names=defined_names,
             )
 
             all_cell_offsets.extend(cell_offsets)
@@ -3790,9 +5738,7 @@ class CodeParser:
 
         # Resolve call targets
         all_edges = self._resolve_call_targets(
-            all_nodes,
-            all_edges,
-            file_path_str,
+            all_nodes, all_edges, file_path_str,
         )
 
         # Tag nodes with cell_index
@@ -3813,22 +5759,18 @@ class CodeParser:
                     test_qnames.add(qn)
             for edge in list(all_edges):
                 if edge.kind == "CALLS" and edge.source in test_qnames:
-                    all_edges.append(
-                        EdgeInfo(
-                            kind="TESTED_BY",
-                            source=edge.target,
-                            target=edge.source,
-                            file_path=edge.file_path,
-                            line=edge.line,
-                        )
-                    )
+                    all_edges.append(EdgeInfo(
+                        kind="TESTED_BY",
+                        source=edge.target,
+                        target=edge.source,
+                        file_path=edge.file_path,
+                        line=edge.line,
+                    ))
 
         return all_nodes, all_edges
 
     def _parse_databricks_py_notebook(
-        self,
-        path: Path,
-        source: bytes,
+        self, path: Path, source: bytes,
     ) -> tuple[list[NodeInfo], list[EdgeInfo]]:
         """Parse a Databricks .py notebook export."""
         text = source.decode("utf-8", errors="replace")
@@ -3874,7 +5816,10 @@ class CodeParser:
 
             if cell_lang:
                 # Strip "# MAGIC " prefix (8 chars) then skip the %lang directive line
-                stripped = [ln[8:] if ln.startswith("# MAGIC ") else ln for ln in chunk]
+                stripped = [
+                    ln[8:] if ln.startswith("# MAGIC ") else ln
+                    for ln in chunk
+                ]
                 # Remove the first non-empty line if it's just the %lang directive
                 stripped_non_empty = [ln for ln in stripped if ln.strip()]
                 if stripped_non_empty and stripped_non_empty[0].strip().startswith("%"):
@@ -3882,13 +5827,9 @@ class CodeParser:
                     first_directive = stripped_non_empty[0]
                     stripped = [ln for ln in stripped if ln != first_directive]
                 cell_source = "\n".join(stripped)
-                cells.append(
-                    CellInfo(
-                        cell_index=cell_idx,
-                        language=cell_lang,
-                        source=cell_source,
-                    )
-                )
+                cells.append(CellInfo(
+                    cell_index=cell_idx, language=cell_lang, source=cell_source,
+                ))
                 continue
 
             # Check for skip prefixes (md, sh)
@@ -3898,13 +5839,9 @@ class CodeParser:
             # Default: Python cell (mixed or no MAGIC)
             py_lines = [ln for ln in chunk if not ln.startswith("# MAGIC ")]
             cell_source = "\n".join(py_lines)
-            cells.append(
-                CellInfo(
-                    cell_index=cell_idx,
-                    language="python",
-                    source=cell_source,
-                )
-            )
+            cells.append(CellInfo(
+                cell_index=cell_idx, language="python", source=cell_source,
+            ))
 
         if not cells:
             file_path_str = normalize_file_path(path)
@@ -3915,7 +5852,7 @@ class CodeParser:
                 line_start=1,
                 line_end=1,
                 language="python",
-                is_test=_is_test_file(file_path_str),
+                is_test=self._is_test_path(file_path_str),
             )
             file_node.extra["notebook_format"] = "databricks_py"
             return [file_node], []
@@ -3935,9 +5872,7 @@ class CodeParser:
     # ------------------------------------------------------------------
 
     def _parse_vbnet(
-        self,
-        path: Path,
-        source: bytes,
+        self, path: Path, source: bytes,
     ) -> tuple[list[NodeInfo], list[EdgeInfo]]:
         """Parse stable VB structure without pretending to be a full compiler.
 
@@ -3950,19 +5885,17 @@ class CodeParser:
         statements = _vbnet_logical_lines(cleaned)
         file_path = normalize_file_path(path)
         line_count = text.count("\n") + 1
-        test_file = _is_test_file(file_path)
+        test_file = self._is_test_path(file_path)
 
-        nodes = [
-            NodeInfo(
-                kind="File",
-                name=file_path,
-                file_path=file_path,
-                line_start=1,
-                line_end=line_count,
-                language="vbnet",
-                is_test=test_file,
-            )
-        ]
+        nodes = [NodeInfo(
+            kind="File",
+            name=file_path,
+            file_path=file_path,
+            line_start=1,
+            line_end=line_count,
+            language="vbnet",
+            is_test=test_file,
+        )]
         edges: list[EdgeInfo] = []
         namespace_stack: list[dict] = []
         type_stack: list[dict] = []
@@ -4000,8 +5933,7 @@ class CodeParser:
                 wanted = kind.casefold()
                 index = next(
                     (
-                        pos
-                        for pos in range(len(type_stack) - 1, -1, -1)
+                        pos for pos in range(len(type_stack) - 1, -1, -1)
                         if type_stack[pos]["kind"] == wanted
                     ),
                     len(type_stack) - 1,
@@ -4010,9 +5942,7 @@ class CodeParser:
             nodes[entry["node_index"]].line_end = line_no
 
         def emit_relationships(
-            statement: str,
-            source_qn: str,
-            line_no: int,
+            statement: str, source_qn: str, line_no: int,
         ) -> None:
             for pattern, edge_kind in (
                 (_VBNET_INHERITS_RE, "INHERITS"),
@@ -4022,32 +5952,28 @@ class CodeParser:
                 if match is None:
                     continue
                 for target in _vbnet_relationship_targets(match.group(1)):
-                    edges.append(
-                        EdgeInfo(
-                            kind=edge_kind,
-                            source=source_qn,
-                            target=target,
-                            file_path=file_path,
-                            line=line_no,
-                            extra={"vbnet_unresolved": True},
-                        )
-                    )
+                    edges.append(EdgeInfo(
+                        kind=edge_kind,
+                        source=source_qn,
+                        target=target,
+                        file_path=file_path,
+                        line=line_no,
+                        extra={"vbnet_unresolved": True},
+                    ))
 
         def emit_calls(statement: str, source_qn: str, line_no: int) -> None:
             new_spans: list[tuple[int, int]] = []
             for match in _VBNET_NEW_RE.finditer(statement):
                 target = _vbnet_normalize_name(match.group("target"))
                 new_spans.append(match.span())
-                edges.append(
-                    EdgeInfo(
-                        kind="CALLS",
-                        source=source_qn,
-                        target=target,
-                        file_path=file_path,
-                        line=line_no,
-                        extra={"vbnet_unresolved": True, "constructor": True},
-                    )
-                )
+                edges.append(EdgeInfo(
+                    kind="CALLS",
+                    source=source_qn,
+                    target=target,
+                    file_path=file_path,
+                    line=line_no,
+                    extra={"vbnet_unresolved": True, "constructor": True},
+                ))
 
             for match in _VBNET_CALL_RE.finditer(statement):
                 if any(start <= match.start() < end for start, end in new_spans):
@@ -4056,16 +5982,14 @@ class CodeParser:
                 first = target.split(".", 1)[0].casefold()
                 if first in _VBNET_CALL_KEYWORDS:
                     continue
-                edges.append(
-                    EdgeInfo(
-                        kind="CALLS",
-                        source=source_qn,
-                        target=target,
-                        file_path=file_path,
-                        line=line_no,
-                        extra={"vbnet_unresolved": True},
-                    )
-                )
+                edges.append(EdgeInfo(
+                    kind="CALLS",
+                    source=source_qn,
+                    target=target,
+                    file_path=file_path,
+                    line=line_no,
+                    extra={"vbnet_unresolved": True},
+                ))
 
         for line_start, line_end, statement in statements:
             if not statement:
@@ -4074,15 +5998,13 @@ class CodeParser:
             import_match = _VBNET_IMPORT_RE.match(statement)
             if import_match:
                 for target in _vbnet_relationship_targets(import_match.group(1)):
-                    edges.append(
-                        EdgeInfo(
-                            kind="IMPORTS_FROM",
-                            source=file_path,
-                            target=target,
-                            file_path=file_path,
-                            line=line_start,
-                        )
-                    )
+                    edges.append(EdgeInfo(
+                        kind="IMPORTS_FROM",
+                        source=file_path,
+                        target=target,
+                        file_path=file_path,
+                        line=line_start,
+                    ))
                 continue
 
             if _VBNET_END_NAMESPACE_RE.match(statement):
@@ -4099,33 +6021,27 @@ class CodeParser:
                 outer = namespace_scope()
                 full_name = ".".join(filter(None, (outer, raw_name)))
                 node_index = len(nodes)
-                nodes.append(
-                    NodeInfo(
-                        kind="Class",
-                        name=raw_name,
-                        file_path=file_path,
-                        line_start=line_start,
-                        line_end=line_end,
-                        language="vbnet",
-                        parent_name=outer,
-                        extra={"vbnet_kind": "namespace"},
-                    )
-                )
-                edges.append(
-                    EdgeInfo(
-                        kind="CONTAINS",
-                        source=container_qn(outer),
-                        target=self._qualify(raw_name, file_path, outer),
-                        file_path=file_path,
-                        line=line_start,
-                    )
-                )
-                namespace_stack.append(
-                    {
-                        "full": full_name,
-                        "node_index": node_index,
-                    }
-                )
+                nodes.append(NodeInfo(
+                    kind="Class",
+                    name=raw_name,
+                    file_path=file_path,
+                    line_start=line_start,
+                    line_end=line_end,
+                    language="vbnet",
+                    parent_name=outer,
+                    extra={"vbnet_kind": "namespace"},
+                ))
+                edges.append(EdgeInfo(
+                    kind="CONTAINS",
+                    source=container_qn(outer),
+                    target=self._qualify(raw_name, file_path, outer),
+                    file_path=file_path,
+                    line=line_start,
+                ))
+                namespace_stack.append({
+                    "full": full_name,
+                    "node_index": node_index,
+                })
                 continue
 
             end_member = _VBNET_END_MEMBER_RE.match(statement)
@@ -4151,43 +6067,35 @@ class CodeParser:
                 if type_params:
                     extra["vbnet_type_parameters"] = type_params
                 node_index = len(nodes)
-                nodes.append(
-                    NodeInfo(
-                        kind="Class",
-                        name=name,
-                        file_path=file_path,
-                        line_start=line_start,
-                        line_end=line_end,
-                        language="vbnet",
-                        parent_name=scope,
-                        extra=extra,
-                    )
-                )
+                nodes.append(NodeInfo(
+                    kind="Class",
+                    name=name,
+                    file_path=file_path,
+                    line_start=line_start,
+                    line_end=line_end,
+                    language="vbnet",
+                    parent_name=scope,
+                    extra=extra,
+                ))
                 type_qn = self._qualify(name, file_path, scope)
-                edges.append(
-                    EdgeInfo(
-                        kind="CONTAINS",
-                        source=container_qn(scope),
-                        target=type_qn,
-                        file_path=file_path,
-                        line=line_start,
-                    )
-                )
-                type_stack.append(
-                    {
-                        "full": full_scope,
-                        "kind": kind,
-                        "node_index": node_index,
-                    }
-                )
+                edges.append(EdgeInfo(
+                    kind="CONTAINS",
+                    source=container_qn(scope),
+                    target=type_qn,
+                    file_path=file_path,
+                    line=line_start,
+                ))
+                type_stack.append({
+                    "full": full_scope,
+                    "kind": kind,
+                    "node_index": node_index,
+                })
                 emit_relationships(type_match.group("rest"), type_qn, line_start)
                 continue
 
             type_entry = current_type()
             if type_entry and re.match(
-                r"^\s*(?:Inherits|Implements)\b",
-                statement,
-                re.IGNORECASE,
+                r"^\s*(?:Inherits|Implements)\b", statement, re.IGNORECASE,
             ):
                 emit_relationships(
                     statement,
@@ -4196,7 +6104,10 @@ class CodeParser:
                 )
                 continue
 
-            member_match = _VBNET_MEMBER_RE.match(statement) or _VBNET_OPERATOR_RE.match(statement)
+            member_match = (
+                _VBNET_MEMBER_RE.match(statement)
+                or _VBNET_OPERATOR_RE.match(statement)
+            )
             if member_match:
                 while member_stack:
                     close_member(line_start)
@@ -4204,14 +6115,9 @@ class CodeParser:
                 name = _vbnet_normalize_name(member_match.group("name"))
                 if member_kind == "operator":
                     name = f"operator_{name}"
-                modifiers = (
-                    re.sub(
-                        r"\s+",
-                        " ",
-                        member_match.group("mods").strip(),
-                    )
-                    or None
-                )
+                modifiers = re.sub(
+                    r"\s+", " ", member_match.group("mods").strip(),
+                ) or None
                 params, return_type, type_params = _vbnet_signature_parts(
                     member_match.group("rest"),
                 )
@@ -4220,42 +6126,37 @@ class CodeParser:
                 key = ((scope or "").casefold(), name.casefold())
                 member_index = member_nodes.get(key)
                 if member_index is None:
-                    is_test = _is_test_function(name, file_path)
+                    is_test = _is_test_function(name, file_path, repo_root=self._repo_root)
                     extra = {"vbnet_kind": member_kind}
                     if type_params:
                         extra["vbnet_type_parameters"] = type_params
                     member_index = len(nodes)
-                    nodes.append(
-                        NodeInfo(
-                            kind="Test" if is_test else "Function",
-                            name=name,
-                            file_path=file_path,
-                            line_start=line_start,
-                            line_end=line_end,
-                            language="vbnet",
-                            parent_name=scope,
-                            params=params,
-                            return_type=return_type,
-                            modifiers=modifiers,
-                            is_test=is_test,
-                            extra=extra,
-                        )
-                    )
+                    nodes.append(NodeInfo(
+                        kind="Test" if is_test else "Function",
+                        name=name,
+                        file_path=file_path,
+                        line_start=line_start,
+                        line_end=line_end,
+                        language="vbnet",
+                        parent_name=scope,
+                        params=params,
+                        return_type=return_type,
+                        modifiers=modifiers,
+                        is_test=is_test,
+                        extra=extra,
+                    ))
                     member_nodes[key] = member_index
-                    edges.append(
-                        EdgeInfo(
-                            kind="CONTAINS",
-                            source=container_qn(scope),
-                            target=qn,
-                            file_path=file_path,
-                            line=line_start,
-                        )
-                    )
+                    edges.append(EdgeInfo(
+                        kind="CONTAINS",
+                        source=container_qn(scope),
+                        target=qn,
+                        file_path=file_path,
+                        line=line_start,
+                    ))
                 else:
                     existing = nodes[member_index]
                     overloads = existing.extra.setdefault(
-                        "vbnet_overloads",
-                        [existing.params or ""],
+                        "vbnet_overloads", [existing.params or ""],
                     )
                     overloads.append(params or "")
                     existing.line_end = max(existing.line_end, line_end)
@@ -4265,28 +6166,26 @@ class CodeParser:
                 )
                 if implements:
                     for target in _vbnet_relationship_targets(implements.group(1)):
-                        edges.append(
-                            EdgeInfo(
-                                kind="IMPLEMENTS",
-                                source=qn,
-                                target=target,
-                                file_path=file_path,
-                                line=line_start,
-                                extra={"vbnet_unresolved": True},
-                            )
-                        )
+                        edges.append(EdgeInfo(
+                            kind="IMPLEMENTS",
+                            source=qn,
+                            target=target,
+                            file_path=file_path,
+                            line=line_start,
+                            extra={"vbnet_unresolved": True},
+                        ))
 
-                modifier_words = {word.casefold() for word in (modifiers or "").split()}
+                modifier_words = {
+                    word.casefold() for word in (modifiers or "").split()
+                }
                 has_body = (
                     not type_entry or type_entry["kind"] != "interface"
                 ) and not modifier_words.intersection({"mustoverride", "declare"})
                 if has_body:
-                    member_stack.append(
-                        {
-                            "node_index": member_index,
-                            "qn": qn,
-                        }
-                    )
+                    member_stack.append({
+                        "node_index": member_index,
+                        "qn": qn,
+                    })
                 continue
 
             if member_stack:
@@ -4309,15 +6208,252 @@ class CodeParser:
             }
             for edge in list(edges):
                 if edge.kind == "CALLS" and edge.source in test_qnames:
-                    edges.append(
-                        EdgeInfo(
-                            kind="TESTED_BY",
-                            source=edge.target,
-                            target=edge.source,
-                            file_path=edge.file_path,
-                            line=edge.line,
-                        )
-                    )
+                    edges.append(EdgeInfo(
+                        kind="TESTED_BY",
+                        source=edge.target,
+                        target=edge.source,
+                        file_path=edge.file_path,
+                        line=edge.line,
+                    ))
+        return nodes, edges
+
+    def _parse_robot(
+        self, path: Path, source: bytes,
+    ) -> tuple[list[NodeInfo], list[EdgeInfo]]:
+        """Extract graph structure from Robot Framework tables."""
+        text = source.decode("utf-8-sig", errors="replace")
+        file_path = normalize_file_path(path)
+        lines = text.splitlines()
+        nodes = [NodeInfo(
+            kind="File",
+            name=file_path,
+            file_path=file_path,
+            line_start=1,
+            line_end=max(1, len(lines)),
+            language="robot",
+            is_test=_is_test_file(file_path),
+        )]
+        edges: list[EdgeInfo] = []
+        section: Optional[str] = None
+        current: Optional[tuple[str, str, int, str]] = None
+        ignored_settings = {
+            "[arguments]", "[documentation]", "[return]", "[returns]",
+            "[timeout]", "[tags]",
+        }
+        # Each of these names a keyword to run, unlike the settings above.
+        keyword_settings = {"[setup]", "[teardown]", "[template]"}
+        suite_keyword_settings = {
+            "suite setup", "suite teardown", "test setup", "test teardown",
+            "test template", "task setup", "task teardown", "task template",
+        }
+        # Robot spells these in upper case only: `End` can be a user keyword.
+        block_starts = {"IF", "FOR", "WHILE", "TRY", "GROUP"}
+        block_branches = {"ELSE IF", "ELSE", "EXCEPT", "FINALLY"}
+        statements = {"BREAK", "CONTINUE", "RETURN", "VAR"}
+        control_words = block_starts | block_branches | statements | {"END"}
+        section_names = {
+            "setting": "settings", "test case": "test cases", "task": "tasks",
+            "keyword": "keywords",
+        }
+
+        def qualified(name: str) -> str:
+            return f"{file_path}::{name}"
+
+        def normalize_keyword(name: str) -> str:
+            return re.sub(r"[\s_]+", "", name).casefold()
+
+        def add_call(source_name: str, target: str, line: int) -> None:
+            edges.append(EdgeInfo(
+                kind="CALLS",
+                source=source_name,
+                target=target,
+                file_path=file_path,
+                line=line,
+            ))
+
+        def finish(end_line: int) -> None:
+            nonlocal current
+            if current is None:
+                return
+            _, name, start_line, _ = current
+            for node in reversed(nodes):
+                if node.name == name and node.line_start == start_line:
+                    node.line_end = max(start_line, end_line)
+                    break
+            current = None
+
+        for line_number, raw_line in enumerate(lines, 1):
+            stripped = raw_line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            if stripped.startswith("|"):
+                # `| name |` defines; `|   | Keyword |` sits in the body, the
+                # same way an indented row does in the space-separated format.
+                row = re.split(r"\s\|(?:\s|$)", stripped[1:] + " ")
+                is_body_row = not row[0].strip()
+                cells = [cell.strip() for cell in row if cell.strip()]
+            else:
+                is_body_row = raw_line[:1].isspace()
+                cells = [cell.strip() for cell in re.split(r"\s{2,}|\t+", raw_line) if cell.strip()]
+            if not cells:
+                continue
+            section_match = re.fullmatch(r"\*+\s*(.+?)\s*\*+", cells[0])
+            if section_match:
+                finish(line_number - 1)
+                section = section_match.group(1).casefold()
+                section = section_names.get(section, section)
+                continue
+            if cells[0] == "...":
+                continue  # A continuation row only adds arguments.
+
+            if section == "settings":
+                setting = cells[0].casefold()
+                if setting in suite_keyword_settings and len(cells) > 1:
+                    if cells[1].casefold() != "none":
+                        add_call(file_path, cells[1], line_number)
+                    continue
+                if setting in {"library", "resource", "variables"} and len(cells) > 1:
+                    target = cells[1]
+                    if setting == "resource":
+                        target = target.replace("${CURDIR}", str(path.parent))
+                        if "${" not in target:
+                            target = normalize_file_path(
+                                os.path.normpath(path.parent / target),
+                            )
+                    edges.append(EdgeInfo(
+                        kind="IMPORTS_FROM",
+                        source=file_path,
+                        target=target,
+                        file_path=file_path,
+                        line=line_number,
+                        extra={"robot_setting": setting},
+                    ))
+                continue
+
+            if section not in {"test cases", "tasks", "keywords"}:
+                continue
+
+            if not is_body_row:
+                finish(line_number - 1)
+                name = cells[0]
+                is_test = section in {"test cases", "tasks"}
+                node_kind = "Test" if is_test else "Function"
+                qname = qualified(name)
+                current = (node_kind, name, line_number, qname)
+                nodes.append(NodeInfo(
+                    kind=node_kind,
+                    name=name,
+                    file_path=file_path,
+                    line_start=line_number,
+                    line_end=line_number,
+                    language="robot",
+                    is_test=is_test,
+                ))
+                edges.append(EdgeInfo(
+                    kind="CONTAINS",
+                    source=file_path,
+                    target=qname,
+                    file_path=file_path,
+                    line=line_number,
+                ))
+                continue
+
+            if current is None:
+                continue
+            # A row may open by assigning variables, with or without `=`, and a
+            # single space can separate the `=` from the keyword.
+            first = re.fullmatch(r"([$@&]\{[^}]+\}\s*=)\s+(.+)", cells[0])
+            if first is not None:
+                cells = [first.group(2), *cells[1:]]
+            while cells and re.fullmatch(r"[$@&]\{[^}]+\}\s*=?", cells[0]):
+                cells = cells[1:]
+            if not cells:
+                continue
+            keyword = cells[0]
+            setting = keyword.casefold()
+            if setting in keyword_settings:
+                if len(cells) > 1 and cells[1].casefold() != "none":
+                    add_call(current[3], cells[1], line_number)
+                continue
+            if setting in ignored_settings:
+                continue
+            if keyword == "IF" and len(cells) > 2:
+                # Inline IF: the condition sits in cell 1, a keyword in cell 2,
+                # and each later branch names its own keyword.
+                branches = [cells[2]]
+                for index, cell in enumerate(cells):
+                    if cell == "ELSE IF" and index + 2 < len(cells):
+                        branches.append(cells[index + 2])
+                    elif cell == "ELSE" and index + 1 < len(cells):
+                        branches.append(cells[index + 1])
+                for branch in branches:
+                    if branch not in control_words:
+                        add_call(current[3], branch, line_number)
+                continue
+            if keyword not in control_words:
+                add_call(current[3], keyword, line_number)
+
+        finish(len(lines))
+
+        # Add a kind-qualified identity only where a test and keyword share a name.
+        test_names = {node.name for node in nodes if node.kind == "Test"}
+        keyword_names = {node.name for node in nodes if node.kind == "Function"}
+        shared_names = test_names & keyword_names
+        if shared_names:
+            for node in nodes:
+                if node.kind not in {"Test", "Function"} or node.name not in shared_names:
+                    continue
+                previous_qname = qualified(node.name)
+                node.identity_name = f"{node.kind}::{node.name}"
+                new_qname = self._node_qualified(node)
+                for edge in edges:
+                    if (
+                        edge.kind == "CONTAINS"
+                        and edge.target == previous_qname
+                        and edge.line == node.line_start
+                    ):
+                        edge.target = new_qname
+                    elif (
+                        edge.kind == "CALLS"
+                        and edge.source == previous_qname
+                        and node.line_start <= edge.line <= node.line_end
+                    ):
+                        edge.source = new_qname
+
+        keyword_definitions: dict[str, list[NodeInfo]] = {}
+        for node in nodes:
+            if node.kind == "Function":
+                normalized = normalize_keyword(node.name)
+                keyword_definitions.setdefault(normalized, []).append(node)
+
+        for edge in edges:
+            if edge.kind != "CALLS":
+                continue
+            matches = keyword_definitions.get(normalize_keyword(edge.target), [])
+            if not matches:
+                # Robot ignores a leading BDD word when it looks up a keyword.
+                edge.target = re.sub(
+                    r"^(?:given|when|then|and|but)\s+", "", edge.target, flags=re.IGNORECASE,
+                )
+                matches = keyword_definitions.get(normalize_keyword(edge.target), [])
+            if len(matches) == 1:
+                edge.target = self._node_qualified(matches[0])
+
+        test_qnames = {
+            self._node_qualified(node)
+            for node in nodes
+            if node.kind == "Test"
+        }
+        for edge in list(edges):
+            if edge.kind == "CALLS" and edge.source in test_qnames:
+                edges.append(EdgeInfo(
+                    kind="TESTED_BY",
+                    source=edge.target,
+                    target=edge.source,
+                    file_path=edge.file_path,
+                    line=edge.line,
+                    extra=edge.extra.copy(),
+                ))
         return nodes, edges
 
     def _resolve_vbnet_edges(
@@ -4381,16 +6517,14 @@ class CodeParser:
                 continue
             extra = dict(edge.extra)
             extra.pop("vbnet_unresolved", None)
-            resolved.append(
-                EdgeInfo(
-                    kind=edge.kind,
-                    source=edge.source,
-                    target=target,
-                    file_path=edge.file_path,
-                    line=edge.line,
-                    extra=extra,
-                )
-            )
+            resolved.append(EdgeInfo(
+                kind=edge.kind,
+                source=edge.source,
+                target=target,
+                file_path=edge.file_path,
+                line=edge.line,
+                extra=extra,
+            ))
         return resolved
 
     # ------------------------------------------------------------------
@@ -4400,9 +6534,7 @@ class CodeParser:
     # ------------------------------------------------------------------
 
     def _parse_rescript(
-        self,
-        path: Path,
-        source: bytes,
+        self, path: Path, source: bytes,
     ) -> tuple[list[NodeInfo], list[EdgeInfo]]:
         """Parse a ReScript `.res` or `.resi` file.
 
@@ -4413,7 +6545,7 @@ class CodeParser:
         """
         text = source.decode("utf-8", errors="replace")
         file_path_str = normalize_file_path(path)
-        test_file = _is_test_file(file_path_str)
+        test_file = self._is_test_path(file_path_str)
         is_interface = path.suffix.lower() == ".resi"
 
         # Strip comments and string/backtick literal content so downstream
@@ -4443,18 +6575,16 @@ class CodeParser:
         file_extra: dict = {}
         if is_interface:
             file_extra["rescript_interface"] = True
-        nodes.append(
-            NodeInfo(
-                kind="File",
-                name=file_path_str,
-                file_path=file_path_str,
-                line_start=1,
-                line_end=text.count("\n") + 1,
-                language="rescript",
-                is_test=test_file,
-                extra=file_extra,
-            )
-        )
+        nodes.append(NodeInfo(
+            kind="File",
+            name=file_path_str,
+            file_path=file_path_str,
+            line_start=1,
+            line_end=text.count("\n") + 1,
+            language="rescript",
+            is_test=test_file,
+            extra=file_extra,
+        ))
 
         # Modules with brace-matched offset ranges.
         modules = _scan_rescript_modules(cleaned, offset_to_line)
@@ -4471,26 +6601,26 @@ class CodeParser:
                     expected = depth_arr[m["body_start_off"]]
                     return d == expected
             return False
-
         for m in modules:
-            nodes.append(
-                NodeInfo(
-                    kind="Class",
-                    name=m["name"],
-                    file_path=file_path_str,
-                    line_start=m["start_line"],
-                    line_end=m["end_line"],
-                    language="rescript",
-                    parent_name=m["parent"],
-                    extra={"rescript_kind": "module"},
-                )
-            )
+            nodes.append(NodeInfo(
+                kind="Class",
+                name=m["name"],
+                file_path=file_path_str,
+                line_start=m["start_line"],
+                line_end=m["end_line"],
+                language="rescript",
+                parent_name=m["parent"],
+                extra={"rescript_kind": "module"},
+            ))
 
         def enclosing_module(off: int) -> Optional[str]:
             innermost_name = None
             innermost_start = -1
             for m in modules:
-                if m["start_off"] <= off <= m["end_off"] and m["start_off"] > innermost_start:
+                if (
+                    m["start_off"] <= off <= m["end_off"]
+                    and m["start_off"] > innermost_start
+                ):
                     innermost_name = m["name"]
                     innermost_start = m["start_off"]
             return innermost_name
@@ -4507,23 +6637,21 @@ class CodeParser:
             if not is_top_level(off, parent):
                 continue  # nested local `let` — not a structural node
             line_start = offset_to_line(off)
-            is_test_fn = _is_test_function(name, file_path_str)
-            let_entries.append(
-                {
-                    "name": name,
-                    "start_off": off,
-                    "line_start": line_start,
-                    "parent": parent,
-                    "is_test": is_test_fn,
-                }
-            )
+            is_test_fn = _is_test_function(name, file_path_str, repo_root=self._repo_root)
+            let_entries.append({
+                "name": name,
+                "start_off": off,
+                "line_start": line_start,
+                "parent": parent,
+                "is_test": is_test_fn,
+            })
 
         # Sort by start_off, compute end_off as next same-or-outer-scope let start
         # or the closing brace of the enclosing module, or end of file.
         let_entries.sort(key=lambda e: e["start_off"])
         for i, entry in enumerate(let_entries):
             nxt = len(cleaned)
-            for later in let_entries[i + 1 :]:
+            for later in let_entries[i + 1:]:
                 nxt = later["start_off"]
                 break
             # Clamp by enclosing module end if any
@@ -4539,18 +6667,16 @@ class CodeParser:
             entry["line_end"] = offset_to_line(entry["end_off"] - 1)
 
         for entry in let_entries:
-            nodes.append(
-                NodeInfo(
-                    kind="Test" if entry["is_test"] else "Function",
-                    name=entry["name"],
-                    file_path=file_path_str,
-                    line_start=entry["line_start"],
-                    line_end=entry["line_end"],
-                    language="rescript",
-                    parent_name=entry["parent"],
-                    is_test=entry["is_test"],
-                )
-            )
+            nodes.append(NodeInfo(
+                kind="Test" if entry["is_test"] else "Function",
+                name=entry["name"],
+                file_path=file_path_str,
+                line_start=entry["line_start"],
+                line_end=entry["line_end"],
+                language="rescript",
+                parent_name=entry["parent"],
+                is_test=entry["is_test"],
+            ))
 
         # External bindings (also create IMPORTS_FROM edges for @module attrs).
         for match in _RESCRIPT_EXTERNAL_RE.finditer(cleaned):
@@ -4562,18 +6688,16 @@ class CodeParser:
             if not is_top_level(off, parent):
                 continue
             line_start = offset_to_line(off)
-            nodes.append(
-                NodeInfo(
-                    kind="Function",
-                    name=name,
-                    file_path=file_path_str,
-                    line_start=line_start,
-                    line_end=line_start,
-                    language="rescript",
-                    parent_name=parent,
-                    extra={"rescript_external": True},
-                )
-            )
+            nodes.append(NodeInfo(
+                kind="Function",
+                name=name,
+                file_path=file_path_str,
+                line_start=line_start,
+                line_end=line_start,
+                language="rescript",
+                parent_name=parent,
+                extra={"rescript_external": True},
+            ))
             # Look back up to 200 chars for a nearby @module("...") attr.
             # Read from the ORIGINAL text (not `cleaned`) so string literal
             # content like "fs" is preserved. Offsets are length-equivalent
@@ -4581,16 +6705,14 @@ class CodeParser:
             look_start = max(0, off - 200)
             snippet = text[look_start:off]
             for attr in _RESCRIPT_MODULE_ATTR_RE.finditer(snippet):
-                edges.append(
-                    EdgeInfo(
-                        kind="IMPORTS_FROM",
-                        source=file_path_str,
-                        target=attr.group(1),
-                        file_path=file_path_str,
-                        line=line_start,
-                        extra={"rescript_import_kind": "external_module"},
-                    )
-                )
+                edges.append(EdgeInfo(
+                    kind="IMPORTS_FROM",
+                    source=file_path_str,
+                    target=attr.group(1),
+                    file_path=file_path_str,
+                    line=line_start,
+                    extra={"rescript_import_kind": "external_module"},
+                ))
 
         # Type definitions.
         for match in _RESCRIPT_TYPE_RE.finditer(cleaned):
@@ -4602,17 +6724,15 @@ class CodeParser:
             if not is_top_level(off, parent):
                 continue
             line_start = offset_to_line(off)
-            nodes.append(
-                NodeInfo(
-                    kind="Type",
-                    name=name,
-                    file_path=file_path_str,
-                    line_start=line_start,
-                    line_end=line_start,
-                    language="rescript",
-                    parent_name=parent,
-                )
-            )
+            nodes.append(NodeInfo(
+                kind="Type",
+                name=name,
+                file_path=file_path_str,
+                line_start=line_start,
+                line_end=line_start,
+                language="rescript",
+                parent_name=parent,
+            ))
 
         # open / include statements.
         for match in _RESCRIPT_OPEN_RE.finditer(cleaned):
@@ -4620,16 +6740,14 @@ class CodeParser:
             target = match.group(2)
             off = match.start()
             line = offset_to_line(off)
-            edges.append(
-                EdgeInfo(
-                    kind="IMPORTS_FROM",
-                    source=file_path_str,
-                    target=target,
-                    file_path=file_path_str,
-                    line=line,
-                    extra={"rescript_import_kind": kind},
-                )
-            )
+            edges.append(EdgeInfo(
+                kind="IMPORTS_FROM",
+                source=file_path_str,
+                target=target,
+                file_path=file_path_str,
+                line=line,
+                extra={"rescript_import_kind": kind},
+            ))
 
         # Module aliases: `module X = Foo.Bar` (no brace body). These
         # re-export another module and are the second most common way ReScript
@@ -4645,19 +6763,17 @@ class CodeParser:
             if any(m["start_off"] == off for m in modules):
                 continue
             line = offset_to_line(off)
-            edges.append(
-                EdgeInfo(
-                    kind="IMPORTS_FROM",
-                    source=file_path_str,
-                    target=target,
-                    file_path=file_path_str,
-                    line=line,
-                    extra={
-                        "rescript_import_kind": "module_alias",
-                        "alias_name": alias_name,
-                    },
-                )
-            )
+            edges.append(EdgeInfo(
+                kind="IMPORTS_FROM",
+                source=file_path_str,
+                target=target,
+                file_path=file_path_str,
+                line=line,
+                extra={
+                    "rescript_import_kind": "module_alias",
+                    "alias_name": alias_name,
+                },
+            ))
 
         # JSX component usage: `<Foo />`, `<Foo.Bar />`. The root module is
         # what matters for cross-file dependency tracking (importers_of);
@@ -4668,16 +6784,14 @@ class CodeParser:
                 off = match.start(1)
                 root = target.split(".", 1)[0]
                 line = offset_to_line(off)
-                edges.append(
-                    EdgeInfo(
-                        kind="IMPORTS_FROM",
-                        source=file_path_str,
-                        target=root,
-                        file_path=file_path_str,
-                        line=line,
-                        extra={"rescript_import_kind": "jsx"},
-                    )
-                )
+                edges.append(EdgeInfo(
+                    kind="IMPORTS_FROM",
+                    source=file_path_str,
+                    target=root,
+                    file_path=file_path_str,
+                    line=line,
+                    extra={"rescript_import_kind": "jsx"},
+                ))
                 # Attribute a CALLS edge to the enclosing let, so
                 # callers_of(<Foo.Bar />) can find the caller.
                 caller = None
@@ -4689,20 +6803,16 @@ class CodeParser:
                     elif entry["start_off"] > off:
                         break
                 if caller is not None:
-                    edges.append(
-                        EdgeInfo(
-                            kind="CALLS",
-                            source=self._qualify(
-                                caller,
-                                file_path_str,
-                                caller_parent,
-                            ),
-                            target=target,
-                            file_path=file_path_str,
-                            line=line,
-                            extra={"rescript_call_kind": "jsx"},
-                        )
-                    )
+                    edges.append(EdgeInfo(
+                        kind="CALLS",
+                        source=self._qualify(
+                            caller, file_path_str, caller_parent,
+                        ),
+                        target=target,
+                        file_path=file_path_str,
+                        line=line,
+                        extra={"rescript_call_kind": "jsx"},
+                    ))
 
         # Calls — interface files have no call sites, skip.
         if not is_interface and let_entries:
@@ -4732,28 +6842,24 @@ class CodeParser:
                     continue
                 line = offset_to_line(off)
                 source_qn = self._qualify(caller, file_path_str, caller_parent)
-                edges.append(
-                    EdgeInfo(
-                        kind="CALLS",
-                        source=source_qn,
-                        target=target,
-                        file_path=file_path_str,
-                        line=line,
-                    )
-                )
+                edges.append(EdgeInfo(
+                    kind="CALLS",
+                    source=source_qn,
+                    target=target,
+                    file_path=file_path_str,
+                    line=line,
+                ))
 
         # CONTAINS edges: each module node contains its members.
         for n in nodes:
             if n.kind in ("Function", "Type", "Test") and n.parent_name:
-                edges.append(
-                    EdgeInfo(
-                        kind="CONTAINS",
-                        source=self._qualify(n.parent_name, file_path_str, None),
-                        target=self._qualify(n.name, file_path_str, n.parent_name),
-                        file_path=file_path_str,
-                        line=n.line_start,
-                    )
-                )
+                edges.append(EdgeInfo(
+                    kind="CONTAINS",
+                    source=self._qualify(n.parent_name, file_path_str, None),
+                    target=self._qualify(n.name, file_path_str, n.parent_name),
+                    file_path=file_path_str,
+                    line=n.line_start,
+                ))
 
         # Tag modules whose member functions are all externals as JS bindings.
         # (e.g. `module TextEncoder = { type encoder; @new external ... }`)
@@ -4765,7 +6871,9 @@ class CodeParser:
             if mod_node.kind != "Class":
                 continue
             members = member_funcs.get(mod_node.name, [])
-            if members and all(m.extra.get("rescript_external") for m in members):
+            if members and all(
+                m.extra.get("rescript_external") for m in members
+            ):
                 mod_node.extra["rescript_kind"] = "js_binding"
 
         # Dedupe IMPORTS_FROM edges by (source, target). The same `open X`
@@ -4793,15 +6901,13 @@ class CodeParser:
                     test_qnames.add(qn)
             for edge in list(edges):
                 if edge.kind == "CALLS" and edge.source in test_qnames:
-                    edges.append(
-                        EdgeInfo(
-                            kind="TESTED_BY",
-                            source=edge.target,
-                            target=edge.source,
-                            file_path=edge.file_path,
-                            line=edge.line,
-                        )
-                    )
+                    edges.append(EdgeInfo(
+                        kind="TESTED_BY",
+                        source=edge.target,
+                        target=edge.source,
+                        file_path=edge.file_path,
+                        line=edge.line,
+                    ))
 
         return nodes, edges
 
@@ -4809,28 +6915,394 @@ class CodeParser:
     # SQL parser
     # ------------------------------------------------------------------
 
+    # Oracle identifiers may contain `$`/`#` in addition to `\w` (common in
+    # practice — e.g. version-suffixed or internal-convention names like
+    # `log_event$v2`, `calc#total`). `\w+` alone truncates at the `$`/`#`,
+    # which then cascades into `_plsql_block_end` searching for the wrong
+    # (truncated) terminator name and mis-bounding the whole block.
+    # The leading class is `[^\W\d]` rather than `[A-Za-z_]` so the first
+    # character stays Unicode-aware (matching `\w`'s own default behavior
+    # elsewhere in this file, e.g. `_SQL_TABLE_RE`) instead of silently
+    # truncating identifiers like `café` at the accented letter.
+    _PLSQL_IDENT = r"[^\W\d][\w$#]*"
+
     # Regex for CREATE PROCEDURE — tree-sitter SQL grammar emits an ERROR node
-    # for this statement, so we fall back to a regex scan.
+    # for this statement, so we fall back to a regex scan. Leading `\b`
+    # keeps this from matching "RECREATE PROCEDURE ..." as if it were
+    # "CREATE PROCEDURE ...". It also serves other dialects, and MySQL allows
+    # a name to start with a digit, so this is wider than `_PLSQL_IDENT`.
     _SQL_PROC_RE = re.compile(
-        r"CREATE\s+(?:OR\s+REPLACE\s+)?PROCEDURE\s+(\w+(?:\.\w+)*)",
+        r"\bCREATE\s+(?:OR\s+REPLACE\s+)?PROCEDURE\s+(\w[\w$#]*(?:\.\w[\w$#]*)*)",
         re.IGNORECASE,
     )
 
     # Named DDL statements supported by tree-sitter-sql.
-    _SQL_DDL_NODE_TYPES = frozenset(
-        {
-            "create_table",
-            "create_view",
-            "create_function",
-        }
+    _SQL_DDL_NODE_TYPES = frozenset({
+        "create_table",
+        "create_view",
+        "create_function",
+    })
+
+    # --- Oracle PL/SQL --------------------------------------------------
+    # tree-sitter-sql has no PL/SQL grammar: `IS|AS ... BEGIN ... END` bodies
+    # with no RETURNS/LANGUAGE clause are ANSI-invalid and parse as ERROR
+    # nodes, so packages, package bodies, triggers, and PL/SQL-style
+    # functions are all extracted via regex, mirroring the CREATE PROCEDURE
+    # fallback above. Each starts with `\b` for the same reason as above.
+    _SQL_PLSQL_FUNC_RE = re.compile(
+        rf"\bCREATE\s+(?:OR\s+REPLACE\s+)?FUNCTION\s+({_PLSQL_IDENT}(?:\.{_PLSQL_IDENT})*)",
+        re.IGNORECASE,
+    )
+    _SQL_TRIGGER_RE = re.compile(
+        rf"\bCREATE\s+(?:OR\s+REPLACE\s+)?TRIGGER\s+({_PLSQL_IDENT}(?:\.{_PLSQL_IDENT})*)",
+        re.IGNORECASE,
+    )
+    # Package *specification* — must not also match "PACKAGE BODY".
+    _SQL_PACKAGE_RE = re.compile(
+        rf"\bCREATE\s+(?:OR\s+REPLACE\s+)?PACKAGE\s+(?!BODY\b)({_PLSQL_IDENT}(?:\.{_PLSQL_IDENT})*)",
+        re.IGNORECASE,
+    )
+    _SQL_PACKAGE_BODY_RE = re.compile(
+        rf"\bCREATE\s+(?:OR\s+REPLACE\s+)?PACKAGE\s+BODY\s+({_PLSQL_IDENT}(?:\.{_PLSQL_IDENT})*)",
+        re.IGNORECASE,
+    )
+    # Nested member declarations inside a PACKAGE BODY (no CREATE prefix).
+    _SQL_PACKAGE_MEMBER_RE = re.compile(
+        rf"\b(PROCEDURE|FUNCTION)\s+({_PLSQL_IDENT})",
+        re.IGNORECASE,
+    )
+    # A call-shaped token: `identifier(` or `pkg.proc(`, not preceded by
+    # another identifier character (so `.owner(` in `foo.owner(` still
+    # matches, but the `owner` in `xowner(` does not).
+    _PLSQL_CALL_RE = re.compile(
+        rf"(?<![\w$#])({_PLSQL_IDENT}(?:\.{_PLSQL_IDENT}){{0,2}})\s*\(",
+    )
+    # PL/SQL control-flow keywords and common scalar type names that also
+    # precede `(` (e.g. `v_x VARCHAR2(50);` or `WHILE (cond)`) but are not
+    # calls.
+    _PLSQL_CALL_KEYWORDS: frozenset[str] = frozenset({
+        "if", "elsif", "else", "then", "end", "loop", "while", "for", "case",
+        "when", "begin", "declare", "exception", "return", "raise", "is",
+        "as", "procedure", "function", "trigger", "package", "cursor",
+        "type", "record", "table", "pragma", "and", "or", "not", "in",
+        "exists", "between", "into", "over",
+        # Scalar/collection type names — precede `(` in declarations
+        # (`v_x VARCHAR2(50);`), not calls.
+        "varchar", "varchar2", "nvarchar2", "number", "char", "nchar",
+        "date", "timestamp", "raw", "boolean", "clob", "blob", "long",
+        "float", "integer", "int", "smallint", "decimal", "numeric",
+        "double", "real", "pls_integer", "binary_integer", "urowid",
+        "rowid", "bfile", "xmltype", "sys_refcursor", "interval",
+    })
+    # Common built-in SQL/PL-SQL functions — real calls, but not to
+    # user-defined code, and the reviewer on PR #785 flagged these as noise
+    # in the CALLS graph. Aggregates, conversions, null-handling, string,
+    # and numeric builtins.
+    _PLSQL_BUILTIN_FUNCS: frozenset[str] = frozenset({
+        "count", "sum", "avg", "max", "min", "greatest", "least",
+        "to_char", "to_date", "to_number", "to_timestamp", "cast",
+        "nvl", "nvl2", "coalesce", "nullif", "decode",
+        "substr", "substrb", "instr", "trim", "ltrim", "rtrim",
+        "upper", "lower", "initcap", "length", "lengthb", "replace",
+        "lpad", "rpad", "concat",
+        "round", "trunc", "mod", "abs", "ceil", "floor", "power", "sqrt",
+        "extract", "sysdate", "systimestamp", "raise_application_error",
+    })
+    # Built-in Oracle package namespaces (DBMS_*, UTL_*) — calls into these
+    # are noise for impact analysis, not user code.
+    _PLSQL_BUILTIN_PACKAGE_PREFIXES = ("dbms_", "utl_")
+    # A builtin's name is the builtin only when bare or under these packages:
+    # `text_utils.replace(` names user code. `l_tab.count()` and `l_tab.trim(1)`
+    # are collection methods, so those two stay out however they are qualified.
+    _PLSQL_BUILTIN_RECEIVERS = frozenset({"", "sys", "standard"})
+    _PLSQL_COLLECTION_METHODS = frozenset({"count", "trim"})
+
+    # Fixed lookback window (chars) for the INSERT INTO check in
+    # _extract_plsql_calls. Comfortably covers "INTO" plus a few lines of
+    # unusual whitespace/newlines before the target, without re-scanning the
+    # whole preceding body on every match.
+    _INTO_LOOKBACK = 60
+
+    # Oracle-specific file extensions that are unambiguously PL/SQL
+    # regardless of content.
+    _ORACLE_EXTENSIONS = frozenset({
+        ".pls", ".plb", ".pks", ".pkb", ".pck", ".prc", ".fnc", ".trg",
+    })
+    # Content signals that only appear in Oracle PL/SQL, never in plain
+    # ANSI SQL, T-SQL, or MySQL: `%TYPE`/`%ROWTYPE` anchored attribute
+    # types, VARCHAR2/PLS_INTEGER/etc. scalar types, DBMS_OUTPUT, packages,
+    # and `:NEW.`/`:OLD.` trigger correlation names (T-SQL uses
+    # `inserted`/`deleted`; MySQL uses unprefixed `NEW.`/`OLD.`).
+    #
+    # A subprogram's own shape counts too, since a plain routine may hold none
+    # of those: `FUNCTION f RETURN` (others write `RETURNS`) and `PROCEDURE p IS`.
+    # `PROCEDURE p AS` is also T-SQL, and with `OR REPLACE` also Postgres, whose
+    # body is then a dollar-quoted or quoted string.
+    _PLSQL_ROUTINE = (
+        rf"{_PLSQL_IDENT}(?:\.{_PLSQL_IDENT})*(?![\w$#])"
+        r"\s*(?:\((?:[^();]|\([^()]*\))*\)\s*)?"
+    )
+    _ORACLE_SIGNAL_RE = re.compile(
+        r"%TYPE\b|%ROWTYPE\b|\bVARCHAR2\b|\bPLS_INTEGER\b|\bBINARY_INTEGER\b|"
+        r"\bSYS_REFCURSOR\b|\bDBMS_OUTPUT\b|:(?:NEW|OLD)\.|"
+        r"\bCREATE\s+(?:OR\s+REPLACE\s+)?PACKAGE\b|"
+        rf"\bCREATE\s+(?:OR\s+REPLACE\s+)?FUNCTION\s+{_PLSQL_ROUTINE}RETURN\b|"
+        rf"\bCREATE\s+(?:OR\s+REPLACE\s+)?PROCEDURE\s+{_PLSQL_ROUTINE}IS\b|"
+        rf"\bCREATE\s+OR\s+REPLACE\s+PROCEDURE\s+{_PLSQL_ROUTINE}AS\s+[^\s$']",
+        re.IGNORECASE,
     )
 
+    @classmethod
+    def _is_plsql_dialect(cls, path: Path, text: str) -> bool:
+        """True if this `.sql`-family file is Oracle PL/SQL, as opposed to
+        plain ANSI SQL, T-SQL, or MySQL.
+
+        Gates every PL/SQL-specific pass (body-span computation and CALLS
+        extraction for packages/triggers/PL/SQL-style functions) so a
+        non-Oracle `CREATE PROCEDURE` with no `END;` terminator (T-SQL uses
+        `GO`, MySQL uses a custom `DELIMITER`) doesn't have its span
+        computed at all — see PR #785 review, where unconditionally
+        computing a body span caused it to fall back to end-of-file and
+        pick up false CALLS edges spanning unrelated code.
+        """
+        if path.suffix.lower() in cls._ORACLE_EXTENSIONS:
+            return True
+        return bool(cls._ORACLE_SIGNAL_RE.search(text))
+
+    # Closing delimiter for each Oracle q-quote bracket-style opener
+    # (`q'[...]'`, `q'{...}'`, `q'(...)'`, `q'<...>'`); any other character
+    # closes with itself (`q'!...!'`).
+    _PLSQL_Q_DELIM_CLOSE = {"[": "]", "{": "}", "(": ")", "<": ">"}
+
+    @staticmethod
+    def _strip_plsql_noise(text: str) -> str:
+        """Blank `--`/`/* */` comments and string-literal contents with
+        spaces, preserving line numbers and overall text length.
+
+        Every PL/SQL-specific regex pass below (block-end search, forward-
+        declaration detection, call extraction, and the CREATE-statement
+        matchers themselves) runs against this cleaned text instead of the
+        raw source. Without it, a `;` or `END name;`-shaped substring inside
+        a trailing comment or a dynamic-SQL string literal (both common in
+        real PL/SQL) is indistinguishable from the real terminator — e.g. a
+        member with a same-line comment containing a semicolon before its
+        `IS` keyword was misdetected as a bodyless forward declaration and
+        dropped entirely; a body with a comment mentioning `END name;` had
+        its span truncated at the comment instead of the real end.
+
+        This runs as one pass over the whole text rather than per line or
+        as a separate global comment-stripping regex applied first (PR #785
+        review): both of those earlier approaches broke on real PL/SQL —
+        a plain `'...'` string's open/close state was reset at the start
+        of every line, so a string spanning multiple lines (or an Oracle
+        `q'[...]'`/`Q'<...>'` quoted string, which allows unescaped `'`
+        inside it) let a `;` or `END name;` inside the string terminate the
+        block early; and a bare `/\\*.*?\\*/` substitution over raw text
+        doesn't know it's inside a string either, so a string containing an
+        unterminated `/*` (e.g. a comment-like fragment in a literal) could
+        pair up with an unrelated later `*/` and blank out everything in
+        between, including real statements — silently dropping a
+        `CREATE PROCEDURE ...` that happened to fall inside that span.
+        """
+        out: list[str] = []
+        i, n = 0, len(text)
+        in_single = False
+        q_close: str | None = None  # set while inside a q'...' string
+        while i < n:
+            c = text[i]
+            if q_close is not None:
+                if text[i:i + len(q_close)] == q_close:
+                    # Keep the apostrophe, like a plain string: the opener kept
+                    # one, and the signature scan pairs them up.
+                    out.append(" " * (len(q_close) - 1) + "'")
+                    i += len(q_close)
+                    q_close = None
+                else:
+                    out.append("\n" if c == "\n" else " ")
+                    i += 1
+                continue
+            if in_single:
+                if c == "'":
+                    if i + 1 < n and text[i + 1] == "'":
+                        out.append("  ")
+                        i += 2
+                        continue
+                    out.append("'")
+                    in_single = False
+                    i += 1
+                    continue
+                out.append("\n" if c == "\n" else " ")
+                i += 1
+                continue
+            # Not inside any string literal here.
+            if c == "-" and i + 1 < n and text[i + 1] == "-":
+                nl = text.find("\n", i)
+                end = n if nl == -1 else nl
+                out.append(" " * (end - i))
+                i = end
+                continue
+            if c == "/" and i + 1 < n and text[i + 1] == "*":
+                close = text.find("*/", i + 2)
+                seg_end = n if close == -1 else close + 2
+                out.append(
+                    "".join("\n" if ch == "\n" else " " for ch in text[i:seg_end]),
+                )
+                i = seg_end
+                continue
+            if (
+                c in "qQ" and i + 2 < n and text[i + 1] == "'"
+                and (i == 0 or not (text[i - 1].isalnum() or text[i - 1] == "_"))
+            ):
+                open_delim = text[i + 2]
+                out.append(c)
+                out.append("'")
+                out.append(" ")
+                i += 3
+                q_close = CodeParser._PLSQL_Q_DELIM_CLOSE.get(
+                    open_delim, open_delim,
+                ) + "'"
+                continue
+            if c == "'":
+                out.append("'")
+                in_single = True
+                i += 1
+                continue
+            out.append(c)
+            i += 1
+        return "".join(out)
+
+    # Any top-level CREATE statement this parser recognizes — used to bound
+    # a block-end search that finds no END at all, so a malformed/unusual
+    # body doesn't swallow the rest of the file.
+    _SQL_NEXT_STMT_RE = re.compile(
+        r"\bCREATE\s+(?:OR\s+REPLACE\s+)?"
+        r"(?:PROCEDURE|FUNCTION|TRIGGER|PACKAGE|TABLE|VIEW)\b",
+        re.IGNORECASE,
+    )
+
+    _PLSQL_NAMED_END_RE = re.compile(rf"\bEND\b\s*({_PLSQL_IDENT})\s*;", re.IGNORECASE)
+    # The lookaround keeps `$END` (conditional compilation) and `end_date` out.
+    _PLSQL_BLOCK_WORD_RE = re.compile(
+        r"(?<![\w$#])(?:(?P<open>BEGIN|CASE)|(?P<skip>END\s+(?:IF|LOOP))|END(?:\s+CASE)?)"
+        r"(?![\w$#])",
+        re.IGNORECASE,
+    )
+
+    _PLSQL_IS_AS_RE = re.compile(r"(?:IS|AS)\b", re.IGNORECASE)
+
+    @staticmethod
+    def _plsql_is_forward_decl(text: str, start: int) -> bool:
+        """True if a PROCEDURE/FUNCTION member at `start` (just after the
+        name) is a forward declaration — `PROCEDURE x(...);` — rather than
+        a real definition — `PROCEDURE x(...) IS ... END;` (or
+        `... RETURN t IS ...` for functions).
+
+        Forward declarations in a PACKAGE BODY (used for mutual recursion)
+        have no body of their own; treating one as a real member makes its
+        block-end search land on the *next* member's END, producing a
+        phantom node with a bogus line span and false CALLS edges — see
+        PR #785 review.
+
+        Callers already pass comment/string-stripped text (`clean_text`),
+        but this function skips `--`/`/* */` comments on its own too, so
+        it's independently correct rather than only correct because of an
+        external pre-processing step — a `;` inside a trailing comment on
+        the declaration line must not be mistaken for the forward-decl
+        terminator. The `IS`/`AS` check also requires a word boundary on
+        *both* sides (`re.match` alone only anchors the end): without it,
+        a return type like `t_alias` matches `AS` mid-word (`t_ali|AS`)
+        and a genuine forward declaration gets misclassified as a real
+        definition, producing the same phantom-node failure mode.
+        """
+        depth = 0
+        i, n = start, len(text)
+        while i < n:
+            c = text[i]
+            if c == "-" and i + 1 < n and text[i + 1] == "-":
+                nl = text.find("\n", i)
+                i = n if nl == -1 else nl + 1
+                continue
+            if c == "/" and i + 1 < n and text[i + 1] == "*":
+                end = text.find("*/", i + 2)
+                i = n if end == -1 else end + 2
+                continue
+            if c == "(":
+                depth += 1
+            elif c == ")":
+                depth -= 1
+            elif depth <= 0:
+                if c == ";":
+                    return True
+                if c.isalpha() and (
+                    i == start or not (text[i - 1].isalnum() or text[i - 1] == "_")
+                ):
+                    if CodeParser._PLSQL_IS_AS_RE.match(text, i):
+                        return False
+            i += 1
+        return True
+
+    @staticmethod
+    def _plsql_member_signature(text: str, start: int) -> str:
+        """Extract the raw, whitespace-normalized parameter-list text right
+        after a PACKAGE BODY member's name (e.g. ``p_x NUMBER, p_y NUMBER``).
+
+        Oracle allows overloaded PROCEDURE/FUNCTION members within a
+        package (never for standalone subprograms), so two members sharing
+        a name are a normal, common pattern — not a duplicate. Without a
+        signature to distinguish them, both would collide on the same
+        qualified name, same root cause as the spec/body collision fixed
+        above. Mirrors ``_cpp_function_identity``'s always-on signature
+        identity, for the same stable-identity property. Returns "" for a
+        parameterless member.
+
+        Skips `--`/`/* */` comments and `'...'` string-literal contents on
+        its own (like ``_plsql_is_forward_decl``), so an unbalanced paren
+        inside a default-value string (e.g. ``p_x VARCHAR2 := '('``) can't
+        throw off the paren-depth count when called directly on raw text.
+        """
+        i, n = start, len(text)
+        while i < n and text[i].isspace():
+            i += 1
+        if i >= n or text[i] != "(":
+            return ""
+        depth = 0
+        sig_start = i + 1
+        while i < n:
+            c = text[i]
+            if c == "-" and i + 1 < n and text[i + 1] == "-":
+                nl = text.find("\n", i)
+                i = n if nl == -1 else nl + 1
+                continue
+            if c == "/" and i + 1 < n and text[i + 1] == "*":
+                end = text.find("*/", i + 2)
+                i = n if end == -1 else end + 2
+                continue
+            if c == "'":
+                j = i + 1
+                while j < n:
+                    if text[j] == "'":
+                        if j + 1 < n and text[j + 1] == "'":
+                            j += 2
+                            continue
+                        j += 1
+                        break
+                    j += 1
+                i = j
+                continue
+            if c == "(":
+                depth += 1
+            elif c == ")":
+                depth -= 1
+                if depth == 0:
+                    return " ".join(text[sig_start:i].split())
+            i += 1
+        return " ".join(text[sig_start:].split())
+
     def _parse_sql(
-        self,
-        path: Path,
-        source: bytes,
+        self, path: Path, source: bytes,
     ) -> tuple[list[NodeInfo], list[EdgeInfo]]:
-        """Parse a `.sql` file.
+        """Parse a `.sql` file, including Oracle PL/SQL (`.sql`, `.pls`,
+        `.plb`, `.pks`, `.pkb`, `.pck`, `.prc`, `.fnc`, `.trg`).
 
         Extracts:
         - Tables (CREATE TABLE) → Class nodes with extra["sql_kind"]="table"
@@ -4838,6 +7310,27 @@ class CodeParser:
         - Functions (CREATE FUNCTION) → Function nodes with extra["sql_kind"]="function"
         - Procedures (CREATE PROCEDURE, regex fallback) → Function nodes with
           extra["sql_kind"]="procedure"
+
+        The following are Oracle-only and only extracted when
+        ``_is_plsql_dialect`` confirms the file is PL/SQL (via an Oracle
+        extension or a content signal like `VARCHAR2`/`%TYPE`/`:NEW.`) —
+        never for plain ANSI/T-SQL/MySQL `.sql` files:
+        - Packages (CREATE PACKAGE) → Class nodes with extra["sql_kind"]="package"
+        - Package bodies (CREATE PACKAGE BODY) → Class nodes with
+          extra["sql_kind"]="package_body", qualified as ``pkg_name$body``
+          (distinct from the spec's ``pkg_name``, since they're separate
+          Oracle objects), containing nested PROCEDURE/FUNCTION members as
+          Function nodes qualified as ``pkg_name$body.member_name(params)``
+          — the parameter signature is always included (even with zero
+          overloads) since Oracle allows overloaded package members
+          — mirrors ``_cpp_function_identity``'s always-on signature identity
+        - Triggers (CREATE TRIGGER) → Function nodes with extra["sql_kind"]="trigger"
+
+        For confirmed-PL/SQL files, procedure/function/trigger/package-member
+        bodies are also scanned for `identifier(` call sites to produce
+        CALLS edges (regex-based: no PL/SQL grammar is available, so this is
+        a best-effort heuristic that skips known PL/SQL keywords, scalar
+        type names, common builtins, and INSERT INTO table targets).
 
         Data dependencies (FROM/JOIN table references) are recorded as
         IMPORTS_FROM edges so the impact-radius query can follow them.
@@ -4850,22 +7343,20 @@ class CodeParser:
         """
         text = source.decode("utf-8", errors="replace")
         file_path_str = normalize_file_path(path)
-        test_file = _is_test_file(file_path_str)
+        test_file = self._is_test_path(file_path_str)
 
         nodes: list[NodeInfo] = []
         edges: list[EdgeInfo] = []
 
-        nodes.append(
-            NodeInfo(
-                kind="File",
-                name=file_path_str,
-                file_path=file_path_str,
-                line_start=1,
-                line_end=text.count("\n") + 1,
-                language="sql",
-                is_test=test_file,
-            )
-        )
+        nodes.append(NodeInfo(
+            kind="File",
+            name=file_path_str,
+            file_path=file_path_str,
+            line_start=1,
+            line_end=text.count("\n") + 1,
+            language="sql",
+            is_test=test_file,
+        ))
 
         # --- dbt model pass ---
         # A dbt model has no DDL (dbt wraps the SELECT at build time), its
@@ -4876,13 +7367,7 @@ class CodeParser:
         dbt_model_path = self._is_dbt_model_path(path)
         if dbt_model_path is True or (dbt_model_path is None and dbt_refs):
             self._extract_dbt_model(
-                path,
-                text,
-                dbt_refs,
-                file_path_str,
-                test_file,
-                nodes,
-                edges,
+                path, text, dbt_refs, file_path_str, test_file, nodes, edges,
             )
             return nodes, edges
 
@@ -4891,57 +7376,278 @@ class CodeParser:
         if parser:
             tree = parser.parse(source)
             self._walk_sql_tree(
-                tree.root_node,
-                source,
-                file_path_str,
-                nodes,
-                edges,
+                tree.root_node, source, file_path_str, nodes, edges,
             )
+
+        # Whether the PL/SQL-specific passes below (body-span computation
+        # and CALLS extraction) should run at all. Plain ANSI/T-SQL/MySQL
+        # `.sql` files skip them entirely — computing a body span for a
+        # dialect that doesn't use `END;` terminators is what caused the
+        # false CALLS edges flagged in the PR #785 review.
+        #
+        # Blanking comments and strings only makes sense for Oracle's quoting
+        # rules. A MySQL `\'` or `#` comment, a `"it's"`, or a pg_dump COPY row
+        # holding an apostrophe would flip its string state and blank real
+        # statements, so anything else keeps the raw text. Blanking can only
+        # remove a signal, so the raw check also spares plain files the cost.
+        # The second check stops a comment that merely mentions an Oracle word
+        # ("-- migrated from Oracle VARCHAR2") from counting as a signal.
+        clean_text = text
+        is_plsql = self._is_plsql_dialect(path, text)
+        if is_plsql:
+            clean_text = self._strip_plsql_noise(text)
+            is_plsql = self._is_plsql_dialect(path, clean_text)
+            if not is_plsql:
+                clean_text = text
+
+        # Names already captured by the tree-sitter pass, so the Oracle-style
+        # FUNCTION regex fallback below doesn't double-count ANSI-style
+        # `CREATE FUNCTION ... LANGUAGE sql` definitions the grammar already
+        # parsed correctly.
+        existing_function_names = {
+            n.name for n in nodes
+            if n.kind == "Function" and n.extra.get("sql_kind") == "function"
+        }
 
         # --- regex fallback for CREATE PROCEDURE ---
-        for m in self._SQL_PROC_RE.finditer(text):
+        # Body-span computation and CALLS extraction only run for confirmed
+        # Oracle PL/SQL; a plain ANSI/T-SQL/MySQL procedure still gets a
+        # Function node (as before this file supported PL/SQL at all), just
+        # without a computed body span.
+        for m in self._SQL_PROC_RE.finditer(clean_text):
             raw_name = m.group(1)
             name = raw_name.split(".")[-1]  # strip schema prefix
-            line = text[: m.start()].count("\n") + 1
+            line = clean_text[: m.start()].count("\n") + 1
             qualified = f"{file_path_str}::{name}"
-            nodes.append(
-                NodeInfo(
-                    kind="Function",
-                    name=name,
-                    file_path=file_path_str,
-                    line_start=line,
-                    line_end=line,
-                    language="sql",
-                    extra={"sql_kind": "procedure"},
+            line_end = line
+            body_end = self._plsql_block_end(clean_text, m.end(), name) if is_plsql else None
+            if body_end is not None:
+                line_end = clean_text[:body_end].count("\n") + 1
+            nodes.append(NodeInfo(
+                kind="Function",
+                name=name,
+                file_path=file_path_str,
+                line_start=line,
+                line_end=line_end,
+                language="sql",
+                extra={"sql_kind": "procedure"},
+            ))
+            edges.append(EdgeInfo(
+                kind="CONTAINS",
+                source=file_path_str,
+                target=qualified,
+                file_path=file_path_str,
+                line=line,
+            ))
+            if body_end is not None:
+                self._extract_plsql_calls(
+                    clean_text, m.end(), body_end, qualified, file_path_str, edges,
                 )
-            )
-            edges.append(
-                EdgeInfo(
-                    kind="CONTAINS",
-                    source=file_path_str,
-                    target=qualified,
-                    file_path=file_path_str,
-                    line=line,
-                )
+
+        # --- regex fallback for Oracle-style CREATE FUNCTION ---
+        # (PL/SQL `IS|AS ... BEGIN ... END` bodies with no RETURNS/LANGUAGE
+        # clause; the ANSI grammar above only catches `RETURNS ... AS $$ ...`
+        # style definitions.) Oracle-only: skip entirely for non-PL/SQL files.
+        for m in self._SQL_PLSQL_FUNC_RE.finditer(clean_text) if is_plsql else ():
+            raw_name = m.group(1)
+            name = raw_name.split(".")[-1]
+            if name in existing_function_names:
+                continue
+            line = clean_text[: m.start()].count("\n") + 1
+            qualified = f"{file_path_str}::{name}"
+            body_end = self._plsql_block_end(clean_text, m.end(), name)
+            nodes.append(NodeInfo(
+                kind="Function",
+                name=name,
+                file_path=file_path_str,
+                line_start=line,
+                line_end=clean_text[:body_end].count("\n") + 1,
+                language="sql",
+                extra={"sql_kind": "function"},
+            ))
+            edges.append(EdgeInfo(
+                kind="CONTAINS",
+                source=file_path_str,
+                target=qualified,
+                file_path=file_path_str,
+                line=line,
+            ))
+            self._extract_plsql_calls(
+                clean_text, m.end(), body_end, qualified, file_path_str, edges,
             )
 
+        # --- regex fallback for CREATE TRIGGER ---
+        # Oracle-only (T-SQL/MySQL also have CREATE TRIGGER with different
+        # body syntax, so this must not run unless the file is confirmed
+        # PL/SQL, or their triggers would get an incorrect body span too).
+        for m in self._SQL_TRIGGER_RE.finditer(clean_text) if is_plsql else ():
+            raw_name = m.group(1)
+            name = raw_name.split(".")[-1]
+            line = clean_text[: m.start()].count("\n") + 1
+            qualified = f"{file_path_str}::{name}"
+            body_end = self._plsql_block_end(clean_text, m.end(), name)
+            nodes.append(NodeInfo(
+                kind="Function",
+                name=name,
+                file_path=file_path_str,
+                line_start=line,
+                line_end=clean_text[:body_end].count("\n") + 1,
+                language="sql",
+                extra={"sql_kind": "trigger"},
+            ))
+            edges.append(EdgeInfo(
+                kind="CONTAINS",
+                source=file_path_str,
+                target=qualified,
+                file_path=file_path_str,
+                line=line,
+            ))
+            self._extract_plsql_calls(
+                clean_text, m.end(), body_end, qualified, file_path_str, edges,
+            )
+
+        # --- regex fallback for CREATE PACKAGE (specification) ---
+        for m in self._SQL_PACKAGE_RE.finditer(clean_text) if is_plsql else ():
+            raw_name = m.group(1)
+            name = raw_name.split(".")[-1]
+            line = clean_text[: m.start()].count("\n") + 1
+            qualified = f"{file_path_str}::{name}"
+            body_end = self._plsql_block_end(clean_text, m.end(), name)
+            nodes.append(NodeInfo(
+                kind="Class",
+                name=name,
+                file_path=file_path_str,
+                line_start=line,
+                line_end=clean_text[:body_end].count("\n") + 1,
+                language="sql",
+                extra={"sql_kind": "package"},
+            ))
+            edges.append(EdgeInfo(
+                kind="CONTAINS",
+                source=file_path_str,
+                target=qualified,
+                file_path=file_path_str,
+                line=line,
+            ))
+
+        # --- regex fallback for CREATE PACKAGE BODY (+ nested members) ---
+        # The body's qualified name gets a `$body` suffix, distinct from the
+        # spec's `file::pkg_name` — spec and body are separate Oracle
+        # objects, and sharing one qualified name collided on the graph
+        # store's `nodes.qualified_name UNIQUE` constraint, silently
+        # dropping whichever was inserted second (PR #785 review).
+        #
+        # GraphStore.upsert_node computes each node's *real* qualified_name
+        # itself, via `identity_name or name` + `parent_name` — it does not
+        # read back whatever string this method uses for edge targets. So
+        # the `$body` suffix has to be threaded through `identity_name`
+        # (for the body's own node) and `parent_name` (for its members),
+        # not just baked into the local `body_qualified`/`member_qualified`
+        # strings below — otherwise the edges above would point at a
+        # qualified name the stored node never actually has.
+        for m in self._SQL_PACKAGE_BODY_RE.finditer(clean_text) if is_plsql else ():
+            raw_name = m.group(1)
+            pkg_name = raw_name.split(".")[-1]
+            body_identity = f"{pkg_name}$body"
+            line = clean_text[: m.start()].count("\n") + 1
+            body_qualified = f"{file_path_str}::{body_identity}"
+            body_start = m.end()
+            body_end = self._plsql_block_end(clean_text, body_start, pkg_name, package=True)
+            nodes.append(NodeInfo(
+                kind="Class",
+                name=pkg_name,
+                identity_name=body_identity,
+                file_path=file_path_str,
+                line_start=line,
+                line_end=clean_text[:body_end].count("\n") + 1,
+                language="sql",
+                extra={"sql_kind": "package_body"},
+            ))
+            edges.append(EdgeInfo(
+                kind="CONTAINS",
+                source=file_path_str,
+                target=body_qualified,
+                file_path=file_path_str,
+                line=line,
+            ))
+
+            body_text = clean_text[body_start:body_end]
+            named_ends: dict[str, list[int]] = {}
+            for em in self._PLSQL_NAMED_END_RE.finditer(clean_text, body_start, body_end):
+                named_ends.setdefault(em.group(1).lower(), []).append(em.end())
+            members = list(self._SQL_PACKAGE_MEMBER_RE.finditer(body_text))
+            # An overload with a bare `END;` must not run on to the `END name;`
+            # of the next overload, so each member stops at the next one of its
+            # name. Other names cannot bound it: it may nest local procedures.
+            member_limits = [body_end] * len(members)
+            next_of_name: dict[str, int] = {}
+            for index in range(len(members) - 1, -1, -1):
+                key = members[index].group(2).lower()
+                member_limits[index] = next_of_name.get(key, body_end)
+                next_of_name[key] = body_start + members[index].start()
+            for mm, member_limit in zip(members, member_limits):
+                member_start = body_start + mm.end()
+                if self._plsql_is_forward_decl(clean_text, member_start):
+                    # `PROCEDURE x(...);` with no body — the real
+                    # definition is matched separately later in this loop.
+                    continue
+                member_kind = mm.group(1).lower()
+                member_name = mm.group(2)
+                member_sig = self._plsql_member_signature(clean_text, member_start)
+                member_identity = f"{member_name}({member_sig})"
+                member_line = clean_text[: body_start + mm.start()].count("\n") + 1
+                member_body_end = self._plsql_block_end(
+                    clean_text, member_start, member_name,
+                    limit=member_limit, named_ends=named_ends,
+                )
+                member_qualified = f"{body_qualified}.{member_identity}"
+                nodes.append(NodeInfo(
+                    kind="Function",
+                    name=member_name,
+                    identity_name=member_identity,
+                    file_path=file_path_str,
+                    line_start=member_line,
+                    line_end=clean_text[:member_body_end].count("\n") + 1,
+                    language="sql",
+                    parent_name=body_identity,
+                    extra={
+                        "sql_kind": (
+                            "procedure" if member_kind == "procedure"
+                            else "function"
+                        ),
+                    },
+                ))
+                edges.append(EdgeInfo(
+                    kind="CONTAINS",
+                    source=body_qualified,
+                    target=member_qualified,
+                    file_path=file_path_str,
+                    line=member_line,
+                ))
+                self._extract_plsql_calls(
+                    clean_text, member_start, member_body_end,
+                    member_qualified, file_path_str, edges,
+                )
+
         # --- table-reference pass (FROM / JOIN targets) ---
+        # Uses clean_text too: PL/SQL dynamic SQL commonly builds statements
+        # inside string literals (`l_sql := 'SELECT * FROM ' || t;`), which
+        # would otherwise produce a phantom IMPORTS_FROM to a table name
+        # that's just documentation/example text inside a string.
         seen_refs: set[str] = set()
-        for m in _SQL_TABLE_RE.finditer(text):
+        for m in _SQL_TABLE_RE.finditer(clean_text):
             raw_ref = m.group(1).strip("`")
             ref = raw_ref.split(".")[-1]  # strip schema/db prefix
             if ref and ref.upper() not in _SQL_KEYWORDS and ref not in seen_refs:
                 seen_refs.add(ref)
-                line = text[: m.start()].count("\n") + 1
-                edges.append(
-                    EdgeInfo(
-                        kind="IMPORTS_FROM",
-                        source=file_path_str,
-                        target=ref,
-                        file_path=file_path_str,
-                        line=line,
-                    )
-                )
+                line = clean_text[: m.start()].count("\n") + 1
+                edges.append(EdgeInfo(
+                    kind="IMPORTS_FROM",
+                    source=file_path_str,
+                    target=ref,
+                    file_path=file_path_str,
+                    line=line,
+                ))
 
         return nodes, edges
 
@@ -5026,27 +7732,23 @@ class CodeParser:
         """
         model_name = path.stem
         qualified = f"{file_path_str}::{model_name}"
-        nodes.append(
-            NodeInfo(
-                kind="Class",
-                name=model_name,
-                file_path=file_path_str,
-                line_start=1,
-                line_end=text.count("\n") + 1,
-                language="sql",
-                is_test=test_file,
-                extra={"sql_kind": "dbt_model"},
-            )
-        )
-        edges.append(
-            EdgeInfo(
-                kind="CONTAINS",
-                source=file_path_str,
-                target=qualified,
-                file_path=file_path_str,
-                line=1,
-            )
-        )
+        nodes.append(NodeInfo(
+            kind="Class",
+            name=model_name,
+            file_path=file_path_str,
+            line_start=1,
+            line_end=text.count("\n") + 1,
+            language="sql",
+            is_test=test_file,
+            extra={"sql_kind": "dbt_model"},
+        ))
+        edges.append(EdgeInfo(
+            kind="CONTAINS",
+            source=file_path_str,
+            target=qualified,
+            file_path=file_path_str,
+            line=1,
+        ))
 
         seen_targets: set[str] = set()
         for m in dbt_refs:
@@ -5061,15 +7763,170 @@ class CodeParser:
                 target = first_arg
             if target and target != model_name and target not in seen_targets:
                 seen_targets.add(target)
-                edges.append(
-                    EdgeInfo(
-                        kind="IMPORTS_FROM",
-                        source=file_path_str,
-                        target=target,
-                        file_path=file_path_str,
-                        line=text[: m.start()].count("\n") + 1,
-                    )
-                )
+                edges.append(EdgeInfo(
+                    kind="IMPORTS_FROM",
+                    source=file_path_str,
+                    target=target,
+                    file_path=file_path_str,
+                    line=text[: m.start()].count("\n") + 1,
+                ))
+
+    @staticmethod
+    def _plsql_block_end(
+        text: str,
+        start: int,
+        name: str,
+        limit: int | None = None,
+        named_ends: dict[str, list[int]] | None = None,
+        package: bool = False,
+    ) -> int:
+        """Return the index just past the terminating ``;`` of a named
+        PL/SQL block beginning at ``start``.
+
+        Prefers a name-qualified ``END <name>;`` — the Oracle style-guide
+        convention — since that reliably identifies the *outer* block even
+        when nested ``BEGIN ... EXCEPTION ... END;`` blocks inside it use a
+        bare, unnamed ``END;``. Falls back to counting blocks if no named
+        terminator exists; see :meth:`_plsql_bare_end`.
+
+        ``limit`` bounds how far either search can look (defaults to the
+        next top-level ``CREATE`` statement after ``start``, or end of
+        file, if no ``END`` at all is found). Without this bound, the named
+        search ran unbounded to end-of-file: two package bodies with a
+        same-named member (two overloads sharing a name is explicitly a
+        supported case, but so is one package body's member called `foo`
+        and another, unrelated package body's member also called `foo`)
+        could bleed into each other when the first used a bare `END;` and
+        the regex, un-bounded, found some *later* package body's own named
+        `END foo;` instead — see PR #785 review. An unbounded scan from
+        every member's start to end-of-file is also quadratic over a file
+        with many members (~4s for 4,000 members, per that review); passing
+        the enclosing block's own end as `limit` keeps each member's search
+        proportional to that block's size instead of to the whole file.
+
+        ``named_ends`` maps a lower-cased name to the sorted end offsets of its
+        ``END name;`` terminators. A caller walking many members of one body
+        passes it so that a member with a bare ``END;`` does not rescan the rest
+        of the body for a name that never appears.
+        """
+        if limit is None:
+            next_stmt = CodeParser._SQL_NEXT_STMT_RE.search(text, start)
+            limit = next_stmt.start() if next_stmt else len(text)
+        if named_ends is not None:
+            ends = named_ends.get(name.lower(), [])
+            at = bisect_left(ends, start)
+            if at < len(ends) and ends[at] <= limit:
+                return ends[at]
+        else:
+            named = re.compile(
+                rf"\bEND\b\s*{re.escape(name)}(?![\w$#])\s*;", re.IGNORECASE,
+            ).search(text, start, limit)
+            if named:
+                return named.end()
+        return CodeParser._plsql_bare_end(text, start, limit, package)
+
+    @staticmethod
+    def _plsql_bare_end(text: str, start: int, limit: int, package: bool) -> int:
+        """Find the end of a block with no ``END <name>;``, counting nested blocks.
+
+        A package body holds whole subprograms, so its end is the ``END`` with no
+        block open. A subprogram ends at the bare ``END;`` closing its outermost
+        block; a named ``END`` that closes everything belongs to a local
+        subprogram. A local subprogram with a bare ``END;`` still under-shoots:
+        telling it apart needs a real PL/SQL grammar, and none is available.
+
+        A package's initialisation section opens a block whose ``END`` is also
+        the package's, so the last ``END`` seen stands in when none is left over.
+        """
+        open_blocks: list[str] = []
+        last_end = limit
+        for m in CodeParser._PLSQL_BLOCK_WORD_RE.finditer(text, start, limit):
+            if m.group("open"):
+                open_blocks.append(m.group("open").upper())
+                continue
+            if m.group("skip"):
+                continue
+            semicolon = text.find(";", m.end(), limit)
+            end = m.end() if semicolon == -1 else semicolon + 1
+            if not open_blocks:
+                return end
+            closed = open_blocks.pop()
+            is_bare = not text[m.end():end - 1].strip()
+            if not open_blocks and closed == "BEGIN" and is_bare and not package:
+                return end
+            last_end = end
+        return last_end
+
+    def _extract_plsql_calls(
+        self,
+        text: str,
+        body_start: int,
+        body_end: int,
+        caller_qualified: str,
+        file_path_str: str,
+        edges: list[EdgeInfo],
+    ) -> None:
+        """Emit CALLS edges for procedure/function invocations found between
+        ``body_start`` and ``body_end``.
+
+        Regex-based (no PL/SQL grammar is available): matches
+        ``identifier(`` / ``pkg.proc(``, skipping PL/SQL/SQL keywords,
+        scalar type names that also precede ``(`` (e.g. ``VARCHAR2(50)``
+        in a variable declaration), the target of ``INSERT INTO t (cols)``,
+        and common builtin functions/packages (``COUNT``, ``NVL``,
+        ``TO_CHAR``, ``DBMS_OUTPUT.PUT_LINE``, ...) which are calls but not
+        to user code.
+        """
+        body_text = text[body_start:body_end]
+        seen: set[str] = set()
+        line = text.count("\n", 0, body_start) + 1
+        counted_to = 0
+        for m in self._PLSQL_CALL_RE.finditer(body_text):
+            target = m.group(1)
+            first = target.split(".", 1)[0]
+            receiver, _, last = target.rpartition(".")
+            if last.lower() in self._PLSQL_CALL_KEYWORDS:
+                continue
+            if last.upper() in _SQL_KEYWORDS:
+                continue
+            if (
+                receiver.lower() in self._PLSQL_BUILTIN_RECEIVERS
+                and last.lower() in self._PLSQL_BUILTIN_FUNCS
+            ):
+                continue
+            if receiver and last.lower() in self._PLSQL_COLLECTION_METHODS:
+                continue
+            if first.lower().startswith(self._PLSQL_BUILTIN_PACKAGE_PREFIXES):
+                continue
+            # Bounded lookback instead of body_text[:m.start()]: slicing and
+            # re-searching the whole preceding text on every match made this
+            # function O(n^2) on files with many call sites (~25s on large
+            # files per review). "INTO" immediately preceding the target is
+            # a local pattern — a small fixed window is enough to catch it
+            # even across a few lines of unusual whitespace/formatting.
+            lookback_start = max(0, m.start() - self._INTO_LOOKBACK)
+            if re.search(
+                r"\bINTO\s*$", body_text[lookback_start:m.start()], re.IGNORECASE,
+            ):
+                continue  # INSERT INTO t (cols) — t is a table, not a call
+            if target in seen:
+                continue
+            seen.add(target)
+            # Counted forward: recounting the prefix per call is quadratic.
+            line += body_text.count("\n", counted_to, m.start())
+            counted_to = m.start()
+            # `pkg.proc(` is stored under `proc`, as other languages store
+            # `obj.method()`. Members are keyed `pkg$body.proc(params)`, so the
+            # dotted spelling can never resolve: the member would look uncalled
+            # to `callers_of` and `dead-code`.
+            edges.append(EdgeInfo(
+                kind="CALLS",
+                source=caller_qualified,
+                target=last,
+                file_path=file_path_str,
+                line=line,
+                extra={"receiver": receiver} if receiver else {},
+            ))
 
     def _walk_sql_tree(
         self,
@@ -5103,19 +7960,18 @@ class CodeParser:
         name: Optional[str] = None
         for child in node.children:
             if child.type in ("identifier", "object_reference", "dotted_name"):
-                raw = source[child.start_byte : child.end_byte].decode("utf-8", errors="replace")
+                raw = source[child.start_byte: child.end_byte].decode("utf-8", errors="replace")
                 # Strip schema prefix (schema.name → name)
-                name = raw.strip('`"').split(".")[-1]
+                name = raw.strip("`\"").split(".")[-1]
                 break
             # Some grammars nest: relation > object_reference > identifier
             if child.type == "relation":
                 for gc in child.children:
                     if gc.type in ("object_reference", "identifier"):
-                        raw = source[gc.start_byte : gc.end_byte].decode(
-                            "utf-8",
-                            errors="replace",
+                        raw = source[gc.start_byte: gc.end_byte].decode(
+                            "utf-8", errors="replace",
                         )
-                        name = raw.strip('`"').split(".")[-1]
+                        name = raw.strip("`\"").split(".")[-1]
                         break
                 if name:
                     break
@@ -5134,26 +7990,22 @@ class CodeParser:
             sql_kind = "function"
 
         qualified = f"{file_path_str}::{name}"
-        nodes.append(
-            NodeInfo(
-                kind=kind,
-                name=name,
-                file_path=file_path_str,
-                line_start=line_start,
-                line_end=line_end,
-                language="sql",
-                extra={"sql_kind": sql_kind},
-            )
-        )
-        edges.append(
-            EdgeInfo(
-                kind="CONTAINS",
-                source=file_path_str,
-                target=qualified,
-                file_path=file_path_str,
-                line=line_start,
-            )
-        )
+        nodes.append(NodeInfo(
+            kind=kind,
+            name=name,
+            file_path=file_path_str,
+            line_start=line_start,
+            line_end=line_end,
+            language="sql",
+            extra={"sql_kind": sql_kind},
+        ))
+        edges.append(EdgeInfo(
+            kind="CONTAINS",
+            source=file_path_str,
+            target=qualified,
+            file_path=file_path_str,
+            line=line_start,
+        ))
 
     def _resolve_call_targets(
         self,
@@ -5172,10 +8024,13 @@ class CodeParser:
         """
         if any(node.language == "julia" for node in nodes):
             return self._resolve_julia_call_targets(
-                nodes,
-                edges,
-                file_path,
+                nodes, edges, file_path,
             )
+
+        # All C# call binding belongs to the namespace-aware graph pass.
+        # A same-file or bare-name match cannot establish C# visibility.
+        if any(node.language == "csharp" for node in nodes):
+            return edges
 
         is_cpp = any(node.language == "cpp" for node in nodes)
         is_go = any(node.language == "go" for node in nodes)
@@ -5206,8 +8061,9 @@ class CodeParser:
                 entry = (qualified, node.parent_name)
                 if entry not in symbols.setdefault(bare, []):
                     symbols[bare].append(entry)
-                if node.kind in ("Function", "Test") and entry not in callable_symbols.setdefault(
-                    bare, []
+                if (
+                    node.kind in ("Function", "Test")
+                    and entry not in callable_symbols.setdefault(bare, [])
                 ):
                     callable_symbols[bare].append(entry)
                 source_scopes[qualified] = node.parent_name
@@ -5216,6 +8072,35 @@ class CodeParser:
             self._node_qualified(node): node.extra["go_receiver"]
             for node in nodes
             if node.language == "go" and "go_receiver" in node.extra
+        }
+        # A dot in a Python member's parent scope proves nesting; Ruby and
+        # Julia always dot, so they are handled by their own rules below. C#
+        # never reaches here: its namespace-aware binder owns every call (#964).
+        disambiguated_leaves = {
+            node.parent_name.rsplit(".", 1)[-1] for node in nodes
+            if node.language == "python" and node.parent_name
+            and "." in node.parent_name and node.kind in ("Function", "Test")
+        }
+        # Ruby and every language that keeps the full nested scope chain
+        # (#934) give each nested member a dotted scope, so a dot proves
+        # nothing there. A leaf is ambiguous only when two scopes share it.
+        chained_scopes_by_leaf: dict[str, set[str]] = {}
+        for node in nodes:
+            if (
+                node.language not in _SEPARATE_SCOPE_RULE_LANGUAGES
+                and node.parent_name and node.kind in ("Function", "Test")
+            ):
+                chained_scopes_by_leaf.setdefault(
+                    node.parent_name.rsplit(".", 1)[-1], set(),
+                ).add(node.parent_name)
+        disambiguated_leaves.update(
+            leaf for leaf, scopes in chained_scopes_by_leaf.items() if len(scopes) > 1
+        )
+        disambiguated_scopes = {
+            node.parent_name for node in nodes
+            if node.language not in ("cpp", "julia", "csharp") and node.parent_name
+            and node.kind in ("Function", "Test")
+            and node.parent_name.rsplit(".", 1)[-1] in disambiguated_leaves
         }
 
         def candidate_entries(
@@ -5229,11 +8114,56 @@ class CodeParser:
 
         resolved: list[EdgeInfo] = []
         for edge in edges:
-            if edge.kind == "REFERENCES" and edge.extra.get("julia_qualified_def"):
+            if (
+                edge.kind == "REFERENCES"
+                and edge.extra.get("julia_qualified_def")
+            ):
+                resolved.append(edge)
+                continue
+            if edge.extra.get("receiver_constant"):
+                # The file says which class this is, so a same-named definition
+                # here is not it. The graph-wide resolver finds the real one.
                 resolved.append(edge)
                 continue
             receiver = edge.extra.get("receiver")
-            has_receiver = bool(receiver)
+            # A Python member call whose receiver is an expression rather than
+            # a name (``os.environ.get(...)``) still has a receiver; the
+            # method belongs to it, never to a same-named definition in this
+            # file's own scope.
+            has_receiver = bool(receiver) or (
+                edge.extra.get("receiver_form") == "expression"
+            )
+            scope = source_scopes.get(edge.source)
+            if (
+                scope in disambiguated_scopes
+                and edge.kind in ("CALLS", "REFERENCES")
+                and "::" not in edge.target
+                and (not has_receiver or receiver in ("self", "this"))
+            ):
+                entries = candidate_entries(edge.target, edge.kind)
+                local = [qualified for qualified, parent in entries if parent == scope]
+                if len(local) == 1:
+                    edge = EdgeInfo(
+                        kind=edge.kind, source=edge.source, target=local[0],
+                        file_path=edge.file_path, line=edge.line, extra=edge.extra,
+                    )
+                    resolved.append(edge)
+                    continue
+                if entries and not any(parent is None for _, parent in entries):
+                    # A same-named member in a different lexical class is
+                    # not evidence of the target of this unbound call. The
+                    # class binding stops post-build resolution choosing it.
+                    edge = EdgeInfo(
+                        kind=edge.kind, source=edge.source, target=edge.target,
+                        file_path=edge.file_path, line=edge.line,
+                        extra={
+                            **edge.extra,
+                            "receiver_binding": "class",
+                            "receiver_class": scope,
+                        },
+                    )
+                    resolved.append(edge)
+                    continue
             if (
                 is_go
                 and edge.kind == "CALLS"
@@ -5243,8 +8173,7 @@ class CodeParser:
                 candidates = [
                     qualified
                     for qualified, parent_scope in candidate_entries(
-                        edge.target,
-                        edge.kind,
+                        edge.target, edge.kind,
                     )
                     if parent_scope == source_scopes.get(edge.source)
                 ]
@@ -5267,7 +8196,9 @@ class CodeParser:
                 # function; otherwise preserve the existing bare-name
                 # resolution behavior.
                 member_call = edge.extra.get("member_call")
-                member_candidates = symbols.get(member_call, [])
+                member_candidates = (
+                    symbols.get(member_call, []) if isinstance(member_call, str) else []
+                )
                 if member_candidates:
                     edge = EdgeInfo(
                         kind=edge.kind,
@@ -5288,7 +8219,8 @@ class CodeParser:
                 and "::" not in edge.target
             ):
                 receiver_candidates = [
-                    qualified for qualified, _ in candidate_entries(edge.target, edge.kind)
+                    qualified
+                    for qualified, _ in candidate_entries(edge.target, edge.kind)
                 ]
                 edge = EdgeInfo(
                     kind=edge.kind,
@@ -5323,7 +8255,9 @@ class CodeParser:
                                 f"{source_scope}.{explicit_scope}",
                             )
                             source_scope = (
-                                source_scope.rsplit(".", 1)[0] if "." in source_scope else None
+                                source_scope.rsplit(".", 1)[0]
+                                if "." in source_scope
+                                else None
                             )
                     explicit_preferred_scopes.append(explicit_scope)
                     matching_entries = []
@@ -5341,7 +8275,9 @@ class CodeParser:
                         for qualified, parent_scope in scoped_entries
                         if parent_scope is None
                     ]
-                scoped_candidates = [qualified for qualified, _ in matching_entries]
+                scoped_candidates = [
+                    qualified for qualified, _ in matching_entries
+                ]
                 if scoped_candidates:
                     if len(scoped_candidates) > 1:
                         edge = EdgeInfo(
@@ -5380,7 +8316,9 @@ class CodeParser:
                     while source_scope:
                         preferred_scopes.append(source_scope)
                         source_scope = (
-                            source_scope.rsplit(".", 1)[0] if "." in source_scope else None
+                            source_scope.rsplit(".", 1)[0]
+                            if "." in source_scope
+                            else None
                         )
                     preferred_scopes.append(None)
                     candidates = []
@@ -5455,16 +8393,17 @@ class CodeParser:
             identity_parent = node.parent_name or ""
             parent_parts = identity_parent.split(".") if identity_parent else []
             qualifier_parts = qualifier.split(".")
-            if parent_parts[-len(qualifier_parts) :] != qualifier_parts:
+            if parent_parts[-len(qualifier_parts):] != qualifier_parts:
                 continue
             lexical_parent = ".".join(
-                parent_parts[: -len(qualifier_parts)],
+                parent_parts[:-len(qualifier_parts)],
             )
-            identity_path = ".".join(part for part in (identity_parent, node.name) if part)
+            identity_path = ".".join(
+                part for part in (identity_parent, node.name) if part
+            )
             qualified_boundaries.append((identity_path, lexical_parent))
         qualified_boundaries.sort(
-            key=lambda item: len(item[0]),
-            reverse=True,
+            key=lambda item: len(item[0]), reverse=True,
         )
 
         symbols: dict[str, str] = {}
@@ -5472,9 +8411,7 @@ class CodeParser:
             if node.kind not in ("Function", "Class", "Type", "Test"):
                 continue
             qualified = self._qualify(
-                node.name,
-                file_path,
-                node.parent_name,
+                node.name, file_path, node.parent_name,
             )
             identity_path = qualified.removeprefix(prefix)
             symbols[identity_path] = qualified
@@ -5488,9 +8425,9 @@ class CodeParser:
             next_seen = seen | {source_scope}
             boundary = next(
                 (
-                    item
-                    for item in qualified_boundaries
-                    if source_scope == item[0] or source_scope.startswith(f"{item[0]}.")
+                    item for item in qualified_boundaries
+                    if source_scope == item[0]
+                    or source_scope.startswith(f"{item[0]}.")
                 ),
                 None,
             )
@@ -5508,14 +8445,24 @@ class CodeParser:
 
         resolved: list[EdgeInfo] = []
         for edge in edges:
-            if edge.kind == "REFERENCES" and edge.extra.get("julia_qualified_def"):
+            if (
+                edge.kind == "REFERENCES"
+                and edge.extra.get("julia_qualified_def")
+            ):
                 resolved.append(edge)
                 continue
-            if edge.kind not in ("CALLS", "REFERENCES") or "::" in edge.target:
+            if (
+                edge.kind not in ("CALLS", "REFERENCES")
+                or "::" in edge.target
+            ):
                 resolved.append(edge)
                 continue
 
-            source_tail = edge.source.removeprefix(prefix) if edge.source.startswith(prefix) else ""
+            source_tail = (
+                edge.source.removeprefix(prefix)
+                if edge.source.startswith(prefix)
+                else ""
+            )
             target = None
             for scope in _search_scopes(source_tail):
                 candidate = f"{scope}.{edge.target}" if scope else edge.target
@@ -5534,43 +8481,23 @@ class CodeParser:
             resolved.append(edge)
         return resolved
 
-    _TYPED_CALL_LANGUAGES = frozenset(
-        {
-            "python",
-            "kotlin",
-            "java",
-            "javascript",
-            "typescript",
-            "tsx",
-            "php",
-            "csharp",
-        }
-    )
+    _TYPED_CALL_LANGUAGES = frozenset({
+        "python", "kotlin", "java", "javascript", "typescript", "tsx", "php",
+        "csharp",
+    })
+    # Languages whose declared receiver type is kept on the edge even when this
+    # file cannot say where the type is declared: a Java class in the same
+    # package needs no import. The graph-wide resolver finds the class.
+    _UNRESOLVED_TYPE_LANGUAGES = frozenset({
+        "java", "kotlin", "javascript", "typescript", "tsx",
+    })
     _TRANSPARENT_TYPE_WRAPPERS = frozenset({"Annotated", "Optional", "Type"})
-    _NON_RECEIVER_TYPE_NAMES = frozenset(
-        {
-            "Array",
-            "Collection",
-            "Dict",
-            "Iterable",
-            "List",
-            "Map",
-            "Mapping",
-            "MutableList",
-            "MutableMap",
-            "MutableMapping",
-            "ReadonlyArray",
-            "Sequence",
-            "Set",
-            "Tuple",
-            "Union",
-            "dict",
-            "frozenset",
-            "list",
-            "set",
-            "tuple",
-        }
-    )
+    _NON_RECEIVER_TYPE_NAMES = frozenset({
+        "Array", "Collection", "Dict", "Iterable", "List", "Map", "Mapping",
+        "MutableList", "MutableMap", "MutableMapping", "ReadonlyArray",
+        "Sequence", "Set", "Tuple", "Union", "dict", "frozenset", "list",
+        "set", "tuple",
+    })
 
     def _collect_typed_call_targets(
         self,
@@ -5579,11 +8506,12 @@ class CodeParser:
         file_path: str,
         import_map: dict[str, str],
         defined_names: set[str],
-    ) -> dict[tuple[int, str, str], tuple[str, str, str]]:
+    ) -> dict[tuple[int, str, str], tuple[Optional[str], str, str]]:
         """Collect evidence-backed targets for calls on typed receivers.
 
-        The result is keyed by source line, receiver, and method so the normal
-        call extractor remains the single producer of CALLS edges. Statically
+        The result is keyed by source position, receiver, and method so the normal
+        call extractor remains the single producer of CALLS edges. C# uses byte
+        offsets to distinguish lexical bindings on the same line. Statically
         typed receivers resolve directly when their class is repository-local.
         PHP variables assigned from ``new Type`` retain a bare parse-time target
         plus the constructed class scope for conservative graph-wide resolution.
@@ -5594,6 +8522,8 @@ class CodeParser:
 
         class_types = set(self._class_types.get(language, []))
         function_types = set(self._function_types.get(language, []))
+        if language == "csharp":
+            function_types.add("local_function_statement")
         call_types = set(self._call_types.get(language, []))
         block_types = {
             "java": {"block"},
@@ -5604,7 +8534,30 @@ class CodeParser:
             "php": {"compound_statement"},
             "csharp": {"block"},
         }.get(language, set())
-        targets: dict[tuple[int, str, str], tuple[str, str, str]] = {}
+        targets: dict[tuple[int, str, str], tuple[Optional[str], str, str]] = {}
+        declared_type_parameters: list[set[str]] = []
+
+        def type_parameters() -> set[str]:
+            """Every generic parameter name declared in the file, read once."""
+            if not declared_type_parameters:
+                names: set[str] = set()
+                stack = [root]
+                while stack:
+                    current = stack.pop()
+                    if current.type == "type_parameter":
+                        name_node = next(
+                            (
+                                child for child in current.named_children
+                                if child.type in ("type_identifier", "identifier")
+                            ),
+                            None,
+                        )
+                        if name_node is not None:
+                            names.add(name_node.text.decode("utf-8", errors="replace"))
+                        continue
+                    stack.extend(current.children)
+                declared_type_parameters.append(names)
+            return declared_type_parameters[0]
 
         def walk(
             node,
@@ -5616,12 +8569,14 @@ class CodeParser:
                 return
             if node.type in class_types:
                 fields = self._collect_class_typed_fields(
-                    node,
-                    language,
-                    function_types,
-                    class_types,
+                    node, language, function_types, class_types,
                 )
-                class_bindings = dict(bindings)
+                class_bindings: dict[str, str] = dict(bindings)
+                if language == "csharp":
+                    for name, type_name in bindings.items():
+                        class_bindings[name] = _OuterBinding(
+                            type_name, getattr(type_name, "levels", 0) + 1,
+                        )
                 class_bindings.update(fields)
                 for child in node.children:
                     walk(child, class_bindings, fields, depth + 1)
@@ -5637,12 +8592,20 @@ class CodeParser:
 
             if node.type in block_types:
                 scoped = dict(bindings)
+                if language == "csharp":
+                    for child in node.named_children:
+                        if child.type == "local_function_statement":
+                            scoped[_csharp_name(child.child_by_field_name("name"))] = ""
                 for child in node.children:
                     walk(child, scoped, class_fields, depth + 1)
                 return
 
             new_bindings = self._typed_bindings_from_node(node, language)
-            assigned_names = self._php_assigned_variables(node) if language == "php" else set()
+            assigned_names = (
+                self._php_assigned_variables(node)
+                if language == "php"
+                else set()
+            )
             if new_bindings or assigned_names:
                 # Initializers are evaluated before their declaration becomes
                 # visible, so visit children with the previous environment.
@@ -5654,14 +8617,37 @@ class CodeParser:
                 return
 
             if node.type in call_types:
+                if language == "csharp":
+                    callee = node.child_by_field_name("function")
+                    if callee is not None and callee.type == "identifier":
+                        name = _csharp_name(callee)
+                        if name in bindings:
+                            # A callable local/member hides containing-type methods.
+                            targets[(node.start_byte, "", name)] = ("", "", "shadowed_callable")
                 receiver, method = self._get_member_call_receiver_method(
-                    node,
-                    language,
+                    node, language,
                 )
                 if receiver and method:
-                    type_name = bindings.get(receiver)
-                    evidence = "constructed_receiver" if language == "php" else "typed_receiver"
-                    if type_name is None and receiver[:1].isupper():
+                    # ``this.field`` is the field even where a parameter or a
+                    # local of that name hides it.
+                    this_field = language == "java" and self._java_this_field_call(node)
+                    type_name = (
+                        class_fields.get(receiver) if this_field else bindings.get(receiver)
+                    )
+                    evidence = (
+                        "constructed_receiver"
+                        if language == "php"
+                        else "typed_receiver"
+                    )
+                    if (
+                        type_name is None
+                        and not this_field
+                        and (receiver[:1].isupper() or language == "csharp")
+                        and not (
+                            language == "csharp"
+                            and receiver.split(".", 1)[0] in bindings
+                        )
+                    ):
                         # C# receivers keep their class-name evidence even
                         # when the class is not visible in this file: the
                         # graph-wide scoped resolver validates it against
@@ -5670,6 +8656,10 @@ class CodeParser:
                             receiver in import_map
                             or receiver in defined_names
                             or language == "csharp"
+                            or (
+                                language == "java"
+                                and self._java_same_package_file(receiver, file_path)
+                            )
                         ):
                             type_name = receiver
                             evidence = "class_receiver"
@@ -5682,9 +8672,30 @@ class CodeParser:
                             import_map,
                             defined_names,
                         )
+                        position = (
+                            node.start_byte if language == "csharp"
+                            else node.start_point[0] + 1
+                        )
+                        key = (position, receiver, method)
                         if target:
-                            key = (node.start_point[0] + 1, receiver, method)
                             targets[key] = (target, type_name, evidence)
+                        elif (
+                            evidence == "typed_receiver"
+                            and language in self._UNRESOLVED_TYPE_LANGUAGES
+                        ):
+                            # The declared type is known though its file is
+                            # not. Keep it, so the resolver can tell ``pet``'s
+                            # ``getName`` from any other ``getName``. A type
+                            # parameter (``T``) or Java's ``var`` names no class.
+                            base_type = self._base_type_name(type_name)
+                            if (
+                                base_type
+                                and base_type != "var"
+                                and base_type not in type_parameters()
+                            ):
+                                targets[key] = (
+                                    None, base_type, "typed_receiver_unresolved",
+                                )
 
             for child in node.children:
                 walk(child, bindings, class_fields, depth + 1)
@@ -5740,7 +8751,9 @@ class CodeParser:
         def visit(node, depth: int = 0) -> None:
             if depth > self._MAX_AST_DEPTH:
                 return
-            if node is not function_node and node.type in self._function_types.get(language, []):
+            if node is not function_node and node.type in self._function_types.get(
+                language, []
+            ):
                 return
             if node.type in parameter_types:
                 bindings.update(self._typed_bindings_from_node(node, language))
@@ -5763,11 +8776,8 @@ class CodeParser:
                 return
             if node.type in ("required_parameter", "optional_parameter"):
                 has_field_modifier = any(
-                    child.type
-                    in (
-                        "accessibility_modifier",
-                        "override_modifier",
-                        "readonly",
+                    child.type in (
+                        "accessibility_modifier", "override_modifier", "readonly",
                     )
                     for child in node.children
                 )
@@ -5793,9 +8803,7 @@ class CodeParser:
         result: dict[str, str] = {}
 
         if language == "python" and node.type in (
-            "assignment",
-            "typed_parameter",
-            "typed_default_parameter",
+            "assignment", "typed_parameter", "typed_default_parameter",
         ):
             name_node = node.child_by_field_name("left")
             if name_node is None:
@@ -5807,50 +8815,65 @@ class CodeParser:
             self._store_typed_binding(result, name_node, type_node)
 
         elif language == "kotlin" and node.type in (
-            "class_parameter",
-            "parameter",
-            "variable_declaration",
+            "class_parameter", "parameter", "variable_declaration",
         ):
             name_node = next(
-                (child for child in node.children if child.type == "simple_identifier"),
+                (
+                    child
+                    for child in node.children
+                    if child.type == "simple_identifier"
+                ),
                 None,
             )
             type_node = next(
-                (child for child in node.children if child.type in ("user_type", "nullable_type")),
+                (
+                    child
+                    for child in node.children
+                    if child.type in ("user_type", "nullable_type")
+                ),
                 None,
             )
             self._store_typed_binding(result, name_node, type_node)
 
         elif language == "java" and node.type in (
-            "formal_parameter",
-            "spread_parameter",
+            "formal_parameter", "spread_parameter",
         ):
-            self._store_typed_binding(
+            self._store_java_typed_binding(
                 result,
                 node.child_by_field_name("name"),
                 node.child_by_field_name("type"),
             )
 
         elif language == "java" and node.type in (
-            "field_declaration",
-            "local_variable_declaration",
+            "field_declaration", "local_variable_declaration",
         ):
             type_node = node.child_by_field_name("type")
             for child in node.children:
                 if child.type == "variable_declarator":
-                    self._store_typed_binding(
+                    declared = type_node
+                    value = child.child_by_field_name("value")
+                    if (
+                        type_node is not None
+                        and type_node.text == b"var"
+                        and value is not None
+                        and value.type == "object_creation_expression"
+                    ):
+                        # ``var x = new Cart()`` states its type on the right.
+                        declared = value.child_by_field_name("type") or type_node
+                    self._store_java_typed_binding(
                         result,
                         child.child_by_field_name("name"),
-                        type_node,
+                        declared,
                     )
 
         elif language in ("javascript", "typescript", "tsx") and node.type in (
-            "required_parameter",
-            "optional_parameter",
-            "variable_declarator",
+            "required_parameter", "optional_parameter", "variable_declarator",
             "public_field_definition",
         ):
-            name_node = node.child_by_field_name("name") or node.child_by_field_name("pattern")
+            name_node = (
+                node.child_by_field_name("name")
+                or node.child_by_field_name("pattern")
+            )
             if name_node is None:
                 name_node = next(
                     (child for child in node.children if child.type == "identifier"),
@@ -5873,7 +8896,10 @@ class CodeParser:
                 if declared_type is None:
                     # ``var x = new Service();`` — use the constructed type.
                     creation = next(
-                        (sub for sub in child.children if sub.type == "object_creation_expression"),
+                        (
+                            sub for sub in child.children
+                            if sub.type == "object_creation_expression"
+                        ),
                         None,
                     )
                     if creation is not None:
@@ -5882,13 +8908,15 @@ class CodeParser:
                     result,
                     child.child_by_field_name("name"),
                     declared_type,
+                    csharp=True,
                 )
 
-        elif language == "csharp" and node.type == "parameter":
+        elif language == "csharp" and node.type in ("parameter", "property_declaration"):
             self._store_typed_binding(
                 result,
                 node.child_by_field_name("name"),
                 node.child_by_field_name("type"),
+                csharp=True,
             )
 
         elif language == "php" and node.type == "assignment_expression":
@@ -5910,12 +8938,10 @@ class CodeParser:
                 )
                 if type_node is not None:
                     name = name_node.text.decode(
-                        "utf-8",
-                        errors="replace",
+                        "utf-8", errors="replace",
                     )
                     type_name = type_node.text.decode(
-                        "utf-8",
-                        errors="replace",
+                        "utf-8", errors="replace",
                     ).strip("\\")
                     if name and type_name:
                         result[name] = type_name
@@ -5934,8 +8960,17 @@ class CodeParser:
         return {name} if name else set()
 
     @classmethod
-    def _store_typed_binding(cls, result: dict[str, str], name_node, type_node) -> None:
-        if name_node is None or type_node is None:
+    def _store_typed_binding(
+        cls, result: dict[str, str], name_node, type_node, *, csharp: bool = False,
+    ) -> None:
+        if name_node is None:
+            return
+        if csharp:
+            # Preserve qualification and type arguments. An unknown local still
+            # shadows a type name; it must not become a static receiver guess.
+            result[_csharp_name(name_node)] = _csharp_name(type_node)
+            return
+        if type_node is None:
             return
         name = name_node.text.decode("utf-8", errors="replace")
         type_name = cls._base_type_name(
@@ -5943,6 +8978,27 @@ class CodeParser:
         )
         if name and type_name:
             result[name] = type_name
+
+    @classmethod
+    def _store_java_typed_binding(cls, result: dict[str, str], name_node, type_node) -> None:
+        """Store a Java binding, keeping a package-qualified type whole.
+
+        ``com.acme.other.Cart`` is not the ``Cart`` in this file's package, so
+        cutting it to ``Cart`` would let the package fallback pick the wrong one.
+        """
+        cls._store_typed_binding(result, name_node, type_node)
+        if name_node is None or type_node is None:
+            return
+        name = name_node.text.decode("utf-8", errors="replace")
+        qualified = _JAVA_PACKAGE_QUALIFIED_TYPE.match(
+            type_node.text.decode("utf-8", errors="replace").strip(),
+        )
+        if (
+            name in result
+            and qualified is not None
+            and qualified.group(0).rsplit(".", 1)[-1] == result[name]
+        ):
+            result[name] = qualified.group(0)
 
     @classmethod
     def _base_type_name(cls, annotation: str) -> Optional[str]:
@@ -5953,28 +9009,23 @@ class CodeParser:
             if match is None:
                 return None
             outer = match.group(1).rsplit(".", 1)[-1]
-            remainder = current[match.end() :].lstrip()
+            remainder = current[match.end():].lstrip()
             if remainder.startswith("[]"):
                 return None
             if outer in cls._TRANSPARENT_TYPE_WRAPPERS:
-                openings = [index for index in (current.find("["), current.find("<")) if index >= 0]
+                openings = [
+                    index for index in (current.find("["), current.find("<"))
+                    if index >= 0
+                ]
                 if not openings:
                     return None
-                current = current[min(openings) + 1 :].lstrip()
+                current = current[min(openings) + 1:].lstrip()
                 continue
             if outer in cls._NON_RECEIVER_TYPE_NAMES:
                 return None
             if outer in (
-                "None",
-                "bool",
-                "boolean",
-                "float",
-                "int",
-                "number",
-                "str",
-                "string",
-                "unknown",
-                "void",
+                "None", "bool", "boolean", "float", "int", "number", "str",
+                "string", "unknown", "void",
             ):
                 return None
             return outer
@@ -6003,10 +9054,15 @@ class CodeParser:
             # class receiver cannot be resolved to its defining file during
             # a single-file parse. Emit the receiver class as a scope target
             # for the graph-wide scoped resolver (#612).
-            base_type = self._base_type_name(type_name)
-            if not base_type:
+            return f"{type_name}::{method}" if type_name else None
+
+        if language == "java" and _JAVA_PACKAGE_QUALIFIED_TYPE.fullmatch(type_name):
+            # A package-qualified type names its file; nothing else may stand in.
+            package_file = self._resolve_module_to_file(type_name, file_path, language)
+            if not package_file:
                 return None
-            return f"{base_type}::{method}"
+            class_name = type_name.rsplit(".", 1)[-1]
+            return f"{self._qualify(class_name, package_file, None)}.{method}"
 
         base_type = self._base_type_name(type_name)
         if not base_type:
@@ -6022,12 +9078,16 @@ class CodeParser:
                 return f"{resolved}.{method}"
         if base_type in defined_names:
             return f"{file_path}::{base_type}.{method}"
+        if language == "java" and base_type not in import_map:
+            same_package = self._java_same_package_file(base_type, file_path)
+            if same_package:
+                return f"{same_package}::{base_type}.{method}"
         return None
 
     @staticmethod
     def _apply_typed_call_targets(
         edges: list[EdgeInfo],
-        targets: dict[tuple[int, str, str], tuple[str, str, str]],
+        targets: dict[tuple[int, str, str], tuple[Optional[str], str, str]],
         language: str,
     ) -> list[EdgeInfo]:
         if not targets:
@@ -6036,18 +9096,22 @@ class CodeParser:
         for edge in edges:
             receiver = edge.extra.get("receiver")
             method = edge.target.rsplit(".", 1)[-1].rsplit("::", 1)[-1]
-            evidence = targets.get((edge.line, receiver, method)) if receiver else None
+            position = edge.extra.get("source_offset", -1) if language == "csharp" else edge.line
+            evidence = (
+                targets.get((position, receiver or "", method))
+                if receiver or language == "csharp" else None
+            )
             if edge.kind == "CALLS" and evidence:
                 target, type_name, evidence_kind = evidence
                 extra = dict(edge.extra)
-                extra.update(
-                    {
-                        "receiver_type": type_name,
-                        "receiver_resolution": evidence_kind,
-                    }
-                )
-                resolved_target = target
-                if evidence_kind == "constructed_receiver" or language == "csharp":
+                extra.update({
+                    "receiver_type": type_name,
+                    "receiver_resolution": evidence_kind,
+                })
+                resolved_target = edge.target if target is None else target
+                if target is not None and (
+                    evidence_kind == "constructed_receiver" or language == "csharp"
+                ):
                     # Keep PHP/C# parse-only CALLS output backward-compatible
                     # (bare method target) while preserving the receiver
                     # class scope for the graph-wide resolver.
@@ -6055,6 +9119,10 @@ class CodeParser:
                     if separator and scope:
                         extra["receiver_scope"] = scope
                     resolved_target = edge.target
+                    levels = getattr(type_name, "levels", 0)
+                    if language == "csharp" and levels:
+                        # The binder looks the type up where it was declared.
+                        extra["csharp_receiver_levels"] = levels
                 edge = EdgeInfo(
                     kind=edge.kind,
                     source=edge.source,
@@ -6065,6 +9133,1485 @@ class CodeParser:
                 )
             resolved.append(edge)
         return resolved
+
+    # -----------------------------------------------------------------------
+    # Python receiver evidence
+    # -----------------------------------------------------------------------
+    #
+    # ``x.get(...)`` calls the ``get`` that belongs to whatever ``x`` holds.
+    # It does NOT call every repository function named ``get``, and it has
+    # nothing to do with which modules the call-site file happens to import.
+    # The graph-wide bare-target resolver only had the file's import list to
+    # go on, so a correct import edge made it *more* confident about calls it
+    # had no business attributing at all.
+    #
+    # These two methods answer the only question that matters — what does this
+    # file say the receiver is — using syntax visible in the file itself:
+    #
+    #   module   an import statement binds the name to a module that resolves
+    #            to an indexed file (``from . import cli``, ``import pkg.mod
+    #            as m``). The method must be a top-level name in that file.
+    #   class    an annotation, a typed parameter, or an assignment from a
+    #            constructor call whose callee is a class this file defines or
+    #            imports. The method must belong to that class.
+    #   builtin  the name is assigned a container or scalar literal, or a
+    #            comprehension. No repository node can own the method.
+    #   unknown  everything else, including a name bound two different ways
+    #            and a receiver expression the parser cannot name at all
+    #            (``os.environ.get(...)``).
+    #
+    # ``builtin`` and ``unknown`` produce no attribution: the target stays
+    # bare and the unresolved path reports it honestly. No method-name list is
+    # consulted anywhere.
+
+    def _collect_python_receiver_evidence(
+        self, root, file_path: str, source: bytes,
+    ) -> tuple[
+        dict[tuple[int, str], tuple[str, str]],
+        list[EdgeInfo],
+    ]:
+        """Collect typed receiver evidence and edges for property reads.
+
+        Scoped the way Python is scoped, because a file-wide answer is wrong
+        often enough to matter: ``store`` is a ``GraphStore`` in fifteen test
+        methods and a ``MagicMock`` in three, and only the enclosing function
+        says which. Module bindings and imported symbols seed the module
+        scope; a class contributes its annotated attributes and every
+        ``self.x = ...`` written anywhere inside it; a function contributes
+        its typed parameters and its own assignments, in source order.
+
+        The whole tree is scanned for imports, not only its top level: the
+        import that decides a receiver is routinely written inside the
+        function that uses it, which is exactly where ``_collect_file_scope``
+        stops looking.
+        """
+        module_bindings: dict[str, set[str]] = {}
+        imported_names: set[str] = set()
+        class_names: set[str] = set()
+        ambiguous_property_classes: set[str] = set()
+        symbol_binding_candidates: dict[str, set[tuple[str, str]]] = {}
+        local_returns: dict[str, str] = {}
+        property_returns: dict[tuple[str, str], str] = {}
+        ambiguous_returns: set[str] = set()
+
+        def scan_declarations(
+            node, owner_class: Optional[str], in_function: bool = False,
+            depth: int = 0,
+        ) -> None:
+            if depth > self._MAX_AST_DEPTH:
+                return
+            if node.type == "class_definition":
+                name_node = node.child_by_field_name("name")
+                if name_node is not None:
+                    class_name: str = name_node.text.decode("utf-8", errors="replace")
+                    owner_class = class_name
+                    if class_name in class_names:
+                        ambiguous_property_classes.add(class_name)
+                    class_names.add(class_name)
+                in_function = False
+            elif (
+                node.type == "function_definition"
+                and owner_class and not in_function
+            ):
+                name_node = node.child_by_field_name("name")
+                return_node = node.child_by_field_name("return_type")
+                decorators = _python_decorator_names(node)
+                if name_node is not None and any(
+                    decorator.rsplit(".", 1)[-1] == "property"
+                    for decorator in decorators
+                ):
+                    property_name = name_node.text.decode(
+                        "utf-8", errors="replace",
+                    )
+                    property_returns[(owner_class, property_name)] = (
+                        return_node.text.decode("utf-8", errors="replace")
+                        if return_node is not None
+                        else ""
+                    )
+            elif (
+                node.type == "function_definition"
+                and owner_class is None and not in_function
+            ):
+                # A module-local ``def`` with a return annotation types every
+                # name assigned from a call to it. Only the annotation is
+                # read; a function body is never inspected for a return type.
+                name_node = node.child_by_field_name("name")
+                type_node = node.child_by_field_name("return_type")
+                if name_node is not None and type_node is not None:
+                    name = name_node.text.decode("utf-8", errors="replace")
+                    annotation = type_node.text.decode("utf-8", errors="replace")
+                    if local_returns.get(name, annotation) != annotation:
+                        # Two same-named defs disagreeing is no evidence.
+                        ambiguous_returns.add(name)
+                    local_returns[name] = annotation
+            elif node.type == "import_statement":
+                self._python_plain_import_bindings(
+                    node, file_path, module_bindings, imported_names,
+                )
+            elif node.type == "import_from_statement":
+                import_origins: dict[str, str] = {}
+                import_names: dict[str, str] = {}
+                self._python_from_import_bindings(
+                    node, file_path, module_bindings, imported_names,
+                    import_origins, import_names,
+                )
+                for name, origin in import_origins.items():
+                    imported_name = import_names.get(name)
+                    if imported_name is not None:
+                        symbol_binding_candidates.setdefault(name, set()).add(
+                            (origin, imported_name),
+                        )
+            for child in node.children:
+                scan_declarations(
+                    child, owner_class,
+                    in_function or node.type == "function_definition",
+                    depth + 1,
+                )
+
+        scan_declarations(root, None)
+        symbol_origins = {
+            name: next(iter(bindings))[0]
+            for name, bindings in symbol_binding_candidates.items()
+            if len(bindings) == 1
+        }
+        symbol_names = {
+            name: next(iter(bindings))[1]
+            for name, bindings in symbol_binding_candidates.items()
+            if len(bindings) == 1
+        }
+        for name in ambiguous_returns:
+            local_returns.pop(name, None)
+        if ambiguous_property_classes:
+            property_returns = {
+                key: annotation
+                for key, annotation in property_returns.items()
+                if key[0] not in ambiguous_property_classes
+            }
+
+        context = _PyReceiverContext(
+            file_path=file_path,
+            class_names=frozenset(class_names),
+            imported_names=frozenset(imported_names),
+            module_bindings=module_bindings,
+            symbol_origins=symbol_origins,
+            symbol_names=symbol_names,
+            local_returns=local_returns,
+            property_returns=property_returns,
+        )
+
+        module_env: dict[str, tuple[str, str]] = {}
+        # A name imported as a symbol is most often a class used as
+        # ``Klass.method()``. Restricting to members of a class with that name
+        # is self-validating: a function, or a module with no file of its own
+        # (``os``, ``subprocess``), matches no node and attributes nothing.
+        for name in imported_names | class_names:
+            module_env[name] = ("class", name)
+        for name, files in module_bindings.items():
+            module_env[name] = (
+                ("module", next(iter(files))) if len(files) == 1
+                else ("unknown", "")
+            )
+
+        evidence: dict[tuple[int, str], tuple[str, str]] = {}
+        expression_evidence: dict[tuple[int, str], list[tuple[str, str]]] = {}
+        property_read_edges: list[EdgeInfo] = []
+        unreachable_positions = _python_unreachable_call_positions(source)
+        function_scopes = _python_function_scope_bindings(source)
+
+        def bind_targets(
+            left, value, type_node, env, class_fields, current_class,
+            instance_receiver_name, class_receiver_name,
+        ) -> None:
+            """Record what one binding form says about each name it binds."""
+            for name, path in self._python_binding_targets(left):
+                bound = self._python_binding_evidence(
+                    value, type_node, path, context,
+                    env, class_fields, current_class, instance_receiver_name,
+                    class_receiver_name,
+                )
+                if bound is not None:
+                    env[name] = bound
+
+        def first_parameter_name(function_node) -> Optional[str]:
+            parameters = function_node.child_by_field_name("parameters")
+            if parameters is None or not parameters.named_children:
+                return None
+            first = parameters.named_children[0]
+            if first.type == "identifier":
+                return first.text.decode("utf-8", errors="replace")
+            if first.type in (
+                "typed_parameter", "typed_default_parameter", "default_parameter",
+            ):
+                name = next(
+                    (child for child in first.children if child.type == "identifier"),
+                    None,
+                )
+                return (
+                    name.text.decode("utf-8", errors="replace")
+                    if name is not None
+                    else None
+                )
+            return None
+
+        def instance_receiver_parameter(function_node) -> Optional[str]:
+            """Name the implicit instance parameter of an ordinary method."""
+            if any(
+                decorator.rsplit(".", 1)[-1] in {"classmethod", "staticmethod"}
+                for decorator in _python_decorator_names(function_node)
+            ):
+                return None
+            return first_parameter_name(function_node)
+
+        def class_receiver_parameter(function_node) -> Optional[str]:
+            """Name the implicit class-object parameter of a class method."""
+            if any(
+                decorator.rsplit(".", 1)[-1] == "classmethod"
+                for decorator in _python_decorator_names(function_node)
+            ):
+                return first_parameter_name(function_node)
+            return None
+
+        def is_named_receiver(expression, receiver_name: Optional[str]) -> bool:
+            return (
+                expression is not None
+                and expression.type == "identifier"
+                and receiver_name is not None
+                and expression.text.decode("utf-8", errors="replace") == receiver_name
+            )
+
+        def is_attribute_store_target(attribute_node) -> bool:
+            """Whether this attribute itself is stored, deleted, or loop-bound.
+
+            Stop at an enclosing attribute/subscript: its receiver is still a
+            load (``self.value.child = ...`` reads ``self.value``). Augmented
+            assignment deliberately remains a read because Python fetches the
+            old property value before applying the operator.
+            """
+            parent = attribute_node.parent
+            while parent is not None:
+                if parent.type in ("attribute", "subscript", "augmented_assignment"):
+                    return False
+                if parent.type in (
+                    "assignment", "for_statement", "for_in_clause",
+                ):
+                    target = (
+                        parent.child_by_field_name("left")
+                        or parent.child_by_field_name("target")
+                    )
+                    return (
+                        target is not None
+                        and target.start_byte <= attribute_node.start_byte
+                        and attribute_node.end_byte <= target.end_byte
+                    )
+                if parent.type == "as_pattern":
+                    alias = parent.child_by_field_name("alias")
+                    return alias is not None and _node_is_in_child(
+                        attribute_node, alias,
+                    )
+                if parent.type == "delete_statement":
+                    return True
+                parent = parent.parent
+            return False
+
+        def walk(
+            node,
+            env: dict[str, tuple[str, str]],
+            class_fields: dict[str, tuple[str, str]],
+            current_class: Optional[str] = None,
+            current_function: Optional[str] = None,
+            depth: int = 0,
+            instance_receiver_name: Optional[str] = None,
+            class_receiver_name: Optional[str] = None,
+        ) -> None:
+            if depth > self._MAX_AST_DEPTH:
+                return
+            node_type = node.type
+            if node_type == "class_definition":
+                fields = self._collect_python_class_fields(node, context)
+                name_node = node.child_by_field_name("name")
+                nested_class = (
+                    name_node.text.decode("utf-8", errors="replace")
+                    if name_node is not None
+                    else current_class
+                )
+                class_env = dict(env)
+                class_env.update(fields)
+                for child in node.children:
+                    walk(
+                        child, class_env, fields, nested_class,
+                        current_function, depth + 1, None, class_receiver_name,
+                    )
+                return
+            if node_type == "function_definition":
+                scoped = dict(env)
+                scoped.update(class_fields)
+                function_key = (node.start_point[0] + 1, node.start_point[1])
+                parameter_names, local_names = function_scopes.get(
+                    function_key, (frozenset(), frozenset()),
+                )
+                for parameter_name in parameter_names:
+                    scoped.pop(parameter_name, None)
+                for name, type_name in self._collect_function_typed_parameters(
+                    node, "python",
+                ).items():
+                    scoped[name] = ("class", type_name)
+                name_node = node.child_by_field_name("name")
+                function_name = (
+                    name_node.text.decode("utf-8", errors="replace")
+                    if name_node is not None
+                    else current_function
+                )
+                # A closure still sees the method's receiver unless it hides it.
+                receiver_name = (
+                    instance_receiver_parameter(node)
+                    if current_class and current_function is None
+                    else (
+                        instance_receiver_name
+                        if instance_receiver_name is not None
+                        and instance_receiver_name not in local_names
+                        else None
+                    )
+                )
+                class_receiver = (
+                    class_receiver_parameter(node)
+                    if current_class and current_function is None
+                    else (
+                        class_receiver_name
+                        if class_receiver_name is not None
+                        and class_receiver_name not in local_names
+                        else None
+                    )
+                )
+                for child in node.children:
+                    walk(
+                        child, scoped, class_fields, current_class,
+                        function_name, depth + 1, receiver_name, class_receiver,
+                    )
+                return
+            if node_type == "assignment":
+                # The right-hand side is evaluated before the name is rebound.
+                for child in node.children:
+                    walk(
+                        child, env, class_fields, current_class,
+                        current_function, depth + 1, instance_receiver_name,
+                        class_receiver_name,
+                    )
+                bind_targets(
+                    node.child_by_field_name("left"),
+                    node.child_by_field_name("right"),
+                    node.child_by_field_name("type"),
+                    env, class_fields, current_class, instance_receiver_name,
+                    class_receiver_name,
+                )
+                return
+            if node_type == "as_pattern":
+                # ``with GraphStore(p) as store`` and
+                # ``with _get_store() as (store, root)`` bind exactly the way
+                # an assignment does; the grammar just spells them
+                # differently. The value is the ``as_pattern``'s first child
+                # and the alias its ``alias`` field.
+                for child in node.children:
+                    walk(
+                        child, env, class_fields, current_class,
+                        current_function, depth + 1, instance_receiver_name,
+                        class_receiver_name,
+                    )
+                alias = node.child_by_field_name("alias")
+                value = node.children[0] if node.children else None
+                if alias is not None and value is not None and value is not alias:
+                    bind_targets(
+                        alias.children[0]
+                        if alias.type == "as_pattern_target" and alias.children
+                        else alias,
+                        value,
+                        None,
+                        env, class_fields, current_class, instance_receiver_name,
+                        class_receiver_name,
+                    )
+                return
+            if node_type == "attribute":
+                owner = node.child_by_field_name("object")
+                property_name_node = node.child_by_field_name("attribute")
+                owner_evidence = self._python_expression_class_evidence(
+                    owner, env, class_fields, current_class, context,
+                    instance_receiver_name, class_receiver_name,
+                )
+                if (
+                    not is_attribute_store_target(node)
+                    and (node.start_point[0] + 1, node.start_point[1])
+                    not in unreachable_positions
+                    and owner_evidence is not None
+                    and owner_evidence[0] == "class"
+                    and property_name_node is not None
+                ):
+                    property_name = property_name_node.text.decode(
+                        "utf-8", errors="replace",
+                    )
+                    definition = self._python_property_definition(
+                        owner_evidence[1], property_name, context,
+                    )
+                    if (
+                        definition is not None
+                        and not is_named_receiver(owner, class_receiver_name)
+                    ):
+                        target_file, target_class, _ = definition
+                        caller = (
+                            self._qualify(
+                                current_function, file_path, current_class,
+                            )
+                            if current_function
+                            else file_path
+                        )
+                        property_read_edges.append(EdgeInfo(
+                            kind="CALLS",
+                            source=caller,
+                            target=self._qualify(
+                                property_name, target_file, target_class,
+                            ),
+                            file_path=file_path,
+                            line=node.start_point[0] + 1,
+                            extra={"python_property_read": True},
+                        ))
+            if node_type == "call":
+                receiver, method = self._get_member_call_receiver_method(
+                    node, "python",
+                )
+                if receiver and method:
+                    evidence[(node.start_point[0] + 1, receiver)] = env.get(
+                        receiver, ("unknown", ""),
+                    )
+                elif method:
+                    # ``CodeParser().parse_file(...)``: the receiver is an
+                    # expression, so it has no name to look up — but a
+                    # constructor expression says its own type outright.
+                    constructed = self._python_expression_receiver_evidence(
+                        node, context,
+                    )
+                    if constructed is None:
+                        callee = node.child_by_field_name("function")
+                        receiver_node = (
+                            callee.child_by_field_name("object")
+                            if callee is not None
+                            and callee.type == "attribute"
+                            else None
+                        )
+                        constructed = self._python_expression_class_evidence(
+                            receiver_node, env, class_fields,
+                            current_class, context, instance_receiver_name,
+                            class_receiver_name,
+                        )
+                    if constructed is not None:
+                        key = (
+                            node.start_point[0] + 1,
+                            _PY_EXPR_RECEIVER_KEY + method,
+                        )
+                        expression_evidence.setdefault(key, []).append(
+                            constructed,
+                        )
+            for child in node.children:
+                walk(
+                    child, env, class_fields, current_class,
+                    current_function, depth + 1, instance_receiver_name,
+                    class_receiver_name,
+                )
+
+        walk(root, module_env, {})
+        for key, found in expression_evidence.items():
+            # Two expression receivers on one line sharing a method name are
+            # indistinguishable downstream, so they must agree to count.
+            evidence[key] = self._merge_python_evidence(found)
+        return evidence, property_read_edges
+
+    def _collect_python_class_fields(
+        self,
+        class_node,
+        context: _PyReceiverContext,
+    ) -> dict[str, tuple[str, str]]:
+        """Instance attributes a class declares, however it declares them.
+
+        Annotated class-body attributes, plus every ``self.x = ...`` written
+        in any of its methods — which is where the binding that matters
+        usually lives, and where the shared typed-field collector stops.
+        """
+        gathered: dict[str, list[tuple[str, str]]] = {}
+
+        def record(left, value, type_node, nested: bool) -> None:
+            for name, path in self._python_binding_targets(left):
+                # Inside a method only ``self.x``/``cls.x`` is a field; a bare
+                # name there is a local and says nothing about the class.
+                if nested and not self._python_target_is_attribute(left, name):
+                    continue
+                bound = self._python_binding_evidence(
+                    value, type_node, path, context,
+                )
+                if bound is not None:
+                    gathered.setdefault(name, []).append(bound)
+
+        def visit(node, in_function: bool, depth: int = 0) -> None:
+            if depth > self._MAX_AST_DEPTH:
+                return
+            if node is not class_node and node.type == "class_definition":
+                return
+            nested = in_function or (
+                node is not class_node and node.type == "function_definition"
+            )
+            if node.type == "as_pattern":
+                alias = node.child_by_field_name("alias")
+                value = node.children[0] if node.children else None
+                if alias is not None and value is not None and value is not alias:
+                    record(
+                        alias.children[0]
+                        if alias.type == "as_pattern_target" and alias.children
+                        else alias,
+                        value,
+                        None,
+                        nested,
+                    )
+            if node.type == "assignment":
+                left = node.child_by_field_name("left")
+                if left is not None:
+                    record(
+                        left,
+                        node.child_by_field_name("right"),
+                        node.child_by_field_name("type"),
+                        nested,
+                    )
+            for child in node.children:
+                visit(child, nested, depth + 1)
+
+        visit(class_node, False)
+        return {
+            name: self._merge_python_evidence(found)
+            for name, found in gathered.items()
+        }
+
+    def _python_property_definition(
+        self,
+        owner_type: str,
+        property_name: str,
+        context: _PyReceiverContext,
+    ) -> Optional[tuple[str, str, str]]:
+        """Return the defining file, class, and return annotation of a property.
+
+        Cross-file metadata is read only from the file bound by a ``from``
+        import in the current module. An unresolved or ambiguous import never
+        supplies a property definition.
+        """
+        identity = _python_split_class_identity(owner_type)
+        if identity is not None:
+            origin, actual_class = identity
+            annotations = self._python_module_property_return_annotations(origin)
+            key = (actual_class, property_name)
+            if key not in annotations:
+                return None
+            return origin, actual_class, annotations[key]
+
+        local_key = (owner_type, property_name)
+        if local_key in context.property_returns:
+            return context.file_path, owner_type, context.property_returns[local_key]
+
+        origin = context.symbol_origins.get(owner_type)
+        if not origin:
+            return None
+        actual_class = context.symbol_names.get(owner_type, owner_type)
+        annotations = self._python_module_property_return_annotations(origin)
+        key = (actual_class, property_name)
+        if key not in annotations:
+            return None
+        return origin, actual_class, annotations[key]
+
+    def _python_module_property_return_annotations(
+        self, module_file: str,
+    ) -> dict[tuple[str, str], str]:
+        """Read explicitly decorated property getters from one Python module."""
+        if not module_file.endswith(".py"):
+            return {}
+        try:
+            module_path = Path(module_file).resolve()
+            file_stat = module_path.stat()
+        except (OSError, ValueError):
+            return {}
+        resolved = normalize_file_path(module_path)
+        if self._excluded_files and resolved in self._excluded_files:
+            return {}
+        cache_key = (resolved, file_stat.st_mtime_ns, file_stat.st_size)
+        with _PYTHON_RETURN_ANNOTATION_CACHE_LOCK:
+            cached = _PYTHON_PROPERTY_RETURN_ANNOTATION_CACHE.get(cache_key)
+            if cached is not None:
+                return cached
+            properties = self._read_python_property_return_annotations(module_path)
+            for stale in [
+                key for key in _PYTHON_PROPERTY_RETURN_ANNOTATION_CACHE
+                if key[0] == resolved and key != cache_key
+            ]:
+                _PYTHON_PROPERTY_RETURN_ANNOTATION_CACHE.pop(stale, None)
+            if len(_PYTHON_PROPERTY_RETURN_ANNOTATION_CACHE) >= _PYTHON_STAR_CACHE_MAX:
+                for oldest in list(_PYTHON_PROPERTY_RETURN_ANNOTATION_CACHE)[
+                    : _PYTHON_STAR_CACHE_MAX // 2
+                ]:
+                    _PYTHON_PROPERTY_RETURN_ANNOTATION_CACHE.pop(oldest, None)
+            _PYTHON_PROPERTY_RETURN_ANNOTATION_CACHE[cache_key] = properties
+            return properties
+
+    def _python_module_class_identities(
+        self, module_file: str,
+    ) -> dict[str, tuple[str, str]]:
+        """Resolve class names in one module without borrowing caller names."""
+        try:
+            module_path = Path(module_file).resolve()
+            file_stat = module_path.stat()
+            source = module_path.read_bytes()
+        except (OSError, RuntimeError, ValueError):
+            return {}
+        resolved = normalize_file_path(module_path)
+        if self._excluded_files and resolved in self._excluded_files:
+            return {}
+        cache_key = (resolved, file_stat.st_mtime_ns, file_stat.st_size)
+        with _PYTHON_MODULE_CLASS_IDENTITY_CACHE_LOCK:
+            cached = _PYTHON_MODULE_CLASS_IDENTITY_CACHE.get(cache_key)
+            if cached is not None:
+                return cached
+
+        parser = self._get_parser("python")
+        if not parser:
+            return {}
+        try:
+            tree = parser.parse(source)  # type: ignore[union-attr]
+        except (RecursionError, ValueError):  # pragma: no cover
+            return {}
+
+        class_counts: dict[str, int] = {}
+        imported_names: set[str] = set()
+        module_bindings: dict[str, set[str]] = {}
+        symbol_bindings: dict[str, set[tuple[str, str]]] = {}
+
+        def visit(node, depth: int = 0) -> None:
+            if depth > self._MAX_AST_DEPTH or node.type == "function_definition":
+                return
+            if node.type == "class_definition":
+                name_node = node.child_by_field_name("name")
+                if name_node is not None:
+                    name = name_node.text.decode("utf-8", errors="replace")
+                    class_counts[name] = class_counts.get(name, 0) + 1
+            elif node.type == "import_statement":
+                self._python_plain_import_bindings(
+                    node, resolved, module_bindings, imported_names,
+                )
+            elif node.type == "import_from_statement":
+                import_origins: dict[str, str] = {}
+                import_names: dict[str, str] = {}
+                self._python_from_import_bindings(
+                    node, resolved, module_bindings, imported_names,
+                    import_origins, import_names,
+                )
+                for name, origin in import_origins.items():
+                    imported_name = import_names.get(name)
+                    if imported_name is not None:
+                        symbol_bindings.setdefault(name, set()).add(
+                            (origin, imported_name),
+                        )
+            for child in node.children:
+                visit(child, depth + 1)
+
+        visit(tree.root_node)
+        identities = {
+            name: (resolved, name)
+            for name, count in class_counts.items()
+            if count == 1 and name not in symbol_bindings
+        }
+        for name, bindings in symbol_bindings.items():
+            if len(bindings) == 1 and name not in class_counts:
+                identities[name] = next(iter(bindings))
+
+        with _PYTHON_MODULE_CLASS_IDENTITY_CACHE_LOCK:
+            for stale in [
+                key for key in _PYTHON_MODULE_CLASS_IDENTITY_CACHE
+                if key[0] == resolved and key != cache_key
+            ]:
+                _PYTHON_MODULE_CLASS_IDENTITY_CACHE.pop(stale, None)
+            if len(_PYTHON_MODULE_CLASS_IDENTITY_CACHE) >= _PYTHON_STAR_CACHE_MAX:
+                for oldest in list(_PYTHON_MODULE_CLASS_IDENTITY_CACHE)[
+                    : _PYTHON_STAR_CACHE_MAX // 2
+                ]:
+                    _PYTHON_MODULE_CLASS_IDENTITY_CACHE.pop(oldest, None)
+            _PYTHON_MODULE_CLASS_IDENTITY_CACHE[cache_key] = identities
+        return identities
+
+    def _read_python_property_return_annotations(
+        self, module_path: Path,
+    ) -> dict[tuple[str, str], str]:
+        """Parse class property declarations without evaluating their bodies."""
+        try:
+            source = module_path.read_bytes()
+        except (OSError, PermissionError):
+            return {}
+        parser = self._get_parser("python")
+        if not parser:
+            return {}
+        try:
+            tree = parser.parse(source)  # type: ignore[union-attr]
+        except (RecursionError, ValueError) as exc:  # pragma: no cover
+            logger.debug("Property-annotation parse failed for %s: %s", module_path, exc)
+            return {}
+
+        properties: dict[tuple[str, str], str] = {}
+        class_names: set[str] = set()
+        ambiguous_classes: set[str] = set()
+
+        def visit(
+            node, owner_class: Optional[str] = None, in_function: bool = False,
+            depth: int = 0,
+        ):
+            if depth > self._MAX_AST_DEPTH:
+                return
+            if node.type == "class_definition":
+                name_node = node.child_by_field_name("name")
+                nested_class = (
+                    name_node.text.decode("utf-8", errors="replace")
+                    if name_node is not None
+                    else owner_class
+                )
+                if nested_class is not None and name_node is not None:
+                    if nested_class in class_names:
+                        ambiguous_classes.add(nested_class)
+                    class_names.add(nested_class)
+                for child in node.children:
+                    visit(child, nested_class, False, depth + 1)
+                return
+            if node.type == "function_definition":
+                if owner_class and not in_function:
+                    name_node = node.child_by_field_name("name")
+                    if name_node is not None and any(
+                        decorator.rsplit(".", 1)[-1] == "property"
+                        for decorator in _python_decorator_names(node)
+                    ):
+                        return_node = node.child_by_field_name("return_type")
+                        properties[(
+                            owner_class,
+                            name_node.text.decode("utf-8", errors="replace"),
+                        )] = (
+                            return_node.text.decode("utf-8", errors="replace")
+                            if return_node is not None
+                            else ""
+                        )
+                for child in node.children:
+                    visit(child, owner_class, True, depth + 1)
+                return
+            for child in node.children:
+                visit(child, owner_class, in_function, depth + 1)
+
+        visit(tree.root_node)
+        if ambiguous_classes:
+            properties = {
+                key: annotation
+                for key, annotation in properties.items()
+                if key[0] not in ambiguous_classes
+            }
+        return properties
+
+    def _python_expression_class_evidence(
+        self,
+        expression,
+        env: dict[str, tuple[str, str]],
+        class_fields: dict[str, tuple[str, str]],
+        current_class: Optional[str],
+        context: _PyReceiverContext,
+        instance_receiver_name: Optional[str] = None,
+        class_receiver_name: Optional[str] = None,
+    ) -> Optional[tuple[str, str]]:
+        """Infer a class only from a local binding, field, or property annotation."""
+        if expression is None:
+            return None
+        if expression.type == "identifier":
+            name = expression.text.decode("utf-8", errors="replace")
+            if name == class_receiver_name:
+                return ("class", current_class) if current_class else None
+            if name == instance_receiver_name:
+                return ("class", current_class) if current_class else None
+            if name in context.class_names or name in context.imported_names:
+                # A bare class symbol is a class receiver, not an instance on
+                # which Python invokes @property getters.
+                return None
+            return env.get(name)
+        if expression.type != "attribute":
+            return None
+        owner = expression.child_by_field_name("object")
+        attribute = expression.child_by_field_name("attribute")
+        if attribute is None:
+            return None
+        owner_evidence = self._python_expression_class_evidence(
+            owner, env, class_fields, current_class, context,
+            instance_receiver_name, class_receiver_name,
+        )
+        if owner_evidence is None or owner_evidence[0] != "class":
+            return None
+        member = attribute.text.decode("utf-8", errors="replace")
+        is_class_receiver = (
+            owner.type == "identifier"
+            and class_receiver_name is not None
+            and owner.text.decode("utf-8", errors="replace") == class_receiver_name
+        )
+        if (
+            is_class_receiver
+            and self._python_property_definition(
+                owner_evidence[1], member, context,
+            ) is not None
+        ):
+            # A classmethod receives a class object. Reading a property through
+            # that object returns the descriptor; it does not invoke the getter.
+            return ("unknown", "")
+        if owner_evidence[1] == current_class:
+            field_evidence = class_fields.get(member)
+            if field_evidence is not None and field_evidence[0] == "class":
+                return field_evidence
+        definition = self._python_property_definition(
+            owner_evidence[1], member, context,
+        )
+        if definition is None:
+            return None
+        annotation = definition[2]
+        if not annotation:
+            return ("unknown", "")
+        type_name = self._base_type_name(annotation)
+        if not type_name:
+            return ("builtin", "")
+        defining_file = definition[0]
+        if defining_file == context.file_path:
+            origin = context.symbol_origins.get(type_name)
+            if origin:
+                if (
+                    type_name in context.class_names
+                    or type_name in context.imported_names
+                ):
+                    return "unknown", ""
+                return (
+                    "class",
+                    _python_qualified_class_identity(
+                        origin, context.symbol_names.get(type_name, type_name),
+                    ),
+                )
+            return "class", type_name
+        identity = self._python_module_class_identities(defining_file).get(
+            type_name,
+        )
+        if identity is None:
+            return "unknown", ""
+        return "class", _python_qualified_class_identity(*identity)
+
+    @staticmethod
+    def _merge_python_evidence(
+        found: list[tuple[str, str]],
+    ) -> tuple[str, str]:
+        """Reconcile several bindings of one name in the same scope.
+
+        ``unknown`` is the ABSENCE of evidence, not evidence against: a field
+        a helper returns in one branch and constructs in another is still that
+        class. Two different classes, a class and a module, or a class and a
+        container literal, do contradict, and contradiction means no
+        attribution.
+        """
+        classes = {detail for kind, detail in found if kind == "class"}
+        modules = {detail for kind, detail in found if kind == "module"}
+        builtin = any(kind == "builtin" for kind, _ in found)
+        kinds = (len(classes) > 0) + (len(modules) > 0) + builtin
+        if kinds != 1:
+            return "unknown", ""
+        if len(classes) == 1:
+            return "class", next(iter(classes))
+        if len(modules) == 1:
+            return "module", next(iter(modules))
+        if builtin:
+            return "builtin", ""
+        return "unknown", ""
+
+    @classmethod
+    def _python_binding_targets(
+        cls, left,
+    ) -> list[tuple[str, tuple[int, ...]]]:
+        """Names one binding form binds, each with its position in the value.
+
+        ``store = ...`` binds ``store`` to the whole value, spelled as the
+        empty path. ``store, root = ...`` binds ``store`` to position 0 and
+        ``root`` to position 1, and ``a, (b, c) = ...`` nests the same way.
+
+        A starred element costs its own position and every position after it —
+        the length of the value is not visible here, so nothing after a star
+        can be numbered — but the names BEFORE it keep their positions rather
+        than the whole statement being thrown away.
+        """
+        found: list[tuple[str, tuple[int, ...]]] = []
+
+        def visit(node, path: tuple[int, ...], depth: int = 0) -> None:
+            if node is None or depth > 8:
+                return
+            if node.type == "parenthesized_expression":
+                inner = node.named_children
+                if len(inner) == 1:
+                    visit(inner[0], path, depth + 1)
+                return
+            if node.type in _PY_TARGET_PATTERN_TYPES:
+                for index, child in enumerate(node.named_children):
+                    if child.type in _PY_SPLAT_PATTERN_TYPES:
+                        return
+                    visit(child, path + (index,), depth + 1)
+                return
+            name = cls._python_binding_target_name(node)
+            if name:
+                found.append((name, path))
+
+        visit(left, ())
+        return found
+
+    @staticmethod
+    def _python_target_is_attribute(left, name: str) -> bool:
+        """Is *name* bound through ``self.x``/``cls.x`` rather than bare?"""
+        if left is None:
+            return False
+        if left.type == "attribute":
+            return True
+        for node in left.named_children:
+            if node.type == "attribute":
+                attribute = node.child_by_field_name("attribute")
+                if (
+                    attribute is not None
+                    and attribute.text.decode("utf-8", errors="replace") == name
+                ):
+                    return True
+        return False
+
+    def _python_binding_evidence(
+        self,
+        value,
+        type_node,
+        path: tuple[int, ...],
+        context: _PyReceiverContext,
+        env: Optional[dict[str, tuple[str, str]]] = None,
+        class_fields: Optional[dict[str, tuple[str, str]]] = None,
+        current_class: Optional[str] = None,
+        instance_receiver_name: Optional[str] = None,
+        class_receiver_name: Optional[str] = None,
+    ) -> Optional[tuple[str, str]]:
+        """What one binding says its target holds, or None for "nothing"."""
+        if type_node is not None:
+            annotation = self._python_annotation_at_path(
+                type_node.text.decode("utf-8", errors="replace"), path,
+            )
+            if annotation is None:
+                return None
+            type_name = self._base_type_name(annotation)
+            # An annotation the type reader rejects names a builtin or a
+            # container: still evidence, just not a class.
+            return ("class", type_name) if type_name else ("builtin", "")
+        if value is None:
+            return None
+        if value.type == "none":
+            # ``x = None`` says nothing about what ``x`` later holds, so it
+            # must neither create nor destroy evidence.
+            return None
+        if value.type in ("tuple", "list") and path:
+            # ``store, root = GraphStore(p), root`` — the value spells out its
+            # own elements, so take the one this name is bound to.
+            elements = value.named_children
+            if path[0] >= len(elements):
+                return "unknown", ""
+            return self._python_binding_evidence(
+                elements[path[0]], None, path[1:], context,
+                env, class_fields, current_class, instance_receiver_name,
+                class_receiver_name,
+            )
+        if value.type in _PY_LITERAL_VALUE_TYPES:
+            return "builtin", ""
+        if value.type == "call":
+            return self._python_call_evidence(value, path, context)
+        if value.type == "attribute":
+            return self._python_expression_class_evidence(
+                value, env or {}, class_fields or {}, current_class, context,
+                instance_receiver_name, class_receiver_name,
+            ) or ("unknown", "")
+        return "unknown", ""
+
+    def _python_call_evidence(
+        self,
+        call,
+        path: tuple[int, ...],
+        context: _PyReceiverContext,
+    ) -> tuple[str, str]:
+        """What a call expression says the value it returns is.
+
+        An annotated return type wins over the constructor rule, because it
+        is what the source actually claims; the constructor rule is the
+        fallback for a class that, being a class, has no return annotation.
+        """
+        callee = call.child_by_field_name("function")
+        if callee is None:
+            return "unknown", ""
+        annotation = self._python_callee_return_annotation(callee, context)
+        if annotation is not None:
+            element = self._python_annotation_at_path(annotation, path)
+            if element is not None:
+                type_name = self._base_type_name(element)
+                return ("class", type_name) if type_name else ("builtin", "")
+            return "unknown", ""
+        if path:
+            # Nothing says how many values this call returns, so a position
+            # in it cannot be typed.
+            return "unknown", ""
+        constructed = self._python_constructor_class(callee, context)
+        return ("class", constructed) if constructed else ("unknown", "")
+
+    def _python_constructor_class(
+        self, callee, context: _PyReceiverContext,
+    ) -> Optional[str]:
+        """Class a constructor call names, bare or dotted, or None.
+
+        ``GraphStore(...)`` counts when the file defines or imports the name —
+        otherwise a local factory function would manufacture class evidence.
+        ``graph.GraphStore(...)`` and ``code_review_graph.graph.GraphStore(...)``
+        count on the same terms, resolved through the file's import map: the
+        root of the dotted chain has to be a name an import bound, and the
+        last segment has to be spelled like a class. Without the spelling
+        rule ``os.path.join(...)`` would claim a class named ``join`` and
+        contradict the real evidence for that name elsewhere in the scope.
+        """
+        callee = self._python_unwrap_callee(callee)
+        if callee is None:
+            return None
+        if callee.type == "identifier":
+            name = callee.text.decode("utf-8", errors="replace")
+            if name in context.class_names or name in context.imported_names:
+                return name
+            return None
+        if callee.type != "attribute":
+            return None
+        attribute = callee.child_by_field_name("attribute")
+        if attribute is None:
+            return None
+        name = attribute.text.decode("utf-8", errors="replace")
+        root = self._python_dotted_root(callee.child_by_field_name("object"))
+        if root is None:
+            return None
+        if root not in context.module_bindings and root not in context.imported_names:
+            return None
+        if name in context.class_names:
+            return name
+        return name if name[:1].isupper() else None
+
+    @staticmethod
+    def _python_unwrap_callee(node):
+        """Strip the wrappers the grammar puts around a callee name.
+
+        ``*CodeParser().parse_file(p)`` parses with the splat INSIDE the
+        constructor call — ``call(list_splat(identifier))`` — so the callee of
+        the inner call is a ``list_splat``, not the class name it plainly is.
+        """
+        for _ in range(4):
+            if node is None:
+                return None
+            if node.type in _PY_SPLAT_PATTERN_TYPES:
+                named = node.named_children
+                node = named[0] if len(named) == 1 else None
+                continue
+            if node.type == "parenthesized_expression":
+                named = node.named_children
+                node = named[0] if len(named) == 1 else None
+                continue
+            return node
+        return None
+
+    @staticmethod
+    def _python_dotted_root(node) -> Optional[str]:
+        """Leftmost identifier of a pure ``a.b.c`` chain, or None."""
+        for _ in range(8):
+            if node is None:
+                return None
+            if node.type == "identifier":
+                return node.text.decode("utf-8", errors="replace")
+            if node.type != "attribute":
+                return None
+            node = node.child_by_field_name("object")
+        return None
+
+    def _python_callee_return_annotation(
+        self, callee, context: _PyReceiverContext,
+    ) -> Optional[str]:
+        """Return annotation the source writes for this call's callee.
+
+        Three places, in the order a reader would look: a ``def`` in this very
+        file, the module a ``from X import f`` statement names, and the module
+        an ``import m`` binding names for ``m.f(...)``. Only the annotation
+        text is ever read — no return statement is inspected, in this file or
+        any other, so nothing here is inferred.
+        """
+        if callee.type == "identifier":
+            name = callee.text.decode("utf-8", errors="replace")
+            local = context.local_returns.get(name)
+            if local is not None:
+                return local
+            origin = context.symbol_origins.get(name)
+            if origin:
+                return self._python_module_return_annotations(origin).get(name)
+            return None
+        if callee.type != "attribute":
+            return None
+        attribute = callee.child_by_field_name("attribute")
+        obj = callee.child_by_field_name("object")
+        if attribute is None or obj is None or obj.type != "identifier":
+            return None
+        module_files = context.module_bindings.get(
+            obj.text.decode("utf-8", errors="replace"), set(),
+        )
+        if len(module_files) != 1:
+            return None
+        return self._python_module_return_annotations(
+            next(iter(module_files)),
+        ).get(attribute.text.decode("utf-8", errors="replace"))
+
+    def _python_expression_receiver_evidence(
+        self, call, context: _PyReceiverContext,
+    ) -> Optional[tuple[str, str]]:
+        """What a nameless Python call receiver is, or None for "nothing".
+
+        Two shapes carry their own answer. ``CodeParser().parse_file(...)``
+        calls a method on a constructor expression, so the class is written
+        right there. ``pkg.graph.GraphStore(...)`` is not a member call at all
+        — it is a dotted module path, and the name it calls is a top-level
+        name of the module that path resolves to.
+        """
+        callee = call.child_by_field_name("function")
+        if callee is None or callee.type != "attribute":
+            return None
+        obj = callee.child_by_field_name("object")
+        if obj is None:
+            return None
+        if obj.type == "call":
+            inner = obj.child_by_field_name("function")
+            if inner is None:
+                return None
+            constructed = self._python_constructor_class(inner, context)
+            return ("class", constructed) if constructed else None
+        module_file = self._python_dotted_module_file(obj, context)
+        return ("module", module_file) if module_file else None
+
+    def _python_dotted_module_file(
+        self, prefix, context: _PyReceiverContext,
+    ) -> Optional[str]:
+        """File the dotted module path *prefix* names, through this file's imports.
+
+        The root of the chain has to be a name one of this file's own
+        ``import`` statements bound to a module; otherwise the chain is an
+        attribute walk over some object and names no module at all.
+        """
+        if prefix is None or prefix.type != "attribute":
+            return None
+        root = self._python_dotted_root(prefix)
+        if root is None or root not in context.module_bindings:
+            return None
+        return self._resolve_module_to_file(
+            prefix.text.decode("utf-8", errors="replace"),
+            context.file_path,
+            "python",
+        )
+
+    @classmethod
+    def _python_annotation_at_path(
+        cls, annotation: str, path: tuple[int, ...],
+    ) -> Optional[str]:
+        """Element of *annotation* at a tuple position, or None if unnamed."""
+        current = annotation.strip()
+        if len(current) >= 2 and current[0] in "\"'" and current[-1] == current[0]:
+            current = current[1:-1].strip()
+        for index in path:
+            elements = cls._python_tuple_annotation_elements(current)
+            if elements is None:
+                return None
+            if len(elements) == 2 and elements[1] == "...":
+                # ``tuple[Node, ...]`` is homogeneous: every position is the
+                # same type.
+                current = elements[0]
+                continue
+            if index >= len(elements):
+                return None
+            current = elements[index]
+        return current
+
+    @staticmethod
+    def _python_tuple_annotation_elements(
+        annotation: str,
+    ) -> Optional[list[str]]:
+        """Split ``tuple[A, B]`` into its element annotations, or None."""
+        opening = annotation.find("[")
+        if opening < 0 or not annotation.rstrip().endswith("]"):
+            return None
+        head = annotation[:opening].strip().rsplit(".", 1)[-1]
+        if head not in _PY_TUPLE_ANNOTATION_NAMES:
+            return None
+        inner = annotation.rstrip()[opening + 1:-1]
+        elements: list[str] = []
+        depth = 0
+        start = 0
+        quote = ""
+        for position, character in enumerate(inner):
+            if quote:
+                if character == quote:
+                    quote = ""
+                continue
+            if character in "\"'":
+                quote = character
+            elif character in "[({":
+                depth += 1
+            elif character in "])}":
+                depth -= 1
+            elif character == "," and depth == 0:
+                elements.append(inner[start:position].strip())
+                start = position + 1
+        elements.append(inner[start:].strip())
+        return [element for element in elements if element]
+
+    def _python_module_return_annotations(
+        self, module_file: str,
+    ) -> dict[str, str]:
+        """Return annotations of every top-level ``def`` in *module_file*.
+
+        Cached on the module's identity and mtime the way star exports are,
+        so a repository-wide build reads each imported module at most once.
+        """
+        if not module_file.endswith(".py"):
+            return {}
+        try:
+            module_path = Path(module_file).resolve()
+            file_stat = module_path.stat()
+        except (OSError, ValueError):
+            return {}
+        resolved = normalize_file_path(module_path)
+        if self._excluded_files and resolved in self._excluded_files:
+            return {}
+        cache_key = (resolved, file_stat.st_mtime_ns, file_stat.st_size)
+        with _PYTHON_RETURN_ANNOTATION_CACHE_LOCK:
+            cached = _PYTHON_RETURN_ANNOTATION_CACHE.get(cache_key)
+            if cached is not None:
+                return cached
+            annotations = self._read_python_return_annotations(module_path)
+            for stale in [
+                key for key in _PYTHON_RETURN_ANNOTATION_CACHE
+                if key[0] == resolved and key != cache_key
+            ]:
+                _PYTHON_RETURN_ANNOTATION_CACHE.pop(stale, None)
+            if len(_PYTHON_RETURN_ANNOTATION_CACHE) >= _PYTHON_STAR_CACHE_MAX:
+                for oldest in list(_PYTHON_RETURN_ANNOTATION_CACHE)[
+                    : _PYTHON_STAR_CACHE_MAX // 2
+                ]:
+                    _PYTHON_RETURN_ANNOTATION_CACHE.pop(oldest, None)
+            _PYTHON_RETURN_ANNOTATION_CACHE[cache_key] = annotations
+            return annotations
+
+    def _read_python_return_annotations(
+        self, module_path: Path,
+    ) -> dict[str, str]:
+        """Parse one module for the return annotations of its top-level defs."""
+        try:
+            source = module_path.read_bytes()
+        except (OSError, PermissionError):
+            return {}
+        parser = self._get_parser("python")
+        if not parser:
+            return {}
+        try:
+            tree = parser.parse(source)  # type: ignore[union-attr]
+        except (RecursionError, ValueError) as exc:  # pragma: no cover
+            logger.debug("Return-annotation parse failed for %s: %s", module_path, exc)
+            return {}
+        annotations: dict[str, str] = {}
+        ambiguous: set[str] = set()
+        for child in tree.root_node.children:
+            node = child
+            if node.type == "decorated_definition":
+                node = node.child_by_field_name("definition") or node
+            if node.type != "function_definition":
+                continue
+            name_node = node.child_by_field_name("name")
+            type_node = node.child_by_field_name("return_type")
+            if name_node is None or type_node is None:
+                continue
+            name = name_node.text.decode("utf-8", errors="replace")
+            annotation = type_node.text.decode("utf-8", errors="replace")
+            if annotations.get(name, annotation) != annotation:
+                ambiguous.add(name)
+            annotations[name] = annotation
+        for name in ambiguous:
+            annotations.pop(name, None)
+        return annotations
+
+    def _python_plain_import_bindings(
+        self,
+        node,
+        file_path: str,
+        module_bindings: dict[str, set[str]],
+        imported_names: set[str],
+    ) -> None:
+        """Record names bound by ``import x`` / ``import x.y as z``."""
+        for child in node.children:
+            local: Optional[str] = None
+            module: Optional[str] = None
+            if child.type == "dotted_name":
+                module = child.text.decode("utf-8", errors="replace")
+                # ``import a.b`` binds only ``a``; ``a.b.f()`` is an attribute
+                # chain the receiver reader never names anyway.
+                local = module.split(".", 1)[0]
+                module = local
+            elif child.type == "aliased_import":
+                names = [
+                    sub.text.decode("utf-8", errors="replace")
+                    for sub in child.children
+                    if sub.type in ("identifier", "dotted_name")
+                ]
+                if len(names) >= 2:
+                    module, local = names[0], names[-1]
+            if not local or not module:
+                continue
+            resolved = self._resolve_module_to_file(module, file_path, "python")
+            if resolved:
+                module_bindings.setdefault(local, set()).add(resolved)
+            else:
+                imported_names.add(local)
+
+    def _python_from_import_bindings(
+        self,
+        node,
+        file_path: str,
+        module_bindings: dict[str, set[str]],
+        imported_names: set[str],
+        symbol_origins: Optional[dict[str, str]] = None,
+        symbol_names: Optional[dict[str, str]] = None,
+    ) -> None:
+        """Record names bound by ``from X import a, b as c``.
+
+        *symbol_origins*, when given, also records the module file each
+        non-module name came from, so a caller can read that module's own
+        annotation for the symbol.
+        """
+        module_node = node.child_by_field_name("module_name")
+        if module_node is None:
+            return
+        module = module_node.text.decode("utf-8", errors="replace")
+        package_dir = self._python_package_dir(module, file_path)
+        submodules = (
+            set(self._python_submodule_names(node, package_dir))
+            if package_dir is not None
+            else set()
+        )
+        module_file = (
+            self._resolve_module_to_file(module, file_path, "python")
+            if symbol_origins is not None
+            else None
+        )
+
+        def bind(local: str, imported: str) -> None:
+            if package_dir is not None and imported in submodules:
+                target = self._python_submodule_file(package_dir, imported)
+                if target is not None:
+                    module_bindings.setdefault(local, set()).add(target)
+                    return
+            imported_names.add(local)
+            if symbol_names is not None:
+                symbol_names[local] = imported
+            if symbol_origins is not None and module_file:
+                # A package re-export names the file that really defines the
+                # symbol; a plain module names itself.
+                symbol_origins[local] = self._python_reexport_origin(
+                    module_file, imported,
+                )
+
+        seen_import_keyword = False
+        for child in node.children:
+            if child.type == "import":
+                seen_import_keyword = True
+            elif seen_import_keyword:
+                if child.type in ("identifier", "dotted_name"):
+                    name = child.text.decode("utf-8", errors="replace")
+                    bind(name, name)
+                elif child.type == "aliased_import":
+                    names = [
+                        sub.text.decode("utf-8", errors="replace")
+                        for sub in child.children
+                        if sub.type in ("identifier", "dotted_name")
+                    ]
+                    if names:
+                        bind(names[-1], names[0])
+
+    @staticmethod
+    def _python_binding_target_name(left) -> Optional[str]:
+        """Name an assignment binds, as the receiver reader would spell it.
+
+        ``self.pool = ...`` binds ``pool``, because ``self.pool.get()`` is
+        recorded with ``pool`` as its receiver.
+        """
+        if left is None:
+            return None
+        if left.type == "identifier":
+            return left.text.decode("utf-8", errors="replace")
+        if left.type == "attribute":
+            obj = left.child_by_field_name("object")
+            attribute = left.child_by_field_name("attribute")
+            if (
+                obj is not None
+                and attribute is not None
+                and obj.text in (b"self", b"cls")
+            ):
+                return attribute.text.decode("utf-8", errors="replace")
+        return None
+
+    def _apply_python_receiver_evidence(
+        self,
+        edges: list[EdgeInfo],
+        evidence: dict[tuple[int, str], tuple[str, str]],
+    ) -> list[EdgeInfo]:
+        """Stamp each bare Python member call with what its receiver is."""
+        annotated: list[EdgeInfo] = []
+        for edge in edges:
+            receiver = edge.extra.get("receiver")
+            if (
+                edge.kind != "CALLS"
+                or "::" in edge.target
+                or (not receiver and not edge.extra.get("receiver_form"))
+            ):
+                annotated.append(edge)
+                continue
+            kind, detail = evidence.get(
+                (
+                    edge.line,
+                    receiver if receiver
+                    # An expression receiver has no name, so its evidence is
+                    # filed under the method it called on that line.
+                    else _PY_EXPR_RECEIVER_KEY + edge.target,
+                ),
+                ("unknown", ""),
+            )
+            extra = dict(edge.extra)
+            extra["receiver_binding"] = kind
+            if kind == "module":
+                # `pkg.func()` where `pkg` only re-exports `func` is a call
+                # into the file that defines it; the resolver looks for the
+                # name at top level of `receiver_module`.
+                extra["receiver_module"] = (
+                    self._python_reexport_origin(detail, edge.target)
+                    if detail
+                    else detail
+                )
+            elif kind == "class":
+                identity = _python_split_class_identity(detail)
+                if identity is None:
+                    extra["receiver_class"] = detail
+                else:
+                    extra["receiver_class_file"], extra["receiver_class"] = identity
+            annotated.append(EdgeInfo(
+                kind=edge.kind,
+                source=edge.source,
+                target=edge.target,
+                file_path=edge.file_path,
+                line=edge.line,
+                extra=extra,
+            ))
+        return annotated
 
     _MAX_AST_DEPTH = 180  # Guard against pathologically nested source files
     _MAX_TEST_DESCRIPTION_LEN = 200  # Cap test description length in node names
@@ -6082,6 +10629,1006 @@ class CodeParser:
                             normalized = normalized[: self._MAX_TEST_DESCRIPTION_LEN]
                         return normalized
         return None
+
+    def _is_ruby_test_block(self, node, call_name: str, file_path: str) -> bool:
+        """Whether a Ruby call is a test block, such as ``it "adds" do ... end``.
+
+        The block is what makes it one: ``[1].map { it + 1 }`` and a helper named
+        ``test`` are not tests, and neither is ``robot.it`` on some other object.
+        """
+        if call_name not in _RUBY_TEST_BLOCK_NAMES:
+            return False
+        if node.child_by_field_name("block") is None:
+            return False
+        receiver = node.child_by_field_name("receiver")
+        if receiver is not None and receiver.text != b"RSpec":
+            return False
+        return self._is_test_path(file_path)
+
+    def _get_ruby_test_description(self, call_node) -> Optional[str]:
+        """Return the subject of a Ruby test block: a string, class or symbol."""
+        arguments = call_node.child_by_field_name("arguments")
+        if arguments is None or not arguments.named_children:
+            return None
+        first = arguments.named_children[0]
+        if first.type not in ("string", "constant", "scope_resolution", "simple_symbol"):
+            return None
+        raw = first.text.decode("utf-8", errors="replace").strip("'\":")
+        # ``::`` splits a qualified name from its file, so it cannot stay here.
+        normalized = re.sub(r"\s+", " ", raw).replace("::", ".").strip()
+        return normalized[: self._MAX_TEST_DESCRIPTION_LEN] or None
+
+    @staticmethod
+    def _ruby_constant_path(node) -> Optional[str]:
+        """Return ``Shop.Cart``, the way nodes spell it, for ``Shop::Cart``."""
+        if node is None or node.type not in ("constant", "scope_resolution"):
+            return None
+        path = (
+            node.text.decode("utf-8", errors="replace")
+            .lstrip(":")
+            .replace("::", ".")
+        )
+        return path if _RUBY_CONSTANT_PATH_RE.match(path) else None
+
+    @classmethod
+    def _ruby_class_ref(cls, node, nesting: tuple[str, ...]) -> Optional[_RubyClassRef]:
+        """Return a constant with the modules around it, innermost first.
+
+        Ruby looks a relative constant up in those modules before the top
+        level, so the scopes travel with it. ``::Cart`` is absolute and has none.
+        """
+        path = cls._ruby_constant_path(node)
+        if path is None:
+            return None
+        return path, () if node.text.startswith(b"::") else nesting
+
+    @classmethod
+    def _ruby_nesting(cls, node, nesting: tuple[str, ...]) -> tuple[str, ...]:
+        """Return the lexical nesting inside a ``module`` or ``class`` body."""
+        if node.type not in ("module", "class"):
+            return nesting
+        name = node.child_by_field_name("name")
+        path = cls._ruby_constant_path(name)
+        if name is None or path is None:
+            return nesting
+        if nesting and not name.text.startswith(b"::"):
+            path = f"{nesting[0]}.{path}"
+        return (path, *nesting)
+
+    def _collect_ruby_test_receivers(
+        self, root,
+    ) -> dict[tuple[int, str], list[tuple[bool, Optional[_RubyClassRef]]]]:
+        """Say which class each call in a Ruby test file is made on.
+
+        Ruby calls carry no receiver, so ``client.push`` matches every ``push``
+        in the repository. Only what the file itself states counts: a constant
+        (``Shop::Cart.build``), a constructor (``Shop::Cart.new.tax``), a name
+        last assigned from a constructor, and ``described_class``. ``@ivars`` and
+        ``let`` names are read file-wide, since ``before`` sets them for the
+        tests beside it, unless the file gives one name two meanings.
+
+        Returns, for each ``(line, method)``, one entry per call in source
+        order: whether it has a receiver, and the class the file says that
+        receiver is, or ``None`` where it does not say. A receiverless call on
+        the same line as one with a receiver keeps its own entry.
+        """
+        shared: dict[str, Optional[_RubyClassRef]] = {}
+
+        def text_of(node) -> str:
+            return node.text.decode("utf-8", errors="replace") if node is not None else ""
+
+        def share(name: str, class_ref: Optional[_RubyClassRef]) -> None:
+            shared[name] = class_ref if shared.get(name, class_ref) == class_ref else None
+
+        def constructed(
+            node, described: Optional[_RubyClassRef], nesting: tuple[str, ...],
+        ) -> Optional[_RubyClassRef]:
+            if node is None or node.type != "call":
+                return None
+            if text_of(node.child_by_field_name("method")) != "new":
+                return None
+            receiver = node.child_by_field_name("receiver")
+            if receiver is not None and text_of(receiver) == "described_class":
+                return described
+            return self._ruby_class_ref(receiver, nesting)
+
+        def narrowed(
+            node, described: Optional[_RubyClassRef], nesting: tuple[str, ...],
+        ) -> Optional[_RubyClassRef]:
+            if node.type == "call" and (
+                text_of(node.child_by_field_name("method"))
+                in _RUBY_DESCRIBING_BLOCK_NAMES
+            ):
+                arguments = node.child_by_field_name("arguments")
+                if arguments is not None and arguments.named_children:
+                    return (
+                        self._ruby_class_ref(arguments.named_children[0], nesting)
+                        or described
+                    )
+            return described
+
+        def gather(
+            node,
+            described: Optional[_RubyClassRef],
+            nesting: tuple[str, ...],
+            depth: int = 0,
+        ) -> None:
+            if depth > self._MAX_AST_DEPTH:
+                return
+            if node.type == "assignment":
+                left = node.child_by_field_name("left")
+                if left is not None and left.type == "instance_variable":
+                    share(
+                        text_of(left),
+                        constructed(node.child_by_field_name("right"), described, nesting),
+                    )
+            elif (
+                node.type == "call"
+                and text_of(node.child_by_field_name("method")) in _RUBY_MEMO_BLOCK_NAMES
+                and node.child_by_field_name("receiver") is None
+            ):
+                block = node.child_by_field_name("block")
+                body = block.child_by_field_name("body") if block is not None else None
+                arguments = node.child_by_field_name("arguments")
+                name = (
+                    text_of(arguments.named_children[0]).lstrip(":")
+                    if arguments is not None and arguments.named_children
+                    else "subject"
+                )
+                share(
+                    name,
+                    constructed(
+                        body.named_children[-1]
+                        if body is not None and body.named_children
+                        else None,
+                        described,
+                        nesting,
+                    ),
+                )
+            described = narrowed(node, described, nesting)
+            nesting = self._ruby_nesting(node, nesting)
+            for child in node.children:
+                gather(child, described, nesting, depth + 1)
+
+        gather(root, None, ())
+
+        found: dict[tuple[int, str], list[tuple[bool, Optional[_RubyClassRef]]]] = {}
+
+        def class_of(
+            receiver,
+            local: dict[str, Optional[_RubyClassRef]],
+            described: Optional[_RubyClassRef],
+            nesting: tuple[str, ...],
+        ) -> Optional[_RubyClassRef]:
+            if receiver.type == "instance_variable":
+                return shared.get(text_of(receiver))
+            if receiver.type == "identifier":
+                name = text_of(receiver)
+                if name == "described_class":
+                    return described
+                return local[name] if name in local else shared.get(name)
+            return (
+                self._ruby_class_ref(receiver, nesting)
+                or constructed(receiver, described, nesting)
+            )
+
+        def walk(
+            node,
+            local: dict[str, Optional[_RubyClassRef]],
+            described: Optional[_RubyClassRef],
+            nesting: tuple[str, ...],
+            depth: int = 0,
+        ) -> None:
+            if depth > self._MAX_AST_DEPTH:
+                return
+            if node.type in ("method", "singleton_method", "block", "do_block"):
+                local = {} if node.type in ("method", "singleton_method") else dict(local)
+                parameters = node.child_by_field_name("parameters")
+                if parameters is not None:
+                    # A parameter hides any ``let`` or outer local of that name.
+                    for parameter in parameters.named_children:
+                        if parameter.type == "identifier":
+                            local[text_of(parameter)] = None
+            if node.type == "call":
+                receiver = node.child_by_field_name("receiver")
+                method = node.child_by_field_name("method")
+                if method is not None:
+                    # Calls are listed in the order the extractor emits their
+                    # edges, so ``Cart.new.total, total(1)`` on one line keeps
+                    # the class with the first ``total`` and off the second.
+                    has_receiver = receiver is not None and receiver.type != "self"
+                    found.setdefault((node.start_point[0] + 1, text_of(method)), []).append(
+                        (
+                            has_receiver,
+                            class_of(receiver, local, described, nesting)
+                            if has_receiver
+                            else None,
+                        ),
+                    )
+            described = narrowed(node, described, nesting)
+            nesting = self._ruby_nesting(node, nesting)
+            for child in node.children:
+                walk(child, local, described, nesting, depth + 1)
+            if node.type == "assignment":
+                left = node.child_by_field_name("left")
+                if left is not None and left.type == "identifier":
+                    local[text_of(left)] = constructed(
+                        node.child_by_field_name("right"), described, nesting,
+                    )
+
+        walk(root, {}, None, ())
+        return found
+
+    @staticmethod
+    def _apply_ruby_test_receivers(
+        edges: list[EdgeInfo],
+        receivers: dict[tuple[int, str], list[tuple[bool, Optional[_RubyClassRef]]]],
+    ) -> list[EdgeInfo]:
+        """Stamp each Ruby test call with the class the file says it is made on.
+
+        A receiver the file says nothing about is stamped too. A test is the one
+        place a wrong call costs a false claim of coverage, and a method that
+        merely shares a name with something the test requires is not evidence.
+        A call with no receiver is left as it is.
+        """
+        pending = {key: iter(calls) for key, calls in receivers.items()}
+        for edge in edges:
+            if edge.kind != "CALLS":
+                continue
+            method = edge.target.rsplit("::", 1)[-1]
+            calls = pending.get((edge.line, method))
+            has_receiver, class_ref = next(calls, (False, None)) if calls else (False, None)
+            if not has_receiver:
+                continue
+            edge.target = method
+            if class_ref is None:
+                edge.extra = {
+                    **edge.extra,
+                    "receiver_binding": "unknown",
+                    "receiver_form": "expression",
+                }
+                continue
+            class_path, scopes = class_ref
+            edge.extra = {
+                **edge.extra,
+                "receiver_binding": "class",
+                "receiver_class": class_path,
+                "receiver_constant": True,
+                **({"receiver_scopes": list(scopes)} if scopes else {}),
+            }
+        return edges
+
+    # -----------------------------------------------------------------------
+    # Generic YAML parser
+    # -----------------------------------------------------------------------
+
+    def _parse_yaml(
+        self,
+        path: Path,
+        source: bytes,
+    ) -> tuple[list[NodeInfo], list[EdgeInfo]]:
+        """Index generic YAML structure while deliberately discarding values.
+
+        Repeated sequence shapes are aggregated under ``[*]`` paths to keep
+        large configuration repositories bounded. Nodes retain occurrence and
+        source-line samples, while duplicate keys and aliases receive explicit
+        diagnostics. Scalar values never enter node or edge metadata.
+        """
+        if len(source) > self._MAX_GENERIC_YAML_BYTES:
+            logger.debug(
+                "Skipping generic YAML file %s: %d bytes exceeds the %d-byte limit",
+                path,
+                len(source),
+                self._MAX_GENERIC_YAML_BYTES,
+            )
+            return [], []
+
+        if _is_locale_yaml(path, self._repo_root):
+            # The file node keeps it visible to change detection and listings.
+            locale_file_path = normalize_file_path(path)
+            return [NodeInfo(
+                kind="File",
+                name=locale_file_path,
+                file_path=locale_file_path,
+                line_start=1,
+                line_end=source.count(b"\n") + 1,
+                language="yaml",
+                extra={
+                    "config_format": path.suffix.lower().lstrip("."),
+                    "yaml_locale_file": True,
+                    "values_indexed": False,
+                },
+            )], []
+
+        text = source.decode("utf-8", errors="replace")
+        try:
+            documents = list(_yaml.compose_all(text))
+            yaml_events = list(_yaml.parse(text)) if b"&" in source else []
+            anchor_definitions = {
+                event.start_mark.index: str(event.anchor)
+                for event in yaml_events
+                if not isinstance(event, _YamlAliasEvent)
+                and getattr(event, "anchor", None) is not None
+            }
+            alias_lines_by_anchor: dict[str, list[int]] = {}
+            for event in yaml_events:
+                if isinstance(event, _YamlAliasEvent):
+                    alias_lines_by_anchor.setdefault(str(event.anchor), []).append(
+                        event.start_mark.line + 1,
+                    )
+        except (_yaml.YAMLError, RecursionError) as exc:
+            logger.debug("YAML parse error in %s: %s", path, exc)
+            return [], []
+
+        file_path = normalize_file_path(path)
+        file_extra: dict[str, Any] = {
+            "config_format": path.suffix.lower().lstrip("."),
+            "yaml_document_count": len(documents),
+            "yaml_duplicate_key_count": 0,
+            "yaml_duplicate_keys": [],
+            "yaml_unsupported_key_count": 0,
+            "yaml_truncated": False,
+            "values_indexed": False,
+        }
+        nodes = [NodeInfo(
+            kind="File",
+            name=file_path,
+            file_path=file_path,
+            line_start=1,
+            line_end=source.count(b"\n") + 1,
+            language="yaml",
+            extra=file_extra,
+        )]
+        edges: list[EdgeInfo] = []
+        shared_targets: dict[int, str] = {}
+        shared_anchor_names: dict[int, str] = {}
+        path_nodes: dict[tuple[int, str], NodeInfo] = {}
+        path_value_types: dict[tuple[int, str], set[str]] = {}
+        path_key_tags: dict[tuple[int, str], set[str]] = {}
+        contains_edges: set[tuple[str, str]] = set()
+        duplicate_summaries: list[dict[str, Any]] = []
+        duplicate_count = 0
+        unsupported_key_count = 0
+        alias_indices: dict[str, int] = {}
+        skipped_seen: set[int] = set()
+        truncated = False
+
+        def qualified(schema_path: str, document_index: int) -> str:
+            return f"{file_path}::yaml:{document_index}:{schema_path}"
+
+        def can_emit(
+            schema_path: str,
+            depth: int,
+            *source_paths: str,
+        ) -> bool:
+            nonlocal truncated
+            if (
+                len(nodes) - 1 >= self._MAX_YAML_NODES
+                or depth > self._MAX_YAML_DEPTH
+                or len(schema_path) > self._MAX_YAML_PATH_LENGTH
+                or any(
+                    len(source_path) > self._MAX_YAML_PATH_LENGTH
+                    for source_path in source_paths
+                )
+            ):
+                truncated = True
+                return False
+            return True
+
+        def add_contains(parent: str, target: str, line: int) -> None:
+            edge_key = (parent, target)
+            if edge_key in contains_edges:
+                return
+            contains_edges.add(edge_key)
+            edges.append(EdgeInfo(
+                kind="CONTAINS",
+                source=parent,
+                target=target,
+                file_path=file_path,
+                line=line,
+            ))
+
+        def next_alias_line(value_node: object, fallback: int) -> int:
+            anchor_name = shared_anchor_names.get(id(value_node))
+            if anchor_name is None:
+                return fallback
+            lines = alias_lines_by_anchor.get(anchor_name, [])
+            alias_index = alias_indices.get(anchor_name, 0)
+            if alias_index >= len(lines):
+                return fallback
+            line = lines[alias_index]
+            alias_indices[anchor_name] = alias_index + 1
+            return line
+
+        def emit_alias(
+            value_node: object,
+            exact_path: str,
+            schema_path: str,
+            identity_path: str,
+            parent_qualified: str,
+            document_index: int,
+            depth: int,
+            line_start: int,
+            extra: dict[str, Any],
+            yaml_merge: bool,
+            line_is_key: bool,
+        ) -> None:
+            if not can_emit(schema_path, depth, exact_path, identity_path):
+                return
+            original_target = shared_targets[id(value_node)]
+            reference_line = next_alias_line(value_node, line_start)
+            node_line_start = min(line_start, reference_line) if line_is_key else reference_line
+            # The alias is this one reference. Its target's own end is elsewhere,
+            # and past later keys when the alias sits inside its own anchor.
+            node_line_end = max(node_line_start, reference_line)
+            alias_identity = f"alias:{identity_path}@{reference_line}"
+            target = qualified(alias_identity, document_index)
+            nodes.append(NodeInfo(
+                kind="YamlPath",
+                name=exact_path,
+                file_path=file_path,
+                line_start=node_line_start,
+                line_end=node_line_end,
+                language="yaml",
+                extra={
+                    "document_index": document_index,
+                    "path": exact_path,
+                    "schema_path": schema_path,
+                    "source_file": path.name,
+                    "value_type": "alias",
+                    "is_alias": True,
+                    "yaml_merge": yaml_merge,
+                    **extra,
+                },
+                identity_name=f"yaml:{document_index}:{alias_identity}",
+            ))
+            add_contains(parent_qualified, target, node_line_start)
+            edges.append(EdgeInfo(
+                kind="REFERENCES",
+                source=target,
+                target=original_target,
+                file_path=file_path,
+                line=reference_line,
+                extra={"yaml_alias": True, "yaml_merge": yaml_merge},
+            ))
+
+        def emit_node(
+            value_node: object,
+            exact_path: str,
+            schema_path: str,
+            identity_path: str,
+            parent_qualified: str,
+            document_index: int,
+            depth: int,
+            line_start: int,
+            line_end: int,
+            extra: dict[str, Any],
+            ancestors: frozenset[int],
+            yaml_merge: bool = False,
+            line_is_key: bool = False,
+        ) -> None:
+            if not can_emit(schema_path, depth, exact_path, identity_path):
+                return
+            value_id = id(value_node)
+            if value_id in shared_targets:
+                emit_alias(
+                    value_node,
+                    exact_path,
+                    schema_path,
+                    identity_path,
+                    parent_qualified,
+                    document_index,
+                    depth,
+                    line_start,
+                    extra,
+                    yaml_merge,
+                    line_is_key,
+                )
+                return
+
+            node_mark = getattr(value_node, "start_mark", None)
+            anchor_name = anchor_definitions.get(getattr(node_mark, "index", -1))
+            if anchor_name is not None:
+                anchor_identity = (
+                    f"anchor:{getattr(node_mark, 'index', line_start)}:{identity_path}"
+                )
+                target = qualified(anchor_identity, document_index)
+                value_type = _yaml_value_type(value_node)
+                node_extra = {
+                    "document_index": document_index,
+                    "path": schema_path,
+                    "schema_path": schema_path,
+                    "example_path": exact_path,
+                    "source_file": path.name,
+                    "value_type": value_type,
+                    "value_types": [value_type],
+                    "occurrence_count": 1,
+                    "line_samples": [line_start],
+                    "range_samples": [[line_start, max(line_start, line_end)]],
+                    "lines_truncated": False,
+                    "is_alias": False,
+                    "anchor_definition": True,
+                    **extra,
+                }
+                key_tag = extra.get("key_tag")
+                if isinstance(key_tag, str):
+                    node_extra["key_tags"] = [key_tag]
+                if extra.get("duplicate_key"):
+                    node_extra["duplicate_key_occurrence_count"] = 1
+                    if extra.get("duplicate_group_start"):
+                        node_extra["duplicate_group_count"] = 1
+                        node_extra["duplicate_group_samples"] = [
+                            extra["duplicate_group"],
+                        ]
+                nodes.append(NodeInfo(
+                    kind="YamlPath",
+                    name=schema_path,
+                    file_path=file_path,
+                    line_start=line_start,
+                    line_end=max(line_start, line_end),
+                    language="yaml",
+                    extra=node_extra,
+                    identity_name=f"yaml:{document_index}:{anchor_identity}",
+                ))
+                add_contains(parent_qualified, target, line_start)
+                shared_targets[value_id] = target
+                shared_anchor_names[value_id] = anchor_name
+                value_ancestors = ancestors | {value_id}
+                if isinstance(value_node, _YamlMapping):
+                    visit_mapping(
+                        value_node,
+                        exact_path,
+                        schema_path,
+                        identity_path,
+                        target,
+                        document_index,
+                        depth + 1,
+                        value_ancestors,
+                    )
+                elif isinstance(value_node, _YamlSequence):
+                    visit_sequence(
+                        value_node,
+                        exact_path,
+                        schema_path,
+                        identity_path,
+                        target,
+                        document_index,
+                        depth + 1,
+                        value_ancestors,
+                        merge_context=yaml_merge or bool(extra.get("merge_key")),
+                    )
+                return
+
+            path_key = (document_index, schema_path)
+            node = path_nodes.get(path_key)
+            if node is None:
+                target = qualified(schema_path, document_index)
+                value_type = _yaml_value_type(value_node)
+                node_extra = {
+                    "document_index": document_index,
+                    "path": schema_path,
+                    "schema_path": schema_path,
+                    "example_path": exact_path,
+                    "source_file": path.name,
+                    "value_type": value_type,
+                    "value_types": [value_type],
+                    "occurrence_count": 1,
+                    "line_samples": [line_start],
+                    "range_samples": [[line_start, max(line_start, line_end)]],
+                    "lines_truncated": False,
+                    "is_alias": False,
+                    **extra,
+                }
+                node = NodeInfo(
+                    kind="YamlPath",
+                    name=schema_path,
+                    file_path=file_path,
+                    line_start=line_start,
+                    line_end=max(line_start, line_end),
+                    language="yaml",
+                    extra=node_extra,
+                    identity_name=f"yaml:{document_index}:{schema_path}",
+                )
+                nodes.append(node)
+                path_nodes[path_key] = node
+                path_value_types[path_key] = {value_type}
+                key_tag = extra.get("key_tag")
+                path_key_tags[path_key] = {key_tag} if isinstance(key_tag, str) else set()
+                add_contains(parent_qualified, target, line_start)
+            else:
+                add_contains(
+                    parent_qualified,
+                    qualified(schema_path, document_index),
+                    line_start,
+                )
+                node.line_start = min(node.line_start, line_start)
+                node.line_end = max(node.line_end, line_end)
+                node.extra["occurrence_count"] += 1
+                line_samples = node.extra["line_samples"]
+                if len(line_samples) < self._MAX_YAML_OCCURRENCE_SAMPLES:
+                    line_samples.append(line_start)
+                    node.extra["range_samples"].append([
+                        line_start,
+                        max(line_start, line_end),
+                    ])
+                else:
+                    node.extra["lines_truncated"] = True
+                value_types = path_value_types[path_key]
+                value_types.add(_yaml_value_type(value_node))
+                node.extra["value_types"] = sorted(value_types)
+                node.extra["value_type"] = (
+                    next(iter(value_types)) if len(value_types) == 1 else "mixed"
+                )
+                key_tag = extra.get("key_tag")
+                if isinstance(key_tag, str):
+                    key_tags = path_key_tags[path_key]
+                    key_tags.add(key_tag)
+                    node.extra["key_tags"] = sorted(key_tags)
+
+            if extra.get("duplicate_key"):
+                node.extra["duplicate_key"] = True
+                node.extra["duplicate_key_occurrence_count"] = (
+                    node.extra.get("duplicate_key_occurrence_count", 0) + 1
+                )
+                if extra.get("duplicate_group_start"):
+                    node.extra["duplicate_group_count"] = (
+                        node.extra.get("duplicate_group_count", 0) + 1
+                    )
+                    group_samples = node.extra.setdefault("duplicate_group_samples", [])
+                    if len(group_samples) < self._MAX_YAML_DUPLICATE_GROUP_SAMPLES:
+                        group_samples.append(extra["duplicate_group"])
+                    else:
+                        node.extra["duplicate_groups_truncated"] = True
+
+            shared_targets[value_id] = qualified(schema_path, document_index)
+            value_ancestors = ancestors | {value_id}
+            if isinstance(value_node, _YamlMapping):
+                visit_mapping(
+                    value_node,
+                    exact_path,
+                    schema_path,
+                    identity_path,
+                    qualified(schema_path, document_index),
+                    document_index,
+                    depth + 1,
+                    value_ancestors,
+                )
+            elif isinstance(value_node, _YamlSequence):
+                visit_sequence(
+                    value_node,
+                    exact_path,
+                    schema_path,
+                    identity_path,
+                    qualified(schema_path, document_index),
+                    document_index,
+                    depth + 1,
+                    value_ancestors,
+                    merge_context=yaml_merge or bool(extra.get("merge_key")),
+                )
+
+        def consume_skipped_aliases(skipped_node: object) -> None:
+            """Advance alias positions hidden below unsupported complex keys.
+
+            Anchors in here never enter ``shared_targets``, so an alias leads
+            back into a node already walked. Walking it again would double the
+            work at every link of a chain of aliases, and would also count the
+            aliases inside it twice though the source holds them once.
+            """
+            skipped_id = id(skipped_node)
+            if skipped_id in shared_targets:
+                next_alias_line(skipped_node, _yaml_line(skipped_node))
+                return
+            if skipped_id in skipped_seen:
+                return
+            skipped_seen.add(skipped_id)
+            if isinstance(skipped_node, _YamlMapping):
+                for child_key, child_value in skipped_node.value:
+                    consume_skipped_aliases(child_key)
+                    consume_skipped_aliases(child_value)
+            elif isinstance(skipped_node, _YamlSequence):
+                for child in skipped_node.value:
+                    consume_skipped_aliases(child)
+
+        def visit_mapping(
+            mapping_node: object,
+            exact_prefix: str,
+            schema_prefix: str,
+            identity_prefix: str,
+            parent_qualified: str,
+            document_index: int,
+            depth: int,
+            ancestors: frozenset[int],
+        ) -> None:
+            nonlocal duplicate_count, unsupported_key_count
+            pairs = list(mapping_node.value)  # type: ignore[attr-defined]
+            key_counts: dict[tuple[str, str], int] = {}
+            key_line_samples: dict[tuple[str, str], list[int]] = {}
+            for key_node, _ in pairs:
+                raw_key = _yaml_scalar(key_node)
+                if raw_key is None:
+                    continue
+                signature = (str(getattr(key_node, "tag", "")), raw_key)
+                key_counts[signature] = key_counts.get(signature, 0) + 1
+                samples = key_line_samples.setdefault(signature, [])
+                if len(samples) < self._MAX_YAML_DUPLICATE_LINE_SAMPLES:
+                    samples.append(_yaml_line(key_node))
+
+            occurrences: dict[tuple[str, str], int] = {}
+            identity_occurrences: dict[str, int] = {}
+            for key_node, value_node in pairs:
+                raw_key = _yaml_scalar(key_node)
+                if raw_key is None or not _is_storable_key(raw_key):
+                    unsupported_key_count += 1
+                    consume_skipped_aliases(key_node)
+                    consume_skipped_aliases(value_node)
+                    continue
+                key_tag = str(getattr(key_node, "tag", ""))
+                signature = (key_tag, raw_key)
+                occurrence = occurrences.get(signature, 0) + 1
+                occurrences[signature] = occurrence
+                exact_path = _yaml_path_child(exact_prefix, raw_key)
+                schema_path = _yaml_path_child(schema_prefix, raw_key)
+                base_identity = _yaml_path_child(identity_prefix, raw_key)
+                identity_occurrence = identity_occurrences.get(base_identity, 0) + 1
+                identity_occurrences[base_identity] = identity_occurrence
+                identity_path = (
+                    f"{base_identity}#{identity_occurrence}"
+                    if identity_occurrence > 1
+                    else base_identity
+                )
+                duplicate = key_counts[signature] > 1
+                bounded_exact_path = exact_path[: self._MAX_YAML_PATH_LENGTH]
+                duplicate_group = {
+                    "example_path": bounded_exact_path,
+                    "occurrence_count": key_counts[signature],
+                    "line_samples": key_line_samples[signature],
+                    "lines_truncated": (
+                        key_counts[signature] > self._MAX_YAML_DUPLICATE_LINE_SAMPLES
+                    ),
+                }
+                extra: dict[str, Any] = {
+                    "raw_key": raw_key,
+                    "key_tag": key_tag,
+                    "duplicate_key": duplicate,
+                    "key_occurrence": occurrence,
+                }
+                if duplicate:
+                    extra["duplicate_group"] = duplicate_group
+                    extra["duplicate_group_start"] = occurrence == 1
+                    if occurrence == 1:
+                        duplicate_count += 1
+                        if len(duplicate_summaries) < self._MAX_YAML_DUPLICATE_GROUP_SAMPLES:
+                            duplicate_summaries.append({
+                                "document_index": document_index,
+                                "path": bounded_exact_path,
+                                **duplicate_group,
+                            })
+                # The tag, not the text: a quoted "<<" is an ordinary string key.
+                is_merge = key_tag == "tag:yaml.org,2002:merge"
+                if is_merge:
+                    extra["merge_key"] = True
+                emit_node(
+                    value_node,
+                    exact_path,
+                    schema_path,
+                    identity_path,
+                    parent_qualified,
+                    document_index,
+                    depth,
+                    _yaml_line(key_node),
+                    _yaml_end_line(value_node),
+                    extra,
+                    ancestors,
+                    yaml_merge=is_merge,
+                    line_is_key=True,
+                )
+
+        def visit_sequence(
+            sequence_node: object,
+            exact_prefix: str,
+            schema_prefix: str,
+            identity_prefix: str,
+            parent_qualified: str,
+            document_index: int,
+            depth: int,
+            ancestors: frozenset[int],
+            merge_context: bool = False,
+        ) -> None:
+            for index, item in enumerate(sequence_node.value):  # type: ignore[attr-defined]
+                exact_path = f"{exact_prefix}[{index}]"
+                schema_path = f"{schema_prefix}[*]"
+                identity_path = f"{identity_prefix}[{index}]"
+                emit_node(
+                    item,
+                    exact_path,
+                    schema_path,
+                    identity_path,
+                    parent_qualified,
+                    document_index,
+                    depth,
+                    _yaml_line(item),
+                    _yaml_end_line(item),
+                    {"sequence_index_sample": index},
+                    ancestors,
+                    yaml_merge=merge_context,
+                )
+
+        for document_index, document in enumerate(documents):
+            if document is None:
+                continue
+            emit_node(
+                document,
+                "$",
+                "$",
+                "$",
+                file_path,
+                document_index,
+                0,
+                _yaml_line(document),
+                _yaml_end_line(document),
+                {"document_root": True},
+                frozenset(),
+            )
+
+        file_extra["yaml_duplicate_key_count"] = duplicate_count
+        file_extra["yaml_duplicate_keys"] = duplicate_summaries
+        file_extra["yaml_unsupported_key_count"] = unsupported_key_count
+        file_extra["yaml_truncated"] = truncated
+        return nodes, edges
+
+    def _parse_json(
+        self,
+        path: Path,
+        source: bytes,
+    ) -> tuple[list[NodeInfo], list[EdgeInfo]]:
+        """Index a JSON file's paths while deliberately discarding its values.
+
+        The shape follows generic YAML: repeated array items share one ``[*]``
+        path, and scalar values never enter node or edge metadata. JSON is far
+        more often data than YAML, so more of it stays out. Translation files
+        follow the YAML rule (``_is_locale_yaml``); test data, docs, examples,
+        data folders and oversized files keep only their file node; and an
+        object used as a table collapses to ``.*``. Paths are read breadth
+        first, so a file over the cap loses its deepest paths, not its last
+        top-level keys.
+        """
+        file_path = normalize_file_path(path)
+        file_extra: dict[str, Any] = {
+            "config_format": "json",
+            "json_truncated": False,
+            "values_indexed": False,
+        }
+        nodes = [NodeInfo(
+            kind="File",
+            name=file_path,
+            file_path=file_path,
+            line_start=1,
+            line_end=source.count(b"\n") + 1,
+            language="json",
+            extra=file_extra,
+        )]
+        edges: list[EdgeInfo] = []
+        if _is_locale_yaml(path, self._repo_root):
+            file_extra["json_locale_file"] = True
+            return nodes, edges
+        relative = repo_relative_path(path, self._repo_root)
+        if self._is_test_path(file_path) or (
+            relative is not None
+            and _JSON_DATA_DIR_NAMES.intersection(relative.lower().split("/")[:-1])
+        ):
+            file_extra["json_data_file"] = True
+            return nodes, edges
+        if len(source) > self._MAX_JSON_BYTES:
+            file_extra["json_truncated"] = True
+            return nodes, edges
+        json_parser = self._get_parser("json")
+        if not json_parser:
+            return nodes, edges
+
+        def qualified(schema_path: str) -> str:
+            return f"{file_path}::json:{schema_path}"
+
+        path_nodes: dict[str, NodeInfo] = {}
+        path_value_types: dict[str, set[str]] = {}
+        # (value, exact path, schema path, parent, depth, first line)
+        queue: deque[tuple[Any, str, str, str, int, int]] = deque(
+            (child, "$", "$", file_path, 0, child.start_point[0] + 1)
+            for child in json_parser.parse(source).root_node.children
+            if child.type in _JSON_VALUE_TYPES
+        )
+        while queue:
+            value, exact_path, schema_path, parent, depth, line_start = queue.popleft()
+            line_end = value.end_point[0] + 1
+            value_type = _JSON_VALUE_TYPES[value.type]
+            node = path_nodes.get(schema_path)
+            if node is None:
+                if (
+                    len(path_nodes) >= self._MAX_JSON_NODES
+                    or depth > self._MAX_JSON_DEPTH
+                    or len(schema_path) > self._MAX_YAML_PATH_LENGTH
+                ):
+                    file_extra["json_truncated"] = True
+                    continue
+                node = NodeInfo(
+                    kind="JsonPath",
+                    name=schema_path,
+                    file_path=file_path,
+                    line_start=line_start,
+                    line_end=line_end,
+                    language="json",
+                    extra={
+                        "path": schema_path,
+                        "schema_path": schema_path,
+                        "example_path": exact_path[: self._MAX_YAML_PATH_LENGTH],
+                        "source_file": path.name,
+                        "value_type": value_type,
+                        "value_types": [value_type],
+                        "occurrence_count": 1,
+                        "line_samples": [line_start],
+                        "range_samples": [[line_start, line_end]],
+                        "lines_truncated": False,
+                    },
+                    identity_name=f"json:{schema_path}",
+                )
+                nodes.append(node)
+                path_nodes[schema_path] = node
+                path_value_types[schema_path] = {value_type}
+                edges.append(EdgeInfo(
+                    kind="CONTAINS",
+                    source=parent,
+                    target=qualified(schema_path),
+                    file_path=file_path,
+                    line=line_start,
+                ))
+            else:
+                node.line_start = min(node.line_start, line_start)
+                node.line_end = max(node.line_end, line_end)
+                node.extra["occurrence_count"] += 1
+                if len(node.extra["line_samples"]) < self._MAX_JSON_OCCURRENCE_SAMPLES:
+                    node.extra["line_samples"].append(line_start)
+                    node.extra["range_samples"].append([line_start, line_end])
+                else:
+                    node.extra["lines_truncated"] = True
+                value_types = path_value_types[schema_path]
+                value_types.add(value_type)
+                node.extra["value_types"] = sorted(value_types)
+                node.extra["value_type"] = (
+                    value_type if len(value_types) == 1 else "mixed"
+                )
+
+            this_path = qualified(schema_path)
+            if value.type == "object":
+                pairs = [child for child in value.children if child.type == "pair"]
+                # Keys past this many are data (ids, hashes, countries), like
+                # array items, so they share one path.
+                is_table = len(pairs) > self._MAX_JSON_OBJECT_KEYS
+                for pair in pairs:
+                    key = _json_key(pair.child_by_field_name("key"))
+                    child_value = pair.child_by_field_name("value")
+                    if key is None or child_value is None:
+                        continue
+                    if child_value.type not in _JSON_VALUE_TYPES:
+                        continue
+                    queue.append((
+                        child_value,
+                        _yaml_path_child(exact_path, key),
+                        f"{schema_path}.*" if is_table else _yaml_path_child(schema_path, key),
+                        this_path,
+                        depth + 1,
+                        pair.start_point[0] + 1,
+                    ))
+            elif value.type == "array":
+                items = (child for child in value.children if child.type in _JSON_VALUE_TYPES)
+                for index, item in enumerate(items):
+                    queue.append((
+                        item,
+                        f"{exact_path}[{index}]",
+                        f"{schema_path}[*]",
+                        this_path,
+                        depth + 1,
+                        item.start_point[0] + 1,
+                    ))
+        return nodes, edges
 
     # -----------------------------------------------------------------------
     # Spring application configuration parser
@@ -6118,7 +11665,7 @@ class CodeParser:
         """Flatten Spring YAML keys using PyYAML's syntax tree, never values."""
         try:
             documents = list(_yaml.compose_all(source.decode("utf-8", errors="replace")))
-        except _yaml.YAMLError as exc:
+        except (_yaml.YAMLError, RecursionError) as exc:
             logger.debug("Spring YAML parse error in %s: %s", path, exc)
             return [], []
 
@@ -6138,22 +11685,20 @@ class CodeParser:
             value_type = tag.rsplit(":", 1)[-1]
             if value_type not in {"bool", "float", "int", "null", "str", "timestamp"}:
                 value_type = "scalar"
-            nodes.append(
-                NodeInfo(
-                    kind="ConfigProperty",
-                    name=key,
-                    file_path=file_path,
-                    line_start=_yaml_line(value_node),
-                    line_end=_yaml_end_line(value_node),
-                    language="yaml",
-                    extra={
-                        "document_index": document_index,
-                        "raw_key": raw_key,
-                        "source_file": path.name,
-                        "value_type": value_type,
-                    },
-                )
-            )
+            nodes.append(NodeInfo(
+                kind="ConfigProperty",
+                name=key,
+                file_path=file_path,
+                line_start=_yaml_line(value_node),
+                line_end=_yaml_end_line(value_node),
+                language="yaml",
+                extra={
+                    "document_index": document_index,
+                    "raw_key": raw_key,
+                    "source_file": path.name,
+                    "value_type": value_type,
+                },
+            ))
 
         def visit(
             node: object,
@@ -6205,7 +11750,9 @@ class CodeParser:
             if not isinstance(document, _YamlMapping):
                 return True
             top_level_keys = {
-                key for key_node, _ in document.value if (key := _yaml_scalar(key_node)) is not None
+                key
+                for key_node, _ in document.value
+                if (key := _yaml_scalar(key_node)) is not None
             }
             if any(signature <= top_level_keys for signature in signatures):
                 return True
@@ -6270,21 +11817,19 @@ class CodeParser:
             if not key or key in emitted:
                 continue
             emitted.add(key)
-            nodes.append(
-                NodeInfo(
-                    kind="ConfigProperty",
-                    name=key,
-                    file_path=file_path,
-                    line_start=line_number,
-                    line_end=line_number,
-                    language="properties",
-                    extra={
-                        "raw_key": raw_key,
-                        "source_file": path.name,
-                        "value_type": "scalar",
-                    },
-                )
-            )
+            nodes.append(NodeInfo(
+                kind="ConfigProperty",
+                name=key,
+                file_path=file_path,
+                line_start=line_number,
+                line_end=line_number,
+                language="properties",
+                extra={
+                    "raw_key": raw_key,
+                    "source_file": path.name,
+                    "value_type": "scalar",
+                },
+            ))
         return nodes, []
 
     # -----------------------------------------------------------------------
@@ -6292,9 +11837,7 @@ class CodeParser:
     # -----------------------------------------------------------------------
 
     def _parse_ansible(
-        self,
-        path: Path,
-        source: bytes,
+        self, path: Path, source: bytes,
     ) -> tuple[list[NodeInfo], list[EdgeInfo]]:
         """Parse an Ansible YAML file using PyYAML's compose() node tree.
 
@@ -6303,7 +11846,7 @@ class CodeParser:
         """
         try:
             root = _yaml.compose(source.decode("utf-8", errors="replace"))
-        except _yaml.YAMLError as exc:
+        except (_yaml.YAMLError, RecursionError) as exc:
             logger.debug("Ansible YAML parse error in %s: %s", path, exc)
             return [], []
         if root is None:
@@ -6311,16 +11854,14 @@ class CodeParser:
 
         file_path_str = normalize_file_path(path)
         line_count = source.count(b"\n") + 1
-        nodes: list[NodeInfo] = [
-            NodeInfo(
-                kind="File",
-                name=file_path_str,
-                file_path=file_path_str,
-                line_start=1,
-                line_end=line_count,
-                language="ansible",
-            )
-        ]
+        nodes: list[NodeInfo] = [NodeInfo(
+            kind="File",
+            name=file_path_str,
+            file_path=file_path_str,
+            line_start=1,
+            line_end=line_count,
+            language="ansible",
+        )]
         edges: list[EdgeInfo] = []
 
         file_type = _ansible_file_type(path)
@@ -6341,10 +11882,7 @@ class CodeParser:
             self._parse_ansible_playbook(root, file_path_str, nodes, edges)
         elif file_type in ("tasks", "handlers"):
             self._parse_ansible_tasks(
-                root,
-                file_path_str,
-                nodes,
-                edges,
+                root, file_path_str, nodes, edges,
                 is_handler=(file_type == "handlers"),
                 parent_play=None,
             )
@@ -6383,7 +11921,8 @@ class CodeParser:
     ) -> list[EdgeInfo]:
         """Qualify notify targets when one same-scope handler matches."""
         node_by_qn = {
-            self._qualify(node.name, node.file_path, node.parent_name): node for node in nodes
+            self._qualify(node.name, node.file_path, node.parent_name): node
+            for node in nodes
         }
         handlers: dict[tuple[Optional[str], str], list[str]] = {}
         for node in nodes:
@@ -6411,16 +11950,14 @@ class CodeParser:
             if len(candidates) != 1:
                 resolved.append(edge)
                 continue
-            resolved.append(
-                EdgeInfo(
-                    kind=edge.kind,
-                    source=edge.source,
-                    target=candidates[0],
-                    file_path=edge.file_path,
-                    line=edge.line,
-                    extra=edge.extra,
-                )
-            )
+            resolved.append(EdgeInfo(
+                kind=edge.kind,
+                source=edge.source,
+                target=candidates[0],
+                file_path=edge.file_path,
+                line=edge.line,
+                extra=edge.extra,
+            ))
         return resolved
 
     def _parse_ansible_playbook(
@@ -6443,16 +11980,14 @@ class CodeParser:
             if import_pb_node is not None:
                 target = _yaml_scalar(import_pb_node)
                 if target:
-                    edges.append(
-                        EdgeInfo(
-                            kind="IMPORTS_FROM",
-                            source=file_path,
-                            target=target,
-                            file_path=file_path,
-                            line=_yaml_line(item),
-                            extra={"ansible_kind": "import_playbook"},
-                        )
-                    )
+                    edges.append(EdgeInfo(
+                        kind="IMPORTS_FROM",
+                        source=file_path,
+                        target=target,
+                        file_path=file_path,
+                        line=_yaml_line(item),
+                        extra={"ansible_kind": "import_playbook"},
+                    ))
                 continue
 
             if not _ansible_is_play_item(item):
@@ -6479,26 +12014,22 @@ class CodeParser:
             )
             play_qn = self._qualify(play_name, file_path, None)
 
-            nodes.append(
-                NodeInfo(
-                    kind="Class",
-                    name=play_name,
-                    file_path=file_path,
-                    line_start=play_line_start,
-                    line_end=play_line_end,
-                    language="ansible",
-                    extra={"ansible_kind": "play"},
-                )
-            )
-            edges.append(
-                EdgeInfo(
-                    kind="CONTAINS",
-                    source=file_path,
-                    target=play_qn,
-                    file_path=file_path,
-                    line=play_line_start,
-                )
-            )
+            nodes.append(NodeInfo(
+                kind="Class",
+                name=play_name,
+                file_path=file_path,
+                line_start=play_line_start,
+                line_end=play_line_end,
+                language="ansible",
+                extra={"ansible_kind": "play"},
+            ))
+            edges.append(EdgeInfo(
+                kind="CONTAINS",
+                source=file_path,
+                target=play_qn,
+                file_path=file_path,
+                line=play_line_start,
+            ))
 
             # vars_files: → IMPORTS_FROM
             vars_files_node = _yaml_get_key(item, "vars_files")
@@ -6506,16 +12037,14 @@ class CodeParser:
                 for vf in vars_files_node.value:
                     vf_path = _yaml_scalar(vf)
                     if vf_path:
-                        edges.append(
-                            EdgeInfo(
-                                kind="IMPORTS_FROM",
-                                source=play_qn,
-                                target=vf_path,
-                                file_path=file_path,
-                                line=_yaml_line(vf),
-                                extra={"ansible_kind": "vars_files"},
-                            )
-                        )
+                        edges.append(EdgeInfo(
+                            kind="IMPORTS_FROM",
+                            source=play_qn,
+                            target=vf_path,
+                            file_path=file_path,
+                            line=_yaml_line(vf),
+                            extra={"ansible_kind": "vars_files"},
+                        ))
 
             # roles: list → IMPORTS_FROM (roles are not tasks)
             roles_node = _yaml_get_key(item, "roles")
@@ -6523,16 +12052,14 @@ class CodeParser:
                 for role_item in roles_node.value:
                     role_name = self._ansible_extract_role_name(role_item)
                     if role_name:
-                        edges.append(
-                            EdgeInfo(
-                                kind="IMPORTS_FROM",
-                                source=play_qn,
-                                target=role_name,
-                                file_path=file_path,
-                                line=_yaml_line(role_item),
-                                extra={"ansible_kind": "role_reference"},
-                            )
-                        )
+                        edges.append(EdgeInfo(
+                            kind="IMPORTS_FROM",
+                            source=play_qn,
+                            target=role_name,
+                            file_path=file_path,
+                            line=_yaml_line(role_item),
+                            extra={"ansible_kind": "role_reference"},
+                        ))
 
             # pre_tasks, tasks, post_tasks, handlers → task extraction
             for section_key, is_handler in (
@@ -6544,10 +12071,7 @@ class CodeParser:
                 section_node = _yaml_get_key(item, section_key)
                 if isinstance(section_node, _YamlSequence):
                     self._parse_ansible_tasks(
-                        section_node,
-                        file_path,
-                        nodes,
-                        edges,
+                        section_node, file_path, nodes, edges,
                         is_handler=is_handler,
                         parent_play=play_name,
                     )
@@ -6616,103 +12140,88 @@ class CodeParser:
                 if listen_val:
                     task_extra["ansible_listen"] = listen_val
 
-            nodes.append(
-                NodeInfo(
-                    kind="Function",
-                    name=task_name,
-                    file_path=file_path,
-                    line_start=_yaml_line(task_node),
-                    line_end=_yaml_end_line(task_node),
-                    language="ansible",
-                    parent_name=parent_play,
-                    extra=task_extra,
-                )
-            )
+            nodes.append(NodeInfo(
+                kind="Function",
+                name=task_name,
+                file_path=file_path,
+                line_start=_yaml_line(task_node),
+                line_end=_yaml_end_line(task_node),
+                language="ansible",
+                parent_name=parent_play,
+                extra=task_extra,
+            ))
 
             # CONTAINS edge: parent play → task, or file → task for standalone files
-            edges.append(
-                EdgeInfo(
-                    kind="CONTAINS",
-                    source=(
-                        self._qualify(parent_play, file_path, None)
-                        if parent_play is not None
-                        else file_path
-                    ),
-                    target=task_qn,
-                    file_path=file_path,
-                    line=_yaml_line(task_node),
-                )
-            )
+            edges.append(EdgeInfo(
+                kind="CONTAINS",
+                source=(
+                    self._qualify(parent_play, file_path, None)
+                    if parent_play is not None
+                    else file_path
+                ),
+                target=task_qn,
+                file_path=file_path,
+                line=_yaml_line(task_node),
+            ))
 
             # notify: → CALLS
             notify_node = _yaml_get_key(task_node, "notify")
             if notify_node is not None:
                 for handler_name in self._ansible_extract_notify_targets(notify_node):
-                    edges.append(
-                        EdgeInfo(
-                            kind="CALLS",
-                            source=task_qn,
-                            target=handler_name,
-                            file_path=file_path,
-                            line=_yaml_line(notify_node),
-                            extra={"ansible_kind": "notify"},
-                        )
-                    )
+                    edges.append(EdgeInfo(
+                        kind="CALLS",
+                        source=task_qn,
+                        target=handler_name,
+                        file_path=file_path,
+                        line=_yaml_line(notify_node),
+                        extra={"ansible_kind": "notify"},
+                    ))
 
             # include_tasks / import_tasks → IMPORTS_FROM (filename)
             if module_short in ("include_tasks", "import_tasks"):
                 target_file = self._ansible_module_arg_str(module_args_node)
                 if target_file:
-                    edges.append(
-                        EdgeInfo(
-                            kind="IMPORTS_FROM",
-                            source=task_qn,
-                            target=target_file,
-                            file_path=file_path,
-                            line=_yaml_line(task_node),
-                            extra={"ansible_kind": module_short},
-                        )
-                    )
+                    edges.append(EdgeInfo(
+                        kind="IMPORTS_FROM",
+                        source=task_qn,
+                        target=target_file,
+                        file_path=file_path,
+                        line=_yaml_line(task_node),
+                        extra={"ansible_kind": module_short},
+                    ))
 
             # include_role / import_role → IMPORTS_FROM (role name)
             if module_short in ("include_role", "import_role"):
                 role_name = self._ansible_role_from_module_args(module_args_node)
                 if role_name:
-                    edges.append(
-                        EdgeInfo(
-                            kind="IMPORTS_FROM",
-                            source=task_qn,
-                            target=role_name,
-                            file_path=file_path,
-                            line=_yaml_line(task_node),
-                            extra={"ansible_kind": module_short},
-                        )
-                    )
+                    edges.append(EdgeInfo(
+                        kind="IMPORTS_FROM",
+                        source=task_qn,
+                        target=role_name,
+                        file_path=file_path,
+                        line=_yaml_line(task_node),
+                        extra={"ansible_kind": module_short},
+                    ))
 
             # include_vars → IMPORTS_FROM (file or dir)
             if module_short == "include_vars":
                 var_target = self._ansible_module_arg_str(module_args_node)
                 if var_target:
-                    edges.append(
-                        EdgeInfo(
-                            kind="IMPORTS_FROM",
-                            source=task_qn,
-                            target=var_target,
-                            file_path=file_path,
-                            line=_yaml_line(task_node),
-                            extra={"ansible_kind": "include_vars"},
-                        )
-                    )
+                    edges.append(EdgeInfo(
+                        kind="IMPORTS_FROM",
+                        source=task_qn,
+                        target=var_target,
+                        file_path=file_path,
+                        line=_yaml_line(task_node),
+                        extra={"ansible_kind": "include_vars"},
+                    ))
 
             # block / rescue / always → recurse with same parent
             for block_key in ("block", "rescue", "always"):
                 block_node = _yaml_get_key(task_node, block_key)
                 if block_node is not None:
                     self._parse_ansible_tasks(
-                        block_node,
-                        file_path,
-                        nodes,
-                        edges,
+                        block_node, file_path, nodes, edges,
                         is_handler=is_handler,
                         parent_play=parent_play,
                     )
@@ -6733,16 +12242,14 @@ class CodeParser:
         for dep_item in deps_node.value:
             dep_name = self._ansible_extract_role_name(dep_item)
             if dep_name:
-                edges.append(
-                    EdgeInfo(
-                        kind="DEPENDS_ON",
-                        source=file_path,
-                        target=dep_name,
-                        file_path=file_path,
-                        line=_yaml_line(dep_item),
-                        extra={"ansible_kind": "role_dependency"},
-                    )
-                )
+                edges.append(EdgeInfo(
+                    kind="DEPENDS_ON",
+                    source=file_path,
+                    target=dep_name,
+                    file_path=file_path,
+                    line=_yaml_line(dep_item),
+                    extra={"ansible_kind": "role_dependency"},
+                ))
 
     def _ansible_extract_role_name(self, item: object) -> Optional[str]:
         """Extract a role name from a roles-list item.
@@ -6750,7 +12257,7 @@ class CodeParser:
         Handles: plain string, ``{role: name}`` dict, ``{name: ns.role}`` dict.
         """
         if isinstance(item, _YamlScalar):
-            return item.value or None
+            return item.value or None  # type: ignore[attr-defined]
         if isinstance(item, _YamlMapping):
             for key in ("role", "name"):
                 v = _yaml_get_key(item, key)
@@ -6762,12 +12269,12 @@ class CodeParser:
     def _ansible_extract_notify_targets(self, notify_node: object) -> list[str]:
         """Extract handler names from a notify: value (scalar or sequence)."""
         if isinstance(notify_node, _YamlScalar):
-            return [notify_node.value] if notify_node.value else []
+            return [notify_node.value] if notify_node.value else []  # type: ignore[attr-defined]
         if isinstance(notify_node, _YamlSequence):
             return [
-                item.value
-                for item in notify_node.value
-                if isinstance(item, _YamlScalar) and item.value
+                item.value  # type: ignore[attr-defined]
+                for item in notify_node.value  # type: ignore[attr-defined]
+                if isinstance(item, _YamlScalar) and item.value  # type: ignore[attr-defined]
             ]
         return []
 
@@ -6780,7 +12287,7 @@ class CodeParser:
         if args_node is None:
             return None
         if isinstance(args_node, _YamlScalar):
-            return args_node.value or None
+            return args_node.value or None  # type: ignore[attr-defined]
         if isinstance(args_node, _YamlMapping):
             for key in ("file", "_raw_params"):
                 v = _yaml_get_key(args_node, key)
@@ -6794,7 +12301,7 @@ class CodeParser:
         if args_node is None:
             return None
         if isinstance(args_node, _YamlScalar):
-            return args_node.value or None
+            return args_node.value or None  # type: ignore[attr-defined]
         if isinstance(args_node, _YamlMapping):
             v = _yaml_get_key(args_node, "name")
             return _yaml_scalar(v)
@@ -6813,7 +12320,9 @@ class CodeParser:
         import_map: Optional[dict[str, str]] = None,
         defined_names: Optional[set[str]] = None,
         _depth: int = 0,
-        _go_receiver_bindings: Optional[tuple[str, tuple[int, ...], tuple[int, ...]]] = None,
+        _go_receiver_bindings: Optional[
+            tuple[str, tuple[int, ...], tuple[int, ...]]
+        ] = None,
     ) -> None:
         """Recursively walk the AST and extract nodes/edges."""
         if _depth > self._MAX_AST_DEPTH:
@@ -6828,34 +12337,17 @@ class CodeParser:
 
             # --- R-specific constructs ---
             if language == "r" and self._extract_r_constructs(
-                child,
-                node_type,
-                source,
-                language,
-                file_path,
-                nodes,
-                edges,
-                enclosing_class,
-                enclosing_func,
-                import_map,
-                defined_names,
+                child, node_type, source, language, file_path,
+                nodes, edges, enclosing_class, enclosing_func,
+                import_map, defined_names,
             ):
                 continue
 
             # --- Lua/Luau-specific constructs ---
             if language in ("lua", "luau") and self._extract_lua_constructs(
-                child,
-                node_type,
-                source,
-                language,
-                file_path,
-                nodes,
-                edges,
-                enclosing_class,
-                enclosing_func,
-                import_map,
-                defined_names,
-                _depth,
+                child, node_type, source, language, file_path,
+                nodes, edges, enclosing_class, enclosing_func,
+                import_map, defined_names, _depth,
             ):
                 continue
 
@@ -6866,18 +12358,9 @@ class CodeParser:
             # TestDecl nodes (functions, structs/unions/enums, @import,
             # test blocks) and walks call sites itself.
             if language == "zig" and self._extract_zig_constructs(
-                child,
-                node_type,
-                source,
-                language,
-                file_path,
-                nodes,
-                edges,
-                enclosing_class,
-                enclosing_func,
-                import_map,
-                defined_names,
-                _depth,
+                child, node_type, source, language, file_path,
+                nodes, edges, enclosing_class, enclosing_func,
+                import_map, defined_names, _depth,
             ):
                 continue
 
@@ -6887,9 +12370,7 @@ class CodeParser:
             # cross-script wiring works the same as in other languages.
             if language == "bash" and node_type == "command":
                 if self._extract_bash_source_command(
-                    child,
-                    file_path,
-                    edges,
+                    child, file_path, edges,
                 ):
                     continue
 
@@ -6902,17 +12383,9 @@ class CodeParser:
             # bodies with the correct enclosing scope. See: #112
             if language == "elixir" and node_type == "call":
                 if self._extract_elixir_constructs(
-                    child,
-                    source,
-                    language,
-                    file_path,
-                    nodes,
-                    edges,
-                    enclosing_class,
-                    enclosing_func,
-                    import_map,
-                    defined_names,
-                    _depth,
+                    child, source, language, file_path, nodes, edges,
+                    enclosing_class, enclosing_func,
+                    import_map, defined_names, _depth,
                 ):
                     continue
 
@@ -6924,17 +12397,9 @@ class CodeParser:
             # applications. See: #366 follow-up (flake-aware Nix support).
             if language == "nix" and node_type == "binding":
                 if self._extract_nix_constructs(
-                    child,
-                    source,
-                    language,
-                    file_path,
-                    nodes,
-                    edges,
-                    enclosing_class,
-                    enclosing_func,
-                    import_map,
-                    defined_names,
-                    _depth,
+                    child, source, language, file_path, nodes, edges,
+                    enclosing_class, enclosing_func,
+                    import_map, defined_names, _depth,
                 ):
                     continue
 
@@ -6946,10 +12411,7 @@ class CodeParser:
             # IMPORTS_FROM/REFERENCES edges.  See issue #199.
             if language == "hcl" and node_type == "block":
                 if self._extract_hcl_constructs(
-                    child,
-                    file_path,
-                    nodes,
-                    edges,
+                    child, file_path, nodes, edges,
                 ):
                     continue
 
@@ -6960,18 +12422,9 @@ class CodeParser:
             # need recursion into bodies that may themselves contain
             # function definitions (e.g. ``@inline function f ... end``).
             if language == "julia" and self._extract_julia_constructs(
-                child,
-                node_type,
-                source,
-                language,
-                file_path,
-                nodes,
-                edges,
-                enclosing_class,
-                enclosing_func,
-                import_map,
-                defined_names,
-                _depth,
+                child, node_type, source, language, file_path,
+                nodes, edges, enclosing_class, enclosing_func,
+                import_map, defined_names, _depth,
             ):
                 continue
 
@@ -7008,19 +12461,18 @@ class CodeParser:
             # for any we find; nested calls are handled by the main recursion.
             if language == "dart":
                 self._extract_dart_calls_from_children(
-                    child,
-                    source,
-                    file_path,
-                    edges,
-                    enclosing_class,
-                    enclosing_func,
+                    child, source, file_path, edges,
+                    enclosing_class, enclosing_func,
                 )
 
             # --- JS/TS static CommonJS and dynamic imports ---
             # Treat only literal module specifiers as definite dependencies.
             # Dynamic templates and path.join/path.resolve expressions are
             # intentionally left unresolved rather than guessed.
-            if language in ("javascript", "typescript", "tsx") and node_type == "call_expression":
+            if (
+                language in ("javascript", "typescript", "tsx")
+                and node_type == "call_expression"
+            ):
                 self._extract_js_module_call(child, file_path, language, edges)
 
             # --- JS/TS variable-assigned functions (const foo = () => {}) ---
@@ -7028,32 +12480,17 @@ class CodeParser:
                 language in ("javascript", "typescript", "tsx")
                 and node_type in ("lexical_declaration", "variable_declaration")
                 and self._extract_js_var_functions(
-                    child,
-                    source,
-                    language,
-                    file_path,
-                    nodes,
-                    edges,
-                    enclosing_class,
-                    enclosing_func,
-                    import_map,
-                    defined_names,
-                    _depth,
+                    child, source, language, file_path, nodes, edges,
+                    enclosing_class, enclosing_func,
+                    import_map, defined_names, _depth,
                 )
             ):
                 continue
 
             # --- Classes ---
             if node_type in class_types and self._extract_classes(
-                child,
-                source,
-                language,
-                file_path,
-                nodes,
-                edges,
-                enclosing_class,
-                import_map,
-                defined_names,
+                child, source, language, file_path, nodes, edges,
+                enclosing_class, import_map, defined_names,
                 _depth,
             ):
                 continue
@@ -7063,17 +12500,9 @@ class CodeParser:
                 language in ("javascript", "typescript", "tsx")
                 and node_type == "public_field_definition"
                 and self._extract_js_field_function(
-                    child,
-                    source,
-                    language,
-                    file_path,
-                    nodes,
-                    edges,
-                    enclosing_class,
-                    enclosing_func,
-                    import_map,
-                    defined_names,
-                    _depth,
+                    child, source, language, file_path, nodes, edges,
+                    enclosing_class, enclosing_func,
+                    import_map, defined_names, _depth,
                 )
             ):
                 continue
@@ -7083,45 +12512,25 @@ class CodeParser:
                 language in ("javascript", "typescript", "tsx")
                 and node_type == "expression_statement"
                 and self._extract_js_member_functions(
-                    child,
-                    source,
-                    language,
-                    file_path,
-                    nodes,
-                    edges,
-                    enclosing_class,
-                    enclosing_func,
-                    import_map,
-                    defined_names,
-                    _depth,
+                    child, source, language, file_path, nodes, edges,
+                    enclosing_class, enclosing_func,
+                    import_map, defined_names, _depth,
                 )
             ):
                 continue
 
             # --- Functions ---
             if node_type in func_types and self._extract_functions(
-                child,
-                source,
-                language,
-                file_path,
-                nodes,
-                edges,
-                enclosing_class,
-                import_map,
-                defined_names,
-                _depth,
-                enclosing_func,
+                child, source, language, file_path, nodes, edges,
+                enclosing_class, import_map, defined_names,
+                _depth, enclosing_func,
             ):
                 continue
 
             # --- Imports ---
             if node_type in import_types:
                 if self._extract_imports(
-                    child,
-                    language,
-                    source,
-                    file_path,
-                    edges,
+                    child, language, source, file_path, edges,
                 ):
                     continue
                 # Node type is shared between imports and calls (e.g. Ruby
@@ -7132,89 +12541,51 @@ class CodeParser:
             # --- Calls ---
             if node_type in call_types:
                 if self._extract_calls(
-                    child,
-                    source,
-                    language,
-                    file_path,
-                    nodes,
-                    edges,
-                    enclosing_class,
-                    enclosing_func,
-                    import_map,
-                    defined_names,
-                    _depth,
-                    _go_receiver_bindings,
+                    child, source, language, file_path, nodes, edges,
+                    enclosing_class, enclosing_func,
+                    import_map, defined_names, _depth, _go_receiver_bindings,
                 ):
                     continue
 
             # --- JSX component invocations ---
-            if language in ("javascript", "typescript", "tsx") and node_type in (
-                "jsx_opening_element",
-                "jsx_self_closing_element",
+            if (
+                language in ("javascript", "typescript", "tsx")
+                and node_type in ("jsx_opening_element", "jsx_self_closing_element")
             ):
                 self._extract_jsx_component_call(
-                    child,
-                    language,
-                    file_path,
-                    edges,
-                    enclosing_class,
-                    enclosing_func,
-                    import_map,
-                    defined_names,
+                    child, language, file_path, edges,
+                    enclosing_class, enclosing_func,
+                    import_map, defined_names,
                 )
 
             # --- TS type-position references ---
             if language in ("typescript", "tsx") and node_type == "type_identifier":
                 self._extract_ts_type_reference(
-                    child,
-                    language,
-                    file_path,
-                    edges,
-                    enclosing_class,
-                    enclosing_func,
-                    import_map,
-                    defined_names,
+                    child, language, file_path, edges,
+                    enclosing_class, enclosing_func,
+                    import_map, defined_names,
                 )
 
             # --- Value references (function-as-value in maps, arrays, args) ---
             self._extract_value_references(
-                child,
-                node_type,
-                source,
-                language,
-                file_path,
-                edges,
-                enclosing_class,
-                enclosing_func,
-                import_map,
-                defined_names,
+                child, node_type, source, language, file_path, edges,
+                enclosing_class, enclosing_func,
+                import_map, defined_names,
             )
 
             # --- Solidity-specific constructs ---
             if language == "solidity" and self._extract_solidity_constructs(
-                child,
-                node_type,
-                source,
-                file_path,
-                nodes,
-                edges,
-                enclosing_class,
-                enclosing_func,
+                child, node_type, source, file_path, nodes, edges,
+                enclosing_class, enclosing_func,
             ):
                 continue
 
             # Recurse for other node types
             self._extract_from_tree(
-                child,
-                source,
-                language,
-                file_path,
-                nodes,
-                edges,
+                child, source, language, file_path, nodes, edges,
                 enclosing_class=enclosing_class,
                 enclosing_func=enclosing_func,
-                import_map=import_map,
-                defined_names=defined_names,
+                import_map=import_map, defined_names=defined_names,
                 _depth=_depth + 1,
                 _go_receiver_bindings=_go_receiver_bindings,
             )
@@ -7252,9 +12623,7 @@ class CodeParser:
         return None
 
     def _elixir_function_name_and_params(
-        self,
-        arguments,
-        source: bytes,
+        self, arguments, source: bytes,
     ) -> tuple[Optional[str], Optional[str]]:
         """Extract the function name and parameter list from a ``def``/
         ``defp``/``defmacro`` arguments node.
@@ -7263,7 +12632,25 @@ class CodeParser:
         first child is the function's identifier and whose children
         (past the parens) are the parameters.
         """
+        def function_head(node):
+            if node.type != "binary_operator":
+                return node
+            operator = next(
+                (child for child in node.children
+                 if child.text.decode("utf-8", errors="replace") == "when"),
+                None,
+            )
+            if operator is None:
+                return None
+            left = node.child_by_field_name("left")
+            if left is None:
+                return None
+            return function_head(left)
+
         for child in arguments.children:
+            child = function_head(child)
+            if child is None:
+                continue
             if child.type == "call":
                 name: Optional[str] = None
                 for sub in child.children:
@@ -7274,7 +12661,7 @@ class CodeParser:
                 params_text = child.text.decode("utf-8", errors="replace")
                 # Strip the function name off the front.
                 if name and params_text.startswith(name):
-                    params_text = params_text[len(name) :]
+                    params_text = params_text[len(name):]
                 return name, params_text
             if child.type == "identifier":
                 # Zero-arity def like `def reset, do: ...` has no inner
@@ -7322,39 +12709,29 @@ class CodeParser:
             if mod_name is None:
                 return False
             qualified = self._qualify(mod_name, file_path, None)
-            nodes.append(
-                NodeInfo(
-                    kind="Class",
-                    name=mod_name,
-                    file_path=file_path,
-                    line_start=node.start_point[0] + 1,
-                    line_end=node.end_point[0] + 1,
-                    language=language,
-                    parent_name=None,
-                )
-            )
+            nodes.append(NodeInfo(
+                kind="Class",
+                name=mod_name,
+                file_path=file_path,
+                line_start=node.start_point[0] + 1,
+                line_end=node.end_point[0] + 1,
+                language=language,
+                parent_name=None,
+            ))
             # CONTAINS file -> module
-            edges.append(
-                EdgeInfo(
-                    kind="CONTAINS",
-                    source=file_path,
-                    target=qualified,
-                    file_path=file_path,
-                    line=node.start_point[0] + 1,
-                )
-            )
+            edges.append(EdgeInfo(
+                kind="CONTAINS",
+                source=file_path,
+                target=qualified,
+                file_path=file_path,
+                line=node.start_point[0] + 1,
+            ))
             if do_block is not None:
                 self._extract_from_tree(
-                    do_block,
-                    source,
-                    language,
-                    file_path,
-                    nodes,
-                    edges,
+                    do_block, source, language, file_path, nodes, edges,
                     enclosing_class=mod_name,
                     enclosing_func=None,
-                    import_map=import_map,
-                    defined_names=defined_names,
+                    import_map=import_map, defined_names=defined_names,
                     _depth=_depth + 1,
                 )
             return True
@@ -7371,53 +12748,55 @@ class CodeParser:
             if arguments is None:
                 return False
             fn_name, params = self._elixir_function_name_and_params(
-                arguments,
-                source,
+                arguments, source,
             )
             if fn_name is None:
                 return False
-            is_test = _is_test_function(fn_name, file_path)
+            is_test = _is_test_function(fn_name, file_path, repo_root=self._repo_root)
             kind = "Test" if is_test else "Function"
             qualified = self._qualify(fn_name, file_path, enclosing_class)
-            nodes.append(
-                NodeInfo(
-                    kind=kind,
-                    name=fn_name,
-                    file_path=file_path,
-                    line_start=node.start_point[0] + 1,
-                    line_end=node.end_point[0] + 1,
-                    language=language,
-                    parent_name=enclosing_class,
-                    params=params,
-                    is_test=is_test,
-                )
-            )
+            nodes.append(NodeInfo(
+                kind=kind,
+                name=fn_name,
+                file_path=file_path,
+                line_start=node.start_point[0] + 1,
+                line_end=node.end_point[0] + 1,
+                language=language,
+                parent_name=enclosing_class,
+                params=params,
+                is_test=is_test,
+            ))
             container = (
-                self._qualify(enclosing_class, file_path, None) if enclosing_class else file_path
+                self._qualify(enclosing_class, file_path, None)
+                if enclosing_class else file_path
             )
-            edges.append(
-                EdgeInfo(
-                    kind="CONTAINS",
-                    source=container,
-                    target=qualified,
-                    file_path=file_path,
-                    line=node.start_point[0] + 1,
-                )
-            )
+            edges.append(EdgeInfo(
+                kind="CONTAINS",
+                source=container,
+                target=qualified,
+                file_path=file_path,
+                line=node.start_point[0] + 1,
+            ))
             if do_block is not None:
                 self._extract_from_tree(
-                    do_block,
-                    source,
-                    language,
-                    file_path,
-                    nodes,
-                    edges,
+                    do_block, source, language, file_path, nodes, edges,
                     enclosing_class=enclosing_class,
                     enclosing_func=fn_name,
-                    import_map=import_map,
-                    defined_names=defined_names,
+                    import_map=import_map, defined_names=defined_names,
                     _depth=_depth + 1,
                 )
+            else:
+                # Short form ``def f(x), do: g(x)``: the body is a keyword
+                # argument of the ``def`` call rather than a do_block.
+                for sub in arguments.children:
+                    if sub.type == "keywords":
+                        self._extract_from_tree(
+                            sub, source, language, file_path, nodes, edges,
+                            enclosing_class=enclosing_class,
+                            enclosing_func=fn_name,
+                            import_map=import_map, defined_names=defined_names,
+                            _depth=_depth + 1,
+                        )
             return True
 
         # ---- alias / import / require / use ----------------------------
@@ -7426,15 +12805,13 @@ class CodeParser:
                 if sub.type == "arguments":
                     mod = self._elixir_module_name(sub)
                     if mod is not None:
-                        edges.append(
-                            EdgeInfo(
-                                kind="IMPORTS_FROM",
-                                source=file_path,
-                                target=mod,
-                                file_path=file_path,
-                                line=node.start_point[0] + 1,
-                            )
-                        )
+                        edges.append(EdgeInfo(
+                            kind="IMPORTS_FROM",
+                            source=file_path,
+                            target=mod,
+                            file_path=file_path,
+                            line=node.start_point[0] + 1,
+                        ))
                     break
             return True
 
@@ -7450,38 +12827,63 @@ class CodeParser:
             else file_path
         )
         target = self._resolve_call_target(
-            call_name,
-            file_path,
-            language,
-            import_map or {},
-            defined_names or set(),
+            call_name, file_path, language,
+            import_map or {}, defined_names or set(),
         )
-        edges.append(
-            EdgeInfo(
-                kind="CALLS",
-                source=caller,
-                target=target,
-                file_path=file_path,
-                line=node.start_point[0] + 1,
-            )
-        )
+        edges.append(EdgeInfo(
+            kind="CALLS",
+            source=caller,
+            target=target,
+            file_path=file_path,
+            line=node.start_point[0] + 1,
+        ))
         # Recurse into arguments + do_block so nested calls are caught.
         for sub in node.children:
             if sub.type in ("arguments", "do_block"):
                 self._extract_from_tree(
-                    sub,
-                    source,
-                    language,
-                    file_path,
-                    nodes,
-                    edges,
+                    sub, source, language, file_path, nodes, edges,
                     enclosing_class=enclosing_class,
                     enclosing_func=enclosing_func,
-                    import_map=import_map,
-                    defined_names=defined_names,
+                    import_map=import_map, defined_names=defined_names,
                     _depth=_depth + 1,
                 )
         return True
+
+    def _merge_elixir_clauses(
+        self, nodes: list[NodeInfo], edges: list[EdgeInfo],
+    ) -> tuple[list[NodeInfo], list[EdgeInfo]]:
+        """Give each multi-clause Elixir function one node spanning its clauses.
+
+        Each clause is its own ``def``, but they share one qualified name and
+        the graph keeps one node per name, so the last clause overwrote the
+        others: the earlier lines belonged to no function and a change there
+        was missed. Calls in every clause already name the shared function as
+        their source, so only the node and its CONTAINS edge need merging. The
+        first clause keeps its parameters: a head with defaults comes first.
+        See: #979
+        """
+        first_clauses: dict[str, NodeInfo] = {}
+        merged_nodes: list[NodeInfo] = []
+        for node in nodes:
+            if node.kind not in ("Function", "Test"):
+                merged_nodes.append(node)
+                continue
+            first = first_clauses.setdefault(self._node_qualified(node), node)
+            if first is node:
+                merged_nodes.append(node)
+                continue
+            first.line_start = min(first.line_start, node.line_start)
+            first.line_end = max(first.line_end, node.line_end)
+
+        contained: set[tuple[str, str]] = set()
+        merged_edges: list[EdgeInfo] = []
+        for edge in edges:
+            if edge.kind == "CONTAINS":
+                if (edge.source, edge.target) in contained:
+                    continue
+                contained.add((edge.source, edge.target))
+            merged_edges.append(edge)
+        return merged_nodes, merged_edges
 
     @staticmethod
     def _is_nix_flake_file(file_path: str) -> bool:
@@ -7502,8 +12904,7 @@ class CodeParser:
         return parts
 
     def _extract_nix_flake_input_urls(
-        self,
-        attrset_node,
+        self, attrset_node,
     ) -> list[tuple[str, int]]:
         """Walk a Nix ``attrset_expression`` looking for ``*.url = "..."``
         bindings whose RHS is a literal string. Returns ``(url, line)``
@@ -7531,7 +12932,11 @@ class CodeParser:
                             inner_rhs = sub
                 if inner_path is not None and inner_rhs is not None:
                     parts = self._nix_attrpath_parts(inner_path)
-                    if parts and parts[-1] == "url" and inner_rhs.type == "string_expression":
+                    if (
+                        parts
+                        and parts[-1] == "url"
+                        and inner_rhs.type == "string_expression"
+                    ):
                         for c in inner_rhs.children:
                             if c.type == "string_fragment":
                                 url = c.text.decode("utf-8", errors="replace")
@@ -7692,15 +13097,13 @@ class CodeParser:
                     url = c.text.decode("utf-8", errors="replace")
                     break
             if url:
-                edges.append(
-                    EdgeInfo(
-                        kind="IMPORTS_FROM",
-                        source=file_path,
-                        target=url,
-                        file_path=file_path,
-                        line=line,
-                    )
-                )
+                edges.append(EdgeInfo(
+                    kind="IMPORTS_FROM",
+                    source=file_path,
+                    target=url,
+                    file_path=file_path,
+                    line=line,
+                ))
                 return True
 
         # Nested form: ``inputs = { nixpkgs.url = "..."; ... };`` — emit an
@@ -7714,69 +13117,56 @@ class CodeParser:
             and rhs_node.type == "attrset_expression"
         ):
             for url, uline in self._extract_nix_flake_input_urls(rhs_node):
-                edges.append(
-                    EdgeInfo(
-                        kind="IMPORTS_FROM",
-                        source=file_path,
-                        target=url,
-                        file_path=file_path,
-                        line=uline,
-                    )
-                )
+                edges.append(EdgeInfo(
+                    kind="IMPORTS_FROM",
+                    source=file_path,
+                    target=url,
+                    file_path=file_path,
+                    line=uline,
+                ))
 
         # --- Regular binding → Function node -----------------------------
         qualified = self._qualify(name, file_path, enclosing_class)
-        nodes.append(
-            NodeInfo(
-                kind="Function",
-                name=name,
-                file_path=file_path,
-                line_start=line,
-                line_end=node.end_point[0] + 1,
-                language=language,
-                parent_name=enclosing_class,
-            )
-        )
+        nodes.append(NodeInfo(
+            kind="Function",
+            name=name,
+            file_path=file_path,
+            line_start=line,
+            line_end=node.end_point[0] + 1,
+            language=language,
+            parent_name=enclosing_class,
+        ))
         container = (
-            self._qualify(enclosing_class, file_path, None) if enclosing_class else file_path
+            self._qualify(enclosing_class, file_path, None)
+            if enclosing_class else file_path
         )
-        edges.append(
-            EdgeInfo(
-                kind="CONTAINS",
-                source=container,
-                target=qualified,
-                file_path=file_path,
-                line=line,
-            )
-        )
+        edges.append(EdgeInfo(
+            kind="CONTAINS",
+            source=container,
+            target=qualified,
+            file_path=file_path,
+            line=line,
+        ))
 
         # --- IMPORTS_FROM edges for import / callPackage inside the RHS --
         for target, tline in self._extract_nix_import_targets(rhs_node):
             resolved = self._resolve_module_to_file(target, file_path, "nix")
-            edges.append(
-                EdgeInfo(
-                    kind="IMPORTS_FROM",
-                    source=file_path,
-                    target=resolved if resolved else target,
-                    file_path=file_path,
-                    line=tline,
-                )
-            )
+            edges.append(EdgeInfo(
+                kind="IMPORTS_FROM",
+                source=file_path,
+                target=resolved if resolved else target,
+                file_path=file_path,
+                line=tline,
+            ))
 
         # Recurse into the RHS so nested bindings become their own nodes
         # (e.g. ``outputs = ...: { packages.default = ...; }`` surfaces
         # ``packages.default`` as a top-level-named Function node too).
         self._extract_from_tree(
-            rhs_node,
-            source,
-            language,
-            file_path,
-            nodes,
-            edges,
+            rhs_node, source, language, file_path, nodes, edges,
             enclosing_class=enclosing_class,
             enclosing_func=enclosing_func,
-            import_map=import_map,
-            defined_names=defined_names,
+            import_map=import_map, defined_names=defined_names,
             _depth=_depth + 1,
         )
         return True
@@ -7829,27 +13219,21 @@ class CodeParser:
         if name is None:
             return True
 
+        if block_type == "provider" and body_node is not None:
+            alias = self._hcl_get_attribute_string(body_node, "alias")
+            if alias:
+                name += f".{alias}"
+
         qualified = self._qualify(name, file_path, None)
-        nodes.append(
-            NodeInfo(
-                kind=kind,
-                name=name,
-                file_path=file_path,
-                line_start=line_start,
-                line_end=node.end_point[0] + 1,
-                language="hcl",
-                extra={"hcl_type": block_type},
-            )
-        )
-        edges.append(
-            EdgeInfo(
-                kind="CONTAINS",
-                source=file_path,
-                target=qualified,
-                file_path=file_path,
-                line=line_start,
-            )
-        )
+        nodes.append(NodeInfo(
+            kind=kind, name=name, file_path=file_path,
+            line_start=line_start, line_end=node.end_point[0] + 1,
+            language="hcl", extra={"hcl_type": block_type},
+        ))
+        edges.append(EdgeInfo(
+            kind="CONTAINS", source=file_path, target=qualified,
+            file_path=file_path, line=line_start,
+        ))
 
         if body_node is None:
             return True
@@ -7858,18 +13242,21 @@ class CodeParser:
             src = self._hcl_get_attribute_string(body_node, "source")
             if src:
                 resolved = self._resolve_module_to_file(src, file_path, "hcl")
-                edges.append(
-                    EdgeInfo(
-                        kind="IMPORTS_FROM",
-                        source=file_path,
-                        target=resolved or src,
-                        file_path=file_path,
-                        line=line_start,
-                    )
-                )
+                edges.append(EdgeInfo(
+                    kind="IMPORTS_FROM", source=file_path, target=resolved or src,
+                    file_path=file_path, line=line_start,
+                ))
 
         if emit_refs:
-            self._walk_hcl_expressions(body_node, file_path, edges, name)
+            provider_attributes = (
+                frozenset({"provider"}) if block_type in ("resource", "data")
+                else frozenset({"providers"}) if block_type == "module"
+                else frozenset()
+            )
+            self._walk_hcl_expressions(
+                body_node, file_path, edges, name,
+                provider_body=body_node, provider_attributes=provider_attributes,
+            )
 
         return True
 
@@ -7891,26 +13278,16 @@ class CodeParser:
                 continue
             lname = f"local.{_hcl_text(key)}"
             lline = attr.start_point[0] + 1
-            nodes.append(
-                NodeInfo(
-                    kind="Function",
-                    name=lname,
-                    file_path=file_path,
-                    line_start=lline,
-                    line_end=attr.end_point[0] + 1,
-                    language="hcl",
-                    extra={"hcl_type": "local"},
-                )
-            )
-            edges.append(
-                EdgeInfo(
-                    kind="CONTAINS",
-                    source=file_path,
-                    target=self._qualify(lname, file_path, None),
-                    file_path=file_path,
-                    line=lline,
-                )
-            )
+            nodes.append(NodeInfo(
+                kind="Function", name=lname, file_path=file_path,
+                line_start=lline, line_end=attr.end_point[0] + 1,
+                language="hcl", extra={"hcl_type": "local"},
+            ))
+            edges.append(EdgeInfo(
+                kind="CONTAINS", source=file_path,
+                target=self._qualify(lname, file_path, None),
+                file_path=file_path, line=lline,
+            ))
             self._walk_hcl_expressions(attr, file_path, edges, lname)
         return True
 
@@ -7942,6 +13319,10 @@ class CodeParser:
         edges: list[EdgeInfo],
         enclosing_name: str,
         local_names: frozenset[str] = frozenset(),
+        *,
+        provider_body=None,
+        provider_attributes: frozenset[str] = frozenset(),
+        provider_context: bool = False,
     ) -> None:
         """Emit REFERENCES edges for every HCL variable reference under *node*.
 
@@ -7955,28 +13336,46 @@ class CodeParser:
             for root, attrs, line in _hcl_variable_refs(node):
                 if root in local_names:
                     continue
-                ref = _hcl_ref_target(root, attrs)
+                ref = _hcl_ref_target(root, attrs, provider=provider_context)
                 if ref:
-                    edges.append(
-                        EdgeInfo(
-                            kind="REFERENCES",
-                            source=self._qualify(enclosing_name, file_path, None),
-                            target=self._qualify(ref, file_path, None),
-                            file_path=file_path,
-                            line=line,
-                        )
-                    )
+                    edges.append(EdgeInfo(
+                        kind="REFERENCES",
+                        source=self._qualify(enclosing_name, file_path, None),
+                        target=self._qualify(ref, file_path, None),
+                        file_path=file_path,
+                        line=line,
+                    ))
         for child in node.children:
             if child.type not in _HCL_RECURSE_TYPES:
                 continue
+            # Module provider-map keys name the child's provider slots;
+            # only their values refer to providers in this module.
+            if provider_context and node.type == "object_elem":
+                if child == node.child_by_field_name("key"):
+                    continue
+            child_provider_context = provider_context
+            if child.type == "attribute":
+                key = _hcl_child(child, "identifier")
+                child_provider_context = (
+                    child.parent == provider_body
+                    and key is not None
+                    and _hcl_text(key) in provider_attributes
+                )
             child_local_names = local_names
             if child.type == "block":
                 iter_name = _hcl_dynamic_iterator_name(child)
                 if iter_name:
                     child_local_names = local_names | {iter_name}
             elif child.type == "for_expr":
-                child_local_names = local_names | _hcl_for_iterator_names(child)
-            self._walk_hcl_expressions(child, file_path, edges, enclosing_name, child_local_names)
+                child_local_names = (
+                    local_names | _hcl_for_iterator_names(child)
+                )
+            self._walk_hcl_expressions(
+                child, file_path, edges, enclosing_name, child_local_names,
+                provider_body=provider_body, provider_attributes=provider_attributes,
+                provider_context=child_provider_context,
+            )
+
 
     def _extract_bash_source_command(
         self,
@@ -8004,15 +13403,13 @@ class CodeParser:
             target = args[0]
             # Try to resolve relative paths to real files
             resolved = self._resolve_module_to_file(target, file_path, "bash")
-            edges.append(
-                EdgeInfo(
-                    kind="IMPORTS_FROM",
-                    source=file_path,
-                    target=resolved if resolved else target,
-                    file_path=file_path,
-                    line=node.start_point[0] + 1,
-                )
-            )
+            edges.append(EdgeInfo(
+                kind="IMPORTS_FROM",
+                source=file_path,
+                target=resolved if resolved else target,
+                file_path=file_path,
+                line=node.start_point[0] + 1,
+            ))
             return True
         return False
 
@@ -8063,7 +13460,9 @@ class CodeParser:
                     if ssub.type == "unconditional_assignable_selector":
                         for ident in ssub.children:
                             if ident.type == "identifier":
-                                method_name = ident.text.decode("utf-8", errors="replace")
+                                method_name = ident.text.decode(
+                                    "utf-8", errors="replace"
+                                )
                                 break
                     elif ssub.type == "argument_part":
                         has_arguments = True
@@ -8072,18 +13471,15 @@ class CodeParser:
                 if has_arguments and call_name:
                     src_qn = (
                         self._qualify(enclosing_func, file_path, enclosing_class)
-                        if enclosing_func
-                        else file_path
+                        if enclosing_func else file_path
                     )
-                    edges.append(
-                        EdgeInfo(
-                            kind="CALLS",
-                            source=src_qn,
-                            target=call_name,
-                            file_path=file_path,
-                            line=parent.start_point[0] + 1,
-                        )
-                    )
+                    edges.append(EdgeInfo(
+                        kind="CALLS",
+                        source=src_qn,
+                        target=call_name,
+                        file_path=file_path,
+                        line=parent.start_point[0] + 1,
+                    ))
                     # After emitting for this call, clear call_name so we
                     # don't re-emit on any trailing chained selector.
                     call_name = None
@@ -8117,16 +13513,9 @@ class CodeParser:
         # R: function definitions via assignment
         if node_type == "binary_operator":
             handled = self._handle_r_binary_operator(
-                child,
-                source,
-                language,
-                file_path,
-                nodes,
-                edges,
-                enclosing_class,
-                enclosing_func,
-                import_map,
-                defined_names,
+                child, source, language, file_path, nodes, edges,
+                enclosing_class, enclosing_func,
+                import_map, defined_names,
             )
             if handled:
                 return True
@@ -8134,16 +13523,9 @@ class CodeParser:
         # R: setClass/setRefClass/setGeneric calls and imports
         if node_type == "call":
             handled = self._handle_r_call(
-                child,
-                source,
-                language,
-                file_path,
-                nodes,
-                edges,
-                enclosing_class,
-                enclosing_func,
-                import_map,
-                defined_names,
+                child, source, language, file_path, nodes, edges,
+                enclosing_class, enclosing_func,
+                import_map, defined_names,
             )
             if handled:
                 return True
@@ -8179,15 +13561,12 @@ class CodeParser:
         return parts
 
     def _julia_field_info(
-        self,
-        field_expr,
+        self, field_expr,
     ) -> tuple[Optional[str], Optional[str]]:
         """Return ``(qualifier, leaf)`` for a Julia field expression."""
         semantic_children = [
-            child
-            for child in field_expr.children
-            if child.type
-            in (
+            child for child in field_expr.children
+            if child.type in (
                 "field_expression",
                 "identifier",
                 "quote_expression",
@@ -8209,8 +13588,7 @@ class CodeParser:
 
     @staticmethod
     def _julia_scope_join(
-        outer: Optional[str],
-        inner: Optional[str],
+        outer: Optional[str], inner: Optional[str],
     ) -> Optional[str]:
         """Join Julia scope paths without repeating an existing prefix."""
         if not outer:
@@ -8224,7 +13602,10 @@ class CodeParser:
     def _julia_signature_call(self, function_node):
         """Return the outer definition call inside a Julia signature."""
         signature = next(
-            (child for child in function_node.children if child.type == "signature"),
+            (
+                child for child in function_node.children
+                if child.type == "signature"
+            ),
             None,
         )
         if signature is None:
@@ -8232,19 +13613,19 @@ class CodeParser:
         scope = signature
         for _ in range(4):
             call = next(
-                (child for child in scope.children if child.type == "call_expression"),
+                (
+                    child for child in scope.children
+                    if child.type == "call_expression"
+                ),
                 None,
             )
             if call is not None:
                 return call
             wrapper = next(
                 (
-                    child
-                    for child in scope.children
-                    if child.type
-                    in (
-                        "where_expression",
-                        "typed_expression",
+                    child for child in scope.children
+                    if child.type in (
+                        "where_expression", "typed_expression",
                     )
                 ),
                 None,
@@ -8260,28 +13641,26 @@ class CodeParser:
         if call is not None:
             return call.children[0] if call.children else None
         signature = next(
-            (child for child in function_node.children if child.type == "signature"),
+            (
+                child for child in function_node.children
+                if child.type == "signature"
+            ),
             None,
         )
         if signature is None:
             return None
         return next(
             (
-                child
-                for child in signature.children
-                if child.type
-                in (
-                    "field_expression",
-                    "identifier",
-                    "operator",
+                child for child in signature.children
+                if child.type in (
+                    "field_expression", "identifier", "operator",
                 )
             ),
             None,
         )
 
     def _julia_definition_qualifier(
-        self,
-        function_node,
+        self, function_node,
     ) -> Optional[str]:
         callee = self._julia_signature_callee(function_node)
         if callee is None or callee.type != "field_expression":
@@ -8393,50 +13772,49 @@ class CodeParser:
         # constants stay on the generic path.
         if node_type == "const_statement":
             assignment = next(
-                (sub for sub in child.children if sub.type == "assignment"),
+                (
+                    sub for sub in child.children
+                    if sub.type == "assignment"
+                ),
                 None,
             )
             if assignment is not None and len(assignment.children) >= 3:
                 name_node = assignment.children[0]
                 value_node = assignment.children[-1]
-                if name_node.type == "identifier" and value_node.type in (
-                    "parametrized_type_expression",
-                    "curly_expression",
+                if (
+                    name_node.type == "identifier"
+                    and value_node.type in (
+                        "parametrized_type_expression",
+                        "curly_expression",
+                    )
                 ):
                     name = name_node.text.decode(
-                        "utf-8",
-                        errors="replace",
+                        "utf-8", errors="replace",
                     )
                     qualified = self._qualify(
-                        name,
-                        file_path,
-                        enclosing_class,
+                        name, file_path, enclosing_class,
                     )
-                    nodes.append(
-                        NodeInfo(
-                            kind="Type",
-                            name=name,
-                            file_path=file_path,
-                            line_start=child.start_point[0] + 1,
-                            line_end=child.end_point[0] + 1,
-                            language=language,
-                            parent_name=enclosing_class,
-                        )
-                    )
+                    nodes.append(NodeInfo(
+                        kind="Type",
+                        name=name,
+                        file_path=file_path,
+                        line_start=child.start_point[0] + 1,
+                        line_end=child.end_point[0] + 1,
+                        language=language,
+                        parent_name=enclosing_class,
+                    ))
                     container = (
                         self._qualify(enclosing_class, file_path, None)
                         if enclosing_class
                         else file_path
                     )
-                    edges.append(
-                        EdgeInfo(
-                            kind="CONTAINS",
-                            source=container,
-                            target=qualified,
-                            file_path=file_path,
-                            line=child.start_point[0] + 1,
-                        )
-                    )
+                    edges.append(EdgeInfo(
+                        kind="CONTAINS",
+                        source=container,
+                        target=qualified,
+                        file_path=file_path,
+                        line=child.start_point[0] + 1,
+                    ))
                     return True
 
         # --- Short-form function: assignment with call_expression LHS ---
@@ -8454,63 +13832,53 @@ class CodeParser:
             if lhs is not None and lhs.type == "call_expression":
                 name = self._julia_short_func_name(lhs)
                 if name:
-                    is_test = _is_test_function(name, file_path, ())
+                    is_test = _is_test_function(name, file_path, (), repo_root=self._repo_root)
                     kind = "Test" if is_test else "Function"
                     lexical_parent = self._julia_scope_join(
-                        enclosing_class,
-                        enclosing_func,
+                        enclosing_class, enclosing_func,
                     )
                     qualifier = self._julia_short_qualifier(lhs)
                     identity_parent = self._julia_scope_join(
-                        lexical_parent,
-                        qualifier,
+                        lexical_parent, qualifier,
                     )
                     qualified = self._qualify(
-                        name,
-                        file_path,
-                        identity_parent,
+                        name, file_path, identity_parent,
                     )
                     extra = {}
                     if qualifier:
                         extra["julia_module_qualifier"] = qualifier
-                    nodes.append(
-                        NodeInfo(
-                            kind=kind,
-                            name=name,
-                            file_path=file_path,
-                            line_start=child.start_point[0] + 1,
-                            line_end=child.end_point[0] + 1,
-                            language=language,
-                            parent_name=identity_parent,
-                            is_test=is_test,
-                            extra=extra,
-                        )
-                    )
+                    nodes.append(NodeInfo(
+                        kind=kind,
+                        name=name,
+                        file_path=file_path,
+                        line_start=child.start_point[0] + 1,
+                        line_end=child.end_point[0] + 1,
+                        language=language,
+                        parent_name=identity_parent,
+                        is_test=is_test,
+                        extra=extra,
+                    ))
                     container = (
                         self._qualify(lexical_parent, file_path, None)
                         if lexical_parent
                         else file_path
                     )
-                    edges.append(
-                        EdgeInfo(
-                            kind="CONTAINS",
-                            source=container,
-                            target=qualified,
+                    edges.append(EdgeInfo(
+                        kind="CONTAINS",
+                        source=container,
+                        target=qualified,
+                        file_path=file_path,
+                        line=child.start_point[0] + 1,
+                    ))
+                    if qualifier:
+                        edges.append(EdgeInfo(
+                            kind="REFERENCES",
+                            source=qualified,
+                            target=qualifier,
                             file_path=file_path,
                             line=child.start_point[0] + 1,
-                        )
-                    )
-                    if qualifier:
-                        edges.append(
-                            EdgeInfo(
-                                kind="REFERENCES",
-                                source=qualified,
-                                target=qualifier,
-                                file_path=file_path,
-                                line=child.start_point[0] + 1,
-                                extra={"julia_qualified_def": True},
-                            )
-                        )
+                            extra={"julia_qualified_def": True},
+                        ))
                     # Recurse into the RHS only (children after the ``=``
                     # operator) with this function as the enclosing scope
                     # so internal calls wire up correctly. Visiting the
@@ -8527,25 +13895,12 @@ class CodeParser:
                         # generic walker only visits a node's children.
                         if sub.type in call_types:
                             self._extract_calls(
-                                sub,
-                                source,
-                                language,
-                                file_path,
-                                nodes,
-                                edges,
-                                identity_parent,
-                                name,
-                                import_map,
-                                defined_names,
-                                _depth + 1,
+                                sub, source, language, file_path,
+                                nodes, edges, identity_parent, name,
+                                import_map, defined_names, _depth + 1,
                             )
                         self._extract_from_tree(
-                            sub,
-                            source,
-                            language,
-                            file_path,
-                            nodes,
-                            edges,
+                            sub, source, language, file_path, nodes, edges,
                             enclosing_class=identity_parent,
                             enclosing_func=name,
                             import_map=import_map,
@@ -8557,7 +13912,10 @@ class CodeParser:
         # --- Skip call_expression nodes that are actually function
         # signatures (``function foo(x) ... end`` has a ``signature >
         # call_expression`` that describes the definition, not a call).
-        if node_type == "call_expression" and self._julia_call_is_in_signature(child):
+        if (
+            node_type == "call_expression"
+            and self._julia_call_is_in_signature(child)
+        ):
             return True
 
         # --- include("file.jl") -> IMPORTS_FROM edge ---
@@ -8566,19 +13924,15 @@ class CodeParser:
                 path_arg = self._julia_string_arg(child)
                 if path_arg:
                     resolved = self._resolve_module_to_file(
-                        path_arg,
-                        file_path,
-                        language,
+                        path_arg, file_path, language,
                     )
-                    edges.append(
-                        EdgeInfo(
-                            kind="IMPORTS_FROM",
-                            source=file_path,
-                            target=resolved if resolved else path_arg,
-                            file_path=file_path,
-                            line=child.start_point[0] + 1,
-                        )
-                    )
+                    edges.append(EdgeInfo(
+                        kind="IMPORTS_FROM",
+                        source=file_path,
+                        target=resolved if resolved else path_arg,
+                        file_path=file_path,
+                        line=child.start_point[0] + 1,
+                    ))
                     # Fall through - let generic call dispatch also record
                     # the CALLS edge and recurse for nested calls.
                     return False
@@ -8590,22 +13944,26 @@ class CodeParser:
         # public surface of this module?".
         if node_type in ("export_statement", "public_statement"):
             source_qual = (
-                self._qualify(enclosing_class, file_path, None) if enclosing_class else file_path
+                self._qualify(enclosing_class, file_path, None)
+                if enclosing_class
+                else file_path
             )
-            marker = "julia_export" if node_type == "export_statement" else "julia_public"
+            marker = (
+                "julia_export"
+                if node_type == "export_statement"
+                else "julia_public"
+            )
             for sub in child.children:
                 if sub.type == "identifier":
                     name = sub.text.decode("utf-8", errors="replace")
-                    edges.append(
-                        EdgeInfo(
-                            kind="REFERENCES",
-                            source=source_qual,
-                            target=name,
-                            file_path=file_path,
-                            line=child.start_point[0] + 1,
-                            extra={marker: True},
-                        )
-                    )
+                    edges.append(EdgeInfo(
+                        kind="REFERENCES",
+                        source=source_qual,
+                        target=name,
+                        file_path=file_path,
+                        line=child.start_point[0] + 1,
+                        extra={marker: True},
+                    ))
             return True
 
         # --- macrocall_expression ---
@@ -8616,8 +13974,7 @@ class CodeParser:
                     for ident in sub.children:
                         if ident.type == "identifier":
                             macro_name = ident.text.decode(
-                                "utf-8",
-                                errors="replace",
+                                "utf-8", errors="replace",
                             )
                             break
                     break
@@ -8638,8 +13995,7 @@ class CodeParser:
                             continue
                         if type_name is None:
                             type_name = arg.text.decode(
-                                "utf-8",
-                                errors="replace",
+                                "utf-8", errors="replace",
                             )
                         else:
                             variant_identifiers.append(arg)
@@ -8648,71 +14004,57 @@ class CodeParser:
                     line_start = child.start_point[0] + 1
                     line_end = child.end_point[0] + 1
                     qualified_type = self._qualify(
-                        type_name,
-                        file_path,
-                        enclosing_class,
+                        type_name, file_path, enclosing_class,
                     )
-                    nodes.append(
-                        NodeInfo(
-                            kind="Class",
-                            name=type_name,
-                            file_path=file_path,
-                            line_start=line_start,
-                            line_end=line_end,
-                            language=language,
-                            parent_name=enclosing_class,
-                            extra={"julia_kind": "enum"},
-                        )
-                    )
+                    nodes.append(NodeInfo(
+                        kind="Class",
+                        name=type_name,
+                        file_path=file_path,
+                        line_start=line_start,
+                        line_end=line_end,
+                        language=language,
+                        parent_name=enclosing_class,
+                        extra={"julia_kind": "enum"},
+                    ))
                     container = (
                         self._qualify(enclosing_class, file_path, None)
                         if enclosing_class
                         else file_path
                     )
-                    edges.append(
-                        EdgeInfo(
-                            kind="CONTAINS",
-                            source=container,
-                            target=qualified_type,
-                            file_path=file_path,
-                            line=line_start,
-                        )
-                    )
+                    edges.append(EdgeInfo(
+                        kind="CONTAINS",
+                        source=container,
+                        target=qualified_type,
+                        file_path=file_path,
+                        line=line_start,
+                    ))
                     for variant in variant_identifiers:
                         vname = variant.text.decode(
-                            "utf-8",
-                            errors="replace",
+                            "utf-8", errors="replace",
                         )
                         variant_parent = self._julia_scope_join(
-                            enclosing_class,
-                            type_name,
+                            enclosing_class, type_name,
                         )
                         qualified_v = self._qualify(
-                            vname,
-                            file_path,
-                            variant_parent,
+                            vname, file_path, variant_parent,
                         )
-                        nodes.append(
-                            NodeInfo(
-                                kind="Function",
-                                name=vname,
-                                file_path=file_path,
-                                line_start=variant.start_point[0] + 1,
-                                line_end=variant.end_point[0] + 1,
-                                language=language,
-                                parent_name=variant_parent,
-                                extra={"julia_kind": "enum_variant"},
-                            )
-                        )
-                        edges.append(
-                            EdgeInfo(
-                                kind="CONTAINS",
-                                source=qualified_type,
-                                target=qualified_v,
-                                file_path=file_path,
-                                line=variant.start_point[0] + 1,
-                            )
-                        )
+                        nodes.append(NodeInfo(
+                            kind="Function",
+                            name=vname,
+                            file_path=file_path,
+                            line_start=variant.start_point[0] + 1,
+                            line_end=variant.end_point[0] + 1,
+                            language=language,
+                            parent_name=variant_parent,
+                            extra={"julia_kind": "enum_variant"},
+                        ))
+                        edges.append(EdgeInfo(
+                            kind="CONTAINS",
+                            source=qualified_type,
+                            target=qualified_v,
+                            file_path=file_path,
+                            line=variant.start_point[0] + 1,
+                        ))
                 return True
 
             if macro_name == "testset":
@@ -8728,8 +14070,7 @@ class CodeParser:
                             for c in arg.children:
                                 if c.type == "content":
                                     desc = c.text.decode(
-                                        "utf-8",
-                                        errors="replace",
+                                        "utf-8", errors="replace",
                                     )
                                     break
                             break
@@ -8737,50 +14078,39 @@ class CodeParser:
                 synth_base = f"testset:{desc}" if desc else "testset"
                 synth_name = f"{synth_base}@L{line_no}"
                 lexical_parent = self._julia_scope_join(
-                    enclosing_class,
-                    enclosing_func,
+                    enclosing_class, enclosing_func,
                 )
                 qualified = self._qualify(
-                    synth_name,
-                    file_path,
-                    lexical_parent,
+                    synth_name, file_path, lexical_parent,
                 )
-                nodes.append(
-                    NodeInfo(
-                        kind="Test",
-                        name=synth_name,
-                        file_path=file_path,
-                        line_start=child.start_point[0] + 1,
-                        line_end=child.end_point[0] + 1,
-                        language=language,
-                        parent_name=lexical_parent,
-                        is_test=True,
-                    )
-                )
+                nodes.append(NodeInfo(
+                    kind="Test",
+                    name=synth_name,
+                    file_path=file_path,
+                    line_start=child.start_point[0] + 1,
+                    line_end=child.end_point[0] + 1,
+                    language=language,
+                    parent_name=lexical_parent,
+                    is_test=True,
+                ))
                 container = (
-                    self._qualify(lexical_parent, file_path, None) if lexical_parent else file_path
+                    self._qualify(lexical_parent, file_path, None)
+                    if lexical_parent
+                    else file_path
                 )
-                edges.append(
-                    EdgeInfo(
-                        kind="CONTAINS",
-                        source=container,
-                        target=qualified,
-                        file_path=file_path,
-                        line=child.start_point[0] + 1,
-                    )
-                )
+                edges.append(EdgeInfo(
+                    kind="CONTAINS",
+                    source=container,
+                    target=qualified,
+                    file_path=file_path,
+                    line=child.start_point[0] + 1,
+                ))
                 if body_parent is not None:
                     self._extract_from_tree(
-                        body_parent,
-                        source,
-                        language,
-                        file_path,
-                        nodes,
-                        edges,
+                        body_parent, source, language, file_path, nodes, edges,
                         enclosing_class=lexical_parent,
                         enclosing_func=synth_name,
-                        import_map=import_map,
-                        defined_names=defined_names,
+                        import_map=import_map, defined_names=defined_names,
                         _depth=_depth + 1,
                     )
                 return True
@@ -8827,33 +14157,17 @@ class CodeParser:
         # --- variable_declaration: require() or anonymous function ---
         if node_type == "variable_declaration":
             return self._handle_lua_variable_declaration(
-                child,
-                source,
-                language,
-                file_path,
-                nodes,
-                edges,
-                enclosing_class,
-                enclosing_func,
-                import_map,
-                defined_names,
-                _depth,
+                child, source, language, file_path, nodes, edges,
+                enclosing_class, enclosing_func,
+                import_map, defined_names, _depth,
             )
 
         # --- function_declaration with dot/method table name ---
         if node_type == "function_declaration":
             return self._handle_lua_table_function(
-                child,
-                source,
-                language,
-                file_path,
-                nodes,
-                edges,
-                enclosing_class,
-                enclosing_func,
-                import_map,
-                defined_names,
-                _depth,
+                child, source, language, file_path, nodes, edges,
+                enclosing_class, enclosing_func,
+                import_map, defined_names, _depth,
             )
 
         # --- Top-level require() not wrapped in variable_declaration ---
@@ -8861,19 +14175,15 @@ class CodeParser:
             req_target = self._lua_get_require_target(child)
             if req_target is not None:
                 resolved = self._resolve_module_to_file(
-                    req_target,
-                    file_path,
-                    language,
+                    req_target, file_path, language,
                 )
-                edges.append(
-                    EdgeInfo(
-                        kind="IMPORTS_FROM",
-                        source=file_path,
-                        target=resolved if resolved else req_target,
-                        file_path=file_path,
-                        line=child.start_point[0] + 1,
-                    )
-                )
+                edges.append(EdgeInfo(
+                    kind="IMPORTS_FROM",
+                    source=file_path,
+                    target=resolved if resolved else req_target,
+                    file_path=file_path,
+                    line=child.start_point[0] + 1,
+                ))
                 return True
 
         return False
@@ -8933,64 +14243,50 @@ class CodeParser:
                 req_target = self._lua_get_require_target(expr)
                 if req_target is not None:
                     resolved = self._resolve_module_to_file(
-                        req_target,
-                        file_path,
-                        language,
+                        req_target, file_path, language,
                     )
-                    edges.append(
-                        EdgeInfo(
-                            kind="IMPORTS_FROM",
-                            source=file_path,
-                            target=resolved if resolved else req_target,
-                            file_path=file_path,
-                            line=child.start_point[0] + 1,
-                        )
-                    )
+                    edges.append(EdgeInfo(
+                        kind="IMPORTS_FROM",
+                        source=file_path,
+                        target=resolved if resolved else req_target,
+                        file_path=file_path,
+                        line=child.start_point[0] + 1,
+                    ))
                     return True
 
         # Check for anonymous function: local foo = function(...) end
         for expr in expr_list.children:
             if expr.type == "function_definition":
-                is_test = _is_test_function(var_name, file_path)
+                is_test = _is_test_function(var_name, file_path, repo_root=self._repo_root)
                 kind = "Test" if is_test else "Function"
                 qualified = self._qualify(var_name, file_path, enclosing_class)
                 params = self._get_params(expr, language, source)
 
-                nodes.append(
-                    NodeInfo(
-                        kind=kind,
-                        name=var_name,
-                        file_path=file_path,
-                        line_start=child.start_point[0] + 1,
-                        line_end=child.end_point[0] + 1,
-                        language=language,
-                        parent_name=enclosing_class,
-                        params=params,
-                        is_test=is_test,
-                    )
-                )
+                nodes.append(NodeInfo(
+                    kind=kind,
+                    name=var_name,
+                    file_path=file_path,
+                    line_start=child.start_point[0] + 1,
+                    line_end=child.end_point[0] + 1,
+                    language=language,
+                    parent_name=enclosing_class,
+                    params=params,
+                    is_test=is_test,
+                ))
                 container = (
                     self._qualify(enclosing_class, file_path, None)
-                    if enclosing_class
-                    else file_path
+                    if enclosing_class else file_path
                 )
-                edges.append(
-                    EdgeInfo(
-                        kind="CONTAINS",
-                        source=container,
-                        target=qualified,
-                        file_path=file_path,
-                        line=child.start_point[0] + 1,
-                    )
-                )
+                edges.append(EdgeInfo(
+                    kind="CONTAINS",
+                    source=container,
+                    target=qualified,
+                    file_path=file_path,
+                    line=child.start_point[0] + 1,
+                ))
                 # Recurse into the function body for calls
                 self._extract_from_tree(
-                    expr,
-                    source,
-                    language,
-                    file_path,
-                    nodes,
-                    edges,
+                    expr, source, language, file_path, nodes, edges,
                     enclosing_class=enclosing_class,
                     enclosing_func=var_name,
                     import_map=import_map,
@@ -9027,58 +14323,49 @@ class CodeParser:
 
         for sub in child.children:
             if sub.type in ("dot_index_expression", "method_index_expression"):
-                identifiers = [c for c in sub.children if c.type == "identifier"]
+                identifiers = [
+                    c for c in sub.children if c.type == "identifier"
+                ]
                 if len(identifiers) >= 2:
                     table_name = identifiers[0].text.decode(
-                        "utf-8",
-                        errors="replace",
+                        "utf-8", errors="replace",
                     )
                     method_name = identifiers[-1].text.decode(
-                        "utf-8",
-                        errors="replace",
+                        "utf-8", errors="replace",
                     )
                 break
 
         if not table_name or not method_name:
             return False
 
-        is_test = _is_test_function(method_name, file_path)
+        is_test = _is_test_function(method_name, file_path, repo_root=self._repo_root)
         kind = "Test" if is_test else "Function"
         qualified = self._qualify(method_name, file_path, table_name)
         params = self._get_params(child, language, source)
 
-        nodes.append(
-            NodeInfo(
-                kind=kind,
-                name=method_name,
-                file_path=file_path,
-                line_start=child.start_point[0] + 1,
-                line_end=child.end_point[0] + 1,
-                language=language,
-                parent_name=table_name,
-                params=params,
-                is_test=is_test,
-            )
-        )
+        nodes.append(NodeInfo(
+            kind=kind,
+            name=method_name,
+            file_path=file_path,
+            line_start=child.start_point[0] + 1,
+            line_end=child.end_point[0] + 1,
+            language=language,
+            parent_name=table_name,
+            params=params,
+            is_test=is_test,
+        ))
         # CONTAINS: table -> method
         container = self._qualify(table_name, file_path, None)
-        edges.append(
-            EdgeInfo(
-                kind="CONTAINS",
-                source=container,
-                target=qualified,
-                file_path=file_path,
-                line=child.start_point[0] + 1,
-            )
-        )
+        edges.append(EdgeInfo(
+            kind="CONTAINS",
+            source=container,
+            target=qualified,
+            file_path=file_path,
+            line=child.start_point[0] + 1,
+        ))
         # Recurse into function body for calls
         self._extract_from_tree(
-            child,
-            source,
-            language,
-            file_path,
-            nodes,
-            edges,
+            child, source, language, file_path, nodes, edges,
             enclosing_class=table_name,
             enclosing_func=method_name,
             import_map=import_map,
@@ -9095,7 +14382,11 @@ class CodeParser:
         """
         # Structure: function_call > identifier("require") > arguments > string
         first_child = call_node.children[0] if call_node.children else None
-        if not first_child or first_child.type != "identifier" or first_child.text != b"require":
+        if (
+            not first_child
+            or first_child.type != "identifier"
+            or first_child.text != b"require"
+        ):
             return None
         for child in call_node.children:
             if child.type == "arguments":
@@ -9105,8 +14396,7 @@ class CodeParser:
                         for sub in arg.children:
                             if sub.type == "string_content":
                                 return sub.text.decode(
-                                    "utf-8",
-                                    errors="replace",
+                                    "utf-8", errors="replace",
                                 )
                         # Fallback: strip quotes from full text
                         raw = arg.text.decode("utf-8", errors="replace")
@@ -9149,17 +14439,9 @@ class CodeParser:
         """
         if node_type == "TestDecl":
             return self._handle_zig_test_decl(
-                child,
-                source,
-                language,
-                file_path,
-                nodes,
-                edges,
-                enclosing_class,
-                enclosing_func,
-                import_map,
-                defined_names,
-                _depth,
+                child, source, language, file_path, nodes, edges,
+                enclosing_class, enclosing_func,
+                import_map, defined_names, _depth,
             )
 
         if node_type != "Decl":
@@ -9179,35 +14461,16 @@ class CodeParser:
 
         if fn_proto is not None:
             return self._handle_zig_fn_decl(
-                child,
-                fn_proto,
-                body_block,
-                source,
-                language,
-                file_path,
-                nodes,
-                edges,
-                enclosing_class,
-                enclosing_func,
-                import_map,
-                defined_names,
-                _depth,
+                child, fn_proto, body_block, source, language, file_path,
+                nodes, edges, enclosing_class, enclosing_func,
+                import_map, defined_names, _depth,
             )
 
         if var_decl is not None:
             return self._handle_zig_var_decl(
-                child,
-                var_decl,
-                source,
-                language,
-                file_path,
-                nodes,
-                edges,
-                enclosing_class,
-                enclosing_func,
-                import_map,
-                defined_names,
-                _depth,
+                child, var_decl, source, language, file_path,
+                nodes, edges, enclosing_class, enclosing_func,
+                import_map, defined_names, _depth,
             )
 
         return False
@@ -9237,42 +14500,36 @@ class CodeParser:
         if not name:
             return False
 
-        is_test = _is_test_function(name, file_path)
+        is_test = _is_test_function(name, file_path, repo_root=self._repo_root)
         kind = "Test" if is_test else "Function"
         qualified = self._qualify(name, file_path, enclosing_class)
 
-        nodes.append(
-            NodeInfo(
-                kind=kind,
-                name=name,
-                file_path=file_path,
-                line_start=decl.start_point[0] + 1,
-                line_end=decl.end_point[0] + 1,
-                language=language,
-                parent_name=enclosing_class,
-                is_test=is_test,
-            )
-        )
+        nodes.append(NodeInfo(
+            kind=kind,
+            name=name,
+            file_path=file_path,
+            line_start=decl.start_point[0] + 1,
+            line_end=decl.end_point[0] + 1,
+            language=language,
+            parent_name=enclosing_class,
+            is_test=is_test,
+        ))
         container = (
-            self._qualify(enclosing_class, file_path, None) if enclosing_class else file_path
+            self._qualify(enclosing_class, file_path, None)
+            if enclosing_class
+            else file_path
         )
-        edges.append(
-            EdgeInfo(
-                kind="CONTAINS",
-                source=container,
-                target=qualified,
-                file_path=file_path,
-                line=decl.start_point[0] + 1,
-            )
-        )
+        edges.append(EdgeInfo(
+            kind="CONTAINS",
+            source=container,
+            target=qualified,
+            file_path=file_path,
+            line=decl.start_point[0] + 1,
+        ))
 
         if body_block is not None:
             self._extract_zig_calls_in_subtree(
-                body_block,
-                file_path,
-                edges,
-                enclosing_class,
-                name,
+                body_block, file_path, edges, enclosing_class, name,
             )
         return True
 
@@ -9324,19 +14581,15 @@ class CodeParser:
             target = self._zig_extract_import_target(suffix_children[1])
             if target is not None:
                 resolved = self._resolve_module_to_file(
-                    target,
-                    file_path,
-                    language,
+                    target, file_path, language,
                 )
-                edges.append(
-                    EdgeInfo(
-                        kind="IMPORTS_FROM",
-                        source=file_path,
-                        target=resolved if resolved else target,
-                        file_path=file_path,
-                        line=decl.start_point[0] + 1,
-                    )
-                )
+                edges.append(EdgeInfo(
+                    kind="IMPORTS_FROM",
+                    source=file_path,
+                    target=resolved if resolved else target,
+                    file_path=file_path,
+                    line=decl.start_point[0] + 1,
+                ))
                 return True
 
         # struct / union / enum / opaque -> Class node
@@ -9357,38 +14610,29 @@ class CodeParser:
                             break
                     break
 
-            nodes.append(
-                NodeInfo(
-                    kind="Class",
-                    name=var_name,
-                    file_path=file_path,
-                    line_start=decl.start_point[0] + 1,
-                    line_end=decl.end_point[0] + 1,
-                    language=language,
-                    parent_name=enclosing_class,
-                    extra={"zig_kind": kind_label},
-                )
-            )
-            edges.append(
-                EdgeInfo(
-                    kind="CONTAINS",
-                    source=(
-                        self._qualify(enclosing_class, file_path, None)
-                        if enclosing_class
-                        else file_path
-                    ),
-                    target=self._qualify(var_name, file_path, enclosing_class),
-                    file_path=file_path,
-                    line=decl.start_point[0] + 1,
-                )
-            )
+            nodes.append(NodeInfo(
+                kind="Class",
+                name=var_name,
+                file_path=file_path,
+                line_start=decl.start_point[0] + 1,
+                line_end=decl.end_point[0] + 1,
+                language=language,
+                parent_name=enclosing_class,
+                extra={"zig_kind": kind_label},
+            ))
+            edges.append(EdgeInfo(
+                kind="CONTAINS",
+                source=(
+                    self._qualify(enclosing_class, file_path, None)
+                    if enclosing_class
+                    else file_path
+                ),
+                target=self._qualify(var_name, file_path, enclosing_class),
+                file_path=file_path,
+                line=decl.start_point[0] + 1,
+            ))
             self._extract_from_tree(
-                container_decl,
-                source,
-                language,
-                file_path,
-                nodes,
-                edges,
+                container_decl, source, language, file_path, nodes, edges,
                 enclosing_class=var_name,
                 enclosing_func=enclosing_func,
                 import_map=import_map,
@@ -9400,11 +14644,8 @@ class CodeParser:
         # Plain ``const x = expr;`` — still scan RHS for call sites so
         # call edges aren't lost when calls appear at module scope.
         self._extract_zig_calls_in_subtree(
-            rhs_suffix,
-            file_path,
-            edges,
-            enclosing_class,
-            enclosing_func,
+            rhs_suffix, file_path, edges,
+            enclosing_class, enclosing_func,
         )
         return True
 
@@ -9439,39 +14680,31 @@ class CodeParser:
         synthetic = f"{base}@L{line_no}"
         qualified = self._qualify(synthetic, file_path, enclosing_class)
 
-        nodes.append(
-            NodeInfo(
-                kind="Test",
-                name=synthetic,
-                file_path=file_path,
-                line_start=child.start_point[0] + 1,
-                line_end=child.end_point[0] + 1,
-                language=language,
-                parent_name=enclosing_class,
-                is_test=True,
-            )
-        )
-        edges.append(
-            EdgeInfo(
-                kind="CONTAINS",
-                source=(
-                    self._qualify(enclosing_class, file_path, None)
-                    if enclosing_class
-                    else file_path
-                ),
-                target=qualified,
-                file_path=file_path,
-                line=line_no,
-            )
-        )
+        nodes.append(NodeInfo(
+            kind="Test",
+            name=synthetic,
+            file_path=file_path,
+            line_start=child.start_point[0] + 1,
+            line_end=child.end_point[0] + 1,
+            language=language,
+            parent_name=enclosing_class,
+            is_test=True,
+        ))
+        edges.append(EdgeInfo(
+            kind="CONTAINS",
+            source=(
+                self._qualify(enclosing_class, file_path, None)
+                if enclosing_class
+                else file_path
+            ),
+            target=qualified,
+            file_path=file_path,
+            line=line_no,
+        ))
 
         if body_block is not None:
             self._extract_zig_calls_in_subtree(
-                body_block,
-                file_path,
-                edges,
-                enclosing_class,
-                synthetic,
+                body_block, file_path, edges, enclosing_class, synthetic,
             )
         return True
 
@@ -9532,15 +14765,13 @@ class CodeParser:
                         if txt != "@import":
                             callee = txt
                     if callee:
-                        edges.append(
-                            EdgeInfo(
-                                kind="CALLS",
-                                source=src_qn,
-                                target=callee,
-                                file_path=file_path,
-                                line=node.start_point[0] + 1,
-                            )
-                        )
+                        edges.append(EdgeInfo(
+                            kind="CALLS",
+                            source=src_qn,
+                            target=callee,
+                            file_path=file_path,
+                            line=node.start_point[0] + 1,
+                        ))
                     break
             for ch in node.children:
                 stack.append(ch)
@@ -9550,8 +14781,142 @@ class CodeParser:
     # ------------------------------------------------------------------
 
     _JS_FUNC_VALUE_TYPES = frozenset(
-        {"arrow_function", "function_expression", "function"},
+        {"arrow_function", "function_expression", "function", "generator_function"},
     )
+
+    # Wrapper calls nest at most this deep before we give up: memo(forwardRef(fn)).
+    _JS_WRAPPER_MAX_DEPTH = 3
+
+    # Wrappers documented to return a component. A single function argument is not
+    # enough on its own to know that a call returns something CALLABLE:
+    # ``const result = evaluate(() => compute())`` has the same shape and returns a
+    # number, so treating it as a definition invents a `result` function and moves
+    # `compute`'s caller off the function that really makes the call. The name is
+    # what establishes it. A wrapper outside this set is simply not a definition
+    # here, which is the behaviour that predates wrapped components being indexed
+    # at all.
+    _JS_COMPONENT_WRAPPERS = frozenset({
+        "forwardRef", "memo", "observer", "withRouter", "withStyles", "withTheme",
+        "connect", "styled", "inject", "withTranslation", "withErrorBoundary",
+    })
+
+    # Curried wrappers: the first call takes configuration and returns the wrapper, and
+    # only the second call, ``connect(mapState)(Component)``, makes a component. The
+    # function in a first call is a selector, a style sheet or a callback.
+    _JS_CURRIED_WRAPPERS = frozenset(
+        {"connect", "withStyles", "inject", "withTranslation", "styled"},
+    )
+
+    # Grammar extras that tree-sitter lists among a call's named arguments.
+    _JS_COMMENT_TYPES = frozenset({"comment", "html_comment"})
+
+    def _js_argument_values(self, arguments) -> list:
+        """The arguments of a call, without the comments between them.
+
+        ``forwardRef(/* why */ fn)`` passes one argument, not two.
+        """
+        return [arg for arg in arguments.named_children if arg.type not in self._JS_COMMENT_TYPES]
+
+    def _js_wrapper_name(self, call_node, _depth: int = 0) -> Optional[str]:
+        """The wrapper a call applies, or None when the callee is not one we can name.
+
+        ``memo(fn)`` and ``React.memo(fn)`` both answer ``memo``; the curried
+        ``styled(Base)(fn)`` and ``connect(map)(fn)`` answer through their own callee,
+        followed no deeper than {@link _JS_WRAPPER_MAX_DEPTH}, the same bound the
+        unwrapping keeps. A member callee answers only on ``React``: ``pool.connect(cb)``
+        and ``utils.memo(fn)`` call methods that share a wrapper's name, and losing a
+        namespace import such as ``ReactModule.forwardRef`` is the smaller mistake.
+        """
+        callee = call_node.children[0] if call_node.children else None
+        if callee is None:
+            return None
+        if callee.type == "call_expression":
+            if _depth >= self._JS_WRAPPER_MAX_DEPTH:
+                return None
+            return self._js_wrapper_name(callee, _depth + 1)
+        if callee.type == "identifier":
+            return callee.text.decode("utf-8", errors="replace")
+        if callee.type == "member_expression":
+            obj = callee.child_by_field_name("object")
+            prop = callee.child_by_field_name("property")
+            if obj is None or prop is None or obj.type != "identifier" or obj.text != b"React":
+                return None
+            return prop.text.decode("utf-8", errors="replace")
+        return None
+
+    def _js_wrapped_function(self, call_node, _depth: int = 0, chain=None):
+        """Return the function literal a component wrapper call receives, if any.
+
+        ``forwardRef(fn)``, ``memo(fn)``, ``observer(fn)``, ``withRouter(fn)`` and
+        ``styled(Base)(fn)`` all put the component's function inside a
+        ``call_expression`` instead of assigning it directly, and nested wrappers
+        (``memo(forwardRef(fn))``) are unwrapped.
+
+        Two things have to hold. The wrapper has to be one that returns a component
+        ({@link _JS_COMPONENT_WRAPPERS}), and it has to take the function as its ONLY
+        argument: a call that takes a callback among others is computing a value, and
+        ``useMemo(() => x, [dep])`` assigns whatever it returns rather than the
+        callback. ``memo`` is the one exception, its documented second argument is the
+        props comparator: ``memo(fn, arePropsEqual)``. Calls without a function
+        argument (``createClient({...})``) return None as well.
+
+        ``chain``, when given, collects every wrapper call traversed, innermost first.
+        Each of them runs where the declaration is, so the caller records them against
+        the enclosing function rather than against the component.
+        """
+        name = self._js_wrapper_name(call_node)
+        if name is None or name not in self._JS_COMPONENT_WRAPPERS:
+            return None
+        callee = call_node.children[0] if call_node.children else None
+        curried = name in self._JS_CURRIED_WRAPPERS
+        if curried and (callee is None or callee.type != "call_expression"):
+            return None
+        arguments = None
+        for sub in call_node.children:
+            if sub.type == "arguments":
+                arguments = sub
+                break
+        if arguments is None:
+            return None
+        args = self._js_argument_values(arguments)
+        if len(args) != 1 and not (name == "memo" and len(args) == 2):
+            return None
+        arg = args[0]
+        # A generator returns an iterator, so no wrapper makes a component of one.
+        if arg.type in self._JS_FUNC_VALUE_TYPES and arg.type != "generator_function":
+            if chain is not None:
+                chain.append(call_node)
+            return arg
+        if arg.type == "call_expression" and _depth < self._JS_WRAPPER_MAX_DEPTH:
+            inner = self._js_wrapped_function(arg, _depth + 1, chain)
+            if inner is not None and chain is not None:
+                chain.append(call_node)
+            return inner
+        return None
+
+    def _js_in_test_body(
+        self,
+        nodes: list[NodeInfo],
+        file_path: str,
+        enclosing_class: Optional[str],
+        enclosing_func: Optional[str],
+    ) -> bool:
+        """Whether a declaration sits in the body of a test (``it``, ``describe``, ...).
+
+        TESTED_BY edges are minted from the calls a test makes. A component a test
+        builds for itself, ``const Probe = React.forwardRef(function Probe(props, ref)
+        { ... useForkRef(handleOwnRef, ref) ... })`` inside ``it(...)``, is part of the
+        test: indexing it would move ``useForkRef``'s caller onto the fixture and take
+        the test out of ``tests_for(useForkRef)``. The enclosing function's node is
+        added before its body is walked, so it is already in ``nodes``.
+        """
+        if not enclosing_func:
+            return False
+        qualified = self._qualify(enclosing_func, file_path, enclosing_class)
+        return any(
+            node.is_test and self._node_qualified(node) == qualified
+            for node in reversed(nodes)
+        )
 
     def _extract_js_var_functions(
         self,
@@ -9573,11 +14938,19 @@ class CodeParser:
           const foo = () => {}
           let bar = function() {}
           export const baz = (x: number): string => x.toString()
+          export const Button = forwardRef((props, ref) => <button ref={ref} />)
 
         Returns True if at least one function was extracted from the
         declaration, so the caller can skip generic recursion.
         """
         handled = False
+        # Declarators this pass does not own. One declaration can mix them:
+        # `const Button = memo(() => paint()), token = nextToken()` defines a
+        # component and calls a function, and the call belongs to whatever function
+        # encloses the declaration. The caller skips its generic recursion over the
+        # whole declaration once anything here is extracted, so what is left has to
+        # be walked here or it is lost.
+        unowned = []
         for declarator in child.children:
             if declarator.type != "variable_declarator":
                 continue
@@ -9585,67 +14958,126 @@ class CodeParser:
             # Find identifier and function value
             var_name = None
             func_node = None
+            # The component's own body. For a wrapped component that is the function
+            # the wrapper receives, NOT the declarator: the wrapper call itself runs
+            # where the declaration is, not inside the component it produces.
+            walk_node = None
+            wrapper_calls = []
             for sub in declarator.children:
                 if sub.type == "identifier" and var_name is None:
                     var_name = sub.text.decode("utf-8", errors="replace")
                 elif sub.type in self._JS_FUNC_VALUE_TYPES:
                     func_node = sub
+                    walk_node = sub
+                elif sub.type == "call_expression":
+                    # Higher-order wrappers (forwardRef, memo, observer, ...) hide
+                    # the component's function inside the call's arguments. In a
+                    # test's body the component is a fixture and its calls stay the
+                    # test's, as they were before wrapped components were indexed.
+                    chain: list = []
+                    wrapped = self._js_wrapped_function(sub, chain=chain)
+                    if wrapped is not None and not self._js_in_test_body(
+                        nodes, file_path, enclosing_class, enclosing_func,
+                    ):
+                        func_node = wrapped
+                        walk_node = wrapped
+                        wrapper_calls = chain
 
             if not var_name or not func_node:
+                unowned.append(declarator)
                 continue
 
-            is_test = _is_test_function(var_name, file_path)
+            is_test = _is_test_function(var_name, file_path, repo_root=self._repo_root)
             kind = "Test" if is_test else "Function"
             qualified = self._qualify(var_name, file_path, enclosing_class)
             params = self._get_params(func_node, language, source)
             ret_type = self._get_return_type(func_node, language, source)
 
-            nodes.append(
-                NodeInfo(
-                    kind=kind,
-                    name=var_name,
-                    file_path=file_path,
-                    line_start=child.start_point[0] + 1,
-                    line_end=child.end_point[0] + 1,
-                    language=language,
-                    parent_name=enclosing_class,
-                    params=params,
-                    return_type=ret_type,
-                    is_test=is_test,
-                )
-            )
+            nodes.append(NodeInfo(
+                kind=kind,
+                name=var_name,
+                file_path=file_path,
+                line_start=child.start_point[0] + 1,
+                line_end=child.end_point[0] + 1,
+                language=language,
+                parent_name=enclosing_class,
+                params=params,
+                return_type=ret_type,
+                is_test=is_test,
+            ))
             container = (
-                self._qualify(enclosing_class, file_path, None) if enclosing_class else file_path
+                self._qualify(enclosing_class, file_path, None)
+                if enclosing_class else file_path
             )
-            edges.append(
-                EdgeInfo(
-                    kind="CONTAINS",
-                    source=container,
-                    target=qualified,
-                    file_path=file_path,
-                    line=child.start_point[0] + 1,
-                )
-            )
+            edges.append(EdgeInfo(
+                kind="CONTAINS",
+                source=container,
+                target=qualified,
+                file_path=file_path,
+                line=child.start_point[0] + 1,
+            ))
 
             # Recurse into the function body for calls
             self._extract_from_tree(
-                func_node,
-                source,
-                language,
-                file_path,
-                nodes,
-                edges,
+                walk_node or func_node, source, language, file_path, nodes, edges,
                 enclosing_class=enclosing_class,
                 enclosing_func=var_name,
                 import_map=import_map,
                 defined_names=defined_names,
                 _depth=_depth + 1,
             )
+            # A wrapped declaration was walked whole before it counted as a
+            # definition, and what it evaluates besides the component still belongs
+            # to the enclosing scope. That starts with its type annotation:
+            # `const Card: FC<Props> = memo(...)` references Props from here.
+            rest: list = []
+            if wrapper_calls:
+                rest = [sub for sub in declarator.children if sub.type == "type_annotation"]
+            for wrapper_call in wrapper_calls:
+                # `memo(...)` and any wrapper it nests are called where the
+                # declaration is, so the edges belong to the enclosing function.
+                # Recorded through the call extractor rather than by walking the
+                # node, which would descend into the wrapped function again and
+                # credit its calls to the enclosing function as well.
+                self._extract_calls(
+                    wrapper_call, source, language, file_path, nodes, edges,
+                    enclosing_class, enclosing_func, import_map, defined_names,
+                    _depth + 1,
+                )
+                # So does the rest of the wrapper call: the inner call of a curried
+                # `connect(mapState)(fn)` or `styled(Base)(fn)`, the type arguments
+                # of `forwardRef<El, Props>(fn)` and memo's comparator. Only the
+                # first argument leads to the component.
+                arguments = wrapper_call.child_by_field_name("arguments")
+                self._extract_value_references(
+                    arguments, arguments.type, source, language, file_path, edges,
+                    enclosing_class, enclosing_func, import_map, defined_names,
+                )
+                rest.extend(part for part in wrapper_call.children if part.type != "arguments")
+                rest.extend(self._js_argument_values(arguments)[1:])
+            if rest:
+                self._extract_from_tree(
+                    _NodeGroup(rest), source, language, file_path, nodes, edges,
+                    enclosing_class=enclosing_class,
+                    enclosing_func=enclosing_func,
+                    import_map=import_map,
+                    defined_names=defined_names,
+                    _depth=_depth + 1,
+                )
             handled = True
 
         if not handled:
             # Not a function assignment — let generic recursion handle it
             return False
+        for declarator in unowned:
+            self._extract_from_tree(
+                declarator, source, language, file_path, nodes, edges,
+                enclosing_class=enclosing_class,
+                enclosing_func=enclosing_func,
+                import_map=import_map,
+                defined_names=defined_names,
+                _depth=_depth + 1,
+            )
         return True
 
     def _extract_js_field_function(
@@ -9674,44 +15106,36 @@ class CodeParser:
         if not prop_name or not func_node:
             return False
 
-        is_test = _is_test_function(prop_name, file_path)
+        is_test = _is_test_function(prop_name, file_path, repo_root=self._repo_root)
         kind = "Test" if is_test else "Function"
         qualified = self._qualify(prop_name, file_path, enclosing_class)
         params = self._get_params(func_node, language, source)
 
-        nodes.append(
-            NodeInfo(
-                kind=kind,
-                name=prop_name,
-                file_path=file_path,
-                line_start=child.start_point[0] + 1,
-                line_end=child.end_point[0] + 1,
-                language=language,
-                parent_name=enclosing_class,
-                params=params,
-                is_test=is_test,
-            )
-        )
+        nodes.append(NodeInfo(
+            kind=kind,
+            name=prop_name,
+            file_path=file_path,
+            line_start=child.start_point[0] + 1,
+            line_end=child.end_point[0] + 1,
+            language=language,
+            parent_name=enclosing_class,
+            params=params,
+            is_test=is_test,
+        ))
         container = (
-            self._qualify(enclosing_class, file_path, None) if enclosing_class else file_path
+            self._qualify(enclosing_class, file_path, None)
+            if enclosing_class else file_path
         )
-        edges.append(
-            EdgeInfo(
-                kind="CONTAINS",
-                source=container,
-                target=qualified,
-                file_path=file_path,
-                line=child.start_point[0] + 1,
-            )
-        )
+        edges.append(EdgeInfo(
+            kind="CONTAINS",
+            source=container,
+            target=qualified,
+            file_path=file_path,
+            line=child.start_point[0] + 1,
+        ))
 
         self._extract_from_tree(
-            func_node,
-            source,
-            language,
-            file_path,
-            nodes,
-            edges,
+            func_node, source, language, file_path, nodes, edges,
             enclosing_class=enclosing_class,
             enclosing_func=prop_name,
             import_map=import_map,
@@ -9779,55 +15203,51 @@ class CodeParser:
         # functions would both become ``file::obj.method`` and produce
         # duplicate CONTAINS targets. Top-level lexical blocks have the same
         # problem, so only direct program statements have a stable identity.
-        if enclosing_func or child.parent is None or child.parent.type != "program":
+        if (
+            enclosing_func
+            or child.parent is None
+            or child.parent.type != "program"
+        ):
             return False
 
         member_name = self._get_js_static_member_path(left)
         if member_name is None:
             return False
 
-        is_test = _is_test_function(member_name, file_path)
+        is_test = _is_test_function(member_name, file_path, repo_root=self._repo_root)
         kind = "Test" if is_test else "Function"
         qualified = self._qualify(member_name, file_path, enclosing_class)
         params = self._get_params(right, language, source)
         ret_type = self._get_return_type(right, language, source)
 
-        nodes.append(
-            NodeInfo(
-                kind=kind,
-                name=member_name,
-                file_path=file_path,
-                line_start=child.start_point[0] + 1,
-                line_end=child.end_point[0] + 1,
-                language=language,
-                parent_name=enclosing_class,
-                params=params,
-                return_type=ret_type,
-                is_test=is_test,
-            )
-        )
+        nodes.append(NodeInfo(
+            kind=kind,
+            name=member_name,
+            file_path=file_path,
+            line_start=child.start_point[0] + 1,
+            line_end=child.end_point[0] + 1,
+            language=language,
+            parent_name=enclosing_class,
+            params=params,
+            return_type=ret_type,
+            is_test=is_test,
+        ))
         container = (
-            self._qualify(enclosing_class, file_path, None) if enclosing_class else file_path
+            self._qualify(enclosing_class, file_path, None)
+            if enclosing_class else file_path
         )
-        edges.append(
-            EdgeInfo(
-                kind="CONTAINS",
-                source=container,
-                target=qualified,
-                file_path=file_path,
-                line=child.start_point[0] + 1,
-            )
-        )
+        edges.append(EdgeInfo(
+            kind="CONTAINS",
+            source=container,
+            target=qualified,
+            file_path=file_path,
+            line=child.start_point[0] + 1,
+        ))
 
         # Recurse into the function body for calls, attributing them to the
         # member function.
         self._extract_from_tree(
-            right,
-            source,
-            language,
-            file_path,
-            nodes,
-            edges,
+            right, source, language, file_path, nodes, edges,
             enclosing_class=enclosing_class,
             enclosing_func=member_name,
             import_map=import_map,
@@ -9950,19 +15370,17 @@ class CodeParser:
                     key = normalize_spring_config_key(prefix)
                     if not key:
                         continue
-                    edges.append(
-                        EdgeInfo(
-                            kind="DEPENDS_ON_CONFIG",
-                            source=source,
-                            target=f"config:{key}.*",
-                            file_path=file_path,
-                            line=annotation.start_point[0] + 1,
-                            extra={
-                                "config_key": key,
-                                "resolution": "configuration_properties",
-                            },
-                        )
-                    )
+                    edges.append(EdgeInfo(
+                        kind="DEPENDS_ON_CONFIG",
+                        source=source,
+                        target=f"config:{key}.*",
+                        file_path=file_path,
+                        line=annotation.start_point[0] + 1,
+                        extra={
+                            "config_key": key,
+                            "resolution": "configuration_properties",
+                        },
+                    ))
 
         for child in class_node.children:
             if child.type != "class_body":
@@ -9986,19 +15404,17 @@ class CodeParser:
                                 key = normalize_spring_config_key(raw_key)
                                 if not key:
                                     continue
-                                edges.append(
-                                    EdgeInfo(
-                                        kind="DEPENDS_ON_CONFIG",
-                                        source=source,
-                                        target=f"config:{key}",
-                                        file_path=file_path,
-                                        line=annotation.start_point[0] + 1,
-                                        extra={
-                                            "config_key": key,
-                                            "resolution": "value_annotation",
-                                        },
-                                    )
-                                )
+                                edges.append(EdgeInfo(
+                                    kind="DEPENDS_ON_CONFIG",
+                                    source=source,
+                                    target=f"config:{key}",
+                                    file_path=file_path,
+                                    line=annotation.start_point[0] + 1,
+                                    extra={
+                                        "config_key": key,
+                                        "resolution": "value_annotation",
+                                    },
+                                ))
 
     def _emit_spring_injections(
         self,
@@ -10008,6 +15424,7 @@ class CodeParser:
         language: str,
         file_path: str,
         edges: list[EdgeInfo],
+        import_map: Optional[dict[str, str]] = None,
     ) -> None:
         """Emit INJECTS edges for Spring DI injection points in a Java class.
 
@@ -10031,19 +15448,12 @@ class CodeParser:
             for member in node.children:
                 if member.type == "field_declaration":
                     self._emit_spring_field_injection(
-                        member,
-                        qualified_source,
-                        file_path,
-                        edges,
-                        has_required_args,
-                        has_all_args,
+                        member, qualified_source, file_path,
+                        edges, has_required_args, has_all_args, import_map,
                     )
                 elif member.type == "constructor_declaration":
                     self._emit_spring_constructor_injection(
-                        member,
-                        qualified_source,
-                        file_path,
-                        edges,
+                        member, qualified_source, file_path, edges, import_map,
                     )
 
     def _emit_spring_field_injection(
@@ -10054,6 +15464,7 @@ class CodeParser:
         edges: list[EdgeInfo],
         has_required_args: bool,
         has_all_args: bool,
+        import_map: Optional[dict[str, str]],
     ) -> None:
         """Emit one INJECTS edge per field selected by Spring/Lombok."""
         field_annotations: list[str] = []
@@ -10073,7 +15484,9 @@ class CodeParser:
                     elif mod.type in ("marker_annotation", "annotation"):
                         for sub in mod.children:
                             if sub.type == "identifier":
-                                field_annotations.append(sub.text.decode("utf-8", errors="replace"))
+                                field_annotations.append(
+                                    sub.text.decode("utf-8", errors="replace")
+                                )
                                 break
             elif child.type in ("type_identifier", "generic_type", "array_type"):
                 # Use outermost type name for generic types like List<Foo>
@@ -10115,19 +15528,20 @@ class CodeParser:
             else:
                 continue
 
-            edges.append(
-                EdgeInfo(
-                    kind="INJECTS",
-                    source=qualified_source,
-                    target=field_type,
-                    file_path=file_path,
-                    line=field_node.start_point[0] + 1,
-                    extra={
-                        "injection_type": injection_type,
-                        "field_name": field_name,
-                    },
-                )
-            )
+            extra = {
+                "injection_type": injection_type,
+                "field_name": field_name,
+            }
+            if import_map is not None:
+                extra["java_type"] = self._spring_java_type(field_type, import_map)
+            edges.append(EdgeInfo(
+                kind="INJECTS",
+                source=qualified_source,
+                target=field_type,
+                file_path=file_path,
+                line=field_node.start_point[0] + 1,
+                extra=extra,
+            ))
 
     def _emit_spring_constructor_injection(
         self,
@@ -10135,6 +15549,7 @@ class CodeParser:
         qualified_source: str,
         file_path: str,
         edges: list[EdgeInfo],
+        import_map: Optional[dict[str, str]],
     ) -> None:
         """Emit INJECTS edges for @Autowired constructor parameters."""
         ctor_annotations = self._get_java_annotations(ctor_node)
@@ -10158,16 +15573,16 @@ class CodeParser:
                     extra: dict = {"injection_type": "constructor"}
                     if param_name:
                         extra["field_name"] = param_name
-                    edges.append(
-                        EdgeInfo(
-                            kind="INJECTS",
-                            source=qualified_source,
-                            target=param_type,
-                            file_path=file_path,
-                            line=param.start_point[0] + 1,
-                            extra=extra,
-                        )
-                    )
+                    if import_map is not None:
+                        extra["java_type"] = self._spring_java_type(param_type, import_map)
+                    edges.append(EdgeInfo(
+                        kind="INJECTS",
+                        source=qualified_source,
+                        target=param_type,
+                        file_path=file_path,
+                        line=param.start_point[0] + 1,
+                        extra=extra,
+                    ))
 
     @staticmethod
     def _java_annotation_name(annotation_node) -> Optional[str]:
@@ -10338,28 +15753,24 @@ class CodeParser:
                             "http_method": method,
                             "route": route,
                         }
-                        nodes.append(
-                            NodeInfo(
-                                kind="Endpoint",
-                                name=endpoint_name,
-                                file_path=file_path,
-                                line_start=annotation.start_point[0] + 1,
-                                line_end=annotation.end_point[0] + 1,
-                                language="java",
-                                parent_name=class_name,
-                                extra=metadata,
-                            )
-                        )
-                        edges.append(
-                            EdgeInfo(
-                                kind="HANDLES",
-                                source=source,
-                                target=self._qualify(endpoint_name, file_path, class_name),
-                                file_path=file_path,
-                                line=annotation.start_point[0] + 1,
-                                extra=metadata,
-                            )
-                        )
+                        nodes.append(NodeInfo(
+                            kind="Endpoint",
+                            name=endpoint_name,
+                            file_path=file_path,
+                            line_start=annotation.start_point[0] + 1,
+                            line_end=annotation.end_point[0] + 1,
+                            language="java",
+                            parent_name=class_name,
+                            extra=metadata,
+                        ))
+                        edges.append(EdgeInfo(
+                            kind="HANDLES",
+                            source=source,
+                            target=self._qualify(endpoint_name, file_path, class_name),
+                            file_path=file_path,
+                            line=annotation.start_point[0] + 1,
+                            extra=metadata,
+                        ))
                         emitted += 1
         return emitted
 
@@ -10373,7 +15784,10 @@ class CodeParser:
             if method == "route":
                 return True
             current = next(
-                (child for child in current.children if child.type == "method_invocation"),
+                (
+                    child for child in current.children
+                    if child.type == "method_invocation"
+                ),
                 None,
             )
             if current is None:
@@ -10384,7 +15798,10 @@ class CodeParser:
     def _webflux_route_arguments(invocation) -> tuple[Optional[str], Optional[object]]:
         """Return a literal route and method-reference handler from one call."""
         arguments = next(
-            (child for child in invocation.children if child.type == "argument_list"),
+            (
+                child for child in invocation.children
+                if child.type == "argument_list"
+            ),
             None,
         )
         if arguments is None:
@@ -10482,7 +15899,9 @@ class CodeParser:
             return False
 
         ancestor = invocation.parent
-        while ancestor is not None and ancestor.type not in self._function_types.get("java", []):
+        while ancestor is not None and ancestor.type not in self._function_types.get(
+            "java", []
+        ):
             if ancestor.type == "lambda_expression":
                 return False
             ancestor = ancestor.parent
@@ -10516,28 +15935,24 @@ class CodeParser:
             "mapping_style": "webflux_functional",
             "route": route,
         }
-        nodes.append(
-            NodeInfo(
-                kind="Endpoint",
-                name=endpoint_name,
-                file_path=file_path,
-                line_start=line,
-                line_end=invocation.end_point[0] + 1,
-                language="java",
-                parent_name=enclosing_class,
-                extra=metadata,
-            )
-        )
-        edges.append(
-            EdgeInfo(
-                kind="HANDLES",
-                source=handler_target,
-                target=endpoint_target,
-                file_path=file_path,
-                line=line,
-                extra=metadata,
-            )
-        )
+        nodes.append(NodeInfo(
+            kind="Endpoint",
+            name=endpoint_name,
+            file_path=file_path,
+            line_start=line,
+            line_end=invocation.end_point[0] + 1,
+            language="java",
+            parent_name=enclosing_class,
+            extra=metadata,
+        ))
+        edges.append(EdgeInfo(
+            kind="HANDLES",
+            source=handler_target,
+            target=endpoint_target,
+            file_path=file_path,
+            line=line,
+            extra=metadata,
+        ))
         return True
 
     @staticmethod
@@ -10577,28 +15992,24 @@ class CodeParser:
                 "schedule_kind": schedule_kind,
                 **attributes,
             }
-            nodes.append(
-                NodeInfo(
-                    kind="Scheduler",
-                    name=schedule_name,
-                    file_path=file_path,
-                    line_start=annotation.start_point[0] + 1,
-                    line_end=annotation.end_point[0] + 1,
-                    language="java",
-                    parent_name=class_name,
-                    extra=metadata,
-                )
-            )
-            edges.append(
-                EdgeInfo(
-                    kind="TRIGGERS",
-                    source=self._qualify(schedule_name, file_path, class_name),
-                    target=target,
-                    file_path=file_path,
-                    line=annotation.start_point[0] + 1,
-                    extra=metadata,
-                )
-            )
+            nodes.append(NodeInfo(
+                kind="Scheduler",
+                name=schedule_name,
+                file_path=file_path,
+                line_start=annotation.start_point[0] + 1,
+                line_end=annotation.end_point[0] + 1,
+                language="java",
+                parent_name=class_name,
+                extra=metadata,
+            ))
+            edges.append(EdgeInfo(
+                kind="TRIGGERS",
+                source=self._qualify(schedule_name, file_path, class_name),
+                target=target,
+                file_path=file_path,
+                line=annotation.start_point[0] + 1,
+                extra=metadata,
+            ))
         return len(annotations)
 
     def _java_annotations_named(self, method_node, names: frozenset[str]) -> list:
@@ -10624,6 +16035,14 @@ class CodeParser:
             if found:
                 return found
         return None
+
+    @classmethod
+    def _spring_java_type(cls, type_name: str, import_map: dict[str, str]) -> str:
+        """Identity of a type in Spring DI, bare when a wildcard hides its package."""
+        head = type_name.strip().partition(".")[0]
+        if import_map.get(_JAVA_WILDCARD_KEY) and head not in import_map:
+            return type_name.strip()
+        return cls._resolve_java_type_identity(type_name, import_map)
 
     @staticmethod
     def _resolve_java_type_identity(
@@ -10676,14 +16095,16 @@ class CodeParser:
 
             if not type_names:
                 parameters = next(
-                    (child for child in method_node.children if child.type == "formal_parameters"),
+                    (
+                        child for child in method_node.children
+                        if child.type == "formal_parameters"
+                    ),
                     None,
                 )
                 if parameters is not None:
                     parameter = next(
                         (
-                            child
-                            for child in parameters.children
+                            child for child in parameters.children
                             if child.type == "formal_parameter"
                         ),
                         None,
@@ -10707,16 +16128,14 @@ class CodeParser:
                 for key in ("condition", "id", "defaultExecution"):
                     if key in attributes:
                         extra[key] = attributes[key]
-                edges.append(
-                    EdgeInfo(
-                        kind="HANDLES",
-                        source=source,
-                        target=f"event::{identity}",
-                        file_path=file_path,
-                        line=annotation.start_point[0] + 1,
-                        extra=extra,
-                    )
-                )
+                edges.append(EdgeInfo(
+                    kind="HANDLES",
+                    source=source,
+                    target=f"event::{identity}",
+                    file_path=file_path,
+                    line=annotation.start_point[0] + 1,
+                    extra=extra,
+                ))
                 emitted += 1
         return emitted
 
@@ -10739,7 +16158,10 @@ class CodeParser:
                 receiver, invoked = self._get_member_call_receiver_method(node, "java")
                 if invoked in _SPRING_EVENT_PUBLISH_METHODS:
                     arguments = next(
-                        (child for child in node.children if child.type == "argument_list"),
+                        (
+                            child for child in node.children
+                            if child.type == "argument_list"
+                        ),
                         None,
                     )
                     if arguments is not None:
@@ -10759,16 +16181,14 @@ class CodeParser:
                             }
                             if receiver:
                                 extra["receiver"] = receiver
-                            edges.append(
-                                EdgeInfo(
-                                    kind="PUBLISHES",
-                                    source=source,
-                                    target=f"event::{identity}",
-                                    file_path=file_path,
-                                    line=node.start_point[0] + 1,
-                                    extra=extra,
-                                )
-                            )
+                            edges.append(EdgeInfo(
+                                kind="PUBLISHES",
+                                source=source,
+                                target=f"event::{identity}",
+                                file_path=file_path,
+                                line=node.start_point[0] + 1,
+                                extra=extra,
+                            ))
                             emitted += 1
             for child in node.children:
                 visit(child)
@@ -10827,21 +16247,16 @@ class CodeParser:
                 if not (field_type.endswith("Activity") or field_type.endswith("Workflow")):
                     continue
 
-                edges.append(
-                    EdgeInfo(
-                        kind="TEMPORAL_STUB",
-                        source=qualified_source,
-                        target=field_type,
-                        file_path=file_path,
-                        line=member.start_point[0] + 1,
-                        extra={
-                            "field_name": field_name,
-                            "stub_type": (
-                                "activity" if field_type.endswith("Activity") else "workflow"
-                            ),
-                        },
-                    )
-                )
+                edges.append(EdgeInfo(
+                    kind="TEMPORAL_STUB",
+                    source=qualified_source,
+                    target=field_type,
+                    file_path=file_path,
+                    line=member.start_point[0] + 1,
+                    extra={"field_name": field_name, "stub_type": (
+                        "activity" if field_type.endswith("Activity") else "workflow"
+                    )},
+                ))
 
     @staticmethod
     def _get_kafka_annotation_topics(annotation_node) -> list[str]:
@@ -10899,7 +16314,7 @@ class CodeParser:
                     continue
                 has_static = False
                 outer_type: Optional[str] = None
-                value_type: Optional[str] = None  # second generic param
+                value_type: Optional[str] = None   # second generic param
                 field_name: Optional[str] = None
 
                 for ch in member.children:
@@ -10937,28 +16352,24 @@ class CodeParser:
 
                 if outer_type in _KAFKA_CONSUMER_TYPES:
                     extra["kafka_type"] = outer_type
-                    edges.append(
-                        EdgeInfo(
-                            kind="CONSUMES",
-                            source=qualified_source,
-                            target="kafka:config",
-                            file_path=file_path,
-                            line=member.start_point[0] + 1,
-                            extra=extra,
-                        )
-                    )
+                    edges.append(EdgeInfo(
+                        kind="CONSUMES",
+                        source=qualified_source,
+                        target="kafka:config",
+                        file_path=file_path,
+                        line=member.start_point[0] + 1,
+                        extra=extra,
+                    ))
                 elif outer_type in _KAFKA_PRODUCER_TYPES:
                     extra["kafka_type"] = outer_type
-                    edges.append(
-                        EdgeInfo(
-                            kind="PRODUCES",
-                            source=qualified_source,
-                            target="kafka:config",
-                            file_path=file_path,
-                            line=member.start_point[0] + 1,
-                            extra=extra,
-                        )
-                    )
+                    edges.append(EdgeInfo(
+                        kind="PRODUCES",
+                        source=qualified_source,
+                        target="kafka:config",
+                        file_path=file_path,
+                        line=member.start_point[0] + 1,
+                        extra=extra,
+                    ))
 
     def _emit_kafka_edges_from_method(
         self,
@@ -10988,28 +16399,24 @@ class CodeParser:
                 topics = self._get_kafka_annotation_topics(mod)
                 if topics:
                     for topic in topics:
-                        edges.append(
-                            EdgeInfo(
-                                kind="CONSUMES",
-                                source=qualified_source,
-                                target=f"kafka:{topic}",
-                                file_path=file_path,
-                                line=method_node.start_point[0] + 1,
-                                extra={"topic": topic, "kafka_type": "KafkaListener"},
-                            )
-                        )
-                else:
-                    # @KafkaListener without resolvable topic (config placeholder)
-                    edges.append(
-                        EdgeInfo(
+                        edges.append(EdgeInfo(
                             kind="CONSUMES",
                             source=qualified_source,
-                            target="kafka:config",
+                            target=f"kafka:{topic}",
                             file_path=file_path,
                             line=method_node.start_point[0] + 1,
-                            extra={"kafka_type": ann_name},
-                        )
-                    )
+                            extra={"topic": topic, "kafka_type": "KafkaListener"},
+                        ))
+                else:
+                    # @KafkaListener without resolvable topic (config placeholder)
+                    edges.append(EdgeInfo(
+                        kind="CONSUMES",
+                        source=qualified_source,
+                        target="kafka:config",
+                        file_path=file_path,
+                        line=method_node.start_point[0] + 1,
+                        extra={"kafka_type": ann_name},
+                    ))
 
     def _get_docstring_summary(self, node, language: str) -> Optional[str]:
         """Extract a bounded documentation summary for a definition node."""
@@ -11080,7 +16487,10 @@ class CodeParser:
     def _preceding_doc_comment(self, node, language: str) -> Optional[str]:
         """Return documentation directly attached above a definition."""
         anchor = node
-        while anchor.parent is not None and anchor.parent.type in _DOC_COMMENT_WRAPPER_TYPES:
+        while (
+            anchor.parent is not None
+            and anchor.parent.type in _DOC_COMMENT_WRAPPER_TYPES
+        ):
             anchor = anchor.parent
 
         siblings: list = []
@@ -11143,17 +16553,88 @@ class CodeParser:
 
         Returns True if the child was handled (class with a name found).
         """
+        if language == "go" and child.type == "type_declaration" and any(
+            part.type == "(" for part in child.children
+        ):
+            # A grouped declaration owns several independent types. Extract
+            # each spec so later embeddings cannot attach to the first type.
+            for spec in child.named_children:
+                if spec.type == "type_spec":
+                    self._extract_classes(
+                        spec, source, language, file_path, nodes, edges,
+                        enclosing_class, import_map, defined_names, _depth,
+                    )
+            return True
+
         name = self._get_name(child, language, "class")
         if not name:
             return False
 
         class_parent = enclosing_class
+        csharp_namespace = None
+        if language == "csharp":
+            name = _csharp_name(child.child_by_field_name("name"))
+            csharp_namespace = _csharp_namespace_context(child)[0][0]
+            class_parent = enclosing_class or csharp_namespace or None
+
+        # Ruby: a compact declaration (``class Foo::Bar``) carries its own
+        # scope, so the enclosing lexical scope is not the whole story. Append
+        # the compact scope chain to the full enclosing scope chain, so the
+        # compact form lands on the same identity as the nested form at any
+        # depth: ``module A; class B::C`` and ``module A; module B; class C``
+        # both qualify to ``A.B.C``. Without this, ``class A::Same`` and
+        # ``class B::Same`` in one file collapse onto a single
+        # ``file.rb::Same``.
+        #
+        # A leading ``::`` (``class ::Root``, ``class ::A::B``) anchors the
+        # name at the top level, so the enclosing scope is dropped instead of
+        # stacked, and the leading separator must not leave an empty segment.
+        if language == "ruby" and child.type in ("class", "module"):
+            _name_child = child.child_by_field_name("name")
+            if _name_child is not None and _name_child.type == "scope_resolution":
+                _scope = _name_child.child_by_field_name("scope")
+                _chain = (
+                    _scope.text.decode("utf-8", errors="replace").replace("::", ".")
+                    if _scope is not None
+                    else ""
+                ).lstrip(".")
+                if _name_child.text.lstrip().startswith(b"::"):
+                    class_parent = _chain or None
+                elif _chain:
+                    class_parent = (
+                        f"{class_parent}.{_chain}" if class_parent else _chain
+                    )
 
         # Swift: detect the actual type keyword (class/struct/enum/actor/extension)
         # and store it in extra["swift_kind"] for richer downstream analysis.
         # Tree-sitter maps struct/enum/actor/extension all to class_declaration;
         # protocol uses its own protocol_declaration node type.
         extra: dict = {}
+        if language == "csharp":
+            extra["csharp_namespace"] = csharp_namespace
+            parameters = next(
+                (c for c in child.children if c.type == "type_parameter_list"), None,
+            )
+            if parameters is not None:
+                # Arity, not a flag: it is what separates the declarations of
+                # ``I``, ``I<T>`` and ``I<T, U>`` from one another.
+                extra["csharp_arity"] = sum(
+                    1 for c in parameters.named_children if c.type == "type_parameter"
+                )
+            if any(c.type == "modifier" and c.text == b"partial" for c in child.children):
+                extra["csharp_partial"] = True
+        # TypeScript interfaces and type aliases share kind Class but have no
+        # runtime body, so changes.py must not report them as test gaps (#1109).
+        if language in ("typescript", "tsx") and child.type in (
+            "interface_declaration", "type_alias_declaration",
+        ):
+            extra["typescript_kind"] = child.type
+        # A PHP interface or trait is not a superclass: a method it declares is
+        # not what ``$this->m()`` runs through ``extends``.
+        if language == "php" and child.type in (
+            "interface_declaration", "trait_declaration",
+        ):
+            extra["php_kind"] = child.type.split("_", 1)[0]
         if language == "swift":
             if child.type == "class_declaration":
                 _swift_keywords = {"class", "struct", "enum", "actor", "extension"}
@@ -11168,6 +16649,17 @@ class CodeParser:
         # Java: detect Spring stereotype annotations and store as metadata
         class_annotations: list[str] = []
         if language == "java":
+            package = (import_map or {}).get(_JAVA_PACKAGE_KEY)
+            if package:
+                extra["java_package"] = package
+            if child.type == "interface_declaration":
+                extra["java_kind"] = "interface"
+            else:
+                extra["java_kind"] = "abstract" if any(
+                    grandchild.type == "abstract"
+                    for modifier in child.children if modifier.type == "modifiers"
+                    for grandchild in modifier.children
+                ) else "concrete"
             class_annotations = self._get_java_annotations(child)
             spring_stereotypes = [
                 a for a in class_annotations if a in _SPRING_STEREOTYPE_ANNOTATIONS
@@ -11176,12 +16668,17 @@ class CodeParser:
                 extra["spring_stereotype"] = spring_stereotypes[0]
             if class_annotations:
                 extra["spring_annotations"] = class_annotations
-            temporal_roles = [a for a in class_annotations if a in _TEMPORAL_INTERFACE_ANNOTATIONS]
+            temporal_roles = [
+                a for a in class_annotations if a in _TEMPORAL_INTERFACE_ANNOTATIONS
+            ]
             if temporal_roles:
                 is_wf = "WorkflowInterface" in temporal_roles
                 role = "workflow_interface" if is_wf else "activity_interface"
                 extra["temporal_role"] = role
             if import_map is not None:
+                java_package = import_map.get(_JAVA_PACKAGE_KEY, "")
+                if java_package:
+                    extra["java_package"] = java_package
                 request_prefixes: list[str] = []
                 for annotation in self._java_annotations_named(
                     child,
@@ -11206,7 +16703,9 @@ class CodeParser:
                 class_decorators.extend(_python_decorator_names(child))
             if language == "csharp":
                 class_decorators.extend(_csharp_attribute_names(child))
-        class_modifiers: Optional[str] = ",".join(class_decorators) if class_decorators else None
+        class_modifiers: Optional[str] = (
+            ",".join(class_decorators) if class_decorators else None
+        )
         if class_decorators and "decorators" not in extra:
             extra["decorators"] = class_decorators
 
@@ -11227,78 +16726,112 @@ class CodeParser:
         )
         nodes.append(node)
 
-        # CONTAINS edge
+        # CONTAINS edge: a nested class is contained by its enclosing class,
+        # which is always emitted as a node on the same scope chain (#934).
+        # Python's collision-only identities are addressed by their own
+        # container below, so they keep the file-level edge here.
         class_container = (
             self._qualify(enclosing_class, file_path, None)
-            if language == "julia" and enclosing_class
+            if enclosing_class and language not in ("python", "cpp")
             else file_path
         )
-        edges.append(
-            EdgeInfo(
-                kind="CONTAINS",
-                source=class_container,
-                target=self._qualify(name, file_path, class_parent),
-                file_path=file_path,
-                line=child.start_point[0] + 1,
-            )
-        )
+        edges.append(EdgeInfo(
+            kind="CONTAINS",
+            source=class_container,
+            target=self._qualify(name, file_path, class_parent),
+            file_path=file_path,
+            line=child.start_point[0] + 1,
+        ))
 
         # Inheritance edges
         bases = self._get_bases(child, language, source)
         for base in bases:
-            edges.append(
-                EdgeInfo(
-                    kind="INHERITS",
-                    source=self._qualify(
-                        name,
-                        file_path,
-                        class_parent,
-                    ),
-                    target=base,
-                    file_path=file_path,
-                    line=child.start_point[0] + 1,
-                )
-            )
+            inheritance_extra = {}
+            if language == "java" and import_map is not None:
+                inheritance_extra["java_type"] = self._spring_java_type(base, import_map)
+            edges.append(EdgeInfo(
+                kind="INHERITS",
+                source=self._qualify(
+                    name, file_path, class_parent,
+                ),
+                target=base,
+                file_path=file_path,
+                line=child.start_point[0] + 1,
+                extra=inheritance_extra,
+            ))
 
         # Spring DI: emit INJECTS edges for injected dependencies
         if language == "java":
             self._emit_spring_injections(
-                child,
-                name,
-                class_annotations,
-                language,
-                file_path,
-                edges,
+                child, name, class_annotations, language, file_path, edges,
+                import_map,
             )
             self._emit_spring_config_edges(
-                child,
-                name,
-                enclosing_class,
-                file_path,
-                edges,
+                child, name, enclosing_class, file_path, edges,
             )
             # Temporal: emit TEMPORAL_STUB edges for activity/workflow stub fields
             self._emit_temporal_stub_fields(child, name, file_path, edges)
             # Kafka: emit CONSUMES/PRODUCES edges for Kafka field declarations
             self._emit_kafka_edges_from_class(child, name, file_path, edges)
 
-        # Recurse into class body using the fully-qualified nested class name
-        # so that grandchildren get the correct parent_name chain.
-        nested_class_scope = f"{enclosing_class}.{name}" if enclosing_class else name
+        # Recurse into class body. Descend with the full accumulated scope
+        # chain (``Parent.Name``), not the bare leaf name: the class node is
+        # keyed ``_qualify(name, file, class_parent)``, so passing the leaf
+        # leaves nested members qualifying to ``file::Name.member`` while the
+        # container node is ``file::Parent.Name`` — two same-named nested
+        # classes collapse their methods onto one node, deep nesting keeps
+        # only one level, and CONTAINS edges point at containers that were
+        # never emitted (#934). Ruby already recursed this way; Julia joins
+        # through its own helper.
+        if language == "julia":
+            recursive_class = self._julia_scope_join(enclosing_class, name)
+        elif language in ("python", "cpp"):
+            # Python keeps its legacy leaf spelling unless a same-leaf class
+            # actually collides; ``_index_ambiguous_method_scopes`` carries
+            # the full chain for exactly those methods (#999). C++ pins
+            # legacy nested-class keys while its namespace-aware function
+            # scopes stay complete (test_cpp_overload_identity).
+            recursive_class = name
+        elif class_parent:
+            recursive_class = f"{class_parent}.{name}"
+        else:
+            recursive_class = name
         self._extract_from_tree(
-            child,
-            source,
-            language,
-            file_path,
-            nodes,
-            edges,
-            enclosing_class=nested_class_scope,
-            enclosing_func=None,
-            import_map=import_map,
-            defined_names=defined_names,
+            child, source, language, file_path, nodes, edges,
+            enclosing_class=recursive_class, enclosing_func=None,
+            import_map=import_map, defined_names=defined_names,
             _depth=_depth + 1,
         )
         return True
+
+    def _index_ambiguous_method_scopes(self, root, language: str, import_map: dict) -> None:
+        """Carry full method scopes only where legacy leaf scopes would collide.
+
+        The per-file import map already carries internal resolver metadata.
+        Keeping this index there avoids parser-instance state leaking between
+        files (including recursive parsing). The tree is visited once.
+
+        Python only: a Ruby class already descends with its full lexical scope,
+        so its methods cannot collide on a leaf.
+        """
+        if language != "python":
+            return
+        scopes: dict[str, set[str]] = {}
+        methods: list[tuple[int, str, str]] = []
+        pending = [(root, "")]
+        while pending:
+            node, scope = pending.pop()
+            if node.type in self._class_types[language]:
+                name = self._get_name(node, language, "class")
+                if name:
+                    scope = f"{scope}.{name}" if scope else name
+                    scopes.setdefault(name, set()).add(scope)
+            if node.type in self._function_types[language] and scope:
+                methods.append((node.id, scope.rsplit(".", 1)[-1], scope))
+            pending.extend((child, scope) for child in reversed(node.named_children))
+        for node_id, leaf, scope in methods:
+            if len(scopes.get(leaf, ())) > 1:
+                import_map[f"__crg_method_scope__:{node_id}"] = scope
 
     def _extract_functions(
         self,
@@ -11321,6 +16854,8 @@ class CodeParser:
         name = self._get_name(child, language, "function")
         if not name:
             return False
+        if language == "csharp":
+            name = _csharp_name(child.child_by_field_name("name")) or name
 
         # Go methods: attach to their receiver type as the enclosing class,
         # so `func (s *T) Foo()` becomes a member of T rather than a
@@ -11381,12 +16916,16 @@ class CodeParser:
         if deco_list:
             decorators = tuple(deco_list)
 
-        is_test = _is_test_function(name, file_path, decorators)
+        is_test = _is_test_function(name, file_path, decorators, repo_root=self._repo_root)
+        # PowerShell's Test-* verb and DSC Test() methods are production
+        # declarations unless the containing file is test code.
+        if language == "powershell":
+            is_test = self._is_test_path(file_path)
         # PHPUnit's name convention is ``test*`` (not only ``test_*``).
         if (
             language == "php"
             and child.type == "method_declaration"
-            and _is_test_file(file_path)
+            and self._is_test_path(file_path)
             and name.startswith("test")
         ):
             is_test = True
@@ -11394,16 +16933,22 @@ class CodeParser:
 
         parent_name = enclosing_class
         container_scope = enclosing_class
+        if language == "python" and import_map is not None:
+            parent_name = import_map.get(f"__crg_method_scope__:{child.id}", parent_name)
+            # A Class node's identity is its direct parent plus its own name,
+            # however deep it sits, so CONTAINS must use the same two parts.
+            container_scope = (
+                ".".join(parent_name.split(".")[-2:]) if parent_name else parent_name
+            )
+            enclosing_class = parent_name
         julia_qualifier: Optional[str] = None
         if language == "julia":
             lexical_parent = self._julia_scope_join(
-                enclosing_class,
-                enclosing_func,
+                enclosing_class, enclosing_func,
             )
             julia_qualifier = self._julia_definition_qualifier(child)
             parent_name = self._julia_scope_join(
-                lexical_parent,
-                julia_qualifier,
+                lexical_parent, julia_qualifier,
             )
             container_scope = lexical_parent
 
@@ -11411,9 +16956,7 @@ class CodeParser:
         params = self._get_params(child, language, source)
         if language == "cpp":
             explicit_scope, identity_name, cpp_params = self._cpp_function_identity(
-                child,
-                name,
-                source,
+                child, name, source,
             )
             lexical_namespace = self._cpp_lexical_namespace(child)
             lexical_classes = self._cpp_lexical_class_names(child)
@@ -11423,7 +16966,7 @@ class CodeParser:
                 explicit_scope or lexical_class_scope or enclosing_class,
             )
             if lexical_classes:
-                container_scope = lexical_class_scope
+                container_scope = ".".join(lexical_classes[-2:])
             elif enclosing_class:
                 container_scope = enclosing_class
             if cpp_params is not None:
@@ -11432,24 +16975,25 @@ class CodeParser:
         qualified = self._qualify(identity_name, file_path, parent_name)
         ret_type = self._get_return_type(child, language, source)
 
-        # Persist decorators so downstream analysis (dead-code filters,
-        # framework detection) can use them regardless of language.
-        method_extra: dict = {}
-        if deco_list:
-            method_extra["decorators"] = decorators
-
         # Java: detect Temporal method-level annotations and Kafka listeners
+        method_extra: dict = {}
+        if language == "csharp":
+            method_extra["csharp_namespace"] = _csharp_namespace_context(child)[0][0]
+            method_extra["csharp_static"] = any(
+                c.type == "modifier" and c.text == b"static" for c in child.children
+            )
         go_receiver_bindings = None
         if language == "go" and child.type == "method_declaration":
             receiver_name = self._get_go_receiver_name(child)
             if receiver_name:
                 method_extra["go_receiver"] = receiver_name
                 go_receiver_bindings = self._go_receiver_binding_index(
-                    child,
-                    receiver_name,
+                    child, receiver_name,
                 )
         if julia_qualifier:
             method_extra["julia_module_qualifier"] = julia_qualifier
+        if child.type == "abstract_method_signature":
+            method_extra["abstract"] = True
         if language == "java" and deco_list:
             endpoint_count = self._emit_spring_endpoint_nodes(
                 child,
@@ -11463,17 +17007,15 @@ class CodeParser:
             if endpoint_count:
                 method_extra["spring_endpoint"] = True
                 method_extra["spring_endpoint_count"] = endpoint_count
-            temporal_method_annots = [a for a in deco_list if a in _TEMPORAL_METHOD_ANNOTATIONS]
+            temporal_method_annots = [
+                a for a in deco_list if a in _TEMPORAL_METHOD_ANNOTATIONS
+            ]
             if temporal_method_annots:
                 method_extra["temporal_role"] = temporal_method_annots[0].lower()
             if any(a.split("(")[0] in _KAFKA_LISTENER_ANNOTATIONS for a in deco_list):
                 method_extra["kafka_listener"] = True
                 self._emit_kafka_edges_from_method(
-                    child,
-                    name,
-                    enclosing_class,
-                    file_path,
-                    edges,
+                    child, name, enclosing_class, file_path, edges,
                 )
             if any(
                 annotation.split("(", 1)[0] in _SPRING_SCHEDULED_ANNOTATIONS
@@ -11534,6 +17076,10 @@ class CodeParser:
         modifiers_str: Optional[str] = ",".join(deco_list) if deco_list else None
         if deco_list:
             method_extra["decorators"] = list(deco_list)
+        if language == "java" and child.type == "constructor_declaration":
+            # Lets consumers tell a constructor from a method; Spring AOP,
+            # for one, cannot intercept constructors.
+            method_extra["java_constructor"] = True
 
         docstring = self._get_docstring_summary(child, language)
         if docstring:
@@ -11558,31 +17104,29 @@ class CodeParser:
 
         # CONTAINS edge
         container = (
-            self._qualify(container_scope, file_path, None) if container_scope else file_path
+            self._qualify(container_scope, file_path, None)
+            if container_scope
+            else file_path
         )
-        edges.append(
-            EdgeInfo(
-                kind="CONTAINS",
-                source=container,
-                target=qualified,
-                file_path=file_path,
-                line=child.start_point[0] + 1,
-            )
-        )
+        edges.append(EdgeInfo(
+            kind="CONTAINS",
+            source=container,
+            target=qualified,
+            file_path=file_path,
+            line=child.start_point[0] + 1,
+        ))
 
         # Qualified Julia methods extend a foreign module while remaining
         # structurally contained by their lexical module.
         if julia_qualifier:
-            edges.append(
-                EdgeInfo(
-                    kind="REFERENCES",
-                    source=qualified,
-                    target=julia_qualifier,
-                    file_path=file_path,
-                    line=child.start_point[0] + 1,
-                    extra={"julia_qualified_def": True},
-                )
-            )
+            edges.append(EdgeInfo(
+                kind="REFERENCES",
+                source=qualified,
+                target=julia_qualifier,
+                file_path=file_path,
+                line=child.start_point[0] + 1,
+                extra={"julia_qualified_def": True},
+            ))
 
         # Solidity: modifier invocations on functions -> CALLS edges
         if language == "solidity":
@@ -11590,33 +17134,25 @@ class CodeParser:
                 if sub.type == "modifier_invocation":
                     for ident in sub.children:
                         if ident.type == "identifier":
-                            edges.append(
-                                EdgeInfo(
-                                    kind="CALLS",
-                                    source=qualified,
-                                    target=ident.text.decode(
-                                        "utf-8",
-                                        errors="replace",
-                                    ),
-                                    file_path=file_path,
-                                    line=sub.start_point[0] + 1,
-                                )
-                            )
+                            edges.append(EdgeInfo(
+                                kind="CALLS",
+                                source=qualified,
+                                target=ident.text.decode(
+                                    "utf-8", errors="replace",
+                                ),
+                                file_path=file_path,
+                                line=sub.start_point[0] + 1,
+                            ))
                             break
 
         # Recurse to find calls inside the function
-        recursive_class = parent_name if language in ("julia", "cpp") else enclosing_class
+        recursive_class = (
+            parent_name if language in ("julia", "cpp") else enclosing_class
+        )
         self._extract_from_tree(
-            child,
-            source,
-            language,
-            file_path,
-            nodes,
-            edges,
-            enclosing_class=recursive_class,
-            enclosing_func=identity_name,
-            import_map=import_map,
-            defined_names=defined_names,
+            child, source, language, file_path, nodes, edges,
+            enclosing_class=recursive_class, enclosing_func=identity_name,
+            import_map=import_map, defined_names=defined_names,
             _depth=_depth + 1,
             _go_receiver_bindings=go_receiver_bindings,
         )
@@ -11638,23 +17174,88 @@ class CodeParser:
         invocation). Returning False lets the dispatcher fall through to call
         extraction instead of silently dropping the call. See: Ruby call graph.
         """
-        imports = self._extract_import(child, language, source)
-        for imp_target in imports:
-            resolved = self._resolve_module_to_file(
-                imp_target,
-                file_path,
-                language,
+        specs = self._extract_import_specs(child, language, source, file_path)
+        csharp_extra = {}
+        if language == "csharp":
+            scopes = _csharp_namespace_context(child)
+            alias = next((c for c in child.children if c.type == "="), None)
+            csharp_extra = {
+                "source_offset": child.start_byte,
+                "csharp_scopes": scopes,
+                "csharp_global": any(c.type == "global" for c in child.children),
+                "csharp_using_kind": (
+                    "alias" if alias is not None
+                    else "static" if any(c.type == "static" for c in child.children)
+                    else "namespace"
+                ),
+            }
+            if alias is not None:
+                csharp_extra["csharp_alias"] = _csharp_name(next(
+                    c for c in child.named_children if c.type != "comment"
+                ))
+        for spec in specs:
+            target, scope = self._resolve_import_target(
+                spec.module, file_path, language, spec.form,
             )
-            edges.append(
-                EdgeInfo(
-                    kind="IMPORTS_FROM",
-                    source=file_path,
-                    target=resolved if resolved else imp_target,
-                    file_path=file_path,
-                    line=child.start_point[0] + 1,
-                )
-            )
-        return bool(imports)
+            if target is None:
+                # Nothing in this repository: the standard library, a gem, a
+                # dependency that is not vendored, or a directory the build
+                # does not index. Keep the bare module string, which is what
+                # the edge said before -- never a guessed path.
+                target, scope = spec.module, None
+            extra: dict[str, str] = {}
+            if scope:
+                extra[IMPORT_SCOPE_KEY] = scope
+            if spec.context:
+                extra[IMPORT_CONTEXT_KEY] = spec.context
+            edges.append(EdgeInfo(
+                kind="IMPORTS_FROM",
+                source=file_path,
+                target=target,
+                file_path=file_path,
+                line=spec.line,
+                extra={**csharp_extra, **extra},
+            ))
+        return bool(specs)
+
+    def _resolve_import_target(
+        self,
+        module: str,
+        file_path: str,
+        language: str,
+        form: Optional[str] = None,
+    ) -> tuple[Optional[str], Optional[str]]:
+        """The single target one import statement names, and its scope.
+
+        Most languages name a file, and the scope is ``None``. Two do not:
+        a Go import names a PACKAGE, which is a directory of files, and
+        Ruby's ``require_all`` names a directory tree. Both resolve to the
+        directory itself with :data:`IMPORT_SCOPE_PACKAGE` or
+        :data:`IMPORT_SCOPE_TREE`, and the read path expands the directory
+        to its member files when a caller asks.
+
+        Naming the directory rather than fanning out to one edge per file is
+        what keeps the edge count proportional to the number of imports
+        instead of imports times package size, and what makes an incremental
+        update equal a rebuild: the target no longer depends on which files
+        happened to be in the package when the importing file was parsed.
+        """
+        if language == "go":
+            package_dir = self._resolve_go_package_dir(module, file_path)
+            if package_dir is None:
+                return None, None
+            return normalize_file_path(package_dir), IMPORT_SCOPE_PACKAGE
+        if language == "ruby" and form == "require_all":
+            directory = self._resolve_ruby_require_all_dir(module, file_path)
+            if directory is not None:
+                return normalize_file_path(directory), IMPORT_SCOPE_TREE
+            # ``require_all`` on a plain file argument behaves like
+            # ``require``, which is what the gem itself does.
+            form = "require"
+        resolved = self._resolve_module_to_file(
+            module, file_path, language, form=form,
+        )
+        return (resolved, None) if resolved else (None, None)
 
     def _extract_calls(
         self,
@@ -11669,7 +17270,9 @@ class CodeParser:
         import_map: Optional[dict[str, str]],
         defined_names: Optional[set[str]],
         _depth: int,
-        _go_receiver_bindings: Optional[tuple[str, tuple[int, ...], tuple[int, ...]]] = None,
+        _go_receiver_bindings: Optional[
+            tuple[str, tuple[int, ...], tuple[int, ...]]
+        ] = None,
     ) -> bool:
         """Extract call expressions, including test runner special cases.
 
@@ -11678,14 +17281,20 @@ class CodeParser:
         recursion). Returns False if the caller should continue to Solidity
         handling and default recursion.
         """
-        if language == "python" and (
-            child.start_point[0] + 1,
-            child.start_point[1],
-        ) in _python_unreachable_call_positions(source):
+        if (
+            language == "python"
+            and (child.start_point[0] + 1, child.start_point[1])
+            in _python_unreachable_call_positions(source)
+        ):
             return True
 
         # Non-Python languages: tree-sitter dead-guard walk (Go/TS/JS
         # ``if false``, C/C++ ``#if 0``).  ``ast`` above cannot reach them.
+        # Rust is separate: its if is an if_expression and its false is a
+        # boolean_literal, and both shapes are shared with Kotlin and Scala,
+        # whose if (false) stays live.
+        if language == "rust" and _is_in_rust_dead_guard(child):
+            return True
         if language != "python" and _is_in_static_dead_guard(child):
             return True
 
@@ -11698,75 +17307,73 @@ class CodeParser:
         if (
             call_name
             and language in ("javascript", "typescript", "tsx")
-            and _is_test_file(file_path)
+            and self._is_test_path(file_path)
             and call_name not in _TEST_RUNNER_NAMES
         ):
-            effective_call_name = self._get_base_call_name(child, source) or call_name
+            effective_call_name = (
+                self._get_base_call_name(child, source) or call_name
+            )
 
         # Special handling: test runner calls in test files -> Test nodes
-        if (
-            effective_call_name
-            and language in ("javascript", "typescript", "tsx")
-            and _is_test_file(file_path)
-            and effective_call_name in _TEST_RUNNER_NAMES
+        if effective_call_name and (
+            (
+                language in ("javascript", "typescript", "tsx")
+                and self._is_test_path(file_path)
+                and effective_call_name in _TEST_RUNNER_NAMES
+            )
+            or (
+                language == "ruby"
+                and self._is_ruby_test_block(child, effective_call_name, file_path)
+            )
         ):
-            test_desc = self._get_test_description(child, source)
+            test_desc = (
+                self._get_ruby_test_description(child)
+                if language == "ruby"
+                else self._get_test_description(child, source)
+            )
             line_no = child.start_point[0] + 1
             synthetic_base = (
-                f"{effective_call_name}:{test_desc}" if test_desc else effective_call_name
+                f"{effective_call_name}:{test_desc}"
+                if test_desc else effective_call_name
             )
             synthetic_name = f"{synthetic_base}@L{line_no}"
             qualified = self._qualify(
-                synthetic_name,
-                file_path,
-                enclosing_class,
+                synthetic_name, file_path, enclosing_class,
             )
 
-            nodes.append(
-                NodeInfo(
-                    kind="Test",
-                    name=synthetic_name,
-                    file_path=file_path,
-                    line_start=child.start_point[0] + 1,
-                    line_end=child.end_point[0] + 1,
-                    language=language,
-                    parent_name=enclosing_class,
-                    is_test=True,
-                )
-            )
+            nodes.append(NodeInfo(
+                kind="Test",
+                name=synthetic_name,
+                file_path=file_path,
+                line_start=child.start_point[0] + 1,
+                line_end=child.end_point[0] + 1,
+                language=language,
+                parent_name=enclosing_class,
+                is_test=True,
+            ))
 
             # CONTAINS edge: parent -> this test
             container = (
                 self._qualify(
-                    enclosing_func,
-                    file_path,
-                    enclosing_class,
+                    enclosing_func, file_path, enclosing_class,
                 )
                 if enclosing_func
                 else file_path
             )
-            edges.append(
-                EdgeInfo(
-                    kind="CONTAINS",
-                    source=container,
-                    target=qualified,
-                    file_path=file_path,
-                    line=child.start_point[0] + 1,
-                )
-            )
+            edges.append(EdgeInfo(
+                kind="CONTAINS",
+                source=container,
+                target=qualified,
+                file_path=file_path,
+                line=child.start_point[0] + 1,
+            ))
 
             # Recurse into the call's children (the arrow function body)
             self._extract_from_tree(
-                child,
-                source,
-                language,
-                file_path,
-                nodes,
-                edges,
+                child, source, language, file_path, nodes, edges,
                 enclosing_class=enclosing_class,
                 enclosing_func=synthetic_name,
-                import_map=import_map,
-                defined_names=defined_names,
+                import_map=import_map, defined_names=defined_names,
                 _depth=_depth + 1,
             )
             return True
@@ -11783,12 +17390,12 @@ class CodeParser:
             # lexical source so same-file resolution can find module members.
             if enclosing_func:
                 caller = self._qualify(
-                    enclosing_func,
-                    file_path,
-                    enclosing_class,
+                    enclosing_func, file_path, enclosing_class,
                 )
             elif language in ("verilog", "julia") and enclosing_class:
-                caller = self._qualify(enclosing_class, file_path, None)
+                caller = self._qualify(
+                    enclosing_class, file_path, None
+                )
             else:
                 caller = file_path
 
@@ -11800,10 +17407,12 @@ class CodeParser:
                 member_call = self._get_js_member_call_name(child)
                 if member_call:
                     call_extra["member_call"] = member_call
-            if language in self._TYPED_CALL_LANGUAGES or language in ("cpp", "go", "rust"):
+            if (
+                language in self._TYPED_CALL_LANGUAGES
+                or language in ("cpp", "go", "rust")
+            ):
                 receiver, method_name = self._get_member_call_receiver_method(
-                    child,
-                    language,
+                    child, language,
                 )
                 if method_name:
                     call_name = method_name
@@ -11814,11 +17423,27 @@ class CodeParser:
                         and _go_receiver_bindings is not None
                         and receiver == _go_receiver_bindings[0]
                         and not self._go_receiver_is_shadowed(
-                            child,
-                            _go_receiver_bindings,
+                            child, _go_receiver_bindings,
                         )
                     ):
                         call_extra["go_method_receiver"] = True
+                elif method_name and language in ("python", "php"):
+                    # ``os.environ.get(...)``: a member call whose receiver is
+                    # an expression, not a name. Without this marker the edge
+                    # is indistinguishable from a plain ``get(...)`` and the
+                    # resolvers below happily bind it to any same-named node.
+                    # In PHP, ``$this->service->run()`` inside a test named
+                    # ``run`` was bound to that test itself (#850).
+                    call_extra["receiver_form"] = "expression"
+                elif (
+                    method_name
+                    and language == "java"
+                    and self._java_expression_receiver(child)
+                    and self._is_test_path(file_path)
+                ):
+                    # The same, for a Java test, where a wrong match is a false
+                    # claim of coverage. Production calls keep their old path.
+                    call_extra["receiver_form"] = "expression"
                 if language == "java" and child.type == "method_reference":
                     call_extra["call_syntax"] = "method_reference"
 
@@ -11848,9 +17473,7 @@ class CodeParser:
                 if qualifier and qualified_name:
                     module_parts = qualifier.split(".")
                     imported_module = self._resolve_julia_import_alias(
-                        module_parts[0],
-                        enclosing_class,
-                        enclosing_func,
+                        module_parts[0], enclosing_class, enclosing_func,
                         import_map or {},
                     )
                     if imported_module:
@@ -11861,9 +17484,7 @@ class CodeParser:
 
             if language == "julia" and "." not in call_name:
                 imported_symbol = self._resolve_julia_import_alias(
-                    call_name,
-                    enclosing_class,
-                    enclosing_func,
+                    call_name, enclosing_class, enclosing_func,
                     import_map or {},
                 )
                 if imported_symbol:
@@ -11873,38 +17494,57 @@ class CodeParser:
             # lives on the receiver's type, not in the current file's scope.
             # The spring_resolver post-pass will do the correct cross-type lookup.
             receiver_name = call_extra.get("receiver")
-            if receiver_name in ("self", "cls", "this") and enclosing_class:
+            if language == "csharp":
+                callee = child.child_by_field_name("function")
+                if callee is not None and callee.type == "identifier":
+                    # ``@Run()`` names ``Run``; declarations drop the ``@`` too.
+                    call_name = _csharp_name(callee) or call_name
+                target = call_name
+                call_extra.update({
+                    "source_offset": child.start_byte,
+                    "csharp_raw_target": call_name,
+                    "csharp_scopes": _csharp_namespace_context(child),
+                    "csharp_containing_type": enclosing_class,
+                    "csharp_call_kind": (
+                        "constructor" if child.type == "object_creation_expression"
+                        else "unqualified" if callee is not None and callee.type == "identifier"
+                        else "member"
+                    ),
+                    "unresolved_targets": [],
+                })
+                if child.type == "object_creation_expression":
+                    call_extra["receiver_scope"] = _csharp_name(
+                        child.child_by_field_name("type"),
+                    )
+            elif receiver_name in ("self", "cls", "this") and enclosing_class:
                 target = (
                     call_name
                     if language == "cpp"
                     else self._qualify(call_name, file_path, enclosing_class)
                 )
-            elif language == "rust" and call_name.startswith("Self::") and enclosing_class:
+            elif (
+                language == "rust"
+                and call_name.startswith("Self::")
+                and enclosing_class
+            ):
                 target = self._qualify(
-                    call_name.rsplit("::", 1)[-1],
-                    file_path,
-                    enclosing_class,
+                    call_name.rsplit("::", 1)[-1], file_path, enclosing_class,
                 )
-            elif receiver_name:
+            elif receiver_name or call_extra.get("receiver_form") == "expression":
                 target = call_name
             else:
                 target = self._resolve_call_target(
-                    call_name,
-                    file_path,
-                    language,
-                    import_map or {},
-                    defined_names or set(),
+                    call_name, file_path, language,
+                    import_map or {}, defined_names or set(),
                 )
-            edges.append(
-                EdgeInfo(
-                    kind="CALLS",
-                    source=caller,
-                    target=target,
-                    file_path=file_path,
-                    line=child.start_point[0] + 1,
-                    extra=call_extra,
-                )
-            )
+            edges.append(EdgeInfo(
+                kind="CALLS",
+                source=caller,
+                target=target,
+                file_path=file_path,
+                line=child.start_point[0] + 1,
+                extra=call_extra,
+            ))
 
         return False
 
@@ -12056,8 +17696,9 @@ class CodeParser:
         if callee.type not in ("attribute", "member_expression"):
             return None, None
         object_node = callee.child_by_field_name("object")
-        property_node = callee.child_by_field_name("attribute") or callee.child_by_field_name(
-            "property"
+        property_node = (
+            callee.child_by_field_name("attribute")
+            or callee.child_by_field_name("property")
         )
         if object_node is None or property_node is None:
             return None, None
@@ -12071,9 +17712,10 @@ class CodeParser:
 
         if object_node.type in ("attribute", "member_expression"):
             root = object_node.child_by_field_name("object")
-            field_node = object_node.child_by_field_name(
-                "attribute"
-            ) or object_node.child_by_field_name("property")
+            field_node = (
+                object_node.child_by_field_name("attribute")
+                or object_node.child_by_field_name("property")
+            )
             if (
                 root is not None
                 and field_node is not None
@@ -12106,13 +17748,13 @@ class CodeParser:
             name_node = callee.child_by_field_name("name")
             if name_node is None:
                 return None, None
-            method = name_node.text.decode("utf-8", errors="replace")
+            method = _csharp_name(name_node)
             receiver_node = callee.child_by_field_name("expression")
             if receiver_node is None:
                 return None, method
             if receiver_node.type in ("identifier", "this", "this_expression"):
                 return (
-                    receiver_node.text.decode("utf-8", errors="replace"),
+                    _csharp_name(receiver_node),
                     method,
                 )
             # ``this.field.Save()``: the class field is the receiver.
@@ -12125,30 +17767,46 @@ class CodeParser:
                     and root.type in ("this", "this_expression")
                 ):
                     return (
-                        field_node.text.decode("utf-8", errors="replace"),
+                        _csharp_name(field_node),
                         method,
                     )
+            # Namespace/type paths retain every segment, including global::.
+            # Calls or computed expressions in the receiver are not type names.
+            pending = [receiver_node]
+            while pending:
+                part = pending.pop()
+                if part.type not in (
+                    "identifier", "member_access_expression", "qualified_name",
+                    "alias_qualified_name", "comment",
+                ):
+                    break
+                pending.extend(part.named_children)
+            else:
+                return _csharp_name(receiver_node), method
             return None, method
 
         if callee.type == "conditional_access_expression":
             bindings = [
-                child for child in callee.children if child.type == "member_binding_expression"
+                child for child in callee.children
+                if child.type == "member_binding_expression"
             ]
             if not bindings:
                 return None, None
             name_node = bindings[-1].child_by_field_name("name")
             if name_node is None:
                 return None, None
-            method = name_node.text.decode("utf-8", errors="replace")
+            method = _csharp_name(name_node)
             receiver_node = callee.child_by_field_name("condition")
-            named_children = [child for child in callee.children if child.is_named]
+            named_children = [
+                child for child in callee.children if child.is_named
+            ]
             if (
                 receiver_node is not None
                 and receiver_node.type == "identifier"
                 and len(named_children) == 2
             ):
                 return (
-                    receiver_node.text.decode("utf-8", errors="replace"),
+                    _csharp_name(receiver_node),
                     method,
                 )
             return None, method
@@ -12222,9 +17880,7 @@ class CodeParser:
             absolute = scope.startswith("\\")
             if imported:
                 qualified = self._php_resolve_class_reference(
-                    scope,
-                    namespace,
-                    imports,
+                    scope, namespace, imports,
                 )
                 evidence = "import"
             elif absolute:
@@ -12232,9 +17888,7 @@ class CodeParser:
                 evidence = "fully_qualified"
             elif "\\" in normalized:
                 qualified = self._php_resolve_class_reference(
-                    scope,
-                    namespace,
-                    imports,
+                    scope, namespace, imports,
                 )
                 evidence = "qualified"
             elif namespace:
@@ -12244,9 +17898,7 @@ class CodeParser:
                 return None, None
 
             resolved_file = self._resolve_module_to_file(
-                qualified,
-                file_path,
-                "php",
+                qualified, file_path, "php",
             )
             if resolved_file is None:
                 return None, None
@@ -12307,20 +17959,16 @@ class CodeParser:
                     stable_scope = scope.lstrip("\\")
                     source_name = (
                         self._qualify(
-                            enclosing_func,
-                            file_path,
-                            enclosing_class,
+                            enclosing_func, file_path, enclosing_class,
                         )
                         if enclosing_func
                         else file_path
                     )
-                    resolutions[
-                        (
-                            node.start_point[0] + 1,
-                            source_name,
-                            f"{stable_scope}::{method}",
-                        )
-                    ] = (target, evidence)
+                    resolutions[(
+                        node.start_point[0] + 1,
+                        source_name,
+                        f"{stable_scope}::{method}",
+                    )] = (target, evidence)
 
             for child in node.children:
                 walk_node(
@@ -12333,9 +17981,7 @@ class CodeParser:
                 )
 
         def walk_sequence(
-            container,
-            namespace: str = "",
-            depth: int = 0,
+            container, namespace: str = "", depth: int = 0,
         ) -> None:
             if depth > self._MAX_AST_DEPTH:
                 return
@@ -12345,7 +17991,10 @@ class CodeParser:
                 if child.type == "namespace_definition":
                     child_namespace = self._php_namespace_name(child)
                     block = next(
-                        (part for part in child.children if part.type == "compound_statement"),
+                        (
+                            part for part in child.children
+                            if part.type == "compound_statement"
+                        ),
                         None,
                     )
                     if block is not None:
@@ -12379,28 +18028,28 @@ class CodeParser:
             target, evidence = resolution
             extra = dict(edge.extra)
             extra["scoped_resolution"] = evidence
-            resolved.append(
-                EdgeInfo(
-                    kind=edge.kind,
-                    source=edge.source,
-                    target=target,
-                    file_path=edge.file_path,
-                    line=edge.line,
-                    extra=extra,
-                )
-            )
+            resolved.append(EdgeInfo(
+                kind=edge.kind,
+                source=edge.source,
+                target=target,
+                file_path=edge.file_path,
+                line=edge.line,
+                extra=extra,
+            ))
         return resolved
 
     def _extract_php_laravel_edges(
         self,
         root,
         file_path: str,
+        nodes: list[NodeInfo],
         edges: list[EdgeInfo],
     ) -> None:
         """Run evidence-gated Laravel analysis without altering generic calls."""
         self._walk_php_laravel_sequence(
             root,
             file_path,
+            nodes,
             edges,
             namespace="",
         )
@@ -12409,6 +18058,7 @@ class CodeParser:
         self,
         container,
         file_path: str,
+        nodes: list[NodeInfo],
         edges: list[EdgeInfo],
         namespace: str,
     ) -> None:
@@ -12420,13 +18070,17 @@ class CodeParser:
             if child.type == "namespace_definition":
                 child_namespace = self._php_namespace_name(child)
                 block = next(
-                    (part for part in child.children if part.type == "compound_statement"),
+                    (
+                        part for part in child.children
+                        if part.type == "compound_statement"
+                    ),
                     None,
                 )
                 if block is not None:
                     self._walk_php_laravel_sequence(
                         block,
                         file_path,
+                        nodes,
                         edges,
                         namespace=child_namespace,
                     )
@@ -12442,6 +18096,7 @@ class CodeParser:
             self._walk_php_laravel_node(
                 child,
                 file_path,
+                nodes,
                 edges,
                 current_namespace,
                 imports,
@@ -12454,6 +18109,7 @@ class CodeParser:
         self,
         node,
         file_path: str,
+        nodes: list[NodeInfo],
         edges: list[EdgeInfo],
         namespace: str,
         imports: dict[str, str],
@@ -12476,6 +18132,7 @@ class CodeParser:
                 self._walk_php_laravel_node(
                     child,
                     file_path,
+                    nodes,
                     edges,
                     namespace,
                     imports,
@@ -12491,6 +18148,7 @@ class CodeParser:
                 self._walk_php_laravel_node(
                     child,
                     file_path,
+                    nodes,
                     edges,
                     namespace,
                     imports,
@@ -12510,21 +18168,29 @@ class CodeParser:
                 enclosing_class,
                 enclosing_func,
             )
-        elif node.type == "member_call_expression" and eloquent_model:
-            self._emit_laravel_relationship_edge(
-                node,
-                file_path,
-                edges,
-                namespace,
-                imports,
-                enclosing_class,
-                enclosing_func,
+            self._emit_laravel_endpoint_nodes(
+                node, file_path, nodes, edges, namespace, imports,
+            )
+        elif node.type == "member_call_expression":
+            if eloquent_model:
+                self._emit_laravel_relationship_edge(
+                    node,
+                    file_path,
+                    edges,
+                    namespace,
+                    imports,
+                    enclosing_class,
+                    enclosing_func,
+                )
+            self._emit_laravel_endpoint_nodes(
+                node, file_path, nodes, edges, namespace, imports,
             )
 
         for child in node.children:
             self._walk_php_laravel_node(
                 child,
                 file_path,
+                nodes,
                 edges,
                 namespace,
                 imports,
@@ -12538,8 +18204,7 @@ class CodeParser:
         for child in node.children:
             if child.type == "namespace_name":
                 return child.text.decode(
-                    "utf-8",
-                    errors="replace",
+                    "utf-8", errors="replace",
                 ).strip("\\")
         return ""
 
@@ -12552,7 +18217,10 @@ class CodeParser:
             return {}
 
         group = next(
-            (child for child in node.children if child.type == "namespace_use_group"),
+            (
+                child for child in node.children
+                if child.type == "namespace_use_group"
+            ),
             None,
         )
         prefix = ""
@@ -12560,13 +18228,18 @@ class CodeParser:
             for child in node.children:
                 if child.type == "namespace_name":
                     prefix = child.text.decode(
-                        "utf-8",
-                        errors="replace",
+                        "utf-8", errors="replace",
                     ).strip("\\")
                     break
-            clauses = [child for child in group.children if child.type == "namespace_use_clause"]
+            clauses = [
+                child for child in group.children
+                if child.type == "namespace_use_clause"
+            ]
         else:
-            clauses = [child for child in node.children if child.type == "namespace_use_clause"]
+            clauses = [
+                child for child in node.children
+                if child.type == "namespace_use_clause"
+            ]
 
         bindings: dict[str, str] = {}
         for clause in clauses:
@@ -12579,14 +18252,12 @@ class CodeParser:
                     continue
                 if imported is None and child.type in ("qualified_name", "name"):
                     imported = child.text.decode(
-                        "utf-8",
-                        errors="replace",
+                        "utf-8", errors="replace",
                     ).strip("\\")
                     continue
                 if seen_alias and child.type == "name":
                     alias = child.text.decode(
-                        "utf-8",
-                        errors="replace",
+                        "utf-8", errors="replace",
                     )
             if not imported:
                 continue
@@ -12653,13 +18324,11 @@ class CodeParser:
         for child in node.children:
             if class_reference is None and child.type in ("name", "qualified_name"):
                 class_reference = child.text.decode(
-                    "utf-8",
-                    errors="replace",
+                    "utf-8", errors="replace",
                 )
             elif child.type == "name":
                 constant = child.text.decode(
-                    "utf-8",
-                    errors="replace",
+                    "utf-8", errors="replace",
                 )
         if class_reference and constant and constant.casefold() == "class":
             return class_reference
@@ -12675,31 +18344,38 @@ class CodeParser:
         )
         if arguments is None:
             return None
-        args = [child for child in arguments.children if child.type == "argument"]
+        args = [
+            child for child in arguments.children
+            if child.type == "argument"
+        ]
         if len(args) < 2:
             return None
         array = next(
-            (child for child in args[1].children if child.type == "array_creation_expression"),
+            (
+                child for child in args[1].children
+                if child.type == "array_creation_expression"
+            ),
             None,
         )
         if array is None:
             return None
-        elements = [child for child in array.children if child.type == "array_element_initializer"]
+        elements = [
+            child for child in array.children
+            if child.type == "array_element_initializer"
+        ]
         if len(elements) != 2:
             return None
 
         class_access = next(
             (
-                child
-                for child in elements[0].children
+                child for child in elements[0].children
                 if child.type == "class_constant_access_expression"
             ),
             None,
         )
         method_string = next(
             (
-                child
-                for child in elements[1].children
+                child for child in elements[1].children
                 if child.type in ("string", "encapsed_string")
             ),
             None,
@@ -12708,12 +18384,277 @@ class CodeParser:
             return None
         class_reference = self._php_class_constant_reference(class_access)
         method = method_string.text.decode(
-            "utf-8",
-            errors="replace",
+            "utf-8", errors="replace",
         ).strip("'\"")
-        if not class_reference or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", method) is None:
+        if (
+            not class_reference
+            or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", method) is None
+        ):
             return None
         return class_reference, method
+
+    @staticmethod
+    def _php_route_arguments(node) -> list:
+        arguments = next((c for c in node.children if c.type == "arguments"), None)
+        return [c for c in arguments.children if c.type == "argument"] if arguments else []
+
+    @staticmethod
+    def _php_string_literal(value) -> Optional[str]:
+        """Return a quoted PHP string's value without interpolation or escapes, else None.
+
+        Single-quoted strings are decoded (``\\'`` and ``\\\\``); double-quoted strings
+        with escape sequences or interpolation are rejected.
+        """
+        if value is None:
+            return None
+        if value.type == "encapsed_string" and any(
+            c.is_named and c.type != "string_content" for c in value.children
+        ):
+            return None
+        if value.type not in ("string", "encapsed_string"):
+            return None
+        text = value.text.decode("utf-8", errors="replace")
+        if value.type == "string" and text.startswith("'"):
+            return re.sub(r"\\([\\'])", r"\1", text[1:-1])
+        return text[1:-1]
+
+    @classmethod
+    def _php_route_literal(cls, node) -> Optional[str]:
+        return cls._php_string_literal(next((c for c in node.children if c.is_named), None))
+
+    def _php_route_facade_call(
+        self, node, namespace: str, imports: dict[str, str],
+    ) -> Optional[str]:
+        receiver, method = self._php_scoped_call_parts(node)
+        if not receiver or not method:
+            return None
+        resolved = self._php_resolve_class_reference(receiver, namespace, imports)
+        return method if resolved.casefold() == self._LARAVEL_ROUTE_FACADE.casefold() else None
+
+    def _php_route_group_settings(
+        self, call, namespace: str, imports: dict[str, str],
+    ) -> Optional[tuple[str, Optional[str]]]:
+        """Read literal prefix and controller from a Route group call chain."""
+        prefix = ""
+        controller = None
+        chain = []
+        current = call
+        while current.type == "member_call_expression":
+            name = current.child_by_field_name("name")
+            if name is None:
+                return None
+            chain.append((name.text.decode("utf-8"), self._php_route_arguments(current)))
+            current = current.child_by_field_name("object")
+            if current is None:
+                return None
+        base = self._php_route_facade_call(current, namespace, imports)
+        if base is None:
+            return None
+        chain.append((base, self._php_route_arguments(current)))
+        for method, args in reversed(chain):
+            if method == "prefix":
+                if not args or (part := self._php_route_literal(args[0])) is None:
+                    return None
+                prefix = self._join_spring_route(prefix, part)
+            elif method == "controller":
+                if not args:
+                    return None
+                access = next(
+                    (c for c in args[0].children if c.type == "class_constant_access_expression"),
+                    None,
+                )
+                controller = self._php_class_constant_reference(access) if access else None
+                if controller is None:
+                    return None
+            elif method == "group" and len(args) > 1:
+                # Route::group($attributes, $routes): only a literal array with literal
+                # keys is static evidence; anything else may carry a prefix we cannot see.
+                options = next((c for c in args[0].children if c.is_named), None)
+                if options is None or options.type != "array_creation_expression":
+                    return None
+                for item in options.children:
+                    if item.type != "array_element_initializer":
+                        continue
+                    values = [c for c in item.children if c.is_named]
+                    if len(values) != 2:
+                        return None
+                    key = self._php_string_literal(values[0])
+                    if key is None:
+                        return None
+                    if key == "prefix":
+                        part = self._php_string_literal(values[1])
+                        if part is None:
+                            return None
+                        prefix = self._join_spring_route(prefix, part)
+                    elif key == "controller":
+                        controller = (
+                            self._php_class_constant_reference(values[1])
+                            if values[1].type == "class_constant_access_expression"
+                            else None
+                        )
+                        if controller is None:
+                            return None
+        return prefix, controller
+
+    def _php_route_enclosing_groups(
+        self, node, namespace: str, imports: dict[str, str],
+    ) -> Optional[tuple[str, Optional[str]]]:
+        groups = []
+        current = node.parent
+        while current is not None:
+            if current.type in ("anonymous_function", "arrow_function"):
+                argument = current.parent
+                if argument is not None and argument.type == "argument":
+                    arguments = argument.parent
+                    call = arguments.parent if arguments is not None else None
+                    if call is not None and call.type in (
+                        "scoped_call_expression", "member_call_expression",
+                    ):
+                        name = call.child_by_field_name("name")
+                        if name is not None and name.text == b"group":
+                            settings = self._php_route_group_settings(call, namespace, imports)
+                            if settings is None:
+                                return None
+                            groups.append(settings)
+            current = current.parent
+        prefix = ""
+        controller = None
+        for group_prefix, group_controller in reversed(groups):
+            prefix = self._join_spring_route(prefix, group_prefix)
+            controller = group_controller or controller
+        return prefix, controller
+
+    def _php_endpoint_handler(
+        self, argument, group_controller: Optional[str],
+    ) -> Optional[tuple[str, str]]:
+        value = next((c for c in argument.children if c.is_named), None)
+        if value is None:
+            return None
+        if value.type == "class_constant_access_expression":
+            controller = self._php_class_constant_reference(value)
+            return (controller, "__invoke") if controller else None
+        if value.type in ("string", "encapsed_string"):
+            literal = self._php_route_literal(argument)
+            if literal is None:
+                return None
+            if "@" in literal:
+                # Laravel reads 'Class@method' as a class name, not through PHP `use`
+                # aliases or the file namespace; the leading backslash keeps it literal.
+                class_name, method = literal.rsplit("@", 1)
+                controller = "\\" + class_name.lstrip("\\") if class_name.strip("\\") else None
+            else:
+                controller, method = group_controller, literal
+            if controller and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", method):
+                return controller, method
+            return None
+        if value.type != "array_creation_expression":
+            return None
+        elements = [c for c in value.children if c.type == "array_element_initializer"]
+        if len(elements) != 2:
+            return None
+        access = next(
+            (c for c in elements[0].children if c.type == "class_constant_access_expression"),
+            None,
+        )
+        controller = self._php_class_constant_reference(access) if access else None
+        method = self._php_route_literal(elements[1])
+        if controller and method and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", method):
+            return controller, method
+        return None
+
+    def _emit_laravel_endpoint_nodes(
+        self, node, file_path: str, nodes: list[NodeInfo], edges: list[EdgeInfo],
+        namespace: str, imports: dict[str, str],
+    ) -> None:
+        """Emit parse-time Laravel endpoints using Spring's node and edge shape."""
+        if Path(file_path).parent.name != "routes":
+            return
+        fluent_prefix, fluent_controller = "", None
+        if node.type == "member_call_expression":
+            # Route::middleware('auth')->get(...): the chain may carry settings.
+            name_node = node.child_by_field_name("name")
+            verb = name_node.text.decode("utf-8") if name_node is not None else None
+        else:
+            verb = self._php_route_facade_call(node, namespace, imports)
+        if verb not in self._LARAVEL_ROUTE_VERBS or verb in {"resource", "apiResource"}:
+            return
+        if node.type == "member_call_expression":
+            fluent = self._php_route_group_settings(node, namespace, imports)
+            if fluent is None:
+                return
+            fluent_prefix, fluent_controller = fluent
+        args = self._php_route_arguments(node)
+        path_index = 1 if verb == "match" else 0
+        if len(args) <= path_index + 1:
+            return
+        path = self._php_route_literal(args[path_index])
+        if path is None:
+            return
+        context = self._php_route_enclosing_groups(node, namespace, imports)
+        if context is None:
+            return
+        prefix = self._join_spring_route(context[0], fluent_prefix)
+        group_controller = fluent_controller or context[1]
+        handler = self._php_endpoint_handler(args[path_index + 1], group_controller)
+        handler_value = next(
+            (c for c in args[path_index + 1].children if c.is_named), None,
+        )
+        if handler is None and (
+            handler_value is None
+            or handler_value.type not in ("anonymous_function", "arrow_function")
+        ):
+            return
+        methods = [verb.upper()]
+        if verb == "match":
+            array = next(
+                (c for c in args[0].children if c.type == "array_creation_expression"),
+                None,
+            )
+            if array is None:
+                return
+            methods = []
+            for item in array.children:
+                if item.type == "array_element_initializer":
+                    method = self._php_route_literal(item)
+                    if method is None:
+                        return
+                    methods.append(method.upper())
+        route = self._join_spring_route(prefix, path)
+        # Route::get(...)->prefix('v1') prepends to the full URI, once per call.
+        current = node
+        while (
+            current.parent is not None
+            and current.parent.type == "member_call_expression"
+            and current.parent.child_by_field_name("object") == current
+        ):
+            current = current.parent
+            name = current.child_by_field_name("name")
+            if name is not None and name.text == b"prefix":
+                chain_args = self._php_route_arguments(current)
+                part = self._php_route_literal(chain_args[0]) if chain_args else None
+                if part is None:
+                    return
+                route = self._join_spring_route(part, route)
+        handler_name = handler[1] if handler else "closure"
+        for method in dict.fromkeys(methods):
+            # No position in the name: a line added above must not rename the node.
+            name = f"{handler_name}@Route {method} {route}"
+            metadata = {"http_method": method, "route": route, "handler": handler_name}
+            nodes.append(NodeInfo(
+                kind="Endpoint", name=name, file_path=file_path,
+                line_start=node.start_point[0] + 1, line_end=node.end_point[0] + 1,
+                language="php", extra=metadata,
+            ))
+            if handler:
+                edges.append(EdgeInfo(
+                    kind="HANDLES",
+                    source=self._php_semantic_target(
+                        handler[0], namespace, imports, file_path, handler[1],
+                    ),
+                    target=self._qualify(name, file_path, None),
+                    file_path=file_path, line=node.start_point[0] + 1,
+                    extra=metadata,
+                ))
 
     def _php_semantic_target(
         self,
@@ -12780,30 +18721,28 @@ class CodeParser:
         if handler is None:
             return
         controller, method = handler
-        edges.append(
-            EdgeInfo(
-                kind="CALLS",
-                source=self._php_laravel_caller(
-                    file_path,
-                    enclosing_class,
-                    enclosing_func,
-                ),
-                target=self._php_semantic_target(
-                    controller,
-                    namespace,
-                    imports,
-                    file_path,
-                    method,
-                ),
-                file_path=file_path,
-                line=node.start_point[0] + 1,
-                extra={
-                    "framework": "laravel",
-                    "laravel_kind": "route",
-                    "route_verb": verb,
-                },
-            )
-        )
+        edges.append(EdgeInfo(
+            kind="CALLS",
+            source=self._php_laravel_caller(
+                file_path,
+                enclosing_class,
+                enclosing_func,
+            ),
+            target=self._php_semantic_target(
+                controller,
+                namespace,
+                imports,
+                file_path,
+                method,
+            ),
+            file_path=file_path,
+            line=node.start_point[0] + 1,
+            extra={
+                "framework": "laravel",
+                "laravel_kind": "route",
+                "route_verb": verb,
+            },
+        ))
 
     def _emit_laravel_relationship_edge(
         self,
@@ -12818,20 +18757,21 @@ class CodeParser:
         if not node.children or node.children[0].type != "variable_name":
             return
         receiver = node.children[0].text.decode(
-            "utf-8",
-            errors="replace",
+            "utf-8", errors="replace",
         )
         if receiver != "$this":
             return
         method_node = next(
-            (child for child in reversed(node.children) if child.type == "name"),
+            (
+                child for child in reversed(node.children)
+                if child.type == "name"
+            ),
             None,
         )
         if method_node is None:
             return
         relationship = method_node.text.decode(
-            "utf-8",
-            errors="replace",
+            "utf-8", errors="replace",
         )
         if relationship not in self._LARAVEL_RELATIONSHIPS:
             return
@@ -12843,15 +18783,17 @@ class CodeParser:
         if arguments is None:
             return
         first_argument = next(
-            (child for child in arguments.children if child.type == "argument"),
+            (
+                child for child in arguments.children
+                if child.type == "argument"
+            ),
             None,
         )
         if first_argument is None:
             return
         class_access = next(
             (
-                child
-                for child in first_argument.children
+                child for child in first_argument.children
                 if child.type == "class_constant_access_expression"
             ),
             None,
@@ -12862,29 +18804,27 @@ class CodeParser:
         if target_model is None:
             return
 
-        edges.append(
-            EdgeInfo(
-                kind="REFERENCES",
-                source=self._php_laravel_caller(
-                    file_path,
-                    enclosing_class,
-                    enclosing_func,
-                ),
-                target=self._php_semantic_target(
-                    target_model,
-                    namespace,
-                    imports,
-                    file_path,
-                ),
-                file_path=file_path,
-                line=node.start_point[0] + 1,
-                extra={
-                    "framework": "laravel",
-                    "laravel_kind": "eloquent_relationship",
-                    "relationship": relationship,
-                },
-            )
-        )
+        edges.append(EdgeInfo(
+            kind="REFERENCES",
+            source=self._php_laravel_caller(
+                file_path,
+                enclosing_class,
+                enclosing_func,
+            ),
+            target=self._php_semantic_target(
+                target_model,
+                namespace,
+                imports,
+                file_path,
+            ),
+            file_path=file_path,
+            line=node.start_point[0] + 1,
+            extra={
+                "framework": "laravel",
+                "laravel_kind": "eloquent_relationship",
+                "relationship": relationship,
+            },
+        ))
 
     @staticmethod
     def _get_java_method_and_receiver(node) -> tuple[Optional[str], Optional[str]]:
@@ -12924,7 +18864,7 @@ class CodeParser:
                     # Second identifier scanning backwards = receiver
                     receiver_name = ch.text.decode("utf-8", errors="replace")
                 break
-            if ch.type == ".":
+            if ch.type == "." :
                 continue
             # Chained call or complex expression as receiver — no simple receiver
             break
@@ -12934,8 +18874,44 @@ class CodeParser:
             first_text = children[0].text.decode("utf-8", errors="replace")
             if first_text != method_name:
                 receiver_name = first_text
+        elif method_name and children[0].type == "field_access":
+            # ``this.field.save()``: the field's declared type answers the call.
+            owner = children[0].child_by_field_name("object")
+            field = children[0].child_by_field_name("field")
+            if owner is not None and owner.type == "this" and field is not None:
+                receiver_name = field.text.decode("utf-8", errors="replace")
+        elif method_name and children[0].type == "this" and children[1].type == ".":
+            # ``this.ping()``: the object's own class, or the ancestor that
+            # declares ``ping``.
+            receiver_name = "this"
 
         return method_name, receiver_name
+
+    @staticmethod
+    def _java_this_field_call(node) -> bool:
+        """Whether a Java call is made on ``this.field``."""
+        receiver = node.child_by_field_name("object")
+        if receiver is None or receiver.type != "field_access":
+            return False
+        owner = receiver.child_by_field_name("object")
+        return owner is not None and owner.type == "this"
+
+    @classmethod
+    def _java_expression_receiver(cls, node) -> bool:
+        """Whether a Java call is made on an expression with no name or type.
+
+        ``items.stream().count()`` and ``"x".length()`` say nothing about which
+        class answers them. ``new Cart().total()`` and ``this.x()`` do.
+        """
+        if node.type != "method_invocation":
+            return False
+        receiver = node.child_by_field_name("object")
+        return (
+            receiver is not None
+            and receiver.type
+            not in ("identifier", "this", "super", "object_creation_expression")
+            and not cls._java_this_field_call(node)
+        )
 
     def _extract_jsx_component_call(
         self,
@@ -12959,11 +18935,7 @@ class CodeParser:
         to the File node.
         """
         target = self._resolve_jsx_component_target(
-            child,
-            language,
-            file_path,
-            import_map or {},
-            defined_names or set(),
+            child, language, file_path, import_map or {}, defined_names or set(),
         )
         if not target:
             return
@@ -12973,15 +18945,13 @@ class CodeParser:
             if enclosing_func
             else file_path
         )
-        edges.append(
-            EdgeInfo(
-                kind="CALLS",
-                source=caller,
-                target=target,
-                file_path=file_path,
-                line=child.start_point[0] + 1,
-            )
-        )
+        edges.append(EdgeInfo(
+            kind="CALLS",
+            source=caller,
+            target=target,
+            file_path=file_path,
+            line=child.start_point[0] + 1,
+        ))
 
     def _resolve_jsx_component_target(
         self,
@@ -12999,19 +18969,12 @@ class CodeParser:
         base_name, component_name = component_ref
         if base_name is None:
             return self._resolve_call_target(
-                component_name,
-                file_path,
-                language,
-                import_map,
-                defined_names,
+                component_name, file_path, language, import_map, defined_names,
             )
 
         if base_name in import_map:
             resolved = self._resolve_imported_symbol(
-                component_name,
-                import_map[base_name],
-                file_path,
-                language,
+                component_name, import_map[base_name], file_path, language,
             )
             if resolved:
                 return resolved
@@ -13025,8 +18988,8 @@ class CodeParser:
     # AST node types that represent object literal key-value pairs.
     _PAIR_TYPES = frozenset({"pair"})
 
-    # AST node types for array/list/tuple containers.
-    _ARRAY_TYPES = frozenset({"array", "list", "tuple"})
+    # AST node types for array/list containers.
+    _ARRAY_TYPES = frozenset({"array", "list"})
 
     # AST node types for call argument containers. JS/TS uses ``arguments``;
     # Python uses ``argument_list``. Both share the same identifier-child shape
@@ -13036,21 +18999,10 @@ class CodeParser:
     # Names that are almost certainly not function references (constants,
     # common primitives).  All-uppercase identifiers and very short names
     # are excluded by a length/casing heuristic in the method itself.
-    _VALUE_REF_SKIP_NAMES = frozenset(
-        {
-            "true",
-            "false",
-            "null",
-            "undefined",
-            "None",
-            "True",
-            "False",
-            "self",
-            "this",
-            "cls",
-            "super",
-        }
-    )
+    _VALUE_REF_SKIP_NAMES = frozenset({
+        "true", "false", "null", "undefined", "None", "True", "False",
+        "self", "this", "cls", "super",
+    })
 
     def _extract_ts_type_reference(
         self,
@@ -13116,12 +19068,8 @@ class CodeParser:
 
         self._emit_reference_if_known(
             child.text.decode("utf-8", errors="replace"),
-            language,
-            file_path,
-            caller,
-            edges,
-            import_map or {},
-            defined_names or set(),
+            language, file_path, caller, edges,
+            import_map or {}, defined_names or set(),
             line=child.start_point[0] + 1,
         )
 
@@ -13165,20 +19113,13 @@ class CodeParser:
             return
 
         # --- JS/TS: shorthand property identifiers  { fnRef } ---
-        if node_type == "shorthand_property_identifier" and language in (
-            "javascript",
-            "typescript",
-            "tsx",
+        if (
+            node_type == "shorthand_property_identifier"
+            and language in ("javascript", "typescript", "tsx")
         ):
             name = child.text.decode("utf-8", errors="replace")
             self._emit_reference_if_known(
-                name,
-                language,
-                file_path,
-                caller,
-                edges,
-                imap,
-                dnames,
+                name, language, file_path, caller, edges, imap, dnames,
                 line=child.start_point[0] + 1,
             )
             return
@@ -13186,14 +19127,7 @@ class CodeParser:
         # --- JS/TS/Python: assignment with member/subscript LHS ---
         if node_type in ("assignment_expression", "augmented_assignment", "assignment"):
             self._ref_from_assignment(
-                child,
-                source,
-                language,
-                file_path,
-                caller,
-                edges,
-                imap,
-                dnames,
+                child, source, language, file_path, caller, edges, imap, dnames,
             )
             return
 
@@ -13205,14 +19139,7 @@ class CodeParser:
         # --- Callback arguments (identifier args inside call_expression) ---
         if node_type in self._ARGUMENTS_TYPES:
             self._ref_from_arguments(
-                child,
-                source,
-                language,
-                file_path,
-                caller,
-                edges,
-                imap,
-                dnames,
+                child, source, language, file_path, caller, edges, imap, dnames,
             )
 
     def _emit_reference_if_known(
@@ -13237,21 +19164,15 @@ class CodeParser:
             return
 
         target = self._resolve_call_target(
-            name,
-            file_path,
-            language,
-            import_map,
-            defined_names,
+            name, file_path, language, import_map, defined_names,
         )
-        edges.append(
-            EdgeInfo(
-                kind="REFERENCES",
-                source=caller,
-                target=target,
-                file_path=file_path,
-                line=line,
-            )
-        )
+        edges.append(EdgeInfo(
+            kind="REFERENCES",
+            source=caller,
+            target=target,
+            file_path=file_path,
+            line=line,
+        ))
 
     def _ref_from_pair(
         self,
@@ -13278,13 +19199,8 @@ class CodeParser:
         if value_node.type == "identifier":
             name = value_node.text.decode("utf-8", errors="replace")
             self._emit_reference_if_known(
-                name,
-                language,
-                file_path,
-                caller,
-                edges,
-                import_map,
-                defined_names,
+                name, language, file_path, caller, edges,
+                import_map, defined_names,
                 line=value_node.start_point[0] + 1,
             )
 
@@ -13306,10 +19222,8 @@ class CodeParser:
         lhs = children[0]
         # LHS must be a member_expression or subscript_expression (map assignment).
         if lhs.type not in (
-            "member_expression",
-            "subscript_expression",
-            "attribute",
-            "subscript",
+            "member_expression", "subscript_expression",
+            "attribute", "subscript",
         ):
             return
         # RHS is the last non-punctuation child.
@@ -13322,13 +19236,8 @@ class CodeParser:
             return
         name = rhs.text.decode("utf-8", errors="replace")
         self._emit_reference_if_known(
-            name,
-            language,
-            file_path,
-            caller,
-            edges,
-            import_map,
-            defined_names,
+            name, language, file_path, caller, edges,
+            import_map, defined_names,
             line=rhs.start_point[0] + 1,
         )
 
@@ -13343,23 +19252,13 @@ class CodeParser:
         import_map: dict[str, str],
         defined_names: set[str],
     ) -> None:
-        """Extract REFERENCES from array/list elements that are identifiers.
-
-        Also handles member expressions like ``self.handler`` (Python) or
-        ``obj.handler`` (JS/TS) so dispatch tables built from method lists
-        keep their targets alive.
-        """
+        """Extract REFERENCES from array/list elements that are identifiers."""
         for ch in array_node.children:
-            name = self._ref_name_from_value_node(ch, language)
-            if name:
+            if ch.type == "identifier":
+                name = ch.text.decode("utf-8", errors="replace")
                 self._emit_reference_if_known(
-                    name,
-                    language,
-                    file_path,
-                    caller,
-                    edges,
-                    import_map,
-                    defined_names,
+                    name, language, file_path, caller, edges,
+                    import_map, defined_names,
                     line=ch.start_point[0] + 1,
                 )
 
@@ -13376,18 +19275,6 @@ class CodeParser:
     ) -> None:
         """Extract REFERENCES from identifier arguments (callbacks)."""
         for ch in args_node.children:
-            name = self._ref_name_from_value_node(ch, language)
-            if name:
-                self._emit_reference_if_known(
-                    name,
-                    language,
-                    file_path,
-                    caller,
-                    edges,
-                    import_map,
-                    defined_names,
-                    line=ch.start_point[0] + 1,
-                )
             reference_node = ch
             if ch.type == "keyword_argument" and language == "python":
                 reference_node = ch.child_by_field_name("value")
@@ -13395,41 +19282,10 @@ class CodeParser:
                 continue
             name = reference_node.text.decode("utf-8", errors="replace")
             self._emit_reference_if_known(
-                name,
-                language,
-                file_path,
-                caller,
-                edges,
-                import_map,
-                defined_names,
+                name, language, file_path, caller, edges,
+                import_map, defined_names,
                 line=reference_node.start_point[0] + 1,
             )
-
-    def _ref_name_from_value_node(
-        self,
-        node,
-        language: str,
-    ) -> Optional[str]:
-        """Return a referenceable name from a value node, or None."""
-        if node.type == "identifier":
-            return node.text.decode("utf-8", errors="replace")
-        # Python: self.method_name
-        if node.type == "attribute":
-            attr = None
-            for sub in reversed(node.children):
-                if sub.type == "identifier":
-                    attr = sub.text.decode("utf-8", errors="replace")
-                    break
-            return attr
-        # JS/TS: obj.method_name
-        if node.type == "member_expression" and language in ("javascript", "typescript", "tsx"):
-            prop = None
-            for sub in reversed(node.children):
-                if sub.type == "property_identifier":
-                    prop = sub.text.decode("utf-8", errors="replace")
-                    break
-            return prop
-        return None
 
     def _extract_solidity_constructs(
         self,
@@ -13456,25 +19312,21 @@ class CodeParser:
                         if ident.type == "identifier":
                             caller = (
                                 self._qualify(
-                                    enclosing_func,
-                                    file_path,
+                                    enclosing_func, file_path,
                                     enclosing_class,
                                 )
                                 if enclosing_func
                                 else file_path
                             )
-                            edges.append(
-                                EdgeInfo(
-                                    kind="CALLS",
-                                    source=caller,
-                                    target=ident.text.decode(
-                                        "utf-8",
-                                        errors="replace",
-                                    ),
-                                    file_path=file_path,
-                                    line=child.start_point[0] + 1,
-                                )
-                            )
+                            edges.append(EdgeInfo(
+                                kind="CALLS",
+                                source=caller,
+                                target=ident.text.decode(
+                                    "utf-8", errors="replace",
+                                ),
+                                file_path=file_path,
+                                line=child.start_point[0] + 1,
+                            ))
             # emit_statement falls through to default recursion
             return False
 
@@ -13488,57 +19340,46 @@ class CodeParser:
             for sub in child.children:
                 if sub.type == "identifier":
                     var_name = sub.text.decode(
-                        "utf-8",
-                        errors="replace",
+                        "utf-8", errors="replace",
                     )
                 elif sub.type == "visibility":
                     var_visibility = sub.text.decode(
-                        "utf-8",
-                        errors="replace",
+                        "utf-8", errors="replace",
                     )
                 elif sub.type == "type_name":
                     var_type = sub.text.decode(
-                        "utf-8",
-                        errors="replace",
+                        "utf-8", errors="replace",
                     )
                 elif sub.type in ("constant", "immutable"):
                     var_mutability = sub.type
             if var_name:
                 qualified = self._qualify(
-                    var_name,
-                    file_path,
-                    enclosing_class,
+                    var_name, file_path, enclosing_class,
                 )
-                nodes.append(
-                    NodeInfo(
-                        kind="Function",
-                        name=var_name,
-                        file_path=file_path,
-                        line_start=child.start_point[0] + 1,
-                        line_end=child.end_point[0] + 1,
-                        language="solidity",
-                        parent_name=enclosing_class,
-                        return_type=var_type,
-                        modifiers=var_visibility,
-                        extra={
-                            "solidity_kind": "state_variable",
-                            "mutability": var_mutability,
-                        },
-                    )
-                )
-                edges.append(
-                    EdgeInfo(
-                        kind="CONTAINS",
-                        source=self._qualify(
-                            enclosing_class,
-                            file_path,
-                            None,
-                        ),
-                        target=qualified,
-                        file_path=file_path,
-                        line=child.start_point[0] + 1,
-                    )
-                )
+                nodes.append(NodeInfo(
+                    kind="Function",
+                    name=var_name,
+                    file_path=file_path,
+                    line_start=child.start_point[0] + 1,
+                    line_end=child.end_point[0] + 1,
+                    language="solidity",
+                    parent_name=enclosing_class,
+                    return_type=var_type,
+                    modifiers=var_visibility,
+                    extra={
+                        "solidity_kind": "state_variable",
+                        "mutability": var_mutability,
+                    },
+                ))
+                edges.append(EdgeInfo(
+                    kind="CONTAINS",
+                    source=self._qualify(
+                        enclosing_class, file_path, None,
+                    ),
+                    target=qualified,
+                    file_path=file_path,
+                    line=child.start_point[0] + 1,
+                ))
                 return True
             return False
 
@@ -13549,47 +19390,39 @@ class CodeParser:
             for sub in child.children:
                 if sub.type == "identifier":
                     var_name = sub.text.decode(
-                        "utf-8",
-                        errors="replace",
+                        "utf-8", errors="replace",
                     )
                 elif sub.type == "type_name":
                     var_type = sub.text.decode(
-                        "utf-8",
-                        errors="replace",
+                        "utf-8", errors="replace",
                     )
             if var_name:
                 qualified = self._qualify(
-                    var_name,
-                    file_path,
-                    enclosing_class,
+                    var_name, file_path, enclosing_class,
                 )
-                nodes.append(
-                    NodeInfo(
-                        kind="Function",
-                        name=var_name,
-                        file_path=file_path,
-                        line_start=child.start_point[0] + 1,
-                        line_end=child.end_point[0] + 1,
-                        language="solidity",
-                        parent_name=enclosing_class,
-                        return_type=var_type,
-                        extra={"solidity_kind": "constant"},
-                    )
-                )
+                nodes.append(NodeInfo(
+                    kind="Function",
+                    name=var_name,
+                    file_path=file_path,
+                    line_start=child.start_point[0] + 1,
+                    line_end=child.end_point[0] + 1,
+                    language="solidity",
+                    parent_name=enclosing_class,
+                    return_type=var_type,
+                    extra={"solidity_kind": "constant"},
+                ))
                 container = (
                     self._qualify(enclosing_class, file_path, None)
                     if enclosing_class
                     else file_path
                 )
-                edges.append(
-                    EdgeInfo(
-                        kind="CONTAINS",
-                        source=container,
-                        target=qualified,
-                        file_path=file_path,
-                        line=child.start_point[0] + 1,
-                    )
-                )
+                edges.append(EdgeInfo(
+                    kind="CONTAINS",
+                    source=container,
+                    target=qualified,
+                    file_path=file_path,
+                    line=child.start_point[0] + 1,
+                ))
                 return True
             return False
 
@@ -13601,28 +19434,23 @@ class CodeParser:
                     for ident in sub.children:
                         if ident.type == "identifier":
                             lib_name = ident.text.decode(
-                                "utf-8",
-                                errors="replace",
+                                "utf-8", errors="replace",
                             )
             if lib_name:
                 source_name = (
                     self._qualify(
-                        enclosing_class,
-                        file_path,
-                        None,
+                        enclosing_class, file_path, None,
                     )
                     if enclosing_class
                     else file_path
                 )
-                edges.append(
-                    EdgeInfo(
-                        kind="DEPENDS_ON",
-                        source=source_name,
-                        target=lib_name,
-                        file_path=file_path,
-                        line=child.start_point[0] + 1,
-                    )
-                )
+                edges.append(EdgeInfo(
+                    kind="DEPENDS_ON",
+                    source=source_name,
+                    target=lib_name,
+                    file_path=file_path,
+                    line=child.start_point[0] + 1,
+                ))
             return True
 
         return False
@@ -13632,16 +19460,11 @@ class CodeParser:
         if node is None:
             return []
         if node.type in (
-            "identifier",
-            "type_identifier",
-            "crate",
-            "self",
-            "super",
+            "identifier", "type_identifier", "crate", "self", "super",
         ):
             return [node.text.decode("utf-8", errors="replace")]
         if node.type in (
-            "scoped_identifier",
-            "scoped_type_identifier",
+            "scoped_identifier", "scoped_type_identifier",
         ):
             path = node.child_by_field_name("path")
             name = node.child_by_field_name("name")
@@ -13653,9 +19476,7 @@ class CodeParser:
         return []
 
     def _parse_rust_use_node(
-        self,
-        node,
-        prefix: tuple[str, ...] = (),
+        self, node, prefix: tuple[str, ...] = (),
     ) -> list[tuple[str, str]]:
         """Flatten nested Rust use trees into local-name/original-path pairs."""
         if node.type == "use_declaration":
@@ -13695,8 +19516,7 @@ class CodeParser:
             if use_list is None:
                 return []
             return self._parse_rust_use_node(
-                use_list,
-                (*prefix, *path_segments),
+                use_list, (*prefix, *path_segments),
             )
 
         if node.type == "use_list":
@@ -13733,17 +19553,13 @@ class CodeParser:
             imported = import_map[first].split("::") + segments[1:]
             original_name = imported[-1]
             resolved = self._resolve_module_to_file(
-                "::".join(imported),
-                file_path,
-                "rust",
+                "::".join(imported), file_path, "rust",
             )
             if resolved:
                 return self._qualify(original_name, resolved, None)
 
         resolved = self._resolve_module_to_file(
-            "::".join(segments),
-            file_path,
-            "rust",
+            "::".join(segments), file_path, "rust",
         )
         if resolved:
             return self._qualify(local_name, resolved, None)
@@ -13770,21 +19586,16 @@ class CodeParser:
         if trait_node is not None:
             trait_segments = self._rust_path_segments(trait_node)
             trait_target = self._resolve_rust_type_target(
-                trait_segments,
-                file_path,
-                import_map,
-                defined_names,
+                trait_segments, file_path, import_map, defined_names,
             )
             if trait_target:
-                edges.append(
-                    EdgeInfo(
-                        kind="IMPLEMENTS",
-                        source=self._qualify(target_name, file_path, None),
-                        target=trait_target,
-                        file_path=file_path,
-                        line=impl_node.start_point[0] + 1,
-                    )
-                )
+                edges.append(EdgeInfo(
+                    kind="IMPLEMENTS",
+                    source=self._qualify(target_name, file_path, None),
+                    target=trait_target,
+                    file_path=file_path,
+                    line=impl_node.start_point[0] + 1,
+                ))
 
         self._extract_from_tree(
             impl_node,
@@ -13851,32 +19662,30 @@ class CodeParser:
             if default is not None:
                 extra["default"] = default
             qualified = self._qualify(name, file_path, enclosing_class)
-            nodes.append(
-                NodeInfo(
-                    kind="Function",
-                    name=name,
-                    file_path=file_path,
-                    line_start=source_node.start_point[0] + 1,
-                    line_end=source_node.end_point[0] + 1,
-                    language="verilog",
-                    parent_name=enclosing_class,
-                    return_type=return_type,
-                    modifiers=modifiers,
-                    extra=extra,
-                )
-            )
+            nodes.append(NodeInfo(
+                kind="Function",
+                name=name,
+                file_path=file_path,
+                line_start=source_node.start_point[0] + 1,
+                line_end=source_node.end_point[0] + 1,
+                language="verilog",
+                parent_name=enclosing_class,
+                return_type=return_type,
+                modifiers=modifiers,
+                extra=extra,
+            ))
             container = (
-                self._qualify(enclosing_class, file_path, None) if enclosing_class else file_path
+                self._qualify(enclosing_class, file_path, None)
+                if enclosing_class
+                else file_path
             )
-            edges.append(
-                EdgeInfo(
-                    kind="CONTAINS",
-                    source=container,
-                    target=qualified,
-                    file_path=file_path,
-                    line=source_node.start_point[0] + 1,
-                )
-            )
+            edges.append(EdgeInfo(
+                kind="CONTAINS",
+                source=container,
+                target=qualified,
+                file_path=file_path,
+                line=source_node.start_point[0] + 1,
+            ))
 
         local_declarations = {
             "data_declaration",
@@ -13926,9 +19735,7 @@ class CodeParser:
             return True
 
         if node_type in (
-            "input_declaration",
-            "output_declaration",
-            "inout_declaration",
+            "input_declaration", "output_declaration", "inout_declaration",
         ):
             direction = node_type.split("_", 1)[0]
             data_type = None
@@ -13962,10 +19769,13 @@ class CodeParser:
             return True
 
         if node_type in (
-            "parameter_declaration",
-            "local_parameter_declaration",
+            "parameter_declaration", "local_parameter_declaration",
         ):
-            kind = "localparam" if node_type == "local_parameter_declaration" else "parameter"
+            kind = (
+                "localparam"
+                if node_type == "local_parameter_declaration"
+                else "parameter"
+            )
             data_type = None
             for sub in child.children:
                 if sub.type in ("data_type_or_implicit1", "data_type"):
@@ -13978,8 +19788,7 @@ class CodeParser:
                         default = None
                         for part in assignment.children:
                             if part.type in (
-                                "parameter_identifier",
-                                "simple_identifier",
+                                "parameter_identifier", "simple_identifier",
                             ):
                                 name = find_simple_identifier(part)
                             elif part.type == "constant_param_expression":
@@ -14092,27 +19901,23 @@ class CodeParser:
                 node.name
                 for node in nodes
                 if node.parent_name == enclosing_class
-                and node.extra.get("verilog_kind")
-                in {
-                    "port",
-                    "net",
-                    "parameter",
-                    "localparam",
+                and node.extra.get("verilog_kind") in {
+                    "port", "net", "parameter", "localparam",
                 }
             }
             source_name = (
-                self._qualify(enclosing_class, file_path, None) if enclosing_class else file_path
+                self._qualify(enclosing_class, file_path, None)
+                if enclosing_class
+                else file_path
             )
             for signal in sorted(roots & known_signals):
-                edges.append(
-                    EdgeInfo(
-                        kind="REFERENCES",
-                        source=source_name,
-                        target=self._qualify(signal, file_path, enclosing_class),
-                        file_path=file_path,
-                        line=child.start_point[0] + 1,
-                    )
-                )
+                edges.append(EdgeInfo(
+                    kind="REFERENCES",
+                    source=source_name,
+                    target=self._qualify(signal, file_path, enclosing_class),
+                    file_path=file_path,
+                    line=child.start_point[0] + 1,
+                ))
             return True
 
         if node_type in ("covergroup_declaration", "property_declaration"):
@@ -14134,7 +19939,11 @@ class CodeParser:
 
         if node_type == "sequence_declaration":
             name = next(
-                (decode(sub) for sub in child.children if sub.type == "simple_identifier"),
+                (
+                    decode(sub)
+                    for sub in child.children
+                    if sub.type == "simple_identifier"
+                ),
                 None,
             )
             emit(name, child, "sequence")
@@ -14147,8 +19956,13 @@ class CodeParser:
         root,
         language: str,
         source: bytes,
+        file_path: Optional[str] = None,
     ) -> tuple[dict[str, str], set[str]]:
         """Pre-scan top-level AST to collect import mappings and defined names.
+
+        ``file_path`` is what makes a Python relative import resolvable —
+        ``.graph`` names a different module from every directory — so callers
+        that have it must pass it.
 
         Returns:
             (import_map, defined_names) where import_map maps imported names
@@ -14181,10 +19995,8 @@ class CodeParser:
                 for import_node in child.children:
                     if import_node.type == "import_header":
                         self._collect_import_names(
-                            import_node,
-                            language,
-                            source,
-                            import_map,
+                            import_node, language, source, import_map,
+                            file_path,
                         )
                 continue
 
@@ -14196,7 +20008,8 @@ class CodeParser:
                         target = inner
                         break
             elif (
-                language in ("javascript", "typescript", "tsx") and node_type == "export_statement"
+                language in ("javascript", "typescript", "tsx")
+                and node_type == "export_statement"
             ):
                 for inner in child.children:
                     if inner.type in func_types or inner.type in class_types:
@@ -14217,33 +20030,57 @@ class CodeParser:
                     defined_names.add(name)
                     continue
 
+            if (
+                language == "rust"
+                and node_type == "mod_item"
+                and child.child_by_field_name("body") is not None
+            ):
+                name_node = child.child_by_field_name("name")
+                body = child.child_by_field_name("body")
+                if name_node is not None:
+                    module_name = name_node.text.decode("utf-8", errors="replace")
+                    for item in body.named_children:
+                        if item.type not in func_types and item.type not in class_types:
+                            continue
+                        item_name = self._get_name(
+                            item, language,
+                            "class" if item.type in class_types else "function",
+                        )
+                        if item_name:
+                            import_map[
+                                f"{_RUST_INLINE_MODULE_KEY}{module_name}::{item_name}"
+                            ] = module_name
+                continue
+
             # Collect defined function/class names
             if target_type in func_types or target_type in class_types:
-                name = self._get_name(
-                    target, language, "class" if target_type in class_types else "function"
-                )
+                name = self._get_name(target, language,
+                                      "class" if target_type in class_types else "function")
                 if name:
                     defined_names.add(name)
                     continue
 
-            if language in ("javascript", "typescript", "tsx") and node_type == "export_statement":
+            if (
+                language in ("javascript", "typescript", "tsx")
+                and node_type == "export_statement"
+            ):
                 self._collect_js_exported_local_names(child, defined_names)
 
             # Collect import mappings: imported_name → module_path
             if node_type in import_types:
-                self._collect_import_names(child, language, source, import_map)
+                self._collect_import_names(
+                    child, language, source, import_map, file_path,
+                )
 
-            if language in ("javascript", "typescript", "tsx") and node_type in (
-                "lexical_declaration",
-                "variable_declaration",
+            if (
+                language in ("javascript", "typescript", "tsx")
+                and node_type in ("lexical_declaration", "variable_declaration")
             ):
                 self._collect_js_require_names(child, import_map)
 
         if language == "julia":
             self._collect_julia_scoped_import_names(
-                root,
-                source,
-                import_map,
+                root, source, import_map,
             )
 
         return import_map, defined_names
@@ -14261,12 +20098,10 @@ class CodeParser:
             name_node = node.child_by_field_name("name")
             if name_node is not None:
                 module_name = name_node.text.decode(
-                    "utf-8",
-                    errors="replace",
+                    "utf-8", errors="replace",
                 )
                 current_scope = self._julia_scope_join(
-                    current_scope,
-                    module_name,
+                    current_scope, module_name,
                 )
 
         import_types = set(self._import_types.get("julia", []))
@@ -14274,10 +20109,7 @@ class CodeParser:
             if child.type in import_types:
                 local_imports: dict[str, str] = {}
                 self._collect_import_names(
-                    child,
-                    "julia",
-                    source,
-                    local_imports,
+                    child, "julia", source, local_imports,
                 )
                 for alias, target in local_imports.items():
                     key = self._julia_scope_join(current_scope, alias)
@@ -14285,10 +20117,7 @@ class CodeParser:
                         import_map[key] = target
                 continue
             self._collect_julia_scoped_import_names(
-                child,
-                source,
-                import_map,
-                current_scope,
+                child, source, import_map, current_scope,
             )
 
     def _expand_python_star_imports(
@@ -14308,12 +20137,13 @@ class CodeParser:
             if module_node is None:
                 continue
             module = module_node.text.decode("utf-8", errors="replace")
-            resolved = self._resolve_python_module_in_repo(module, file_path)
+            # `_python_import_origin` sees through sys.modules shims, so
+            # `from shim import *` enumerates the real module's exports.
+            resolved = self._python_import_origin(module, file_path)
             if resolved is None or resolved in resolving:
                 continue
             for name, origin in self._get_python_star_exports(
-                resolved,
-                resolving,
+                resolved, resolving,
             ).items():
                 import_map.setdefault(name, origin)
 
@@ -14331,6 +20161,13 @@ class CodeParser:
         resolved_module = normalize_file_path(module_path)
         if resolved_module in resolving:
             return {}
+        if self._excluded_files:
+            # Origins are resolved with the exclusions in force, so a cache
+            # shared process-wide (and keyed only by the module's own mtime
+            # and size) would serve `forget` an answer computed for a
+            # different set of files on disk. Forget touches a handful of
+            # referrers, so recomputing is cheap and parity is exact.
+            return self._read_python_star_exports(module_path, resolving)
 
         cache_key = (resolved_module, file_stat.st_mtime_ns, file_stat.st_size)
         with _PYTHON_STAR_EXPORT_CACHE_LOCK:
@@ -14339,12 +20176,10 @@ class CodeParser:
                 return dict(cached)
 
             exports = self._read_python_star_exports(
-                module_path,
-                resolving,
+                module_path, resolving,
             )
             stale_keys = [
-                key
-                for key in _PYTHON_STAR_EXPORT_CACHE
+                key for key in _PYTHON_STAR_EXPORT_CACHE
                 if key[0] == resolved_module and key != cache_key
             ]
             for stale_key in stale_keys:
@@ -14371,23 +20206,27 @@ class CodeParser:
             parser = self._get_parser("python")
             if not parser:
                 return {}
-            tree = parser.parse(source)
+            tree = parser.parse(source)  # type: ignore[union-attr]
             import_map, defined_names = self._collect_file_scope(
-                tree.root_node,
-                "python",
-                source,
+                tree.root_node, "python", source, resolved_module,
             )
 
             origins: dict[str, str] = {}
             next_resolving = resolving | {resolved_module}
             self._expand_python_star_imports(
-                tree.root_node,
-                resolved_module,
-                origins,
-                next_resolving,
+                tree.root_node, resolved_module, origins, next_resolving,
             )
             for name, module in import_map.items():
-                origin = self._resolve_python_module_in_repo(module, resolved_module)
+                if f"{_JS_IMPORT_ORIGINAL_PREFIX_KEY}{name}" in import_map:
+                    # `from .impl import charge as pay` exports `pay`, but the
+                    # origin file defines `charge`; an origin keyed by file
+                    # alone would send `pkg.pay` to an unrelated `impl.pay`.
+                    # Keep the name on this module, where it stays unresolved.
+                    origins[name] = resolved_module
+                    continue
+                # A relative import stores its already-resolved file here,
+                # an absolute one a dotted module name; both must work.
+                origin = self._python_import_origin(module, resolved_module)
                 if origin is not None:
                     origins[name] = origin
             for name in defined_names:
@@ -14395,8 +20234,15 @@ class CodeParser:
 
             explicit_exports = self._extract_python_dunder_all(tree.root_node)
             if explicit_exports is not None:
-                return {name: origins.get(name, resolved_module) for name in explicit_exports}
-            return {name: origin for name, origin in origins.items() if not name.startswith("_")}
+                return {
+                    name: origins.get(name, resolved_module)
+                    for name in explicit_exports
+                }
+            return {
+                name: origin
+                for name, origin in origins.items()
+                if not name.startswith("_")
+            }
         except Exception as exc:
             logger.debug(
                 "Skipping Python star exports for %s: %s",
@@ -14426,8 +20272,13 @@ class CodeParser:
             return {name for name in value if isinstance(name, str)}
         return None
 
-    def _python_repo_boundary(self, file_path: str) -> Path:
-        """Return the filesystem boundary for safe Python import lookup."""
+    def _import_repo_boundary(self, file_path: str) -> Path:
+        """Return the filesystem boundary for safe import lookup.
+
+        Shared by every language whose resolver walks the filesystem: the
+        configured repository root when there is one, else the nearest VCS
+        checkout at or above the caller.
+        """
         caller_dir = Path(file_path).resolve().parent
         if self._repo_root is not None:
             return self._repo_root
@@ -14445,14 +20296,495 @@ class CodeParser:
             return False
         return True
 
-    def _resolve_python_module_in_repo(
-        self,
-        module: str,
-        file_path: str,
+    def _file_exists_exact(self, path: Path) -> bool:
+        """Case-exact ``is_file`` for module lookup in any language.
+
+        ``Path.is_file()`` answers "yes" to ``Registry.py`` on APFS/NTFS when
+        only ``registry.py`` exists, which is how a wrong import target
+        reached the graph as a confident, real-looking file path and stayed
+        invisible to everyone not on Linux. Module resolution therefore
+        compares against the directory's real listing, cached per directory
+        because a package is probed once per import that names it.
+
+        A file marked via :meth:`exclude_files` answers False. ``forget`` asks
+        for the graph a build without that file would have produced, and in
+        that build the file is simply not on disk — so the probe must miss it
+        here rather than be filtered out one layer up in
+        :meth:`_resolve_module_to_file`, which every Python-specific caller
+        below reaches around. Missing *here* also lets resolution fall through
+        to the next candidate, exactly as the real absence would.
+        """
+        if path.name not in self._dir_entry_names(path.parent):
+            return False
+        try:
+            if not path.is_file():
+                return False
+        except OSError:
+            return False
+        if self._excluded_files and normalize_file_path(path) in self._excluded_files:
+            return False
+        return True
+
+    def _dir_entry_names(self, directory: Path) -> frozenset[str]:
+        """The real names in *directory*, cached per directory.
+
+        One listing backs every case-exact probe below, because a package is
+        probed once per import that names it.
+        """
+        key = str(directory)
+        entries = self._dir_entries_cache.get(key)
+        if entries is None:
+            try:
+                entries = frozenset(os.listdir(directory))
+            except OSError:
+                entries = frozenset()
+            if len(self._dir_entries_cache) >= self._MODULE_CACHE_MAX:
+                self._dir_entries_cache.clear()
+            self._dir_entries_cache[key] = entries
+        return entries
+
+    def _npm_alias_path_is_indexed(self, path: Path) -> bool:
+        """:meth:`_path_is_indexed` under this parser's repository, for aliases."""
+        return self._repo_root is None or self._path_is_indexed(path, self._repo_root)
+
+    def _path_is_indexed(self, path: Path, boundary: Path) -> bool:
+        """Whether a build would index *path*, so an edge may name it.
+
+        The ignore patterns are the single source of truth for what becomes a
+        node. Resolving an import into ``vendor/`` -- excluded by the default
+        ``**/vendor/**`` -- produced 73,507 kubernetes edges naming files that
+        no node answers to: a confident-looking path that resolves to
+        nothing, which reads worse than the bare module string it replaced.
+        An import that lands on an unindexed path therefore resolves to
+        nothing, and the edge keeps the bare module string.
+
+        ``incremental`` imports this module, so the patterns can only be
+        fetched at call time; the answer is memoised per boundary, and a
+        parser is rebuilt for every build and every update.
+        """
+        key = str(path)
+        cached = self._indexed_path_cache.get(key)
+        if cached is not None:
+            return cached
+        verdict = self._compute_path_is_indexed(path, boundary)
+        if len(self._indexed_path_cache) >= self._MODULE_CACHE_MAX:
+            self._indexed_path_cache.clear()
+        self._indexed_path_cache[key] = verdict
+        return verdict
+
+    def _compute_path_is_indexed(self, path: Path, boundary: Path) -> bool:
+        """The uncached body of :meth:`_path_is_indexed`."""
+        try:
+            relative = path.resolve().relative_to(boundary).as_posix()
+        except (OSError, ValueError, RuntimeError):
+            return True
+        patterns = self._ignore_patterns(boundary)
+        if patterns is None:
+            return True
+        from .incremental import _should_ignore
+
+        return not _should_ignore(relative, patterns)
+
+    def _ignore_patterns(self, boundary: Path) -> Optional[list[str]]:
+        """The ignore patterns in force under *boundary*, or ``None``."""
+        key = str(boundary)
+        if key in self._ignore_patterns_cache:
+            return self._ignore_patterns_cache[key]
+        patterns: Optional[list[str]]
+        try:
+            from .incremental import _load_ignore_patterns
+
+            patterns = _load_ignore_patterns(boundary)
+        except Exception:  # pragma: no cover - defensive
+            patterns = None
+        if len(self._ignore_patterns_cache) >= self._MODULE_CACHE_MAX:
+            self._ignore_patterns_cache.clear()
+        self._ignore_patterns_cache[key] = patterns
+        return patterns
+
+    def _dir_exists_exact(self, path: Path) -> bool:
+        """Case-exact ``is_dir`` for package lookup in any language.
+
+        Same reason as :meth:`_file_exists_exact`: a PEP 420 namespace
+        package is a directory, and ``Path.is_dir()`` would confirm a
+        spelling that is not on disk.
+        """
+        if path.name not in self._dir_entry_names(path.parent):
+            return False
+        try:
+            return path.is_dir()
+        except OSError:
+            return False
+
+    @staticmethod
+    def _python_imported_names(node) -> list[str]:
+        """Original (pre-alias) names bound after ``import`` in a from-import."""
+        names: list[str] = []
+        seen_import_keyword = False
+        for child in node.children:
+            if child.type == "import":
+                seen_import_keyword = True
+                continue
+            if not seen_import_keyword:
+                continue
+            if child.type in ("dotted_name", "identifier"):
+                names.append(child.text.decode("utf-8", errors="replace"))
+            elif child.type == "aliased_import":
+                # `a as b` — the module-side name is `a`; `b` is only local.
+                for sub in child.children:
+                    if sub.type in ("dotted_name", "identifier"):
+                        names.append(sub.text.decode("utf-8", errors="replace"))
+                        break
+        return names
+
+    def _python_package_dir(
+        self, module: str, file_path: Optional[str],
+    ) -> Optional[Path]:
+        """Directory of the package *module* names, or None if it is not one.
+
+        Covers both kinds of package CPython recognises: a regular one, whose
+        directory holds ``__init__.py``, and a PEP 420 namespace package,
+        which is a bare directory. A namespace package has no file of its own
+        — nothing for an ``IMPORTS_FROM`` edge to point at — but its
+        submodules are ordinary files, so callers still need its directory.
+        """
+        if not file_path:
+            return None
+        package_file = self._resolve_module_to_file(module, file_path, "python")
+        if package_file:
+            path = Path(package_file)
+            return path.parent if path.name == "__init__.py" else None
+        return self._resolve_python_namespace_dir(module, file_path)
+
+    def _python_submodule_file(
+        self, package_dir: Path, name: str,
     ) -> Optional[str]:
-        """Resolve a Python module without traversing above the repository."""
+        """File backing submodule *name* of the package at *package_dir*.
+
+        ``None`` for a name that is a symbol rather than a module, and for a
+        namespace subpackage, which has no file of its own.
+        """
+        for candidate in (
+            package_dir / name / "__init__.py",
+            package_dir / f"{name}.py",
+        ):
+            if self._file_exists_exact(candidate):
+                return self._python_module_alias_target(
+                    normalize_file_path(candidate),
+                )
+        return None
+
+    # Shims that re-point each other are followed at most this many hops.
+    _PY_MODULE_ALIAS_MAX_DEPTH = 5
+
+    def _python_module_alias_target(self, module_file: str) -> str:
+        """The module that really answers an import of *module_file*.
+
+        A compatibility shim such as::
+
+            import importlib, sys
+            sys.modules[__name__] = importlib.import_module("pkg.real")
+
+        swaps itself out of ``sys.modules`` on first import, so ``import shim``
+        hands the caller ``pkg/real.py``. Treating the five-line shim as the
+        module left every ``shim.func()`` without a definition to land on and
+        recorded the shim as the file importers depend on. Follows chains of
+        shims; returns *module_file* unchanged for an ordinary module, a
+        target outside the repository, or a target excluded via
+        :meth:`exclude_files` (a build without that file would not see it).
+        """
+        current = module_file
+        seen = {current}
+        for _ in range(self._PY_MODULE_ALIAS_MAX_DEPTH):
+            target = self._python_module_alias(current)
+            if (
+                target is None
+                or target in seen
+                or target in self._excluded_files
+            ):
+                break
+            seen.add(target)
+            current = target
+        return current
+
+    def _python_module_alias(self, module_file: str) -> Optional[str]:
+        """One hop of :meth:`_python_module_alias_target`, cached per file."""
+        if not module_file.endswith(".py"):
+            return None
+        if module_file in self._python_module_alias_cache:
+            return self._python_module_alias_cache[module_file]
+        target: Optional[str] = None
+        # A repository path can be a symlink to a file elsewhere; only a file
+        # that really lives inside the repository is read.
+        try:
+            real_path = Path(module_file).resolve()
+        except (OSError, ValueError):
+            real_path = None
+        module_name = (
+            self._cached_python_module_alias(real_path)
+            if real_path is not None
+            and self._path_is_within(
+                real_path, self._import_repo_boundary(module_file),
+            )
+            else None
+        )
+        if module_name:
+            target = self._resolve_python_module_in_repo(module_name, module_file)
+        if len(self._python_module_alias_cache) >= self._MODULE_CACHE_MAX:
+            self._python_module_alias_cache.clear()
+        self._python_module_alias_cache[module_file] = target
+        return target
+
+    @classmethod
+    def _cached_python_module_alias(cls, module_path: Path) -> Optional[str]:
+        """:meth:`_read_python_module_alias`, cached by the file's mtime and size."""
+        try:
+            file_stat = module_path.stat()
+        except (OSError, ValueError):
+            return None
+        cache_key = (str(module_path), file_stat.st_mtime_ns, file_stat.st_size)
+        with _PYTHON_MODULE_ALIAS_CACHE_LOCK:
+            if cache_key in _PYTHON_MODULE_ALIAS_CACHE:
+                return _PYTHON_MODULE_ALIAS_CACHE[cache_key]
+            module_name = cls._read_python_module_alias(module_path)
+            if len(_PYTHON_MODULE_ALIAS_CACHE) >= _PYTHON_STAR_CACHE_MAX:
+                _PYTHON_MODULE_ALIAS_CACHE.clear()
+            _PYTHON_MODULE_ALIAS_CACHE[cache_key] = module_name
+            return module_name
+
+    @staticmethod
+    def _read_python_module_alias(module_path: Path) -> Optional[str]:
+        """Dotted module a file installs as ``sys.modules[__name__]``, if any.
+
+        Only the literal, module-level form counts:
+        ``sys.modules[__name__] = importlib.import_module("dotted.name")``
+        (or ``import_module(...)`` imported from ``importlib``). A computed or
+        relative module name, a swap inside a function or ``if`` block, or a
+        later write that replaces the literal swap is not something static
+        analysis can follow, so the file stays the module. Of several
+        module-level swaps the last one is what importers get.
+        """
+        try:
+            source = module_path.read_bytes()
+        except OSError:
+            return None
+        if b"sys.modules" not in source or b"import_module" not in source:
+            return None
+        try:
+            tree = ast.parse(source)
+        except (SyntaxError, ValueError, RecursionError, MemoryError):
+            # A file ast cannot read must not cost its importers their edges.
+            return None
+
+        def writes_own_entry(target: ast.AST) -> bool:
+            return (
+                isinstance(target, ast.Subscript)
+                and isinstance(target.value, ast.Attribute)
+                and target.value.attr == "modules"
+                and isinstance(target.value.value, ast.Name)
+                and target.value.value.id == "sys"
+                and isinstance(target.slice, ast.Name)
+                and target.slice.id == "__name__"
+            )
+
+        # Importers get the LAST value written, so every write counts: a
+        # second swap, one nested in a block, or a computed one means the
+        # module that answers the import is not provable from the source.
+        top_level = {id(statement) for statement in tree.body}
+        writes: list[ast.stmt] = []
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Assign, ast.Delete)):
+                targets = node.targets
+            elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
+                targets = [node.target]
+            else:
+                continue
+            if any(writes_own_entry(target) for target in targets):
+                if id(node) not in top_level:
+                    return None
+                writes.append(node)
+        if not writes:
+            return None
+        final = max(writes, key=lambda node: (node.lineno, node.col_offset))
+        if not (isinstance(final, ast.Assign) and len(final.targets) == 1):
+            return None
+        call = final.value
+        if not (
+            isinstance(call, ast.Call)
+            and len(call.args) == 1
+            and not call.keywords
+            and isinstance(call.args[0], ast.Constant)
+            and isinstance(call.args[0].value, str)
+        ):
+            return None
+        func = call.func
+        expected: tuple[str, Optional[str]]
+        if (
+            isinstance(func, ast.Attribute)
+            and func.attr == "import_module"
+            and isinstance(func.value, ast.Name)
+            and func.value.id == "importlib"
+        ):
+            callee, expected = "importlib", ("importlib", None)
+        elif isinstance(func, ast.Name) and func.id == "import_module":
+            callee, expected = "import_module", ("importlib", "import_module")
+        else:
+            return None
+        # The name must mean importlib's function and nothing else: a local
+        # `def import_module(...)` or a rebinding of `importlib` makes the
+        # call something static analysis cannot vouch for.
+        for local, wanted in ((callee, expected), ("sys", ("sys", None))):
+            # `sys` too: `import fake as sys` makes `sys.modules` an ordinary
+            # mapping, and the assignment replaces nothing.
+            bindings = CodeParser._python_name_bindings(tree, local)
+            if not bindings or any(binding != wanted for binding in bindings):
+                return None
+        name = call.args[0].value
+        if name and not name.startswith("."):
+            return name
+        return None
+
+    @staticmethod
+    def _python_name_bindings(
+        tree: ast.Module, local: str,
+    ) -> list[tuple[str, Optional[str]]]:
+        """How *local* is bound anywhere in *tree*, one entry per binding.
+
+        An import binding is ``(module, imported name)``: ``import importlib``
+        gives ``("importlib", None)`` and ``from importlib import
+        import_module`` gives ``("importlib", "import_module")``. Any other
+        binding (def, class, assignment, loop or ``with`` target, ``global``)
+        is ``("", None)``, which matches no expected import.
+        """
+        bindings: list[tuple[str, Optional[str]]] = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.asname is not None:
+                        if alias.asname == local:
+                            bindings.append((alias.name, None))
+                    elif alias.name.split(".")[0] == local:
+                        # `import importlib.util` binds `importlib` itself.
+                        bindings.append((local, None))
+            elif isinstance(node, ast.ImportFrom):
+                for alias in node.names:
+                    if (alias.asname or alias.name) == local:
+                        module = node.module if not node.level else ""
+                        bindings.append((module or "", alias.name))
+            elif isinstance(
+                node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef),
+            ):
+                if node.name == local:
+                    bindings.append(("", None))
+            elif isinstance(node, ast.Name) and isinstance(
+                node.ctx, (ast.Store, ast.Del),
+            ):
+                if node.id == local:
+                    bindings.append(("", None))
+            elif isinstance(node, (ast.Global, ast.Nonlocal)):
+                if local in node.names:
+                    bindings.append(("", None))
+        return bindings
+
+    def _python_submodule_names(
+        self, node, package_dir: Path,
+    ) -> list[str]:
+        """Imported names that are themselves modules inside *package_dir*.
+
+        ``from . import incremental`` and ``from .tools import query`` import a
+        MODULE through a package: the statement's real dependency is that
+        submodule's file, not only the package ``__init__.py``. Only names
+        that answer to a module in the package directory qualify, so
+        ``from .graph import GraphStore`` (a class) stays a single edge and
+        edge counts do not inflate.
+        """
+        submodules: list[str] = []
+        for name in self._python_imported_names(node):
+            if "." in name or name in submodules:
+                continue
+            if self._python_submodule_file(
+                package_dir, name,
+            ) is not None or self._dir_exists_exact(package_dir / name):
+                submodules.append(name)
+        return submodules
+
+    def _python_from_import_targets(
+        self, node, module: str, file_path: Optional[str],
+    ) -> list[str]:
+        """Every module one ``from X import a, b`` statement depends on.
+
+        The package itself, plus any imported name that is a submodule rather
+        than a symbol. A PEP 420 namespace package contributes no target of
+        its own — it has no file — only its submodules; emitting the raw
+        ``.ns`` specifier there would be a target no node can ever answer to.
+        """
+        package_dir = self._python_package_dir(module, file_path)
+        namespace = package_dir is not None and not self._file_exists_exact(
+            package_dir / "__init__.py",
+        )
+        prefix = module if module.endswith(".") else f"{module}."
+        targets: list[str] = [] if namespace else [module]
+        if package_dir is not None:
+            for name in self._python_submodule_names(node, package_dir):
+                dotted = f"{prefix}{name}"
+                submodule = self._python_submodule_file(package_dir, name)
+                if (
+                    submodule is not None
+                    and file_path
+                    and submodule not in self._excluded_files
+                    and self._resolve_module_to_file(dotted, file_path, "python")
+                    != submodule
+                ):
+                    # `module` is a shim installing another package, so the
+                    # dotted name points under the shim, where no file is.
+                    targets.append(submodule)
+                else:
+                    targets.append(dotted)
+        # A namespace package that binds no submodule (only possible for a
+        # name that cannot be imported at all) still has to say something.
+        return targets or [module]
+
+    def _python_import_origin(
+        self, module: str, file_path: str,
+    ) -> Optional[str]:
+        """Resolve an ``import_map`` value for Python to a repository file.
+
+        Values are either a dotted module name (absolute import) or an
+        already-resolved absolute file path — relative imports and star
+        imports both store the path, because a relative module string cannot
+        be resolved without the importing file's package.
+        """
+        candidate = Path(module)
+        if candidate.is_absolute():
+            boundary = self._import_repo_boundary(file_path)
+            try:
+                resolved = candidate.resolve()
+            except (OSError, ValueError):
+                return None
+            if not self._path_is_within(resolved, boundary):
+                return None
+            return (
+                self._python_module_alias_target(normalize_file_path(resolved))
+                if self._file_exists_exact(resolved)
+                else None
+            )
+        origin = self._resolve_python_module_in_repo(module, file_path)
+        return self._python_module_alias_target(origin) if origin else None
+
+    def _python_module_search(
+        self, module: str, file_path: str,
+    ) -> tuple[list[Path], Path, Path]:
+        """``(search roots, boundary, module tail)`` for a Python module.
+
+        The leading dots of a relative import ARE the resolution: one dot is
+        the caller's own package, each further dot one package up, and there
+        is exactly one place to look. An absolute import walks up from the
+        caller's directory, never past the repository root — a match above it
+        is another checkout or a site-packages copy, not this repository's
+        module.
+        """
         caller_dir = Path(file_path).resolve().parent
-        boundary = self._python_repo_boundary(file_path)
+        boundary = self._import_repo_boundary(file_path)
         leading_dots = len(module) - len(module.lstrip("."))
         module_name = module[leading_dots:]
         relative = Path(*module_name.split(".")) if module_name else Path()
@@ -14462,38 +20794,101 @@ class CodeParser:
             base = caller_dir
             for _ in range(leading_dots - 1):
                 if base == boundary:
-                    return None
+                    return [], boundary, relative
                 base = base.parent
             search_roots.append(base)
         else:
             current = caller_dir
             while self._path_is_within(current, boundary):
-                search_roots.append(current)
+                if not self._python_folder_hides_module(module_name, current):
+                    search_roots.append(current)
                 if current == boundary:
                     break
                 current = current.parent
+        return search_roots, boundary, relative
 
+    def _python_folder_hides_module(self, module: str, folder: Path) -> bool:
+        """Whether *folder* cannot be where an absolute standard library import lands.
+
+        Python 3 looks on ``sys.path``, and a package's own folder is not on it,
+        so ``pkg/typing.py`` does not answer ``import typing``.
+        """
+        return module.split(".", 1)[0] in sys.stdlib_module_names and self._file_exists_exact(
+            folder / "__init__.py",
+        )
+
+    @staticmethod
+    def _python_module_candidates(base: Path, has_tail: bool) -> tuple[Path, ...]:
+        """The files CPython would load for a module rooted at *base*, in order.
+
+        ``FileFinder`` checks the package directory before the same-named
+        module file, so with both ``pkg/m/__init__.py`` and ``pkg/m.py`` on
+        disk ``import pkg.m`` loads the package — verified against the
+        interpreter, not inferred. Probing ``m.py`` first silently bound
+        every such import to the wrong file.
+        """
+        if not has_tail:
+            return (base / "__init__.py",)
+        return (base / "__init__.py", base.with_suffix(".py"))
+
+    def _resolve_python_module_in_repo(
+        self, module: str, file_path: str,
+    ) -> Optional[str]:
+        """Resolve a Python module without traversing above the repository."""
+        search_roots, boundary, relative = self._python_module_search(
+            module, file_path,
+        )
+        has_tail = relative != Path()
         for root in search_roots:
             base = root / relative
-            candidates = (
-                base.with_suffix(".py") if module_name else base / "__init__.py",
-                base / "__init__.py",
-            )
-            for candidate in candidates:
+            for candidate in self._python_module_candidates(base, has_tail):
                 try:
                     resolved = candidate.resolve()
                 except (OSError, ValueError):
                     continue
                 if not self._path_is_within(resolved, boundary):
                     continue
-                if resolved.is_file():
+                if self._file_exists_exact(resolved):
                     return normalize_file_path(resolved)
         return None
 
+    def _resolve_python_namespace_dir(
+        self, module: str, file_path: str,
+    ) -> Optional[Path]:
+        """Directory of the PEP 420 namespace package *module* names.
+
+        Only reached once :meth:`_resolve_python_module_in_repo` has found no
+        file, which keeps CPython's precedence intact: a real ``m.py`` wins
+        over a same-named directory with no ``__init__.py``, because the
+        namespace package is what the finder falls back to, not what it
+        prefers.
+        """
+        search_roots, boundary, relative = self._python_module_search(
+            module, file_path,
+        )
+        if relative == Path() and not module.startswith("."):
+            # A bare ``from  import x`` cannot occur; only the relative form
+            # reaches here with no tail.
+            return None
+        for root in search_roots:
+            try:
+                candidate = (root / relative).resolve()
+            except (OSError, ValueError):
+                continue
+            if not self._path_is_within(candidate, boundary):
+                continue
+            # ``from . import x`` inside a namespace package: the package IS
+            # the search root, so there is no name to compare case-exactly.
+            if candidate == root:
+                if candidate.is_dir():
+                    return candidate
+                continue
+            if self._dir_exists_exact(candidate):
+                return candidate
+        return None
+
     def _collect_js_exported_local_names(
-        self,
-        node,
-        defined_names: set[str],
+        self, node, defined_names: set[str],
     ) -> None:
         """Collect locally exported JS/TS names from export statements."""
         for child in node.children:
@@ -14558,20 +20953,50 @@ class CodeParser:
         if not module:
             return
         target = self._resolve_module_to_file(module, file_path, language) or module
-        if any(
-            edge.kind == "IMPORTS_FROM" and edge.source == file_path and edge.target == target
-            for edge in edges
-        ):
-            return
-        edges.append(
-            EdgeInfo(
-                kind="IMPORTS_FROM",
-                source=file_path,
-                target=target,
-                file_path=file_path,
-                line=call_node.start_point[0] + 1,
-            )
-        )
+        deferred = self._js_module_call_is_deferred(call_node)
+        line = call_node.start_point[0] + 1
+        for edge in edges:
+            if (
+                edge.kind == "IMPORTS_FROM"
+                and edge.source == file_path
+                and edge.target == target
+            ):
+                # One edge per target, so it says the strongest load: a call
+                # that runs beats a type-only import, and one at load beats
+                # both. It then cites the line that does that load.
+                context = edge.extra.get(IMPORT_CONTEXT_KEY)
+                if not deferred and context is not None:
+                    edge.extra.pop(IMPORT_CONTEXT_KEY)
+                    edge.line = line
+                elif deferred and context == IMPORT_CONTEXT_TYPE_ONLY:
+                    edge.extra[IMPORT_CONTEXT_KEY] = IMPORT_CONTEXT_DEFERRED
+                    edge.line = line
+                return
+        edges.append(EdgeInfo(
+            kind="IMPORTS_FROM",
+            source=file_path,
+            target=target,
+            file_path=file_path,
+            line=line,
+            extra={IMPORT_CONTEXT_KEY: IMPORT_CONTEXT_DEFERRED} if deferred else {},
+        ))
+
+    @staticmethod
+    def _js_module_call_is_deferred(call_node) -> bool:
+        """Whether a ``require``/``import()`` call runs after its file has loaded."""
+        function = call_node.child_by_field_name("function")
+        if function is not None and function.text == b"import":
+            return True
+        current = call_node.parent
+        while current is not None:
+            if current.type in (
+                "function_declaration", "function_expression", "function",
+                "arrow_function", "method_definition",
+                "generator_function", "generator_function_declaration",
+            ):
+                return True
+            current = current.parent
+        return False
 
     def _collect_js_require_names(
         self,
@@ -14607,22 +21032,81 @@ class CodeParser:
         language: str,
         source: bytes,
         import_map: dict[str, str],
+        file_path: Optional[str] = None,
     ) -> None:
         """Extract imported names and their source modules into import_map."""
         if language == "python":
             if node.type == "import_from_statement":
                 # from X.Y import A, B → {A: X.Y, B: X.Y}
-                module = None
+                #
+                # Same trap as `_extract_import`: a relative import's module
+                # is a `relative_import` node, so the old first-`dotted_name`
+                # scan never matched one and `module` stayed None — every
+                # relatively imported name was simply absent from the map,
+                # and each call through one stayed an unresolved bare name.
+                module_node = node.child_by_field_name("module_name")
+                if module_node is None:
+                    return
+                module = module_node.text.decode("utf-8", errors="replace")
+                # Submodules the statement binds by name, so `from . import
+                # cli` agrees with the IMPORTS_FROM edge `_extract_import`
+                # writes for the same line instead of pointing `cli` at the
+                # package `__init__.py`, where no `cli` is defined.
+                package_dir = self._python_package_dir(module, file_path)
+                submodules = (
+                    set(self._python_submodule_names(node, package_dir))
+                    if package_dir is not None
+                    else set()
+                )
+                if module.startswith("."):
+                    # A relative module string means nothing away from the
+                    # file that wrote it, so store the resolved file instead;
+                    # `_resolve_imported_symbol` already accepts a path here,
+                    # which is what star-import expansion stores too.
+                    resolved = (
+                        self._resolve_module_to_file(module, file_path, "python")
+                        if file_path
+                        else None
+                    )
+                    module = resolved or module
+
+                def _bind(local_name: str, imported_name: str, module: str = module) -> None:
+                    if imported_name in submodules and package_dir is not None:
+                        target = self._python_submodule_file(
+                            package_dir, imported_name,
+                        )
+                        if target is not None:
+                            import_map[local_name] = target
+                            # A name bound to a MODULE is not a symbol inside
+                            # one: the reference belongs to the module's file
+                            # node, not to `<file>::<name>`, which matches
+                            # nothing. See `_resolve_call_target`.
+                            import_map[
+                                f"{_PY_MODULE_BINDING_KEY}{local_name}"
+                            ] = target
+                            import_map.pop(
+                                f"{_JS_IMPORT_ORIGINAL_PREFIX_KEY}{local_name}",
+                                None,
+                            )
+                            return
+                    import_map[local_name] = module
+                    original_key = f"{_JS_IMPORT_ORIGINAL_PREFIX_KEY}{local_name}"
+                    if imported_name != local_name:
+                        # `from X import A as B; B()` calls X's `A`; without
+                        # the original name the call qualified as `X::B`.
+                        import_map[original_key] = imported_name
+                    else:
+                        # A later `from Y import B` rebinds B to Y's own `B`.
+                        import_map.pop(original_key, None)
+
                 seen_import_keyword = False
                 for child in node.children:
-                    if child.type == "dotted_name" and not seen_import_keyword:
-                        module = child.text.decode("utf-8", errors="replace")
-                    elif child.type == "import":
+                    if child.type == "import":
                         seen_import_keyword = True
-                    elif seen_import_keyword and module:
+                    elif seen_import_keyword:
                         if child.type in ("identifier", "dotted_name"):
                             name = child.text.decode("utf-8", errors="replace")
-                            import_map[name] = module
+                            _bind(name, name)
                         elif child.type == "aliased_import":
                             # from X import A as B → {B: X}
                             names = [
@@ -14632,7 +21116,7 @@ class CodeParser:
                             ]
                             # Last name is the alias (local name)
                             if names:
-                                import_map[names[-1]] = module
+                                _bind(names[-1], names[0])
 
         elif language in ("javascript", "typescript", "tsx"):
             # import { A, B } from './path' → {A: ./path, B: ./path}
@@ -14651,7 +21135,6 @@ class CodeParser:
                     import_map[local_name] = original_path
 
         elif language == "julia":
-
             def _alias_parts(alias_node) -> tuple[Optional[str], Optional[str]]:
                 names: list[str] = []
                 for part in alias_node.children:
@@ -14663,8 +21146,7 @@ class CodeParser:
                         names.append(
                             ".".join(
                                 child.text.decode(
-                                    "utf-8",
-                                    errors="replace",
+                                    "utf-8", errors="replace",
                                 )
                                 for child in part.children
                                 if child.type == "identifier"
@@ -14689,14 +21171,12 @@ class CodeParser:
                         seen_colon = True
                     elif not seen_colon and part.type == "identifier":
                         module_name = part.text.decode(
-                            "utf-8",
-                            errors="replace",
+                            "utf-8", errors="replace",
                         )
                     elif not seen_colon and part.type == "import_path":
                         module_name = ".".join(
                             component.text.decode(
-                                "utf-8",
-                                errors="replace",
+                                "utf-8", errors="replace",
                             )
                             for component in part.children
                             if component.type == "identifier"
@@ -14706,12 +21186,37 @@ class CodeParser:
                         if module_name and real_name and alias:
                             import_map[alias] = f"{module_name}.{real_name}"
 
-        elif language in ("java", "kotlin"):
+        elif language == "kotlin":
+            module = None
+            alias = None
+            wildcard = False
+            for child in node.children:
+                if child.type == "identifier":
+                    module = child.text.decode("utf-8", errors="replace")
+                elif child.type == "wildcard_import":
+                    wildcard = True
+                elif child.type == "import_alias":
+                    alias = next(
+                        (
+                            part.text.decode("utf-8", errors="replace")
+                            for part in child.children
+                            if part.type == "type_identifier"
+                        ),
+                        None,
+                    )
+            if module and not wildcard:
+                local_name = alias or module.rsplit(".", 1)[-1]
+                import_map[local_name] = module
+
+        elif language == "java":
             text = node.text.decode("utf-8", errors="replace").strip()
             if not text.startswith("import "):
                 return
-            imported = text[len("import ") :].rstrip(";").strip()
-            if imported.startswith("static ") or imported.endswith(".*"):
+            imported = text[len("import "):].rstrip(";").strip()
+            if imported.startswith("static "):
+                return
+            if imported.endswith(".*"):
+                import_map[_JAVA_WILDCARD_KEY] = "1"
                 return
             original, separator, alias = imported.partition(" as ")
             local_name = alias.strip() if separator else original.rsplit(".", 1)[-1]
@@ -14722,10 +21227,7 @@ class CodeParser:
             import_map.update(self._php_import_bindings(node))
 
     def _collect_js_import_names(
-        self,
-        clause_node,
-        module: str,
-        import_map: dict[str, str],
+        self, clause_node, module: str, import_map: dict[str, str],
     ) -> None:
         """Walk JS/TS import_clause to extract named and default imports."""
         for child in clause_node.children:
@@ -14754,16 +21256,15 @@ class CodeParser:
                             import_map[local_name] = module
                             imported_name = (
                                 imported_node.text.decode(
-                                    "utf-8",
-                                    errors="replace",
+                                    "utf-8", errors="replace",
                                 )
                                 if imported_node is not None
                                 else names[0]
                             )
                             if alias_node is not None and imported_name != local_name:
-                                import_map[f"{_JS_IMPORT_ORIGINAL_PREFIX_KEY}{local_name}"] = (
-                                    imported_name
-                                )
+                                import_map[
+                                    f"{_JS_IMPORT_ORIGINAL_PREFIX_KEY}{local_name}"
+                                ] = imported_name
 
     @staticmethod
     def _js_imported_symbol_name(
@@ -14788,25 +21289,35 @@ class CodeParser:
         self._excluded_files = {normalize_file_path(Path(p).resolve()) for p in paths}
         # Drop resolutions cached before the exclusions were applied.
         self._module_file_cache.clear()
+        self._python_reexport_cache.clear()
+        self._python_module_alias_cache.clear()
 
     def _resolve_module_to_file(
         self,
         module: str,
         file_path: str,
         language: str,
+        form: Optional[str] = None,
     ) -> Optional[str]:
         """Resolve a module/import path to an absolute file path.
 
         Uses self._module_file_cache to avoid repeated filesystem lookups.
         Files marked via :meth:`exclude_files` resolve to ``None`` so callers
         fall back to the bare module string, matching a build without them.
+
+        *form* distinguishes two import keywords that take identical module
+        strings and resolve them differently -- Ruby's ``require`` against
+        the load paths, ``require_relative`` against the requiring file's
+        own directory -- so it is part of the cache key, not just an
+        argument. See :class:`_ImportSpec`.
         """
         caller_dir = str(Path(file_path).parent)
-        cache_key = f"{language}:{caller_dir}:{module}"
+        prefix = f"{language}:{form}" if form else language
+        cache_key = f"{prefix}:{caller_dir}:{module}"
         if cache_key in self._module_file_cache:
             resolved = self._module_file_cache[cache_key]
         else:
-            resolved = self._do_resolve_module(module, file_path, language)
+            resolved = self._do_resolve_module(module, file_path, language, form)
             if resolved is not None:
                 # Resolution walks the real filesystem, so on Windows the
                 # raw result uses backslashes; identity must not (#774).
@@ -14816,6 +21327,8 @@ class CodeParser:
             self._module_file_cache[cache_key] = resolved
         if resolved is not None and resolved in self._excluded_files:
             return None
+        if resolved is not None and language == "python":
+            resolved = self._python_module_alias_target(resolved)
         return resolved
 
     def _do_resolve_module(
@@ -14823,9 +21336,19 @@ class CodeParser:
         module: str,
         file_path: str,
         language: str,
+        form: Optional[str] = None,
     ) -> Optional[str]:
         """Language-aware module-to-file resolution."""
         caller_dir = Path(file_path).parent
+
+        if language == "go":
+            # A Go import names a package -- a directory -- so there is no
+            # single file to answer with. :meth:`_resolve_import_target` is
+            # the entry point, and it resolves to the directory itself.
+            return None
+
+        if language == "ruby":
+            return self._resolve_ruby_module_file(module, file_path, form)
 
         if language == "bash":
             # ``source ./lib.sh`` or ``source lib.sh`` — resolve relative
@@ -14865,16 +21388,45 @@ class CodeParser:
             return None
 
         if language == "python":
+            if Path(module).is_absolute():
+                # A submodule reached through a shim that installs a package
+                # is named by its file; see `_python_from_import_targets`.
+                return self._python_import_origin(module, file_path)
+            if module.startswith("."):
+                # Relative import. The leading dots ARE the resolution: one
+                # dot is the caller's own package, each further dot one
+                # package up. There is no walk to perform and nothing above
+                # the repository to search, so delegate to the level-aware,
+                # repository-bounded resolver rather than flattening the
+                # dots into a path (`.graph` -> `/graph.py`, which collapses
+                # to an absolute path at the filesystem root and never
+                # resolves).
+                return self._resolve_python_module_in_repo(module, file_path)
             rel_path = module.replace(".", "/")
-            candidates = [rel_path + ".py", rel_path + "/__init__.py"]
-            # Walk up from caller's directory to find the module file
+            # Package before module: with both ``pkg/m/__init__.py`` and
+            # ``pkg/m.py`` on disk, ``import pkg.m`` loads the package, because
+            # ``FileFinder`` checks the directory before the file loaders. The
+            # relative resolver agrees; see ``_python_module_candidates``.
+            candidates = [rel_path + "/__init__.py", rel_path + ".py"]
+            # Walk up from caller's directory to find the module file, never
+            # past the repository root: a match outside it is another
+            # checkout or a site-packages copy, not this repository's module.
             current = caller_dir
             while True:
-                for candidate in candidates:
+                for candidate in (
+                    () if self._python_folder_hides_module(module, current) else candidates
+                ):
                     target = current / candidate
-                    if target.is_file():
-                        return str(target.resolve())
+                    if self._file_exists_exact(target):
+                        found = target.resolve()
+                        if self._repo_root is not None and not _path_is_within(
+                            found, self._repo_root,
+                        ):
+                            return None
+                        return str(found)
                 if current == current.parent:
+                    break
+                if self._repo_root is not None and current == self._repo_root:
                     break
                 current = current.parent
 
@@ -14882,7 +21434,9 @@ class CodeParser:
             if module.startswith("."):
                 # Relative import — resolve from caller's directory
                 base = caller_dir / module
-                extensions = [".ts", ".tsx", ".js", ".jsx", ".vue"]
+                extensions = [
+                    ".ts", ".tsx", ".js", ".jsx", ".vue", ".mts", ".cts",
+                ]
                 # Try exact path first (might already have extension)
                 if base.is_file():
                     return str(base.resolve())
@@ -14900,8 +21454,14 @@ class CodeParser:
                         return str(target.resolve())
                 # ESM/NodeNext writes `./foo.js` for a file that is `foo.ts` on
                 # disk; only here does replacing the suffix become correct.
-                if base.suffix in (".js", ".jsx", ".mjs", ".cjs"):
-                    for ext in (".ts", ".tsx"):
+                suffix_substitutions = {
+                    ".js": (".ts", ".tsx", ".jsx"),
+                    ".jsx": (".ts", ".tsx"),
+                    ".mjs": (".mts", ".ts", ".tsx"),
+                    ".cjs": (".cts", ".ts", ".tsx"),
+                }
+                if base.suffix in suffix_substitutions:
+                    for ext in suffix_substitutions[base.suffix]:
                         target = base.with_suffix(ext)
                         if target.is_file():
                             return str(target.resolve())
@@ -14912,9 +21472,32 @@ class CodeParser:
                         if target.is_file():
                             return str(target.resolve())
             else:
-                # Non-relative import — try tsconfig path alias resolution
+                # Non-relative import — try tsconfig path alias resolution, but
+                # never an edge to a file the build would not index. baseUrl
+                # reaches every bare specifier, ``vendor/x`` and ``dist/x`` too.
                 resolved = self._tsconfig_resolver.resolve_alias(module, file_path)
-                if resolved:
+                if resolved and (
+                    self._repo_root is None
+                    or self._path_is_indexed(Path(resolved), self._repo_root)
+                ):
+                    return resolved
+                # npm dependency aliases can point at workspace source present
+                # in the scanned repository (#343). Explicit tsconfig paths
+                # remain the stronger, user-provided resolution and are tried
+                # first. When the nearest manifest declares the name as an
+                # ``npm:`` alias, npm installs that package under the name, so
+                # a workspace member that happens to share it must not answer.
+                if self._npm_alias_resolver.governs(module, file_path):
+                    resolved = self._npm_alias_resolver.resolve_alias(module, file_path)
+                # Otherwise a sibling package of an npm/yarn/pnpm workspace (#1030).
+                else:
+                    resolved = self._workspace_resolver.resolve(module, file_path)
+                # Either way never an edge to a file the build would not index:
+                # one that is ignored, or (a CSS export, say) has no language.
+                if resolved and self.detect_language(Path(resolved)) and (
+                    self._repo_root is None
+                    or self._path_is_indexed(Path(resolved), self._repo_root)
+                ):
                     return resolved
 
         elif language == "dart":
@@ -14937,11 +21520,13 @@ class CodeParser:
                 # ``lib/<sub_path>`` iff a ``pubspec.yaml`` declaring that
                 # package name is found in an ancestor directory. See: #87
                 try:
-                    uri_body = module[len("package:") :]
+                    uri_body = module[len("package:"):]
                     pkg_name, _, sub_path = uri_body.partition("/")
                     if not sub_path:
                         return None
-                    pubspec_root = self._find_dart_pubspec_root(caller_dir, pkg_name)
+                    pubspec_root = self._find_dart_pubspec_root(
+                        caller_dir, pkg_name
+                    )
                     if pubspec_root is not None:
                         target = pubspec_root / "lib" / sub_path
                         if target.is_file():
@@ -14964,6 +21549,7 @@ class CodeParser:
             if module.endswith(".*"):
                 return None  # wildcard import — can't resolve to one file
             rel_path = module.replace(".", "/") + ".java"
+            _, sibling_roots = self._java_source_roots(file_path)
             current = caller_dir
             while True:
                 target = current / rel_path
@@ -14972,6 +21558,10 @@ class CodeParser:
                 if current == current.parent:
                     break
                 current = current.parent
+            for root in sibling_roots:
+                target = root / rel_path
+                if target.is_file():
+                    return str(target.resolve())
             # Static import: ``pkg.Class.member`` — strip member, try again
             dot = module.rfind(".")
             if dot > 0:
@@ -14985,6 +21575,10 @@ class CodeParser:
                     if current == current.parent:
                         break
                     current = current.parent
+                for root in sibling_roots:
+                    target = root / rel_path2
+                    if target.is_file():
+                        return str(target.resolve())
 
         elif language == "kotlin":
             if module.endswith(".*"):
@@ -15001,9 +21595,20 @@ class CodeParser:
                 current = current.parent
 
         elif language == "php":
+            # Literal include paths are filesystem paths, not PHP namespaces.
+            # Preserve absolute paths and explicit relative traversal instead
+            # of stripping the root or searching ancestor namespace roots.
+            if "/" in module or module.endswith(".php"):
+                try:
+                    boundary = self._php_repository_boundary(caller_dir)
+                    target = (caller_dir / module).resolve()
+                except (OSError, RuntimeError, ValueError):
+                    return None
+                if boundary is not None and _path_is_within(target, boundary) and target.is_file():
+                    return str(target)
+                return None
             composer_resolved = self._resolve_php_composer_module(
-                module,
-                caller_dir,
+                module, caller_dir,
             )
             if composer_resolved:
                 return composer_resolved
@@ -15015,7 +21620,12 @@ class CodeParser:
             # ``.../App/Foo``) resolve; vendor/global classes (``\Exception``)
             # and ``use function`` / ``use const`` targets with no matching
             # file stay unresolved and keep the bare FQN, like JDK imports.
-            rel_path = module.replace("\\", "/").lstrip("/") + ".php"
+            normalized_module = module.replace("\\", "/").lstrip("/")
+            rel_path = (
+                normalized_module
+                if normalized_module.endswith(".php")
+                else normalized_module + ".php"
+            )
             try:
                 boundary = self._php_repository_boundary(caller_dir)
                 current = caller_dir.resolve()
@@ -15029,12 +21639,573 @@ class CodeParser:
                     target = (current / rel_path).resolve()
                 except (OSError, RuntimeError, ValueError):
                     target = None
-                if target is not None and _path_is_within(target, boundary) and target.is_file():
+                if (
+                    target is not None
+                    and _path_is_within(target, boundary)
+                    and target.is_file()
+                ):
                     return str(target)
                 if current == boundary:
                     break
                 current = current.parent
 
+        return None
+
+    # ------------------------------------------------------------------
+    # Repository-bounded, case-exact path walking.
+    #
+    # Shared by the Go and Ruby resolvers below. Both reuse the existing
+    # machinery rather than adding a third one: `_dir_entries_cache` backs
+    # the case-exact probes, and `_path_is_within` is the repository clamp
+    # that Python, Rust and PHP already apply.
+    # ------------------------------------------------------------------
+
+    def _parts_within(
+        self, base: Path, relative: str, boundary: Path,
+    ) -> Optional[tuple[str, ...]]:
+        """Join *relative* onto *base*, as parts relative to *boundary*.
+
+        ``None`` when the result leaves *boundary*. That is the repository
+        rule: a go.mod ``replace => ../outside`` and a
+        ``require_relative "../../../elsewhere"`` both name real files, and
+        neither may become an edge target.
+        """
+        try:
+            joined = Path(os.path.normpath(os.path.join(str(base), relative)))
+            return joined.relative_to(boundary).parts
+        except (OSError, ValueError):
+            return None
+
+    def _exact_dir(self, boundary: Path, parts: tuple[str, ...]) -> Optional[Path]:
+        """Walk *parts* below *boundary*, each component case-exactly.
+
+        Empty *parts* is *boundary* itself, which is what a Go import equal
+        to the module path (``import "github.com/spf13/cobra"``) names.
+        """
+        current = boundary
+        for part in parts:
+            if not part or part in (".", ".."):
+                return None
+            if not self._dir_exists_exact(current / part):
+                return None
+            current = current / part
+        return current
+
+    def _exact_file(self, boundary: Path, parts: tuple[str, ...]) -> Optional[Path]:
+        """The file at *parts* below *boundary*, every component case-exact."""
+        if not parts:
+            return None
+        parent = self._exact_dir(boundary, parts[:-1])
+        if parent is None:
+            return None
+        candidate = parent / parts[-1]
+        return candidate if self._file_exists_exact(candidate) else None
+
+    # ------------------------------------------------------------------
+    # Go: go.mod anchored package resolution
+    # ------------------------------------------------------------------
+
+    def _go_module_at(self, directory: Path) -> Optional[_GoModule]:
+        """The ``go.mod`` declared in *directory*, if there is one."""
+        key = str(directory)
+        if key in self._go_module_cache:
+            return self._go_module_cache[key]
+        record: Optional[_GoModule] = None
+        candidate = directory / "go.mod"
+        if self._file_exists_exact(candidate):
+            try:
+                stat = candidate.stat()
+            except OSError:
+                stat = None
+            if stat is not None:
+                module_path, replacements = _read_go_mod(
+                    str(candidate), stat.st_mtime_ns, stat.st_size,
+                )
+                if module_path:
+                    record = _GoModule(directory, module_path, replacements)
+        if len(self._go_module_cache) >= self._MODULE_CACHE_MAX:
+            self._go_module_cache.clear()
+        self._go_module_cache[key] = record
+        return record
+
+    def _go_module_chain(
+        self, caller_dir: Path, boundary: Path,
+    ) -> list[_GoModule]:
+        """Every go.mod from *caller_dir* up to *boundary*, nearest first.
+
+        Nearest first is what makes a nested module win over its ancestor.
+        Keeping the ancestors in the chain is what lets a file inside a
+        nested module (cli/cli has one under .github/codeql) still resolve
+        an import of the outer module's own packages.
+        """
+        chain: list[_GoModule] = []
+        current = caller_dir
+        while True:
+            record = self._go_module_at(current)
+            if record is not None:
+                chain.append(record)
+            if current == boundary or current == current.parent:
+                break
+            current = current.parent
+            if not _path_is_within(current, boundary):
+                break
+        return chain
+
+    def _go_package_dir(
+        self, record: _GoModule, module: str, boundary: Path,
+    ) -> Optional[Path]:
+        """The directory *module* names within one module, or ``None``."""
+        if module == record.path:
+            relative = ""
+        elif module.startswith(record.path + "/"):
+            relative = module[len(record.path) + 1:]
+        else:
+            for prefix, local in record.replacements:
+                if module == prefix:
+                    remainder = ""
+                elif module.startswith(prefix + "/"):
+                    remainder = module[len(prefix) + 1:]
+                else:
+                    continue
+                parts = self._parts_within(
+                    record.root / local, remainder, boundary,
+                )
+                return None if parts is None else self._exact_dir(boundary, parts)
+            return None
+        parts = self._parts_within(record.root, relative, boundary)
+        return None if parts is None else self._exact_dir(boundary, parts)
+
+    def _go_package_holds_source(
+        self, package_dir: Path, boundary: Path,
+    ) -> bool:
+        """Whether *package_dir* holds at least one indexed ``.go`` file.
+
+        A Go import path names a package, and a directory with no indexed Go
+        source is not one that this graph can answer for: ``vendor/`` is
+        excluded by the default ignore patterns, and ``k8s.io/kubernetes``
+        has an ``api/`` directory of OpenAPI specs that no import can mean.
+        Only PRESENCE is tested, never how many files, so adding a file to a
+        package -- the case that made an incremental update disagree with a
+        rebuild -- never changes what an import of it resolves to.
+        """
+        if not self._path_is_indexed(package_dir, boundary):
+            return False
+        return any(
+            name.endswith(".go")
+            and self._path_is_indexed(package_dir / name, boundary)
+            for name in self._dir_entry_names(package_dir)
+        )
+
+    def _resolve_go_package_dir(
+        self, module: str, file_path: str,
+    ) -> Optional[Path]:
+        """Resolve one Go import path to the package DIRECTORY it names.
+
+        A directory, not a file: a Go import names a package, and every file
+        in that directory is part of it. Emitting the directory once is what
+        keeps the edge count proportional to the number of import statements
+        rather than to imports times package size; the read path expands the
+        directory to its files. See :meth:`_resolve_import_target`.
+
+        Returns ``None`` for the standard library, for any dependency that is
+        neither vendored nor ``replace``d into this repository, and for any
+        directory the build does not index, so the caller keeps the bare
+        import string rather than naming a path nothing will answer to.
+        """
+        if not module or module.startswith("."):
+            return None
+        if "." not in module.split("/", 1)[0]:
+            # No dot in the first segment is the standard library, by
+            # definition (``fmt``, ``net/http``, ``path/filepath``). Searching
+            # the filesystem for these instead would bind 149 of cli/cli's
+            # 3575 standard-library imports to same-named repository
+            # directories (context 133, embed 11, io 5).
+            return None
+        # Memoised on the same cache, with the same key shape and eviction
+        # cap, as :meth:`_resolve_module_to_file`; the ``go-pkg`` prefix keeps
+        # a package directory from colliding with a file resolution.
+        cache_key = f"go-pkg:{Path(file_path).parent}:{module}"
+        if cache_key in self._module_file_cache:
+            cached = self._module_file_cache[cache_key]
+            return Path(cached) if cached else None
+        resolved = self._do_resolve_go_package_dir(module, file_path)
+        if len(self._module_file_cache) >= self._MODULE_CACHE_MAX:
+            self._module_file_cache.clear()
+        self._module_file_cache[cache_key] = str(resolved) if resolved else None
+        return resolved
+
+    def _do_resolve_go_package_dir(
+        self, module: str, file_path: str,
+    ) -> Optional[Path]:
+        """The uncached body of :meth:`_resolve_go_package_dir`."""
+        try:
+            caller_dir = Path(file_path).resolve().parent
+        except (OSError, RuntimeError, ValueError):
+            return None
+        boundary = self._import_repo_boundary(file_path)
+        if not _path_is_within(caller_dir, boundary):
+            return None
+        chain = self._go_module_chain(caller_dir, boundary)
+        candidates: list[Path] = []
+        for record in chain:
+            package_dir = self._go_package_dir(record, module, boundary)
+            if package_dir is not None:
+                candidates.append(package_dir)
+        # ``vendor/<import path>`` holds a dependency's own source in-tree.
+        # It is only a target when the build actually indexes it: the default
+        # ignore patterns exclude ``**/vendor/**``, and 73,507 of kubernetes'
+        # import edges used to name files inside it that are not nodes.
+        for record in chain:
+            parts = self._parts_within(record.root / "vendor", module, boundary)
+            if parts is None:
+                continue
+            package_dir = self._exact_dir(boundary, parts)
+            if package_dir is not None:
+                candidates.append(package_dir)
+        for package_dir in candidates:
+            if self._go_package_holds_source(package_dir, boundary):
+                return package_dir
+        return None
+
+    # ------------------------------------------------------------------
+    # Ruby: load-path and caller-relative resolution
+    # ------------------------------------------------------------------
+
+    def _ruby_looks_like_rails(self, boundary: Path) -> bool:
+        """Whether *boundary* is shaped like a Rails application."""
+        try:
+            return (
+                (boundary / "config" / "application.rb").is_file()
+                or (boundary / "app" / "models").is_dir()
+            )
+        except OSError:
+            return False
+
+    def _ruby_gemspec_require_paths(self, boundary: Path) -> tuple[str, ...]:
+        """``require_paths`` declared by the gemspecs at the repository root."""
+        try:
+            gemspecs = sorted(
+                name for name in os.listdir(boundary)
+                if name.endswith(".gemspec")
+            )[:self._RUBY_MANIFEST_SCAN_MAX]
+        except OSError:
+            return ()
+        paths: list[str] = []
+        for name in gemspecs:
+            candidate = boundary / name
+            try:
+                stat = candidate.stat()
+            except OSError:
+                continue
+            for value in _read_gemspec_require_paths(
+                str(candidate), stat.st_mtime_ns, stat.st_size,
+            ):
+                if value not in paths:
+                    paths.append(value)
+        return tuple(paths)
+
+    def _ruby_load_path_additions(self, boundary: Path) -> list[Path]:
+        """Directories a repository-root script adds to ``$LOAD_PATH``.
+
+        Only the scripts a build can afford to read are scanned: the root's
+        own ``.rb`` files, ``Rakefile``, ``Gemfile``, the gemspecs, and the
+        two conventional test helpers. A ``$LOAD_PATH`` push written
+        anywhere else is not visible here. That is a stated limit, not a
+        guarantee -- the alternative is reading every file in the repository
+        before resolving the first import.
+        """
+        candidates: list[Path] = []
+        try:
+            for name in sorted(os.listdir(boundary)):
+                if name in ("Rakefile", "Gemfile") or name.endswith(
+                    (".rb", ".gemspec"),
+                ):
+                    candidates.append(boundary / name)
+        except OSError:
+            return []
+        candidates = candidates[:self._RUBY_MANIFEST_SCAN_MAX]
+        candidates.append(boundary / "spec" / "spec_helper.rb")
+        candidates.append(boundary / "test" / "test_helper.rb")
+        additions: list[Path] = []
+        for path in candidates:
+            try:
+                if path.stat().st_size > self._RUBY_MANIFEST_MAX_BYTES:
+                    continue
+                text = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            for match in _RUBY_LOAD_PATH_RE.finditer(text):
+                literal, anchor = match.group(2), match.group(3)
+                if anchor == "__FILE__":
+                    # File.expand_path("../lib", __FILE__) expands against
+                    # the file PATH, so the first ".." is the file itself.
+                    base = path
+                elif anchor == "__dir__":
+                    base = path.parent
+                else:
+                    # A bare literal is relative to the working directory,
+                    # which for a repository-root script is the root.
+                    base = boundary
+                additions.append(
+                    Path(os.path.normpath(os.path.join(str(base), literal))),
+                )
+        return additions
+
+    def _ruby_load_roots(self, boundary: Path) -> tuple[Path, ...]:
+        """The directories a bare ``require`` searches in this repository.
+
+        Discovered from the repository rather than guessed: the gemspec's
+        ``require_paths`` (``lib`` when it declares none), ``lib``/``test``/
+        ``spec`` when they exist, the Rails ``app`` autoload roots, and any
+        directory a ``$LOAD_PATH.unshift`` in a repository-root script
+        names.
+
+        Rails' implicit Zeitwerk autoloading by constant name is out of
+        scope and deliberately absent: a bare ``Jekyll::Drops::Drop``
+        reference is not an import statement, so there is nothing for a
+        module-to-file import resolver to resolve. Supporting it needs a
+        constant-reference resolver and autoload-root discovery from
+        config/application.rb, which is a separate feature.
+        """
+        key = str(boundary)
+        cached = self._ruby_load_roots_cache.get(key)
+        if cached is not None:
+            return cached
+        roots: list[Path] = []
+        seen: set[str] = set()
+
+        def add(path: Path) -> None:
+            try:
+                candidate = Path(os.path.normpath(str(path)))
+            except (OSError, ValueError):
+                return
+            token = str(candidate)
+            if token in seen or not _path_is_within(candidate, boundary):
+                return
+            try:
+                if not candidate.is_dir():
+                    return
+            except OSError:
+                return
+            seen.add(token)
+            roots.append(candidate)
+
+        for name in self._ruby_gemspec_require_paths(boundary):
+            add(boundary / name)
+        for name in ("lib", "test", "spec"):
+            add(boundary / name)
+        if self._ruby_looks_like_rails(boundary):
+            app = boundary / "app"
+            add(app)
+            try:
+                for child in sorted(os.listdir(app)):
+                    add(app / child)
+            except OSError:
+                pass
+        for extra in self._ruby_load_path_additions(boundary):
+            add(extra)
+        result = tuple(roots)
+        if len(self._ruby_load_roots_cache) >= self._MODULE_CACHE_MAX:
+            self._ruby_load_roots_cache.clear()
+        self._ruby_load_roots_cache[key] = result
+        return result
+
+    def _ruby_tree_holds_source(self, directory: Path, boundary: Path) -> bool:
+        """Whether any indexed ``.rb`` file sits below *directory*.
+
+        Like :meth:`_go_package_holds_source`, this tests presence and never
+        counts: what a ``require_all`` resolves to does not change when a
+        file is added to or removed from the tree it names.
+        """
+        if not self._path_is_indexed(directory, boundary):
+            return False
+        for current, dirnames, filenames in os.walk(directory):
+            dirnames.sort()
+            for name in sorted(filenames):
+                if name.endswith(".rb") and self._path_is_indexed(
+                    Path(current) / name, boundary,
+                ):
+                    return True
+        return False
+
+    def _resolve_ruby_require_all_dir(
+        self, module: str, file_path: str,
+    ) -> Optional[Path]:
+        """Resolve ``require_all "jekyll/commands"`` to the DIRECTORY it names.
+
+        The ``require_all`` gem loads every ``.rb`` file below the directory
+        it names, so it is a directory-scoped import like a Go package
+        import, not a single file. jekyll declares six subsystems this way
+        (commands, converters, converters/markdown, drops, generators, tags)
+        and every one of them was invisible to the graph.
+
+        ``None`` when the name is not an indexed directory, which sends the
+        caller to the ordinary ``require`` probe -- what the gem itself does
+        for a plain file argument.
+        """
+        if not module:
+            return None
+        try:
+            caller_dir = Path(file_path).resolve().parent
+        except (OSError, RuntimeError, ValueError):
+            return None
+        boundary = self._import_repo_boundary(file_path)
+        for root in (caller_dir, *self._ruby_load_roots(boundary)):
+            parts = self._parts_within(root, module, boundary)
+            if parts is None:
+                continue
+            directory = self._exact_dir(boundary, parts)
+            if directory is None:
+                continue
+            if self._ruby_tree_holds_source(directory, boundary):
+                return directory
+        return None
+
+    def _java_source_roots(self, file_path: str) -> tuple[Optional[Path], list[Path]]:
+        """Return a Java file's Maven or Gradle source root and the others it sees.
+
+        ``src/test/java`` compiles against ``src/main/java``, but the two share
+        no directory the import walk climbs through, so a test's own module was
+        out of its reach. ``main`` sees none of the others. Returns
+        ``(None, [])`` outside that layout.
+        """
+        directory = Path(file_path).resolve().parent
+        boundary = self._import_repo_boundary(file_path)
+        for root in (directory, *directory.parents):
+            if not self._path_is_within(root, boundary):
+                break
+            source_set = root.parent
+            source_dir = source_set.parent
+            if root.name != "java" or source_dir.name != "src":
+                continue
+            if source_set.name == "main":
+                return root, []
+            try:
+                names = sorted(
+                    entry.name for entry in source_dir.iterdir()
+                    if entry.name != source_set.name and (entry / "java").is_dir()
+                )
+            except OSError:
+                return root, []
+            names.sort(key=lambda name: name != "main")
+            return root, [source_dir / name / "java" for name in names]
+        return None, []
+
+    def _java_same_package_file(self, class_name: str, file_path: str) -> Optional[str]:
+        """Return the file of a class in this file's package, in any source set.
+
+        Java asks for no import here, so a test beside its class has no other
+        evidence to offer. The file name is what ties the class to the package,
+        so a class written inside another file's body is not found.
+        """
+        if not class_name.isidentifier():
+            return None
+        directory = Path(file_path).parent
+        cache_key = f"java-package:{directory}:{class_name}"
+        if cache_key in self._module_file_cache:
+            resolved = self._module_file_cache[cache_key]
+        else:
+            resolved = None
+            file_name = f"{class_name}.java"
+            candidates = [directory.resolve() / file_name]
+            own_root, sibling_roots = self._java_source_roots(file_path)
+            if own_root is not None:
+                package = directory.resolve().relative_to(own_root)
+                candidates.extend(root / package / file_name for root in sibling_roots)
+            for candidate in candidates:
+                if self._file_exists_exact(candidate):
+                    resolved = normalize_file_path(candidate)
+                    break
+            if len(self._module_file_cache) >= self._MODULE_CACHE_MAX:
+                self._module_file_cache.clear()
+            self._module_file_cache[cache_key] = resolved
+        if resolved is not None and resolved in self._excluded_files:
+            return None
+        return resolved
+
+    def _qualify_java_same_package_constructors(
+        self,
+        edges: list[EdgeInfo],
+        file_path: str,
+        import_map: dict[str, str],
+    ) -> list[EdgeInfo]:
+        """Point ``new Cart()`` at ``Cart`` when it lives in this file's package.
+
+        An import wins over the package in Java, so a name this file imports is
+        left alone even when the import leads outside the repository.
+        """
+        for edge in edges:
+            if (
+                edge.kind == "CALLS"
+                and "::" not in edge.target
+                and not edge.extra.get("receiver")
+                and edge.target[:1].isupper()
+                and edge.target not in import_map
+            ):
+                found = self._java_same_package_file(edge.target, file_path)
+                if found:
+                    edge.target = f"{found}::{edge.target}"
+        return edges
+
+    @staticmethod
+    def _mark_java_unknown_test_receivers(edges: list[EdgeInfo]) -> list[EdgeInfo]:
+        """Stop a Java test's call on an unknown type matching by name alone.
+
+        Now that a test's imports resolve, ``items.size()`` on a ``List`` would
+        otherwise bind to ``size`` in any class the test imports, and claim
+        coverage of it. A receiver with a known type already has a target.
+        """
+        for edge in edges:
+            if (
+                edge.kind == "CALLS"
+                and "::" not in edge.target
+                and (
+                    edge.extra.get("receiver")
+                    or edge.extra.get("receiver_form") == "expression"
+                )
+                and "receiver_type" not in edge.extra
+            ):
+                edge.extra = {**edge.extra, "receiver_binding": "unknown"}
+        return edges
+
+    def _resolve_ruby_module_file(
+        self, module: str, file_path: str, form: Optional[str],
+    ) -> Optional[str]:
+        """Resolve one Ruby require/autoload/load to a file in this repository.
+
+        ``require_relative`` resolves against the requiring file's own
+        directory. ``require``, ``load`` and ``autoload`` resolve against
+        the repository's load roots. A gem or a stdlib feature matches no
+        root and stays ``None``, so the edge keeps the bare string --
+        ``nokogiri`` must never bind to a repository file.
+        """
+        if not module:
+            return None
+        try:
+            caller_dir = Path(file_path).resolve().parent
+        except (OSError, RuntimeError, ValueError):
+            return None
+        boundary = self._import_repo_boundary(file_path)
+        roots: tuple[Path, ...] = (
+            (caller_dir,) if form == "require_relative"
+            else self._ruby_load_roots(boundary)
+        )
+        # ``load`` always carries the extension; the other forms may omit it.
+        candidates = (
+            (module,) if module.endswith(".rb") else (module + ".rb", module)
+        )
+        for root in roots:
+            for candidate in candidates:
+                parts = self._parts_within(root, candidate, boundary)
+                if parts is None:
+                    continue
+                found = self._exact_file(boundary, parts)
+                # An unindexed file (``vendor/bundle``, anything a
+                # .code-review-graphignore excludes) is not a target: the
+                # graph has no node for it, so naming it would be a
+                # confident path that resolves to nothing.
+                if found is not None and self._path_is_indexed(found, boundary):
+                    return str(found)
         return None
 
     @staticmethod
@@ -15051,9 +22222,7 @@ class CodeParser:
                 if not isinstance(target, dict):
                     continue
                 for section in (
-                    "dependencies",
-                    "dev-dependencies",
-                    "build-dependencies",
+                    "dependencies", "dev-dependencies", "build-dependencies",
                 ):
                     table = target.get(section)
                     if isinstance(table, dict):
@@ -15081,8 +22250,7 @@ class CodeParser:
         return None
 
     def _rust_project_context(
-        self,
-        file_path: str,
+        self, file_path: str,
     ) -> Optional[tuple[Path, Path, Path, dict[str, Path], Path]]:
         """Discover a bounded Cargo crate/workspace once per source directory."""
         try:
@@ -15090,8 +22258,7 @@ class CodeParser:
         except (OSError, RuntimeError, ValueError):
             return None
         if self._repo_root is not None and not _path_is_within(
-            caller_dir,
-            self._repo_root,
+            caller_dir, self._repo_root,
         ):
             return None
         key = str(caller_dir)
@@ -15111,7 +22278,10 @@ class CodeParser:
             current = current.parent
 
         crate_entry = next(
-            (entry for entry in manifests if isinstance(entry[1].get("package"), dict)),
+            (
+                entry for entry in manifests
+                if isinstance(entry[1].get("package"), dict)
+            ),
             None,
         )
         if crate_entry is None:
@@ -15119,10 +22289,15 @@ class CodeParser:
         crate_manifest, crate_data = crate_entry
         crate_root = crate_manifest.parent
         workspace_entry = next(
-            (entry for entry in manifests if isinstance(entry[1].get("workspace"), dict)),
+            (
+                entry for entry in manifests
+                if isinstance(entry[1].get("workspace"), dict)
+            ),
             None,
         )
-        workspace_root = workspace_entry[0].parent if workspace_entry else crate_root
+        workspace_root = (
+            workspace_entry[0].parent if workspace_entry else crate_root
+        )
         boundary = self._repo_root or workspace_root
         try:
             boundary = boundary.resolve()
@@ -15192,25 +22367,39 @@ class CodeParser:
 
     @staticmethod
     def _rust_module_file_for_parts(
-        source_root: Path,
-        root_file: Path,
-        parts: list[str],
+        source_root: Path, root_file: Path, parts: list[str],
     ) -> Optional[Path]:
         if not parts:
             return root_file
         relative = Path(*parts)
         flat = source_root / relative.with_suffix(".rs")
         nested = source_root / relative / "mod.rs"
-        if flat.is_file():
-            return flat
-        if nested.is_file():
-            return nested
+        for candidate in (flat, nested):
+            if candidate.is_file() and CodeParser._rust_names_match_case(
+                source_root, candidate,
+            ):
+                return candidate
         return None
 
+    @staticmethod
+    def _rust_names_match_case(source_root: Path, candidate: Path) -> bool:
+        """Is every name below *source_root* spelt on disk as in *candidate*?
+
+        macOS and Windows find ``src/Glob.rs`` when only ``src/glob.rs`` exists,
+        and the type ``Glob`` would then pass for the module ``glob`` (#984).
+        """
+        directory = source_root
+        try:
+            for name in candidate.relative_to(source_root).parts:
+                if name not in os.listdir(directory):
+                    return False
+                directory = directory / name
+        except (OSError, ValueError):
+            return False
+        return True
+
     def _resolve_rust_module_file(
-        self,
-        module: str,
-        file_path: str,
+        self, module: str, file_path: str,
     ) -> Optional[str]:
         """Resolve crate/self/super and local path dependencies to source files."""
         context = self._rust_project_context(file_path)
@@ -15225,28 +22414,25 @@ class CodeParser:
         current_file = root_file
         remaining = list(segments)
         first = remaining[0]
+        anchored = first in ("crate", "self", "super") or first in dependencies
         if first == "crate":
             remaining.pop(0)
         elif first == "self":
             remaining.pop(0)
             current_parts = self._rust_current_module_parts(
-                Path(file_path),
-                source_root,
+                Path(file_path), source_root,
             )
             current_file = Path(file_path)
         elif first == "super":
             current_parts = self._rust_current_module_parts(
-                Path(file_path),
-                source_root,
+                Path(file_path), source_root,
             )
             while remaining and remaining[0] == "super":
                 remaining.pop(0)
                 if current_parts:
                     current_parts.pop()
             parent_file = self._rust_module_file_for_parts(
-                source_root,
-                root_file,
-                current_parts,
+                source_root, root_file, current_parts,
             )
             if parent_file is None:
                 return None
@@ -15263,16 +22449,19 @@ class CodeParser:
         for index, segment in enumerate(remaining):
             candidate_parts = [*current_parts, segment]
             candidate = self._rust_module_file_for_parts(
-                source_root,
-                current_file if not current_parts else root_file,
+                source_root, current_file if not current_parts else root_file,
                 candidate_parts,
             )
             if candidate is not None:
                 current_parts = candidate_parts
                 current_file = candidate
                 continue
-            # The final segment can be an item exported by the current module.
-            if index != len(remaining) - 1:
+            # The final segment can be an item exported by the current module,
+            # but only a module the path reached. ``Vec`` on its own reached
+            # nothing: it comes from the prelude or another crate, and calling
+            # it an item of the crate root is how ``Vec::new()`` became
+            # ``src/lib.rs::new`` (#984).
+            if index != len(remaining) - 1 or (index == 0 and not anchored):
                 return None
             break
 
@@ -15303,7 +22492,7 @@ class CodeParser:
                 if normalized_module == prefix:
                     relative = ""
                 elif normalized_module.startswith(prefix + "\\"):
-                    relative = normalized_module[len(prefix) + 1 :]
+                    relative = normalized_module[len(prefix) + 1:]
                 else:
                     continue
             else:
@@ -15371,9 +22560,7 @@ class CodeParser:
         return ()
 
     def _find_dart_pubspec_root(
-        self,
-        start: Path,
-        pkg_name: str,
+        self, start: Path, pkg_name: str,
     ) -> Optional[Path]:
         """Walk up from ``start`` to find a ``pubspec.yaml`` whose ``name:``
         matches ``pkg_name``. Returns the directory containing that pubspec,
@@ -15420,28 +22607,26 @@ class CodeParser:
             return None
         if len(prefix) == 1 and prefix[0] in defined_names:
             return f"{self._qualify(prefix[0], file_path, None)}.{method}"
+        if len(prefix) == 1 and (
+            f"{_RUST_INLINE_MODULE_KEY}{prefix[0]}::{method}" in import_map
+        ):
+            return self._qualify(method, file_path, None)
 
         if prefix[0] in import_map:
             prefix = import_map[prefix[0]].split("::") + prefix[1:]
 
         resolved = self._resolve_module_to_file(
-            "::".join(prefix),
-            file_path,
-            "rust",
+            "::".join(prefix), file_path, "rust",
         )
         if resolved is None:
             return None
         parent_resolved = None
         if len(prefix) > 1:
             parent_resolved = self._resolve_module_to_file(
-                "::".join(prefix[:-1]),
-                file_path,
-                "rust",
+                "::".join(prefix[:-1]), file_path, "rust",
             )
         if parent_resolved == resolved and prefix[-1] not in {
-            "crate",
-            "self",
-            "super",
+            "crate", "self", "super",
         }:
             return f"{self._qualify(prefix[-1], resolved, None)}.{method}"
         return self._qualify(method, resolved, None)
@@ -15457,10 +22642,7 @@ class CodeParser:
         """Resolve a bare call name to a qualified target, with fallback."""
         if language == "rust" and "::" in call_name:
             resolved_rust = self._resolve_rust_scoped_call(
-                call_name,
-                file_path,
-                import_map,
-                defined_names,
+                call_name, file_path, import_map, defined_names,
             )
             if resolved_rust:
                 return resolved_rust
@@ -15471,6 +22653,14 @@ class CodeParser:
         if call_name in import_map:
             if language == "julia":
                 return import_map[call_name]
+            module_binding = import_map.get(
+                f"{_PY_MODULE_BINDING_KEY}{call_name}",
+            )
+            if module_binding:
+                # `from . import cli` binds a MODULE. The reference is to the
+                # module's file node; `<pkg>/__init__.py::cli` (what this used
+                # to produce) matches no node in any graph.
+                return module_binding
             resolved = self._resolve_imported_symbol(
                 self._js_imported_symbol_name(call_name, import_map),
                 import_map[call_name],
@@ -15495,7 +22685,7 @@ class CodeParser:
                 candidate = module_path.resolve()
             except (OSError, ValueError):
                 return None
-            boundary = self._python_repo_boundary(file_path)
+            boundary = self._import_repo_boundary(file_path)
             if not self._path_is_within(candidate, boundary) or not candidate.is_file():
                 return None
             resolved = normalize_file_path(candidate)
@@ -15504,10 +22694,52 @@ class CodeParser:
         if not resolved:
             return None
 
+        if language == "python":
+            resolved = self._python_reexport_origin(resolved, symbol_name)
         export_target = self._resolve_exported_symbol(resolved, symbol_name)
         if export_target:
             return export_target
+        if language in ("java", "kotlin", "scala"):
+            symbol_name = _nested_import_chain(module, resolved, symbol_name)
         return self._qualify(symbol_name, resolved, None)
+
+    def _python_reexport_origin(self, module_file: str, symbol_name: str) -> str:
+        """Follow a package's re-exports to the file that defines *symbol_name*.
+
+        ``from .tools import query_graph`` resolves to ``tools/__init__.py``,
+        but the function lives in ``tools/query.py``, so qualifying the symbol
+        against the package file produced ``tools/__init__.py::query_graph`` —
+        a confident-looking target that matches no node. The package's own
+        export map already knows where each name came from; reuse it. Returns
+        *module_file* unchanged when the name is defined there, when the
+        origin is outside the repository, or when the module cannot be read.
+        """
+        if not module_file.endswith(".py"):
+            return module_file
+        # The same (module, symbol) pair is asked for once per call site, and
+        # the answer costs a resolve + stat + lock even on a cache hit inside
+        # `_get_python_star_exports`. Remember it here instead.
+        cache_key = f"{module_file}::{symbol_name}"
+        cached = self._python_reexport_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        # A repository path can be a symlink to a file elsewhere; only a file
+        # that really lives inside the repository is read.
+        try:
+            real_path: Optional[Path] = Path(module_file).resolve()
+        except (OSError, ValueError):
+            real_path = None
+        origin = (
+            self._get_python_star_exports(module_file).get(symbol_name)
+            if real_path is not None
+            and self._path_is_within(real_path, self._import_repo_boundary(module_file))
+            else None
+        )
+        result = origin if origin and origin != module_file else module_file
+        if len(self._python_reexport_cache) >= self._MODULE_CACHE_MAX:
+            self._python_reexport_cache.clear()
+        self._python_reexport_cache[cache_key] = result
+        return result
 
     def _resolve_exported_symbol(
         self,
@@ -15545,9 +22777,7 @@ class CodeParser:
 
         # Direct local definition/export in the module file.
         import_map, defined_names = self._collect_file_scope(
-            tree.root_node,
-            language,
-            source,
+            tree.root_node, language, source, module_file,
         )
         if symbol_name in defined_names:
             result = self._qualify(symbol_name, module_file, None)
@@ -15588,15 +22818,11 @@ class CodeParser:
                         continue
                     if target_module:
                         resolved_module = self._resolve_module_to_file(
-                            target_module,
-                            module_file,
-                            language,
+                            target_module, module_file, language,
                         )
                         if resolved_module:
                             result = self._resolve_exported_symbol(
-                                resolved_module,
-                                original_name,
-                                seen,
+                                resolved_module, original_name, seen,
                             ) or self._qualify(original_name, resolved_module, None)
                             self._export_symbol_cache[cache_key] = result
                             return result
@@ -15607,15 +22833,11 @@ class CodeParser:
             # Star re-export: export * from './x'
             if has_star_export and target_module:
                 resolved_module = self._resolve_module_to_file(
-                    target_module,
-                    module_file,
-                    language,
+                    target_module, module_file, language,
                 )
                 if resolved_module:
                     result = self._resolve_exported_symbol(
-                        resolved_module,
-                        symbol_name,
-                        seen,
+                        resolved_module, symbol_name, seen,
                     )
                     if result:
                         self._export_symbol_cache[cache_key] = result
@@ -15649,15 +22871,9 @@ class CodeParser:
     # Used when descending from a configured ``name_field`` target to a clean
     # text leaf (config-driven custom languages only).
     _CUSTOM_NAME_LEAF_TYPES = (
-        "word",
-        "identifier",
-        "name",
-        "simple_identifier",
-        "command_name",
-        "key_brace",
-        "type_identifier",
-        "property_identifier",
-        "constant",
+        "word", "identifier", "name", "simple_identifier",
+        "command_name", "key_brace", "type_identifier",
+        "property_identifier", "constant",
     )
     #: Depth guard for custom name-field descent / descendant search.
     _MAX_CUSTOM_NAME_DEPTH = 4
@@ -15706,7 +22922,9 @@ class CodeParser:
         """
         leaf = self._custom_name_leaf(node, self._MAX_CUSTOM_NAME_DEPTH)
         target = leaf if leaf is not None else node
-        return self._clean_custom_name(target.text.decode("utf-8", errors="replace"))
+        return self._clean_custom_name(
+            target.text.decode("utf-8", errors="replace")
+        )
 
     def _resolve_custom_name(self, node, language: str) -> Optional[str]:
         """Resolve a definition name for a config-driven custom language using
@@ -15732,7 +22950,9 @@ class CodeParser:
                     return resolved
         # Pass 2: typed-descendant search (for fieldless shapes).
         for cand in candidates:
-            target = self._find_custom_descendant(node, cand, self._MAX_CUSTOM_NAME_DEPTH)
+            target = self._find_custom_descendant(
+                node, cand, self._MAX_CUSTOM_NAME_DEPTH
+            )
             if target is not None:
                 resolved = self._custom_leaf_name(target)
                 if resolved:
@@ -15741,6 +22961,12 @@ class CodeParser:
 
     def _get_name(self, node, language: str, kind: str) -> Optional[str]:
         """Extract the name from a class/function definition node."""
+        if language == "powershell":
+            for child in node.children:
+                if child.type in ("function_name", "simple_name"):
+                    name = child.text.decode("utf-8", errors="replace")
+                    return _POWERSHELL_SCOPE_RE.sub("", name)
+            return None
         # Dart: function_signature has a return-type node before the identifier;
         # search only for 'identifier' to avoid returning the return type name.
         if language == "dart" and node.type == "function_signature":
@@ -15781,14 +23007,8 @@ class CodeParser:
         # misnamed C# methods when a non-generic return type is itself an
         # ``identifier`` (e.g. ``Task``). Prefer the name field; unusual shapes
         # still fall through.
-        if (
-            language in ("java", "csharp")
-            and kind == "function"
-            and node.type
-            in (
-                "method_declaration",
-                "constructor_declaration",
-            )
+        if language in ("java", "csharp") and kind == "function" and node.type in (
+            "method_declaration", "constructor_declaration",
         ):
             name_node = node.child_by_field_name("name")
             if name_node is not None:
@@ -15797,9 +23017,10 @@ class CodeParser:
         if language == "cpp" and kind == "function":
             declarator = node.child_by_field_name("declarator")
             if node.type in ("declaration", "field_declaration"):
-                if not self._cpp_declaration_has_callable_scope(
-                    node
-                ) or not self._cpp_is_callable_declaration(declarator):
+                if (
+                    not self._cpp_declaration_has_callable_scope(node)
+                    or not self._cpp_is_callable_declaration(declarator)
+                ):
                     return None
                 return self._cpp_callable_name(declarator)
             cpp_name = self._cpp_callable_name(declarator)
@@ -15831,7 +23052,6 @@ class CodeParser:
             # Nested scopes (Outer::Inner::method) produce nested
             # qualified_identifier nodes — peel until we find the leaf name.
             if language == "cpp" and node.type == "function_declarator":
-
                 def _leaf_name(qi):
                     # Walk right-to-left: the rightmost identifier/
                     # destructor_name/operator_name is the method name.
@@ -15843,13 +23063,13 @@ class CodeParser:
                             "destructor_name",
                             "operator_name",
                         ):
-                            return sub.text.decode("utf-8", errors="replace")
+                            return sub.text.decode(
+                                "utf-8", errors="replace")
                         if sub.type == "qualified_identifier":
                             inner = _leaf_name(sub)
                             if inner:
                                 return inner
                     return None
-
                 for child in node.children:
                     if child.type == "qualified_identifier":
                         name = _leaf_name(child)
@@ -15860,7 +23080,8 @@ class CodeParser:
                         "destructor_name",
                         "operator_name",
                     ):
-                        return child.text.decode("utf-8", errors="replace")
+                        return child.text.decode(
+                            "utf-8", errors="replace")
 
         # Objective-C method_definition: the method name is the first
         # ``identifier`` child (first part of the selector). Multi-part
@@ -15968,8 +23189,7 @@ class CodeParser:
                     for part in callee.children:
                         if part.type == "identifier":
                             return part.text.decode(
-                                "utf-8",
-                                errors="replace",
+                                "utf-8", errors="replace",
                             )
                     return None
                 return self._julia_component_name(callee)
@@ -15980,8 +23200,7 @@ class CodeParser:
                         for sub in child.children:
                             if sub.type == "identifier":
                                 return sub.text.decode(
-                                    "utf-8",
-                                    errors="replace",
+                                    "utf-8", errors="replace",
                                 )
                         # Subtyped: type_head > binary_expression > identifier (first)
                         for sub in child.children:
@@ -15989,15 +23208,13 @@ class CodeParser:
                                 for ident in sub.children:
                                     if ident.type == "identifier":
                                         return ident.text.decode(
-                                            "utf-8",
-                                            errors="replace",
+                                            "utf-8", errors="replace",
                                         )
                                     if ident.type == "parametrized_type_expression":
                                         for p in ident.children:
                                             if p.type == "identifier":
                                                 return p.text.decode(
-                                                    "utf-8",
-                                                    errors="replace",
+                                                    "utf-8", errors="replace",
                                                 )
                                         return None
                                 return None
@@ -16007,8 +23224,7 @@ class CodeParser:
                                 for p in sub.children:
                                     if p.type == "identifier":
                                         return p.text.decode(
-                                            "utf-8",
-                                            errors="replace",
+                                            "utf-8", errors="replace",
                                         )
                                 return None
                 return None
@@ -16024,18 +23240,36 @@ class CodeParser:
             if name_child is not None:
                 return name_child.text.decode("utf-8", errors="replace")
 
+        # Ruby: compact namespace declarations (``class Foo::Bar`` /
+        # ``module Foo::Bar``) put the name in a ``scope_resolution`` node, not
+        # a bare ``constant``, so the generic loop below misses them and
+        # _extract_classes drops the whole Class node. Take the rightmost
+        # ``constant`` so the emitted name matches the nested form
+        # (``module Foo`` + ``class Bar`` -> Class "Bar").
+        if language == "ruby" and node.type in ("class", "module"):
+            name_child = node.child_by_field_name("name")
+            if name_child is not None and name_child.type == "scope_resolution":
+                # Only a constant scope names a namespace. ``class klass::Inner``
+                # (identifier) and ``class self::Foo`` (self) resolve their scope
+                # at runtime, so there is no static namespace to record -- fall
+                # through and emit nothing, as before this branch existed. The
+                # root of the chain decides: ``klass::Outer::Inner`` is no more
+                # static than ``klass::Inner``.
+                scope = name_child.child_by_field_name("scope")
+                while scope is not None and scope.type == "scope_resolution":
+                    scope = scope.child_by_field_name("scope")
+                if scope is None or scope.type == "constant":
+                    for sub in reversed(name_child.children):
+                        if sub.type == "constant":
+                            return sub.text.decode("utf-8", errors="replace")
+
         # Most built-in languages use a 'name' child.
         # field_identifier covers C++ class member function names inside
         # function_declarator (e.g. virtual std::string get_name() = 0).
         for child in node.children:
             if child.type in (
-                "identifier",
-                "name",
-                "type_identifier",
-                "property_identifier",
-                "simple_identifier",
-                "constant",
-                "field_identifier",
+                "identifier", "name", "type_identifier", "property_identifier",
+                "simple_identifier", "constant", "field_identifier",
             ):
                 return child.text.decode("utf-8", errors="replace")
         # For Go type declarations, look for type_spec
@@ -16056,15 +23290,21 @@ class CodeParser:
         if receiver is None:
             return None
         parameter = next(
-            (child for child in receiver.named_children if child.type == "parameter_declaration"),
+            (child for child in receiver.named_children
+             if child.type == "parameter_declaration"),
             None,
         )
         receiver_type = parameter.child_by_field_name("type") if parameter else None
         while receiver_type is not None and receiver_type.type in {
-            "generic_type",
-            "pointer_type",
+            "generic_type", "pointer_type", "parenthesized_type",
         }:
-            receiver_type = next(iter(receiver_type.named_children), None)
+            receiver_type = next(
+                (
+                    child for child in receiver_type.named_children
+                    if child.type != "comment"
+                ),
+                None,
+            )
         if receiver_type is None or receiver_type.type != "type_identifier":
             return None
         return receiver_type.text.decode("utf-8", errors="replace")
@@ -16087,41 +23327,30 @@ class CodeParser:
         )
         return name.text.decode("utf-8", errors="replace") if name else None
 
-    _GO_LEXICAL_SCOPE_TYPES = frozenset(
-        {
-            "block",
-            "communication_case",
-            "default_case",
-            "expression_case",
-            "type_case",
-        }
-    )
+    _GO_LEXICAL_SCOPE_TYPES = frozenset({
+        "block", "communication_case", "default_case", "expression_case", "type_case",
+    })
     _GO_DECLARATION_NAME_FIELDS = {
         "const_spec": "name",
         "type_alias": "name",
         "type_spec": "name",
         "var_spec": "name",
     }
-    _GO_INIT_SCOPE_PARENTS = frozenset(
-        {
-            "expression_switch_statement",
-            "if_statement",
-            "type_switch_statement",
-        }
-    )
-    _GO_PARAMETER_TYPES = frozenset(
-        {
-            "parameter_declaration",
-            "variadic_parameter_declaration",
-        }
-    )
+    _GO_INIT_SCOPE_PARENTS = frozenset({
+        "expression_switch_statement", "if_statement", "type_switch_statement",
+    })
+    _GO_PARAMETER_TYPES = frozenset({
+        "parameter_declaration", "variadic_parameter_declaration",
+    })
 
     @staticmethod
     def _go_field_binds_name(node, field: str, name: str) -> bool:
         """Return whether a grammar field declares ``name``."""
         for field_node in node.children_by_field_name(field):
             candidates = (
-                field_node.named_children if field_node.type == "expression_list" else (field_node,)
+                field_node.named_children
+                if field_node.type == "expression_list"
+                else (field_node,)
             )
             if any(
                 candidate.type in {"identifier", "type_identifier"}
@@ -16145,9 +23374,7 @@ class CodeParser:
         return False
 
     def _go_receiver_binding_index(
-        self,
-        method,
-        receiver_name: str,
+        self, method, receiver_name: str,
     ) -> tuple[str, tuple[int, ...], tuple[int, ...]]:
         """Build merged lexical-shadow intervals for one Go method."""
         body = method.child_by_field_name("body")
@@ -16167,20 +23394,25 @@ class CodeParser:
 
             if node.type == "func_literal":
                 function_body = node.child_by_field_name("body")
-                if function_body is not None and self._go_function_parameters_bind_name(
-                    node, receiver_name
+                if (
+                    function_body is not None
+                    and self._go_function_parameters_bind_name(node, receiver_name)
                 ):
                     intervals.append((function_body.start_byte, function_body.end_byte))
                     receiver_scopes.add(scope_key(function_body))
 
-            if node.type == "type_switch_statement" and self._go_field_binds_name(
-                node, "alias", receiver_name
+            if (
+                node.type == "type_switch_statement"
+                and self._go_field_binds_name(node, "alias", receiver_name)
             ):
                 for case in node.named_children:
                     if case.type not in {"default_case", "type_case"}:
                         continue
                     statements = next(
-                        (child for child in case.named_children if child.type == "statement_list"),
+                        (
+                            child for child in case.named_children
+                            if child.type == "statement_list"
+                        ),
                         None,
                     )
                     if statements is not None:
@@ -16188,14 +23420,16 @@ class CodeParser:
                     receiver_scopes.add(scope_key(case))
 
             declaration_field = self._GO_DECLARATION_NAME_FIELDS.get(node.type)
-            if declaration_field is not None and self._go_field_binds_name(
-                node, declaration_field, receiver_name
+            if (
+                declaration_field is not None
+                and self._go_field_binds_name(node, declaration_field, receiver_name)
             ):
                 intervals.append((node.end_byte, scope.end_byte))
                 receiver_scopes.add(scope_key(scope))
 
-            if node.type == "short_var_declaration" and self._go_field_binds_name(
-                node, "left", receiver_name
+            if (
+                node.type == "short_var_declaration"
+                and self._go_field_binds_name(node, "left", receiver_name)
             ):
                 parent = node.parent
                 if parent is not None and parent.type == "for_clause":
@@ -16204,7 +23438,10 @@ class CodeParser:
                     binding_scope = parent
                 else:
                     binding_scope = scope
-                if binding_scope is not None and scope_key(binding_scope) not in receiver_scopes:
+                if (
+                    binding_scope is not None
+                    and scope_key(binding_scope) not in receiver_scopes
+                ):
                     intervals.append((node.end_byte, binding_scope.end_byte))
                     receiver_scopes.add(scope_key(binding_scope))
 
@@ -16314,15 +23551,12 @@ class CodeParser:
         explicit_scope: Optional[str] = None
         if callable_node is not None and callable_node.type == "qualified_identifier":
             callable_text = callable_node.text.decode(
-                "utf-8",
-                errors="replace",
+                "utf-8", errors="replace",
             )
             if "::" in callable_text:
                 scope_text = callable_text.rsplit("::", 1)[0].lstrip(":").strip()
                 explicit_scope = re.sub(
-                    r"\s*::\s*",
-                    ".",
-                    scope_text,
+                    r"\s*::\s*", ".", scope_text,
                 )
 
         parameters = declarator.child_by_field_name("parameters")
@@ -16378,7 +23612,10 @@ class CodeParser:
             return False
 
         callable_declarator = function_declarator.child_by_field_name("declarator")
-        if callable_declarator is None or callable_declarator.type != "parenthesized_declarator":
+        if (
+            callable_declarator is None
+            or callable_declarator.type != "parenthesized_declarator"
+        ):
             return True
 
         # ``void (*callback)(int)`` has no nested function declarator inside
@@ -16431,8 +23668,7 @@ class CodeParser:
             if function_declarator is not None:
                 prefix_end = function_declarator.start_byte - operator_cast.start_byte
                 name = operator_cast.text[:prefix_end].decode(
-                    "utf-8",
-                    errors="replace",
+                    "utf-8", errors="replace",
                 )
                 name = re.sub(r"\s+", " ", name).strip()
                 return re.sub(r"\s*([*&])\s*", r"\1", name)
@@ -16481,13 +23717,12 @@ class CodeParser:
         name_node = self._cpp_declarator_name(declarator)
         if name_node is not None and name_node.start_byte < end_byte:
             raw = (
-                source[parameter.start_byte : name_node.start_byte]
-                + source[name_node.end_byte : end_byte]
+                source[parameter.start_byte:name_node.start_byte]
+                + source[name_node.end_byte:end_byte]
             ).decode("utf-8", errors="replace")
         else:
-            raw = source[parameter.start_byte : end_byte].decode(
-                "utf-8",
-                errors="replace",
+            raw = source[parameter.start_byte:end_byte].decode(
+                "utf-8", errors="replace",
             )
 
         raw = re.sub(r"/\*.*?\*/|//[^\r\n]*", " ", raw, flags=re.DOTALL)
@@ -16522,10 +23757,8 @@ class CodeParser:
         """Extract parameter list as a string."""
         for child in node.children:
             param_types = (
-                "parameters",
-                "formal_parameters",
-                "parameter_list",
-                "formal_parameter_list",
+                "parameters", "formal_parameters",
+                "parameter_list", "formal_parameter_list",
             )
             if child.type in param_types:
                 return child.text.decode("utf-8", errors="replace")
@@ -16594,11 +23827,15 @@ class CodeParser:
                         # Positional records contain Base(args); retain only Base.
                         type_node = sub.child_by_field_name("type")
                         if type_node is not None:
-                            bases.append(type_node.text.decode("utf-8", errors="replace"))
+                            bases.append(
+                                type_node.text.decode("utf-8", errors="replace")
+                            )
                         else:
                             for nested in sub.children:
                                 if nested.is_named and nested.type != "argument_list":
-                                    bases.append(nested.text.decode("utf-8", errors="replace"))
+                                    bases.append(
+                                        nested.text.decode("utf-8", errors="replace")
+                                    )
                                     break
                         continue
                     bases.append(sub.text.decode("utf-8", errors="replace"))
@@ -16606,12 +23843,8 @@ class CodeParser:
             # Look for superclass/interfaces in extends/implements clauses
             for child in node.children:
                 if child.type in (
-                    "superclass",
-                    "super_interfaces",
-                    "extends_type",
-                    "implements_type",
-                    "type_identifier",
-                    "supertype",
+                    "superclass", "super_interfaces", "extends_type",
+                    "implements_type", "type_identifier", "supertype",
                     "delegation_specifier",
                 ):
                     text = child.text.decode("utf-8", errors="replace")
@@ -16625,7 +23858,9 @@ class CodeParser:
                         elif sub.type == "generic_type":
                             for ident in sub.children:
                                 if ident.type == "type_identifier":
-                                    bases.append(ident.text.decode("utf-8", errors="replace"))
+                                    bases.append(
+                                        ident.text.decode("utf-8", errors="replace")
+                                    )
                                     break
         elif language == "cpp":
             # C++: base_class_clause contains type_identifiers
@@ -16667,16 +23902,39 @@ class CodeParser:
                                 if ident.type == "identifier":
                                     bases.append(ident.text.decode("utf-8", errors="replace"))
         elif language == "go":
-            # Embedded structs / interface composition
-            for child in node.children:
-                if child.type == "type_spec":
-                    for sub in child.children:
-                        if sub.type in ("struct_type", "interface_type"):
-                            for field_node in sub.children:
-                                if field_node.type == "field_declaration_list":
-                                    for f in field_node.children:
-                                        if f.type == "type_identifier":
-                                            bases.append(f.text.decode("utf-8", errors="replace"))
+            spec = node if node.type == "type_spec" else next(
+                (child for child in node.named_children if child.type == "type_spec"),
+                None,
+            )
+            body = spec.child_by_field_name("type") if spec is not None else None
+            embedded_types: list = []
+            if body is not None and body.type == "struct_type":
+                for fields in body.named_children:
+                    if fields.type != "field_declaration_list":
+                        continue
+                    for field in fields.named_children:
+                        if (
+                            field.type == "field_declaration"
+                            and field.child_by_field_name("name") is None
+                        ):
+                            # The optional '*' and tag are siblings of the
+                            # type; named fields are composition, not embedding.
+                            embedded_types.append(field.child_by_field_name("type"))
+            elif body is not None and body.type == "interface_type":
+                for element in body.named_children:
+                    if element.type != "type_elem":
+                        continue
+                    types = [part for part in element.named_children if part.type != "comment"]
+                    # A union is a constraint, not a list of embedded bases.
+                    if len(types) == 1:
+                        embedded_types.append(types[0])
+            for embedded in embedded_types:
+                if embedded is not None and embedded.type == "generic_type":
+                    # Link to the declared type, just as generic Go receivers
+                    # do. Keep package qualification; arguments are not bases.
+                    embedded = embedded.child_by_field_name("type")
+                if embedded is not None and embedded.type in ("type_identifier", "qualified_type"):
+                    bases.append(embedded.text.decode("utf-8", errors="replace"))
         elif language == "dart":
             # class Foo extends Bar with Mixin implements Iface { ... }
             # AST: superclass contains type_identifier (base) and mixins (with clause);
@@ -16703,7 +23961,9 @@ class CodeParser:
                         if sub.type == "user_type":
                             for ident in sub.children:
                                 if ident.type == "type_identifier":
-                                    bases.append(ident.text.decode("utf-8", errors="replace"))
+                                    bases.append(
+                                        ident.text.decode("utf-8", errors="replace")
+                                    )
                                     break
         elif language == "julia":
             # Julia: struct Foo <: Bar / abstract type Foo <: Bar end
@@ -16719,12 +23979,17 @@ class CodeParser:
                             continue
                         has_subtype_op = False
                         for op_child in sub.children:
-                            if op_child.type == "operator" and op_child.text == b"<:":
+                            if (
+                                op_child.type == "operator"
+                                and op_child.text == b"<:"
+                            ):
                                 has_subtype_op = True
                                 break
                         if not has_subtype_op:
                             continue
-                        idents = [c for c in sub.children if c.type == "identifier"]
+                        idents = [
+                            c for c in sub.children if c.type == "identifier"
+                        ]
                         # First identifier is the type being defined; the
                         # second (if present) is the supertype.
                         if len(idents) >= 2:
@@ -16749,7 +24014,238 @@ class CodeParser:
                         )
         return bases
 
-    def _extract_import(self, node, language: str, source: bytes) -> list[str]:
+    @staticmethod
+    def _extract_go_import_specs(node) -> list[_ImportSpec]:
+        """Every specifier of one Go import declaration, at its own line.
+
+        Covers all eight forms: single, grouped, named (``alias "path"``),
+        blank (``_ "path"``), dot (``. "path"``), vendored, internal and
+        standard library. The alias, the blank and the dot are discarded --
+        they change what the importing file may call the package, never
+        which package is imported.
+
+        The line comes from the ``import_spec``, not the enclosing
+        ``import_declaration``: every spec in a grouped block used to be
+        stamped with the line of the ``import (`` token.
+        """
+        specs: list[_ImportSpec] = []
+
+        def add(spec_node) -> None:
+            for part in spec_node.children:
+                if part.type != "interpreted_string_literal":
+                    continue
+                value = part.text.decode("utf-8", errors="replace").strip('"')
+                if value:
+                    specs.append(
+                        _ImportSpec(value, spec_node.start_point[0] + 1),
+                    )
+                return
+
+        for child in node.children:
+            if child.type == "import_spec_list":
+                for spec in child.children:
+                    if spec.type == "import_spec":
+                        add(spec)
+            elif child.type == "import_spec":
+                add(child)
+        return specs
+
+    @staticmethod
+    def _ruby_string_literal(node) -> Optional[str]:
+        """The literal value of a Ruby string node, or ``None``.
+
+        ``None`` for anything that is not a plain literal -- an
+        interpolated string, an escape, a ``File.join(...)`` call, a bare
+        variable. A path a program builds at runtime is not a path this
+        parser may guess at: ``require File.join(__dir__, "app", "helper")``
+        used to become an edge to ``app``, the first quoted string in the
+        call.
+        """
+        if node.type != "string":
+            return None
+        parts: list[str] = []
+        for child in node.children:
+            if child.type == "string_content":
+                parts.append(child.text.decode("utf-8", errors="replace"))
+            elif child.type in ("interpolation", "escape_sequence"):
+                return None
+        return "".join(parts) or None
+
+    def _extract_ruby_import_specs(self, node) -> list[_ImportSpec]:
+        """The file one Ruby ``call`` node loads, if it loads one at all.
+
+        Dispatches on the call's METHOD, not on whether the node's text
+        happens to contain the letters "require". The substring test made
+        14% of jekyll's ruby import edges false positives, with targets
+        like ``Missing --ssl_cert or --ssl_key. Both are required.`` from a
+        ``raise``, and it never saw ``autoload``, which is how jekyll
+        declares its entire internal module graph (49 statements).
+        """
+        method = node.child_by_field_name("method")
+        if method is None or method.type != "identifier":
+            return []
+        name = method.text.decode("utf-8", errors="replace")
+        if name not in _RUBY_IMPORT_METHODS:
+            return []
+        receiver = node.child_by_field_name("receiver")
+        if receiver is not None and not (
+            name == "autoload"
+            and receiver.type in ("constant", "self", "scope_resolution")
+        ):
+            # `Jekyll.autoload :Site, "jekyll/site"` names a real path;
+            # `some_object.load(x)` is an ordinary method call.
+            return []
+        arguments = node.child_by_field_name("arguments")
+        if arguments is None:
+            return []
+        positional = [
+            child for child in arguments.children
+            if child.type not in (",", "(", ")")
+        ]
+        index = _RUBY_IMPORT_PATH_ARGUMENT.get(name, 0)
+        if len(positional) <= index:
+            return []
+        value = self._ruby_string_literal(positional[index])
+        if value is None:
+            return []
+        return [_ImportSpec(value, node.start_point[0] + 1, name)]
+
+    def _extract_import_specs(
+        self,
+        node,
+        language: str,
+        source: bytes,
+        file_path: Optional[str] = None,
+    ) -> list[_ImportSpec]:
+        """Import statements as (module, line, form) triples.
+
+        Most grammars give one form and one line per statement, so those
+        come straight from :meth:`_extract_import`. Go and Ruby do not: a Go
+        ``import ( ... )`` block holds many specifiers at many lines, and
+        Ruby's ``require`` and ``require_relative`` resolve identical
+        strings by different algorithms, so the keyword has to survive as
+        far as the resolver.
+        """
+        if language == "go":
+            return self._extract_go_import_specs(node)
+        context = self._import_context(node, language, source, file_path)
+        if language == "ruby":
+            # `autoload` only loads the file when its constant is first used.
+            return [
+                spec._replace(
+                    context=IMPORT_CONTEXT_DEFERRED if spec.form == "autoload" else context,
+                )
+                for spec in self._extract_ruby_import_specs(node)
+            ]
+        line = node.start_point[0] + 1
+        specs = [
+            _ImportSpec(module, line, context=context)
+            for module in self._extract_import(node, language, source, file_path)
+        ]
+        if (
+            language == "python"
+            and specs
+            and context != IMPORT_CONTEXT_TYPE_ONLY
+            and self._python_names_parent_package(node, specs[0].module, file_path)
+        ):
+            specs[0] = specs[0]._replace(context=IMPORT_CONTEXT_PARENT_PACKAGE)
+        return specs
+
+    def _import_context(
+        self, node, language: str, source: bytes, file_path: Optional[str],
+    ) -> Optional[str]:
+        """Say when an import statement does not run as its file loads."""
+        if language == "python":
+            return self._python_import_context(node, source)
+        if language in ("javascript", "typescript", "tsx"):
+            return (
+                IMPORT_CONTEXT_TYPE_ONLY
+                if self._js_import_is_type_only(node, file_path)
+                else None
+            )
+        if language == "ruby":
+            current = node.parent
+            while current is not None:
+                if current.type in ("method", "singleton_method"):
+                    return IMPORT_CONTEXT_DEFERRED
+                current = current.parent
+        return None
+
+    @staticmethod
+    def _python_import_context(node, source: bytes) -> Optional[str]:
+        """``TYPE_CHECKING`` wins: such an import never runs, even in a function."""
+        if (
+            (node.start_point[0] + 1, node.start_point[1])
+            in _python_unreachable_import_positions(source)
+        ):
+            return IMPORT_CONTEXT_TYPE_ONLY
+        current = node.parent
+        while current is not None:
+            if current.type == "function_definition":
+                return IMPORT_CONTEXT_DEFERRED
+            current = current.parent
+        return None
+
+    def _python_names_parent_package(
+        self, node, module: str, file_path: Optional[str],
+    ) -> bool:
+        """Whether *module* is only the route to siblings of the importing file.
+
+        ``from . import sibling`` emits an edge to the package and one to the
+        sibling. The file's own package is loaded before the file is, so the
+        package edge is no dependency, unless a name is a symbol read from it:
+        ``from . import app`` with ``app`` set in ``__init__.py`` really needs it.
+        """
+        if node.type != "import_from_statement" or not file_path:
+            return False
+        package_dir = self._python_package_dir(module, file_path)
+        if package_dir is None or package_dir not in Path(file_path).parents:
+            return False
+        names = set(self._python_imported_names(node))
+        return bool(names) and names == set(
+            self._python_submodule_names(node, package_dir),
+        )
+
+    def _js_import_is_type_only(self, node, file_path: Optional[str]) -> bool:
+        """``import type X`` or ``import { type A, type B }``; a value makes it real.
+
+        The second form is only dropped when the compiler drops unused imports.
+        Under ``verbatimModuleSyntax`` it is emitted as ``import {} from "./b"``,
+        which still runs ``b``.
+        """
+        if any(child.type == "type" for child in node.children):
+            return True
+        for child in node.children:
+            if child.type != "import_clause":
+                continue
+            if len(child.named_children) != 1:
+                return False
+            named = child.named_children[0]
+            if named.type != "named_imports":
+                return False
+            specifiers = [
+                spec for spec in named.named_children
+                if spec.type == "import_specifier"
+            ]
+            return (
+                bool(specifiers)
+                and all(
+                    any(part.type == "type" for part in spec.children)
+                    for spec in specifiers
+                )
+                and not (
+                    file_path and self._tsconfig_resolver.keeps_empty_imports(file_path)
+                )
+            )
+        return False
+
+    def _extract_import(
+        self,
+        node,
+        language: str,
+        source: bytes,
+        file_path: Optional[str] = None,
+    ) -> list[str]:
         """Extract import targets as module/path strings."""
         imports = []
         text = node.text.decode("utf-8", errors="replace").strip()
@@ -16757,14 +24253,34 @@ class CodeParser:
         if language == "python":
             # import x.y.z  or  from x.y import z
             if node.type == "import_from_statement":
-                for child in node.children:
-                    if child.type == "dotted_name":
-                        imports.append(child.text.decode("utf-8", errors="replace"))
-                        break
+                # tree-sitter-python wraps the module half of a RELATIVE
+                # import in a `relative_import` node, never a `dotted_name`:
+                # `from .m import a` is [from, relative_import('.m'), import,
+                # dotted_name('a')]. Scanning for the first `dotted_name`
+                # therefore skipped the module and returned the imported
+                # SYMBOL — `from .registry import Registry` resolved to a
+                # `Registry.py` that exists on no filesystem that tells `R`
+                # from `r`, and `from .cli import main` landed on the sibling
+                # `main.py`. The `module_name` field is the module for both
+                # the relative and the absolute form, and is the only node
+                # carrying the leading dots that set the package level.
+                module_node = node.child_by_field_name("module_name")
+                if module_node is not None:
+                    module = module_node.text.decode("utf-8", errors="replace")
+                    imports.extend(
+                        self._python_from_import_targets(node, module, file_path),
+                    )
             else:
                 for child in node.children:
                     if child.type == "dotted_name":
                         imports.append(child.text.decode("utf-8", errors="replace"))
+                    elif child.type == "aliased_import":
+                        for imported in child.children:
+                            if imported.type == "dotted_name":
+                                imports.append(
+                                    imported.text.decode("utf-8", errors="replace")
+                                )
+                                break
         elif language in ("javascript", "typescript", "tsx"):
             # import ... from 'module'
             for child in node.children:
@@ -16772,28 +24288,25 @@ class CodeParser:
                     val = child.text.decode("utf-8", errors="replace").strip("'\"")
                     imports.append(val)
         elif language == "go":
-            for child in node.children:
-                if child.type == "import_spec_list":
-                    for spec in child.children:
-                        if spec.type == "import_spec":
-                            for s in spec.children:
-                                if s.type == "interpreted_string_literal":
-                                    val = s.text.decode("utf-8", errors="replace")
-                                    imports.append(val.strip('"'))
-                elif child.type == "import_spec":
-                    for s in child.children:
-                        if s.type == "interpreted_string_literal":
-                            val = s.text.decode("utf-8", errors="replace")
-                            imports.append(val.strip('"'))
+            imports.extend(
+                spec.module for spec in self._extract_go_import_specs(node)
+            )
         elif language == "rust":
-            imports.extend(original_path for _, original_path in self._parse_rust_use_node(node))
+            imports.extend(
+                original_path
+                for _, original_path in self._parse_rust_use_node(node)
+            )
         elif language in ("c", "cpp"):
             # #include <header> or #include "header"
             for child in node.children:
                 if child.type in ("system_lib_string", "string_literal"):
-                    val = child.text.decode("utf-8", errors="replace").strip('<>"')
+                    val = child.text.decode("utf-8", errors="replace").strip("<>\"")
                     imports.append(val)
-        elif language in ("java", "csharp"):
+        elif language == "csharp":
+            names = [c for c in node.named_children if c.type != "comment"]
+            if names:
+                imports.append(_csharp_name(names[-1]))
+        elif language == "java":
             # import/using package.Class
             parts = text.split()
             if len(parts) >= 2:
@@ -16853,11 +24366,9 @@ class CodeParser:
                             imports.append(val)
                     break  # Only first argument matters
         elif language == "ruby":
-            # require 'module' or require_relative 'path'
-            if "require" in text:
-                match = re.search(r"""['"](.*?)['"]""", text)
-                if match:
-                    imports.append(match.group(1))
+            imports.extend(
+                spec.module for spec in self._extract_ruby_import_specs(node)
+            )
         elif language == "dart":
             # import 'dart:async' or import 'package:flutter/material.dart'
             # Node structure: import_or_export > library_import > import_specification
@@ -16870,7 +24381,6 @@ class CodeParser:
                     if result is not None:
                         return result
                 return None
-
             val = _find_string_literal(node)
             if val:
                 imports.append(val)
@@ -16902,8 +24412,7 @@ class CodeParser:
                         break
                     if sub.type == "identifier":
                         return sub.text.decode(
-                            "utf-8",
-                            errors="replace",
+                            "utf-8", errors="replace",
                         )
                     if sub.type == "import_path":
                         path = _import_path_text(sub)
@@ -16933,8 +24442,7 @@ class CodeParser:
                         if not seen_colon:
                             if sub.type == "identifier":
                                 module_name = sub.text.decode(
-                                    "utf-8",
-                                    errors="replace",
+                                    "utf-8", errors="replace",
                                 )
                             elif sub.type == "import_path":
                                 path = _import_path_text(sub)
@@ -16943,8 +24451,7 @@ class CodeParser:
                         else:
                             if sub.type == "identifier" and module_name:
                                 imported = sub.text.decode(
-                                    "utf-8",
-                                    errors="replace",
+                                    "utf-8", errors="replace",
                                 )
                                 imports.append(f"{module_name}.{imported}")
                             elif sub.type == "import_alias" and module_name:
@@ -16973,6 +24480,27 @@ class CodeParser:
                     if txt and txt != "extends":
                         imports.append(txt)
         elif language == "php":
+            include_types = {
+                "include_expression",
+                "include_once_expression",
+                "require_expression",
+                "require_once_expression",
+            }
+            if node.type in include_types:
+                for child in node.children:
+                    # A double-quoted literal uses encapsed_string even with
+                    # no interpolation. Variables and escapes need evaluation.
+                    if child.type == "string" or (
+                        child.type == "encapsed_string"
+                        and all(part.type == "string_content" for part in child.named_children)
+                    ):
+                        value = child.text.decode(
+                            "utf-8", errors="replace",
+                        ).strip("'\"")
+                        if value:
+                            imports.append(value)
+                return imports
+
             # ``namespace_use_declaration`` covers several shapes:
             #   use A\B\C;            use A\B\C as D;
             #   use function A\b;     use const A\B;
@@ -16987,8 +24515,7 @@ class CodeParser:
                 for sub in clause.children:
                     if sub.type in ("qualified_name", "name"):
                         return sub.text.decode(
-                            "utf-8",
-                            errors="replace",
+                            "utf-8", errors="replace",
                         ).lstrip("\\")
                 return None
 
@@ -16997,8 +24524,7 @@ class CodeParser:
             for child in node.children:
                 if child.type == "namespace_name":
                     prefix = child.text.decode(
-                        "utf-8",
-                        errors="replace",
+                        "utf-8", errors="replace",
                     ).strip("\\")
                 elif child.type == "namespace_use_group":
                     group_node = child
@@ -17082,7 +24608,6 @@ class CodeParser:
         # call_expression (first child is identifier or field_expression)
         # so the generic paths below handle it.
         if language == "php":
-
             def _normalize_php_name(text: str) -> str:
                 # PHP global/function names can be prefixed with '\\'.
                 return text.lstrip("\\")
@@ -17152,18 +24677,21 @@ class CodeParser:
                 return method_node.text.decode("utf-8", errors="replace")
 
         # Bash: `command` node's first child is the command name.
-        if language == "bash" and node.type == "command":
+        if language in ("bash", "powershell") and node.type == "command":
             for child in node.children:
                 if child.type == "command_name":
                     # command_name wraps a word — get its text
                     txt = child.text.decode("utf-8", errors="replace").strip()
+                    # The PowerShell grammar can wrap a numeric range in a
+                    # command_name even though it is a pipeline expression.
+                    if language == "powershell" and _POWERSHELL_RANGE_RE.fullmatch(txt):
+                        return None
                     return txt or None
             return None
 
         # Verilog/SystemVerilog: the first child is the instantiated type.
         if language == "verilog" and node.type in (
-            "module_instantiation",
-            "interface_instantiation",
+            "module_instantiation", "interface_instantiation",
         ):
             if first.type == "simple_identifier":
                 return first.text.decode("utf-8", errors="replace")
@@ -17192,8 +24720,7 @@ class CodeParser:
         # Lua/Luau: dot_index_expression (obj.method) and method_index_expression
         # (obj:method) — extract the rightmost identifier as the call name.
         if language in ("lua", "luau") and first.type in (
-            "dot_index_expression",
-            "method_index_expression",
+            "dot_index_expression", "method_index_expression",
         ):
             for child in reversed(first.children):
                 if child.type == "identifier":
@@ -17203,12 +24730,9 @@ class CodeParser:
         # Method call: obj.method(args)
         # Kotlin uses "navigation_expression" for member access (obj.method).
         member_types = (
-            "attribute",
-            "member_expression",
-            "field_expression",
-            "selector_expression",
-            "navigation_expression",
-            "member_access_expression",
+            "attribute", "member_expression",
+            "field_expression", "selector_expression",
+            "navigation_expression", "member_access_expression",
             "conditional_access_expression",
         )
         if first.type in member_types:
@@ -17216,11 +24740,8 @@ class CodeParser:
             # Kotlin navigation_expression uses navigation_suffix > simple_identifier.
             for child in reversed(first.children):
                 if child.type in (
-                    "identifier",
-                    "property_identifier",
-                    "field_identifier",
-                    "field_name",
-                    "simple_identifier",
+                    "identifier", "property_identifier", "field_identifier",
+                    "field_name", "simple_identifier",
                 ):
                     return child.text.decode("utf-8", errors="replace")
                 if child.type == "navigation_suffix":
@@ -17331,16 +24852,9 @@ class CodeParser:
         return bool(name) and name[0].isupper()
 
     # Modifier suffixes used in JS/TS test runners
-    _TEST_MODIFIER_SUFFIXES = frozenset(
-        {
-            "only",
-            "skip",
-            "each",
-            "todo",
-            "concurrent",
-            "failing",
-        }
-    )
+    _TEST_MODIFIER_SUFFIXES = frozenset({
+        "only", "skip", "each", "todo", "concurrent", "failing",
+    })
 
     def _get_base_call_name(self, node, source: bytes) -> Optional[str]:
         """Return the base object name for member-expression calls like describe.only()."""
@@ -17431,15 +24945,9 @@ class CodeParser:
     # ------------------------------------------------------------------
 
     def _handle_r_binary_operator(
-        self,
-        node,
-        source: bytes,
-        language: str,
-        file_path: str,
-        nodes: list[NodeInfo],
-        edges: list[EdgeInfo],
-        enclosing_class: Optional[str],
-        enclosing_func: Optional[str],
+        self, node, source: bytes, language: str, file_path: str,
+        nodes: list[NodeInfo], edges: list[EdgeInfo],
+        enclosing_class: Optional[str], enclosing_func: Optional[str],
         import_map: Optional[dict[str, str]],
         defined_names: Optional[set[str]],
     ) -> bool:
@@ -17454,49 +24962,39 @@ class CodeParser:
 
         if right.type == "function_definition" and left.type == "identifier":
             name = left.text.decode("utf-8", errors="replace")
-            is_test = _is_test_function(name, file_path)
+            is_test = _is_test_function(name, file_path, repo_root=self._repo_root)
             kind = "Test" if is_test else "Function"
             qualified = self._qualify(name, file_path, enclosing_class)
             params = self._get_params(right, language, source)
 
-            nodes.append(
-                NodeInfo(
-                    kind=kind,
-                    name=name,
-                    file_path=file_path,
-                    line_start=right.start_point[0] + 1,
-                    line_end=right.end_point[0] + 1,
-                    language=language,
-                    parent_name=enclosing_class,
-                    params=params,
-                    is_test=is_test,
-                )
-            )
+            nodes.append(NodeInfo(
+                kind=kind,
+                name=name,
+                file_path=file_path,
+                line_start=right.start_point[0] + 1,
+                line_end=right.end_point[0] + 1,
+                language=language,
+                parent_name=enclosing_class,
+                params=params,
+                is_test=is_test,
+            ))
 
             container = (
-                self._qualify(enclosing_class, file_path, None) if enclosing_class else file_path
+                self._qualify(enclosing_class, file_path, None)
+                if enclosing_class else file_path
             )
-            edges.append(
-                EdgeInfo(
-                    kind="CONTAINS",
-                    source=container,
-                    target=qualified,
-                    file_path=file_path,
-                    line=right.start_point[0] + 1,
-                )
-            )
+            edges.append(EdgeInfo(
+                kind="CONTAINS",
+                source=container,
+                target=qualified,
+                file_path=file_path,
+                line=right.start_point[0] + 1,
+            ))
 
             self._extract_from_tree(
-                right,
-                source,
-                language,
-                file_path,
-                nodes,
-                edges,
-                enclosing_class=enclosing_class,
-                enclosing_func=name,
-                import_map=import_map,
-                defined_names=defined_names,
+                right, source, language, file_path, nodes, edges,
+                enclosing_class=enclosing_class, enclosing_func=name,
+                import_map=import_map, defined_names=defined_names,
             )
             return True
 
@@ -17505,31 +25003,18 @@ class CodeParser:
             if call_func in ("setRefClass", "setClass", "setGeneric"):
                 assign_name = left.text.decode("utf-8", errors="replace")
                 return self._handle_r_class_call(
-                    right,
-                    source,
-                    language,
-                    file_path,
-                    nodes,
-                    edges,
-                    enclosing_class,
-                    enclosing_func,
-                    import_map,
-                    defined_names,
+                    right, source, language, file_path, nodes, edges,
+                    enclosing_class, enclosing_func,
+                    import_map, defined_names,
                     assign_name=assign_name,
                 )
 
         return False
 
     def _handle_r_call(
-        self,
-        node,
-        source: bytes,
-        language: str,
-        file_path: str,
-        nodes: list[NodeInfo],
-        edges: list[EdgeInfo],
-        enclosing_class: Optional[str],
-        enclosing_func: Optional[str],
+        self, node, source: bytes, language: str, file_path: str,
+        nodes: list[NodeInfo], edges: list[EdgeInfo],
+        enclosing_class: Optional[str], enclosing_func: Optional[str],
         import_map: Optional[dict[str, str]],
         defined_names: Optional[set[str]],
     ) -> bool:
@@ -17541,29 +25026,20 @@ class CodeParser:
         if func_name in ("library", "require", "source"):
             imports = self._extract_import(node, language, source)
             for imp_target in imports:
-                edges.append(
-                    EdgeInfo(
-                        kind="IMPORTS_FROM",
-                        source=file_path,
-                        target=imp_target,
-                        file_path=file_path,
-                        line=node.start_point[0] + 1,
-                    )
-                )
+                edges.append(EdgeInfo(
+                    kind="IMPORTS_FROM",
+                    source=file_path,
+                    target=imp_target,
+                    file_path=file_path,
+                    line=node.start_point[0] + 1,
+                ))
             return True
 
         if func_name in ("setRefClass", "setClass", "setGeneric"):
             return self._handle_r_class_call(
-                node,
-                source,
-                language,
-                file_path,
-                nodes,
-                edges,
-                enclosing_class,
-                enclosing_func,
-                import_map,
-                defined_names,
+                node, source, language, file_path, nodes, edges,
+                enclosing_class, enclosing_func,
+                import_map, defined_names,
             )
 
         # Module-scope R calls attribute to the File node.
@@ -17575,46 +25051,28 @@ class CodeParser:
                 else file_path
             )
             target = self._resolve_call_target(
-                call_name,
-                file_path,
-                language,
-                import_map or {},
-                defined_names or set(),
+                call_name, file_path, language,
+                import_map or {}, defined_names or set(),
             )
-            edges.append(
-                EdgeInfo(
-                    kind="CALLS",
-                    source=caller,
-                    target=target,
-                    file_path=file_path,
-                    line=node.start_point[0] + 1,
-                )
-            )
+            edges.append(EdgeInfo(
+                kind="CALLS",
+                source=caller,
+                target=target,
+                file_path=file_path,
+                line=node.start_point[0] + 1,
+            ))
 
         self._extract_from_tree(
-            node,
-            source,
-            language,
-            file_path,
-            nodes,
-            edges,
-            enclosing_class=enclosing_class,
-            enclosing_func=enclosing_func,
-            import_map=import_map,
-            defined_names=defined_names,
+            node, source, language, file_path, nodes, edges,
+            enclosing_class=enclosing_class, enclosing_func=enclosing_func,
+            import_map=import_map, defined_names=defined_names,
         )
         return True
 
     def _handle_r_class_call(
-        self,
-        node,
-        source: bytes,
-        language: str,
-        file_path: str,
-        nodes: list[NodeInfo],
-        edges: list[EdgeInfo],
-        enclosing_class: Optional[str],
-        enclosing_func: Optional[str],
+        self, node, source: bytes, language: str, file_path: str,
+        nodes: list[NodeInfo], edges: list[EdgeInfo],
+        enclosing_class: Optional[str], enclosing_func: Optional[str],
         import_map: Optional[dict[str, str]],
         defined_names: Optional[set[str]],
         assign_name: Optional[str] = None,
@@ -17625,51 +25083,36 @@ class CodeParser:
             return False
 
         qualified = self._qualify(class_name, file_path, enclosing_class)
-        nodes.append(
-            NodeInfo(
-                kind="Class",
-                name=class_name,
-                file_path=file_path,
-                line_start=node.start_point[0] + 1,
-                line_end=node.end_point[0] + 1,
-                language=language,
-                parent_name=enclosing_class,
-            )
-        )
-        edges.append(
-            EdgeInfo(
-                kind="CONTAINS",
-                source=file_path,
-                target=qualified,
-                file_path=file_path,
-                line=node.start_point[0] + 1,
-            )
-        )
+        nodes.append(NodeInfo(
+            kind="Class",
+            name=class_name,
+            file_path=file_path,
+            line_start=node.start_point[0] + 1,
+            line_end=node.end_point[0] + 1,
+            language=language,
+            parent_name=enclosing_class,
+        ))
+        edges.append(EdgeInfo(
+            kind="CONTAINS",
+            source=file_path,
+            target=qualified,
+            file_path=file_path,
+            line=node.start_point[0] + 1,
+        ))
 
         methods_list = self._r_find_named_arg(node, "methods")
         if methods_list is not None:
             self._extract_r_methods(
-                methods_list,
-                source,
-                language,
-                file_path,
-                nodes,
-                edges,
-                class_name,
-                import_map,
-                defined_names,
+                methods_list, source, language, file_path,
+                nodes, edges, class_name,
+                import_map, defined_names,
             )
 
         return True
 
     def _extract_r_methods(
-        self,
-        list_call,
-        source: bytes,
-        language: str,
-        file_path: str,
-        nodes: list[NodeInfo],
-        edges: list[EdgeInfo],
+        self, list_call, source: bytes, language: str, file_path: str,
+        nodes: list[NodeInfo], edges: list[EdgeInfo],
         class_name: str,
         import_map: Optional[dict[str, str]],
         defined_names: Optional[set[str]],
@@ -17683,34 +25126,25 @@ class CodeParser:
 
             qualified = self._qualify(method_name, file_path, class_name)
             params = self._get_params(func_def, language, source)
-            nodes.append(
-                NodeInfo(
-                    kind="Function",
-                    name=method_name,
-                    file_path=file_path,
-                    line_start=func_def.start_point[0] + 1,
-                    line_end=func_def.end_point[0] + 1,
-                    language=language,
-                    parent_name=class_name,
-                    params=params,
-                )
-            )
-            edges.append(
-                EdgeInfo(
-                    kind="CONTAINS",
-                    source=self._qualify(class_name, file_path, None),
-                    target=qualified,
-                    file_path=file_path,
-                    line=func_def.start_point[0] + 1,
-                )
-            )
+            nodes.append(NodeInfo(
+                kind="Function",
+                name=method_name,
+                file_path=file_path,
+                line_start=func_def.start_point[0] + 1,
+                line_end=func_def.end_point[0] + 1,
+                language=language,
+                parent_name=class_name,
+                params=params,
+            ))
+            edges.append(EdgeInfo(
+                kind="CONTAINS",
+                source=self._qualify(class_name, file_path, None),
+                target=qualified,
+                file_path=file_path,
+                line=func_def.start_point[0] + 1,
+            ))
             self._extract_from_tree(
-                func_def,
-                source,
-                language,
-                file_path,
-                nodes,
-                edges,
+                func_def, source, language, file_path, nodes, edges,
                 enclosing_class=class_name,
                 enclosing_func=method_name,
                 import_map=import_map,

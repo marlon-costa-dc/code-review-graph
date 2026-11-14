@@ -3,8 +3,6 @@
 from pathlib import Path
 from unittest.mock import patch
 
-import pytest
-
 from code_review_graph.graph import GraphStore
 from code_review_graph.incremental import CPP_IDENTITY_VERSION, incremental_update
 from code_review_graph.parser import CodeParser, EdgeInfo, NodeInfo
@@ -77,7 +75,9 @@ void attributed([[maybe_unused]] int value) {}
 
     try:
         functions = [
-            node for node in store.get_nodes_by_file(str(source_path)) if node.kind == "Function"
+            node
+            for node in store.get_nodes_by_file(str(source_path))
+            if node.kind == "Function"
         ]
         assert {node.qualified_name for node in functions} == {
             f"{source_path.as_posix()}::Widget.update(const std::vector<int>&,DataFile*,bool)",
@@ -105,7 +105,11 @@ void caller() { process(1); }
     caller = f"{prefix}::caller()"
 
     try:
-        call_edges = [edge for edge in store.get_edges_by_source(caller) if edge.kind == "CALLS"]
+        call_edges = [
+            edge
+            for edge in store.get_edges_by_source(caller)
+            if edge.kind == "CALLS"
+        ]
         assert len(call_edges) == 1
         assert call_edges[0].target_qualified == "process"
         assert set(call_edges[0].extra["ambiguous_targets"]) == {
@@ -117,10 +121,9 @@ void caller() { process(1); }
 
     ambiguous = query_graph("callers_of", "process", repo_root=str(tmp_path))
     assert ambiguous["status"] == "ambiguous"
-    assert {candidate["qualified_name"] for candidate in ambiguous["disambiguation"]} == {
-        int_overload,
-        double_overload,
-    }
+    assert {
+        candidate["qualified_name"] for candidate in ambiguous["disambiguation"]
+    } == {int_overload, double_overload}
 
     exact = query_graph("callers_of", int_overload, repo_root=str(tmp_path))
     assert exact["status"] == "ok"
@@ -128,17 +131,20 @@ void caller() { process(1); }
 
     callees = query_graph("callees_of", caller, repo_root=str(tmp_path))
     assert callees["status"] == "ok"
-    assert callees["results"] == [
-        {
-            "kind": "Function",
-            "name": "process",
-            "qualified_name": "process",
-            "resolution": "ambiguous",
-            "candidates": [int_overload, double_overload],
-            "candidate_count": 2,
-            "candidates_truncated": False,
-        }
-    ]
+    assert callees["results"] == [{
+        "kind": "Function",
+        "name": "process",
+        "qualified_name": "process",
+        "resolution": "ambiguous",
+        "candidates": [int_overload, double_overload],
+        "candidate_count": 2,
+        "candidates_truncated": False,
+        # An overload set was never bound to one node, so the row says so and
+        # carries the line the unresolved call is written at.
+        "target_resolution": "unresolved",
+        "call_site": {"line": 3, "file": prefix},
+    }]
+    assert callees["resolution_split"] == {"direct": 0, "unresolved": 1}
     assert callees["edges"][0]["ambiguous_targets"] == [
         int_overload,
         double_overload,
@@ -162,7 +168,11 @@ struct B { void process() {} };
     target = f"{prefix}::A.process()"
 
     try:
-        call_edges = [edge for edge in store.get_edges_by_source(caller) if edge.kind == "CALLS"]
+        call_edges = [
+            edge
+            for edge in store.get_edges_by_source(caller)
+            if edge.kind == "CALLS"
+        ]
         assert [(edge.target_qualified, edge.extra) for edge in call_edges] == [
             (target, {}),
         ]
@@ -184,7 +194,11 @@ struct A {
     caller = f"{prefix}::A.caller(B&)"
 
     try:
-        call_edges = [edge for edge in store.get_edges_by_source(caller) if edge.kind == "CALLS"]
+        call_edges = [
+            edge
+            for edge in store.get_edges_by_source(caller)
+            if edge.kind == "CALLS"
+        ]
         assert len(call_edges) == 1
         assert call_edges[0].target_qualified == "process"
         assert call_edges[0].extra["receiver"] == "b"
@@ -211,7 +225,11 @@ def test_cpp_this_call_resolves_to_signature_identity(tmp_path: Path):
     target = f"{source_path.as_posix()}::A.process()"
 
     try:
-        call_edges = [edge for edge in store.get_edges_by_source(caller) if edge.kind == "CALLS"]
+        call_edges = [
+            edge
+            for edge in store.get_edges_by_source(caller)
+            if edge.kind == "CALLS"
+        ]
         assert [(edge.target_qualified, edge.extra) for edge in call_edges] == [
             (target, {"receiver": "this"}),
         ]
@@ -236,7 +254,11 @@ struct A {
     caller = f"{source_path.as_posix()}::A.caller()"
 
     try:
-        call_edges = [edge for edge in store.get_edges_by_source(caller) if edge.kind == "CALLS"]
+        call_edges = [
+            edge
+            for edge in store.get_edges_by_source(caller)
+            if edge.kind == "CALLS"
+        ]
         assert len(call_edges) == 1
         assert call_edges[0].target_qualified == "process"
         assert set(call_edges[0].extra["ambiguous_targets"]) == {
@@ -266,7 +288,9 @@ struct A { void caller() { helper(); } };
     try:
         for caller in (f"{prefix}::N.M.caller()", f"{prefix}::N.A.caller()"):
             call_edges = [
-                edge for edge in store.get_edges_by_source(caller) if edge.kind == "CALLS"
+                edge
+                for edge in store.get_edges_by_source(caller)
+                if edge.kind == "CALLS"
             ]
             assert [(edge.target_qualified, edge.extra) for edge in call_edges] == [
                 (target, {}),
@@ -289,7 +313,11 @@ void caller() { A::run(); }
     target = f"{source_path.as_posix()}::N.A.run()"
 
     try:
-        call_edges = [edge for edge in store.get_edges_by_source(caller) if edge.kind == "CALLS"]
+        call_edges = [
+            edge
+            for edge in store.get_edges_by_source(caller)
+            if edge.kind == "CALLS"
+        ]
         assert [(edge.target_qualified, edge.extra) for edge in call_edges] == [
             (target, {}),
         ]
@@ -309,7 +337,11 @@ void caller() { process(1); }
     target = f"{source_path.as_posix()}::process(int)"
 
     try:
-        call_edges = [edge for edge in store.get_edges_by_source(caller) if edge.kind == "CALLS"]
+        call_edges = [
+            edge
+            for edge in store.get_edges_by_source(caller)
+            if edge.kind == "CALLS"
+        ]
         assert [(edge.target_qualified, edge.extra) for edge in call_edges] == [
             (target, {}),
         ]
@@ -318,7 +350,9 @@ void caller() { process(1); }
 
 
 def test_cpp_candidate_metadata_is_bounded_and_reports_truncation(tmp_path: Path):
-    overloads = "\n".join(f"void process(Type{index} value) {{}}" for index in range(25))
+    overloads = "\n".join(
+        f"void process(Type{index} value) {{}}" for index in range(25)
+    )
     source_path, store = _index_source(
         tmp_path,
         f"{overloads}\nvoid caller() {{ process(1); }}\n",
@@ -326,7 +360,11 @@ def test_cpp_candidate_metadata_is_bounded_and_reports_truncation(tmp_path: Path
     caller = f"{source_path.as_posix()}::caller()"
 
     try:
-        call_edges = [edge for edge in store.get_edges_by_source(caller) if edge.kind == "CALLS"]
+        call_edges = [
+            edge
+            for edge in store.get_edges_by_source(caller)
+            if edge.kind == "CALLS"
+        ]
         assert len(call_edges) == 1
         assert len(call_edges[0].extra["ambiguous_targets"]) == 20
         assert call_edges[0].extra["ambiguous_target_count"] == 25
@@ -364,14 +402,22 @@ void caller() { A::unique(); A::overloaded(1); N::helper(); }
     caller = f"{source_path.as_posix()}::caller()"
 
     try:
-        call_edges = [edge for edge in store.get_edges_by_source(caller) if edge.kind == "CALLS"]
+        call_edges = [
+            edge
+            for edge in store.get_edges_by_source(caller)
+            if edge.kind == "CALLS"
+        ]
         assert {
-            edge.target_qualified for edge in call_edges if not edge.extra.get("ambiguous_targets")
+            edge.target_qualified
+            for edge in call_edges
+            if not edge.extra.get("ambiguous_targets")
         } == {
             f"{source_path.as_posix()}::A.unique()",
             f"{source_path.as_posix()}::N.helper()",
         }
-        ambiguous_edges = [edge for edge in call_edges if edge.extra.get("ambiguous_targets")]
+        ambiguous_edges = [
+            edge for edge in call_edges if edge.extra.get("ambiguous_targets")
+        ]
         assert len(ambiguous_edges) == 1
         assert ambiguous_edges[0].target_qualified == "A::overloaded"
         assert set(ambiguous_edges[0].extra["ambiguous_targets"]) == {
@@ -383,7 +429,9 @@ void caller() { A::unique(); A::overloaded(1); N::helper(); }
 
     callees = query_graph("callees_of", caller, repo_root=str(tmp_path))
     ambiguous_result = next(
-        result for result in callees["results"] if result.get("resolution") == "ambiguous"
+        result
+        for result in callees["results"]
+        if result.get("resolution") == "ambiguous"
     )
     assert ambiguous_result["qualified_name"] == "A::overloaded"
     assert ambiguous_result["candidate_count"] == 2
@@ -465,7 +513,7 @@ namespace Beta { void process(int value) {} }
         store.close()
 
 
-def test_cpp_nested_class_and_function_keys_use_complete_scope(
+def test_cpp_nested_class_keys_stay_legacy_while_function_scope_is_complete(
     tmp_path: Path,
 ):
     source_path, store = _index_source(
@@ -480,7 +528,7 @@ def test_cpp_nested_class_and_function_keys_use_complete_scope(
     prefix = source_path.as_posix()
     outer = f"{prefix}::Outer"
     inner = f"{prefix}::Outer.Inner"
-    deep = f"{prefix}::Outer.Inner.Deep"
+    deep = f"{prefix}::Inner.Deep"
     run = f"{prefix}::Outer.Inner.Deep.run()"
 
     try:
@@ -533,10 +581,9 @@ def test_reindex_replaces_legacy_unsuffixed_cpp_identity(tmp_path: Path):
         store.store_file_nodes_edges(str(source_path), nodes, edges)
 
         assert store.get_node(legacy_qn) is None
-        assert (
-            store.get_node(f"{source_path.as_posix()}::IWorkspace.deleteDataFile(DataFile*,bool)")
-            is not None
-        )
+        assert store.get_node(
+            f"{source_path.as_posix()}::IWorkspace.deleteDataFile(DataFile*,bool)"
+        ) is not None
     finally:
         store.close()
 
@@ -554,25 +601,21 @@ def test_incremental_upgrade_rebuilds_cpp_identities_and_removes_stale_edges(
 
     try:
         for path, name in ((callee_path, "run"), (caller_path, "caller")):
-            store.upsert_node(
-                NodeInfo(
-                    kind="Function",
-                    name=name,
-                    file_path=str(path),
-                    line_start=1,
-                    line_end=1,
-                    language="cpp",
-                )
-            )
-        store.upsert_edge(
-            EdgeInfo(
-                kind="CALLS",
-                source=legacy_caller,
-                target=legacy_callee,
-                file_path=str(caller_path),
-                line=1,
-            )
-        )
+            store.upsert_node(NodeInfo(
+                kind="Function",
+                name=name,
+                file_path=str(path),
+                line_start=1,
+                line_end=1,
+                language="cpp",
+            ))
+        store.upsert_edge(EdgeInfo(
+            kind="CALLS",
+            source=legacy_caller,
+            target=legacy_callee,
+            file_path=str(caller_path),
+            line=1,
+        ))
         store.commit()
 
         with patch(
@@ -636,23 +679,21 @@ def test_cross_file_bare_call_is_not_claimed_by_each_exact_overload(
         assert callers["results"] == []
 
 
-def test_failed_cpp_identity_upgrade_propagates_without_marking_complete(tmp_path: Path):
+def test_failed_cpp_identity_upgrade_remains_pending_and_retries(tmp_path: Path):
     source_path = tmp_path / "run.cpp"
     source_path.write_text("void run(int value) {}\n", encoding="utf-8")
     legacy_qn = f"{source_path.as_posix()}::run"
     store = GraphStore(tmp_path / "graph.db")
 
     try:
-        store.upsert_node(
-            NodeInfo(
-                kind="Function",
-                name="run",
-                file_path=str(source_path),
-                line_start=1,
-                line_end=1,
-                language="cpp",
-            )
-        )
+        store.upsert_node(NodeInfo(
+            kind="Function",
+            name="run",
+            file_path=str(source_path),
+            line_start=1,
+            line_end=1,
+            language="cpp",
+        ))
         store.commit()
 
         with (
@@ -665,11 +706,25 @@ def test_failed_cpp_identity_upgrade_propagates_without_marking_complete(tmp_pat
                 side_effect=RuntimeError("simulated parse failure"),
             ),
         ):
-            with pytest.raises(RuntimeError, match="simulated parse failure"):
-                incremental_update(tmp_path, store, changed_files=[])
+            failed = incremental_update(tmp_path, store, changed_files=[])
 
+        assert failed["identity_rebuild"] is True
+        assert failed["errors"]
         assert store.get_metadata("cpp_identity_version") is None
         assert store.get_node(legacy_qn) is not None
+
+        with patch(
+            "code_review_graph.incremental.get_all_tracked_files",
+            return_value=["run.cpp"],
+        ):
+            retried = incremental_update(tmp_path, store, changed_files=[])
+
+        assert retried.get("identity_rebuild") is None
+        assert retried["files_updated"] == 1
+        assert retried["errors"] == []
+        assert store.get_metadata("cpp_identity_version") == CPP_IDENTITY_VERSION
+        assert store.get_node(legacy_qn) is None
+        assert store.get_node(f"{source_path.as_posix()}::run(int)") is not None
     finally:
         store.close()
 
@@ -745,18 +800,20 @@ def test_cross_file_receiver_call_without_type_evidence_stays_unresolved(
         for path in (callee_path, caller_path):
             nodes, edges = parser.parse_file(path)
             store.store_file_nodes_edges(str(path), nodes, edges)
-        store.upsert_edge(
-            EdgeInfo(
-                kind="IMPORTS_FROM",
-                source=caller_path.as_posix(),
-                target=callee_path.as_posix(),
-                file_path=str(caller_path),
-                line=1,
-            )
-        )
+        store.upsert_edge(EdgeInfo(
+            kind="IMPORTS_FROM",
+            source=caller_path.as_posix(),
+            target=callee_path.as_posix(),
+            file_path=str(caller_path),
+            line=1,
+        ))
         store.commit()
 
-        call = next(edge for edge in store.get_edges_by_source(caller) if edge.kind == "CALLS")
+        call = next(
+            edge
+            for edge in store.get_edges_by_source(caller)
+            if edge.kind == "CALLS"
+        )
         assert call.target_qualified == "process"
         assert call.extra["receiver"] == "b"
         assert call.extra["unresolved_targets"] == []
@@ -764,10 +821,16 @@ def test_cross_file_receiver_call_without_type_evidence_stays_unresolved(
         assert store.resolve_bare_call_targets() == 0
         assert store.resolve_bare_tested_by_sources() == 0
         call_after_postprocess = next(
-            edge for edge in store.get_edges_by_source(caller) if edge.kind == "CALLS"
+            edge
+            for edge in store.get_edges_by_source(caller)
+            if edge.kind == "CALLS"
         )
         assert call_after_postprocess.target_qualified == "process"
-        tested_by = [edge for edge in store.get_edges_by_target(caller) if edge.kind == "TESTED_BY"]
+        tested_by = [
+            edge
+            for edge in store.get_edges_by_target(caller)
+            if edge.kind == "TESTED_BY"
+        ]
         assert len(tested_by) == 1
         assert tested_by[0].source_qualified == "process"
         assert tested_by[0].extra["unresolved_targets"] == []
@@ -809,7 +872,11 @@ void A::run(double value) {}
 
         assert store.resolve_cpp_scoped_call_targets() == 1
         assert store.resolve_cpp_scoped_call_targets() == 0
-        calls = [edge for edge in store.get_edges_by_source(caller) if edge.kind == "CALLS"]
+        calls = [
+            edge
+            for edge in store.get_edges_by_source(caller)
+            if edge.kind == "CALLS"
+        ]
         unique = next(edge for edge in calls if edge.target_qualified.endswith("unique()"))
         assert unique.target_qualified == f"{callee_path.as_posix()}::A.unique()"
 
@@ -833,26 +900,20 @@ void A::run(double value) {}
             match["qualified_name"]
             for match in store.get_transitive_tests(unique_target, max_depth=0)
         ] == [caller]
-        assert (
-            store.get_transitive_tests(
-                f"{callee_path.as_posix()}::A.run(int)",
-                max_depth=0,
-            )
-            == []
-        )
+        assert store.get_transitive_tests(
+            f"{callee_path.as_posix()}::A.run(int)", max_depth=0,
+        ) == []
     finally:
         store.close()
 
     tests_for_unique = query_graph(
-        "tests_for",
-        unique_target,
-        repo_root=str(tmp_path),
+        "tests_for", unique_target, repo_root=str(tmp_path),
     )
-    assert [result["qualified_name"] for result in tests_for_unique["results"]] == [caller]
+    assert [
+        result["qualified_name"] for result in tests_for_unique["results"]
+    ] == [caller]
     tests_for_overload = query_graph(
-        "tests_for",
-        f"{callee_path.as_posix()}::A.run(int)",
-        repo_root=str(tmp_path),
+        "tests_for", f"{callee_path.as_posix()}::A.run(int)", repo_root=str(tmp_path),
     )
     assert tests_for_overload["results"] == []
 
@@ -892,9 +953,7 @@ def test_ambiguous_scoped_calls_do_not_create_indirect_test_coverage(
         store.close()
 
     tests_for_production = query_graph(
-        "tests_for",
-        production,
-        repo_root=str(tmp_path),
+        "tests_for", production, repo_root=str(tmp_path),
     )
     assert tests_for_production["results"] == []
 
@@ -925,18 +984,25 @@ def test_deleted_scoped_candidate_becomes_explicitly_unresolved(tmp_path: Path):
             store.store_file_nodes_edges(str(path), nodes, edges)
 
         assert store.resolve_cpp_scoped_call_targets() == 2
-        assert [match["qualified_name"] for match in store.get_transitive_tests(production)] == [
-            test
-        ]
+        assert [
+            match["qualified_name"]
+            for match in store.get_transitive_tests(production)
+        ] == [test]
 
         callee_path.write_text("// A::run was removed\n", encoding="utf-8")
         nodes, edges = parser.parse_file(callee_path)
         store.store_file_nodes_edges(str(callee_path), nodes, edges)
 
         assert store.resolve_cpp_scoped_call_targets() == 0
-        call = next(edge for edge in store.get_edges_by_source(production) if edge.kind == "CALLS")
+        call = next(
+            edge
+            for edge in store.get_edges_by_source(production)
+            if edge.kind == "CALLS"
+        )
         tested_by = next(
-            edge for edge in store.get_edges_by_target(test) if edge.kind == "TESTED_BY"
+            edge
+            for edge in store.get_edges_by_target(test)
+            if edge.kind == "TESTED_BY"
         )
         assert call.target_qualified == "A::run"
         assert call.extra["unresolved_targets"] == []
@@ -948,9 +1014,7 @@ def test_deleted_scoped_candidate_becomes_explicitly_unresolved(tmp_path: Path):
         store.close()
 
     tests_for_production = query_graph(
-        "tests_for",
-        production,
-        repo_root=str(tmp_path),
+        "tests_for", production, repo_root=str(tmp_path),
     )
     assert tests_for_production["results"] == []
 
@@ -971,7 +1035,11 @@ def test_missing_scoped_candidate_rechecks_when_definition_appears(tmp_path: Pat
         store.store_file_nodes_edges(str(caller_path), nodes, edges)
 
         assert store.resolve_cpp_scoped_call_targets() == 0
-        call = next(edge for edge in store.get_edges_by_source(caller) if edge.kind == "CALLS")
+        call = next(
+            edge
+            for edge in store.get_edges_by_source(caller)
+            if edge.kind == "CALLS"
+        )
         assert call.target_qualified == "A::run"
         assert call.extra["cpp_scoped_target"] == "A::run"
         assert call.extra["unresolved_targets"] == []
@@ -982,21 +1050,45 @@ def test_missing_scoped_candidate_rechecks_when_definition_appears(tmp_path: Pat
         store.store_file_nodes_edges(str(callee_path), nodes, edges)
 
         assert store.resolve_cpp_scoped_call_targets() == 1
-        call = next(edge for edge in store.get_edges_by_source(caller) if edge.kind == "CALLS")
+        call = next(
+            edge
+            for edge in store.get_edges_by_source(caller)
+            if edge.kind == "CALLS"
+        )
         assert call.target_qualified == f"{callee_path.as_posix()}::A.run(int)"
         assert "unresolved_targets" not in call.extra
     finally:
         store.close()
 
+def _reindex_cpp_source(store, parser, path: Path, source: str) -> None:
+    path.write_text(source, encoding="utf-8")
+    nodes, edges = parser.parse_file(path)
+    store.store_file_nodes_edges(str(path), nodes, edges)
+
+
+def _get_scoped_call_edges(store, caller: str):
+    call = next(
+        edge
+        for edge in store.get_edges_by_source(caller)
+        if edge.kind == "CALLS"
+    )
+    tested_by = next(
+        edge
+        for edge in store.get_edges_by_target(caller)
+        if edge.kind == "TESTED_BY"
+    )
+    return call, tested_by
 
 def test_cross_file_scoped_resolution_rechecks_candidate_changes(tmp_path: Path):
     callee_path = tmp_path / "callee.cpp"
     caller_path = tmp_path / "caller.cpp"
+
     callee_path.write_text("void A::run(int value) {}\n", encoding="utf-8")
     caller_path.write_text(
         "void test_caller() { A::run(1); }\n",
         encoding="utf-8",
     )
+
     store = GraphStore(tmp_path / "graph.db")
     parser = CodeParser()
     caller = f"{caller_path.as_posix()}::test_caller()"
@@ -1006,57 +1098,57 @@ def test_cross_file_scoped_resolution_rechecks_candidate_changes(tmp_path: Path)
             nodes, edges = parser.parse_file(path)
             store.store_file_nodes_edges(str(path), nodes, edges)
 
+        # First: the call resolves to A::run(int).
         assert store.resolve_cpp_scoped_call_targets() == 1
-        call = next(edge for edge in store.get_edges_by_source(caller) if edge.kind == "CALLS")
+
+        call, tested_by = _get_scoped_call_edges(store, caller)
+
         assert call.target_qualified == f"{callee_path.as_posix()}::A.run(int)"
         assert call.extra["cpp_scoped_target"] == "A::run"
-        tested_by = next(
-            edge for edge in store.get_edges_by_target(caller) if edge.kind == "TESTED_BY"
-        )
         assert tested_by.source_qualified == f"{callee_path.as_posix()}::A.run(int)"
         assert tested_by.extra == call.extra
 
-        callee_path.write_text(
+        # Second: two overloads make it ambiguous.
+        _reindex_cpp_source(
+            store,
+            parser,
+            callee_path,
             "void A::run(int value) {}\nvoid A::run(double value) {}\n",
-            encoding="utf-8",
         )
-        nodes, edges = parser.parse_file(callee_path)
-        store.store_file_nodes_edges(str(callee_path), nodes, edges)
 
         assert store.resolve_cpp_scoped_call_targets() == 0
-        call = next(edge for edge in store.get_edges_by_source(caller) if edge.kind == "CALLS")
+
+        call, tested_by = _get_scoped_call_edges(store, caller)
+
         assert call.target_qualified == "A::run"
         assert call.extra["ambiguous_target_count"] == 2
-        tested_by = next(
-            edge for edge in store.get_edges_by_target(caller) if edge.kind == "TESTED_BY"
-        )
         assert tested_by.source_qualified == "A::run"
         assert tested_by.extra == call.extra
 
-        callee_path.write_text(
+        # Third: the call resolves to A::run(double).
+        _reindex_cpp_source(
+            store,
+            parser,
+            callee_path,
             "void A::run(double value) {}\n",
-            encoding="utf-8",
         )
-        nodes, edges = parser.parse_file(callee_path)
-        store.store_file_nodes_edges(str(callee_path), nodes, edges)
 
         assert store.resolve_cpp_scoped_call_targets() == 1
-        call = next(edge for edge in store.get_edges_by_source(caller) if edge.kind == "CALLS")
+
+        call, tested_by = _get_scoped_call_edges(store, caller)
+
         assert call.target_qualified == f"{callee_path.as_posix()}::A.run(double)"
         assert call.extra["cpp_scoped_target"] == "A::run"
         assert "ambiguous_targets" not in call.extra
         assert "ambiguous_target_count" not in call.extra
         assert "ambiguous_targets_truncated" not in call.extra
-        tested_by = next(
-            edge for edge in store.get_edges_by_target(caller) if edge.kind == "TESTED_BY"
-        )
         assert tested_by.source_qualified == f"{callee_path.as_posix()}::A.run(double)"
         assert tested_by.extra == call.extra
     finally:
         store.close()
 
 
-def test_non_cpp_failure_propagates_during_cpp_identity_migration(tmp_path: Path):
+def test_non_cpp_failure_does_not_repeat_cpp_identity_migration(tmp_path: Path):
     cpp_path = tmp_path / "run.cpp"
     python_path = tmp_path / "broken.py"
     cpp_path.write_text("void run(int value) {}\n", encoding="utf-8")
@@ -1070,16 +1162,14 @@ def test_non_cpp_failure_propagates_during_cpp_identity_migration(tmp_path: Path
         return original_parse_bytes(parser, path, source)
 
     try:
-        store.upsert_node(
-            NodeInfo(
-                kind="Function",
-                name="run",
-                file_path=str(cpp_path),
-                line_start=1,
-                line_end=1,
-                language="cpp",
-            )
-        )
+        store.upsert_node(NodeInfo(
+            kind="Function",
+            name="run",
+            file_path=str(cpp_path),
+            line_start=1,
+            line_end=1,
+            language="cpp",
+        ))
         store.commit()
 
         with (
@@ -1089,10 +1179,17 @@ def test_non_cpp_failure_propagates_during_cpp_identity_migration(tmp_path: Path
             ),
             patch.object(CodeParser, "parse_bytes", new=parse_with_python_failure),
         ):
-            with pytest.raises(RuntimeError, match=r"simulated non-C\+\+ parse failure"):
-                incremental_update(tmp_path, store, changed_files=[])
+            migrated = incremental_update(tmp_path, store, changed_files=[])
 
-        assert store.get_metadata("cpp_identity_version") is None
+        assert migrated["identity_rebuild"] is True
+        assert migrated["errors"] == [
+            {"file": "broken.py", "error": "simulated non-C++ parse failure"},
+        ]
+        assert store.get_metadata("cpp_identity_version") == CPP_IDENTITY_VERSION
+        assert store.get_node(f"{cpp_path.as_posix()}::run(int)") is not None
+
+        no_retry = incremental_update(tmp_path, store, changed_files=[])
+        assert no_retry.get("identity_rebuild") is None
     finally:
         store.close()
 
@@ -1107,25 +1204,21 @@ def test_non_cpp_scoped_unresolved_callee_query_behavior_stays_unchanged(
     caller = f"{source_path.as_posix()}::caller"
 
     try:
-        store.upsert_node(
-            NodeInfo(
-                kind="Function",
-                name="caller",
-                file_path=str(source_path),
-                line_start=1,
-                line_end=1,
-                language="rust",
-            )
-        )
-        store.upsert_edge(
-            EdgeInfo(
-                kind="CALLS",
-                source=caller,
-                target="external::missing",
-                file_path=str(source_path),
-                line=1,
-            )
-        )
+        store.upsert_node(NodeInfo(
+            kind="Function",
+            name="caller",
+            file_path=str(source_path),
+            line_start=1,
+            line_end=1,
+            language="rust",
+        ))
+        store.upsert_edge(EdgeInfo(
+            kind="CALLS",
+            source=caller,
+            target="external::missing",
+            file_path=str(source_path),
+            line=1,
+        ))
         store.commit()
     finally:
         store.close()

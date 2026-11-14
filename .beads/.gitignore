@@ -1,1 +1,11 @@
 *
+!.gitignore
+!README.md
+!config.yaml
+!metadata.json
+!hooks/
+!hooks/post-checkout
+!hooks/post-merge
+!hooks/pre-commit
+!hooks/pre-push
+!hooks/prepare-commit-msg

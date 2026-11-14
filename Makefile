@@ -1,56 +1,78 @@
 SHELL := /bin/sh
 
-WHAT ?= all
-FILE ?=
-MATCH ?=
-APPLY ?= N
-REPO ?= .
-TEST_TMPDIR ?= $(if $(XDG_CACHE_HOME),$(XDG_CACHE_HOME),$(HOME)/.cache)/code-review-graph/pytest
-PROFILE_LIMIT ?= 30
-DUPLICATION_ROOT ?= .
-
-.PHONY: help setup deps check fix test profile
-
-help:
-	@printf '%s\n' \
-	  'code-review-graph' \
-	  '  setup' \
-	  '  deps WHAT=check|lock|vscode-lock|vscode-security' \
-	  '  check WHAT=all|lint|mypy|duplication [DUPLICATION_ROOT=<snapshot>]' \
-	  '  fix FILE=<path>' \
-	  '  test [FILE=<path>] [MATCH=<pytest-expression>]' \
-	  '  profile FILE=<profile-output> REPO=<repository>'
+.PHONY: setup gen upg lint fix types mypy mod test test-release
 
 setup:
-	uv sync --all-extras
+	uv sync --locked --extra dev
 
-deps:
-	@case "$(WHAT)" in \
-	  check) uv lock --check ;; \
-	  lock) test "$(APPLY)" = Y || { echo 'ERROR: deps WHAT=lock requires' >&2; exit 2; }; uv lock ;; \
-	  vscode-lock) test "$(APPLY)" = Y || { echo 'ERROR: deps WHAT=vscode-lock requires' >&2; exit 2; }; npm install --package-lock-only --ignore-scripts --prefix code-review-graph-vscode ;; \
-	  vscode-security) test "$(APPLY)" = Y || { echo 'ERROR: deps WHAT=vscode-security requires' >&2; exit 2; }; npm audit fix --package-lock-only --ignore-scripts --prefix code-review-graph-vscode ;; \
-	  *) echo 'ERROR: WHAT must be check|lock|vscode-lock|vscode-security' >&2; exit 2 ;; \
-	esac
+gen:
+	uv run --locked --extra dev python scripts/generate_documentary_skills.py
+	uv run --locked --extra dev python -c 'from pathlib import Path; from code_review_graph.skills import generate_skills; generate_skills(Path.cwd(), Path("skills"))'
 
-check:
-	@set -eu; case "$(WHAT)" in \
-	  all) uv run ruff check code_review_graph tests; uv run mypy code_review_graph --ignore-missing-imports --no-strict-optional; $(MAKE) check WHAT=duplication ;; \
-	  lint) uv run ruff check $(if $(FILE),$(FILE),code_review_graph tests) ;; \
-	  mypy) uv run mypy $(if $(FILE),$(FILE),code_review_graph) --ignore-missing-imports --no-strict-optional ;; \
-	  duplication) npx --yes jscpd@5.1.2 --min-lines 8 --mode strict --reporters ai --summary "$(DUPLICATION_ROOT)/code_review_graph" "$(DUPLICATION_ROOT)/tests" ;; \
-	  *) echo 'ERROR: WHAT must be all|lint|mypy|duplication' >&2; exit 2 ;; \
-	esac
+upg:
+	uv lock --upgrade
+
+lint:
+	uv run --locked --extra dev ruff check code_review_graph tests
 
 fix:
-	@test "$(APPLY)" = Y || { echo 'ERROR: fix requires' >&2; exit 2; }
-	uv run ruff check --fix $(if $(FILE),$(FILE),code_review_graph tests)
+	uv run --locked --extra dev ruff check --fix code_review_graph tests
+
+types:
+	uv run --locked --extra dev pyrefly check code_review_graph
+
+mypy:
+	uv run --locked --extra dev mypy code_review_graph --ignore-missing-imports --no-strict-optional
+
+mod:
+	flext-infra refactor mod --repository-root .
 
 test:
-	@mkdir -p "$(TEST_TMPDIR)"
-	TMPDIR="$(TEST_TMPDIR)" uv run pytest $(if $(FILE),$(FILE),tests) $(if $(MATCH),-k '$(MATCH)',)
+	uv run --locked --extra dev pytest tests
 
-profile:
-	@test -n "$(FILE)" || { echo 'ERROR: FILE must name the cProfile output' >&2; exit 2; }
-	uv run python -m cProfile -o "$(FILE)" scripts/profile_inventory.py "$(REPO)"
-	uv run python -c 'import pstats; pstats.Stats("$(FILE)").strip_dirs().sort_stats("cumulative").print_stats($(PROFILE_LIMIT))'
+test-release:
+	uv run --locked --extra dev pytest tests/test_release_provenance.py tests/test_documentation.py -q --tb=short
+
+.PHONY: test-notebooks
+test-notebooks:
+	uv run --locked --extra dev pytest tests/test_notebook.py -q --tb=short
+
+.PHONY: test-skills
+test-skills:
+	uv run --locked --extra dev pytest tests/test_skill_template_schema_sync.py tests/test_skills.py -q --tb=short
+
+.PHONY: test-daemon
+test-daemon:
+	uv run --locked --extra dev pytest tests/test_daemon.py tests/test_daemon_external_graph.py tests/test_prune.py -q --tb=short
+
+.PHONY: test-worktrees
+test-worktrees:
+	uv run --locked --extra dev pytest tests/test_multi_worktree.py -q --tb=short
+
+.PHONY: test-watch-locks
+test-watch-locks:
+	uv run --locked --extra dev pytest tests/test_write_lock.py tests/test_write_lock_all_writers.py -q --tb=short
+
+.PHONY: test-freshness
+test-freshness:
+	uv run --locked --extra dev pytest tests/test_freshness_metadata.py tests/test_tools.py -q --tb=short
+
+.PHONY: test-install
+test-install:
+	uv run --locked --extra dev pytest tests/test_cli_install.py tests/test_steering_hook.py tests/test_installer_ownership.py tests/test_install_outputs_are_ignored.py -q --tb=short
+
+.PHONY: test-read-guard
+test-read-guard:
+	uv run --locked --extra dev pytest tests/test_not_built_guard.py tests/test_uncertainty.py -q --tb=short
+
+.PHONY: test-review-budget
+test-review-budget:
+	uv run --locked --extra dev pytest tests/test_complete_change_analysis.py -q --tb=short
+
+.PHONY: test-update-contract
+test-update-contract:
+	uv run --locked --extra dev pytest tests/test_integration_git.py tests/test_update_in_a_graph_only_project.py tests/test_hook_update.py tests/test_codex_hook_never_builds_a_new_graph.py -q --tb=short
+
+.PHONY: test-registry
+test-registry:
+	uv run --locked --extra dev pytest tests/test_registry.py tests/test_dependency_floors.py tests/test_cli_reconciliation.py tests/test_install_outputs_are_ignored.py -q --tb=short

@@ -1,11 +1,19 @@
 """Tests for the Tree-sitter parser module."""
 
+import ast
 import tempfile
 from pathlib import Path
 
+import pytest
+
 from code_review_graph.graph import GraphStore
 from code_review_graph.incremental import full_build
-from code_review_graph.parser import CodeParser
+from code_review_graph.parser import (
+    CodeParser,
+    _clear_parser_probe_cache,
+    _python_type_checking_aliases,
+    _PythonUnreachableCallVisitor,
+)
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -23,6 +31,388 @@ class TestCodeParser:
     def test_detect_language_unknown(self):
         assert self.parser.detect_language(Path("foo.txt")) is None
 
+    def test_parse_robot_and_resource_files(self, tmp_path):
+        robot = tmp_path / "sample.robot"
+        robot.write_text(
+            "*** Settings ***\n"
+            "Resource    keywords.resource\n"
+            "Library     OperatingSystem\n\n"
+            "*** Test Cases ***\n"
+            "A passing test\n"
+            "    Log    hello\n"
+            "    Prepare environment\n\n"
+            "*** Keywords ***\n"
+            "Prepare environment\n"
+            "    Create directory    ${OUTPUT}\n",
+            encoding="utf-8",
+        )
+        resource = tmp_path / "keywords.resource"
+        resource.write_text(
+            "*** Keywords ***\n"
+            "Prepare environment\n"
+            "    Log    ready\n",
+            encoding="utf-8",
+        )
+
+        assert self.parser.detect_language(robot) == "robot"
+        assert self.parser.detect_language(resource) == "robot"
+        nodes, edges = self.parser.parse_file(robot)
+        assert {node.name for node in nodes} >= {
+            str(robot), "A passing test", "Prepare environment",
+        }
+        assert any(node.kind == "Test" and node.name == "A passing test" for node in nodes)
+        assert any(
+            edge.kind == "IMPORTS_FROM" and edge.target == resource.as_posix()
+            for edge in edges
+        )
+        assert any(
+            edge.kind == "CALLS"
+            and edge.source.endswith("::A passing test")
+            and edge.target == f"{robot.as_posix()}::Prepare environment"
+            for edge in edges
+        )
+
+    def test_robot_keyword_matching_ignores_case_spaces_and_underscores(self, tmp_path):
+        robot = tmp_path / "keywords.robot"
+        robot.write_text(
+            "*** Test Cases ***\n"
+            "Normalize keyword names\n"
+            "    Prepare environment\n"
+            "    prepare_environment\n"
+            "    PREPARE ENVIRONMENT\n"
+            "*** Keywords ***\n"
+            "Prepare environment\n"
+            "    Log    ready\n",
+            encoding="utf-8",
+        )
+
+        nodes, edges = self.parser.parse_file(robot)
+
+        keyword = next(node for node in nodes if node.kind == "Function")
+        calls = [edge for edge in edges if edge.kind == "CALLS"]
+        keyword_calls = [edge for edge in calls if edge.target.endswith("::Prepare environment")]
+        assert len(keyword_calls) == 3
+        assert all(edge.source.endswith("::Normalize keyword names") for edge in keyword_calls)
+        assert any(edge.target == "Log" for edge in calls)
+        assert keyword.name == "Prepare environment"
+
+    def test_robot_control_flow_and_variable_assignment(self, tmp_path):
+        robot = tmp_path / "control.robot"
+        robot.write_text(
+            "*** Test Cases ***\n"
+            "Control flow\n"
+            "    ${result}= Prepare environment\n"
+            "    ${first}    ${result}=    Prepare environment\n"
+            "    IF    ${result}\n"
+            "        FOR    ${item}    IN    one    two\n"
+            "            Prepare environment\n"
+            "        END\n"
+            "    ELSE IF    ${other}\n"
+            "        Prepare environment\n"
+            "    ELSE\n"
+            "        Prepare environment\n"
+            "    END\n"
+            "    IF wrapper\n"
+            "    TRY\n"
+            "        Prepare environment\n"
+            "    EXCEPT\n"
+            "        Prepare environment\n"
+            "    ELSE\n"
+            "        Prepare environment\n"
+            "    FINALLY\n"
+            "        Prepare environment\n"
+            "    END\n"
+            "    IF    ${flag}    Prepare environment\n"
+            "    IF    ${flag}    Prepare environment    ELSE    Prepare environment\n"
+            "*** Keywords ***\n"
+            "Prepare environment\n"
+            "IF wrapper\n"
+            "    Log    wrapper\n",
+            encoding="utf-8",
+        )
+
+        _, edges = self.parser.parse_file(robot)
+
+        calls = [edge for edge in edges if edge.kind == "CALLS"]
+        expected_keyword = f"{robot.as_posix()}::Prepare environment"
+        test_calls = [edge for edge in calls if edge.source.endswith("::Control flow")]
+        assert len(test_calls) == 13
+        assert sum(edge.target == expected_keyword for edge in test_calls) == 12
+        assert any(edge.target == f"{robot.as_posix()}::IF wrapper" for edge in test_calls)
+        assert not any(
+            edge.target
+            in {"IF", "FOR", "TRY", "END", "ELSE", "ELSE IF", "EXCEPT", "FINALLY", "${result}="}
+            for edge in calls
+        )
+
+    def test_robot_pipe_rows_define_tests_with_clean_names(self, tmp_path):
+        robot = tmp_path / "pipe.robot"
+        robot.write_text(
+            "| *** Settings *** |\n"
+            "| Resource | keywords.resource |\n"
+            "| *** Test Cases *** |\n"
+            "| Valid Login |\n"
+            "|             | Open Page |\n"
+            "|             | ${x}= | Read Value | a|b |\n"
+            "| |\n"
+            "| T2 |\n"
+            "| *** Keywords *** |\n"
+            "| Open Page |\n"
+            "|           | Log | ready |\n",
+            encoding="utf-8",
+        )
+
+        nodes, edges = self.parser.parse_file(robot)
+
+        names = {node.kind: [] for node in nodes}
+        for node in nodes:
+            names[node.kind].append(node.name)
+        assert names["Test"] == ["Valid Login", "T2"]
+        assert names["Function"] == ["Open Page"]
+        calls = {
+            (edge.source.rsplit("::", 1)[-1], edge.target.rsplit("::", 1)[-1])
+            for edge in edges
+            if edge.kind == "CALLS"
+        }
+        assert calls == {
+            ("Valid Login", "Open Page"),
+            ("Valid Login", "Read Value"),
+            ("Open Page", "Log"),
+        }
+        assert any(
+            edge.kind == "IMPORTS_FROM" and edge.target.endswith("/keywords.resource")
+            for edge in edges
+        )
+
+    def _robot_calls(self, tmp_path, source: bytes) -> list[tuple[str, str]]:
+        robot = tmp_path / "suite.robot"
+        robot.write_bytes(source)
+        _, edges = self.parser.parse_file(robot)
+        return [
+            (edge.source.rsplit("::", 1)[-1], edge.target.rsplit("::", 1)[-1])
+            for edge in edges
+            if edge.kind == "CALLS"
+        ]
+
+    @pytest.mark.parametrize(
+        "row",
+        [
+            "${x}=    Kw",
+            "${x} =    Kw",
+            "${x}= Kw",
+            "${x}    Kw",
+            "${a}    ${b}    Kw",
+            "${a}    ${b}=    Kw",
+            "@{items}=    Kw",
+        ],
+    )
+    def test_robot_every_assignment_form_keeps_the_keyword(self, tmp_path, row):
+        source = f"*** Test Cases ***\nT\n    {row}\n*** Keywords ***\nKw\n".encode()
+
+        assert self._robot_calls(tmp_path, source) == [("T", "Kw")]
+
+    def test_robot_setup_teardown_and_template_are_calls(self, tmp_path):
+        calls = self._robot_calls(
+            tmp_path,
+            b"*** Settings ***\n"
+            b"Suite Setup    Kw One\n"
+            b"Test Teardown    NONE\n"
+            b"Library    Collections\n"
+            b"*** Test Cases ***\n"
+            b"T\n"
+            b"    [Setup]    Kw Two\n"
+            b"    [Teardown]    NONE\n"
+            b"    [Template]    Kw Three\n"
+            b"    [Tags]    smoke\n"
+            b"*** Keywords ***\n"
+            b"K\n"
+            b"    [Teardown]    Kw Four\n"
+            b"Kw One\nKw Two\nKw Three\nKw Four\n",
+        )
+
+        assert set(calls) == {
+            ((tmp_path / "suite.robot").as_posix(), "Kw One"),
+            ("T", "Kw Two"),
+            ("T", "Kw Three"),
+            ("K", "Kw Four"),
+        }
+
+    def test_robot_a_test_mirror_comes_only_from_a_test(self, tmp_path):
+        robot = tmp_path / "suite.robot"
+        robot.write_text(
+            "*** Settings ***\nSuite Setup    Kw\n"
+            "*** Test Cases ***\nT\n    Kw\n"
+            "*** Keywords ***\nKw\n",
+            encoding="utf-8",
+        )
+
+        _, edges = self.parser.parse_file(robot)
+
+        mirrors = [edge.target.rsplit("::", 1)[-1] for edge in edges if edge.kind == "TESTED_BY"]
+        assert mirrors == ["T"]
+
+    def test_robot_bdd_words_are_not_part_of_the_keyword(self, tmp_path):
+        calls = self._robot_calls(
+            tmp_path,
+            b"*** Test Cases ***\n"
+            b"T\n"
+            b"    Given Prepare Env\n"
+            b"    when prepare_env\n"
+            b"    Then External Kw\n"
+            b"*** Keywords ***\n"
+            b"Prepare Env\n",
+        )
+
+        assert calls == [("T", "Prepare Env"), ("T", "Prepare Env"), ("T", "External Kw")]
+
+    def test_robot_control_words_are_never_calls(self, tmp_path):
+        calls = self._robot_calls(
+            tmp_path,
+            b"*** Keywords ***\n"
+            b"K\n"
+            b"    FOR    ${i}    IN    a\n"
+            b"        CONTINUE\n"
+            b"        BREAK\n"
+            b"    END\n"
+            b"    WHILE\n"
+            b"        One\n"
+            b"    END\n"
+            b"    GROUP    name\n"
+            b"        Two\n"
+            b"    END\n"
+            b"    VAR    ${x}    1\n"
+            b"    IF    ${a}    RETURN\n"
+            b"    IF    ${a}    Three    ELSE IF    ${b}    Four    ELSE    Five\n"
+            b"    RETURN    1\n",
+        )
+
+        assert [target for _, target in calls] == ["One", "Two", "Three", "Four", "Five"]
+
+    def test_robot_keywords_may_be_named_like_lower_case_control_words(self, tmp_path):
+        calls = self._robot_calls(
+            tmp_path,
+            b"*** Test Cases ***\nT\n    End\n    If    x\n*** Keywords ***\nEnd\nIf\n",
+        )
+
+        assert [target for _, target in calls] == ["End", "If"]
+
+    @pytest.mark.parametrize(
+        ("settings", "tests", "keywords"),
+        [
+            ("*** Settings ***", "*** Test Cases ***", "*** Keywords ***"),
+            ("*** Setting ***", "*** Test Case ***", "*** Keyword ***"),
+            ("* Settings *", "* Test Cases *", "* Keywords *"),
+            ("*** settings ***", "*** test cases ***", "*** keywords ***"),
+        ],
+    )
+    def test_robot_section_header_spellings(self, tmp_path, settings, tests, keywords):
+        robot = tmp_path / "suite.robot"
+        robot.write_text(
+            f"{settings}\nLibrary    X\n{tests}\nT\n    Kw\n{keywords}\nKw\n",
+            encoding="utf-8",
+        )
+
+        nodes, edges = self.parser.parse_file(robot)
+
+        assert {(node.kind, node.name) for node in nodes if node.kind != "File"} == {
+            ("Test", "T"), ("Function", "Kw"),
+        }
+        assert any(edge.kind == "IMPORTS_FROM" and edge.target == "X" for edge in edges)
+
+    def test_robot_bom_and_crlf_do_not_hide_the_first_section(self, tmp_path):
+        calls = self._robot_calls(
+            tmp_path,
+            b"\xef\xbb\xbf*** Test Cases ***\r\nT\r\n    Kw\r\n*** Keywords ***\r\nKw\r\n",
+        )
+
+        assert calls == [("T", "Kw")]
+
+    def test_robot_continuation_row_at_column_zero_is_not_a_definition(self, tmp_path):
+        robot = tmp_path / "suite.robot"
+        robot.write_text(
+            "*** Test Cases ***\nT\n    Kw    a\n...    b\n*** Keywords ***\nKw\n",
+            encoding="utf-8",
+        )
+
+        nodes, _ = self.parser.parse_file(robot)
+
+        assert [node.name for node in nodes if node.kind == "Test"] == ["T"]
+
+    def test_robot_resource_paths(self, tmp_path):
+        folder = tmp_path / "sub"
+        folder.mkdir()
+        robot = folder / "suite.robot"
+        robot.write_text(
+            "*** Settings ***\n"
+            "Resource    ../shared/a.resource\n"
+            "Resource    ${CURDIR}/b.resource\n"
+            "Resource    ${ROOT}/c.resource\n",
+            encoding="utf-8",
+        )
+
+        _, edges = self.parser.parse_file(robot)
+
+        assert [edge.target for edge in edges if edge.kind == "IMPORTS_FROM"] == [
+            (tmp_path / "shared" / "a.resource").as_posix(),
+            (folder / "b.resource").as_posix(),
+            "${ROOT}/c.resource",
+        ]
+
+    def test_robot_test_and_keyword_with_same_name_coexist(self, tmp_path):
+        robot = tmp_path / "shared.robot"
+        robot.write_text(
+            "*** Test Cases ***\n"
+            "Shared\n"
+            "    Log    Test case\n"
+            "*** Keywords ***\n"
+            "Shared\n"
+            "    Log    Keyword\n",
+            encoding="utf-8",
+        )
+
+        nodes, edges = self.parser.parse_file(robot)
+        with GraphStore(tmp_path / "graph.db") as store:
+            for node in nodes:
+                store.upsert_node(node)
+            for edge in edges:
+                store.upsert_edge(edge)
+            store.commit()
+            persisted = store.get_nodes_by_file(robot.as_posix())
+            contains = list(store.iter_edges_by_source(robot.as_posix()))
+
+        shared = [node for node in persisted if node.name == "Shared"]
+        assert {node.kind for node in shared} == {"Test", "Function"}
+        assert len({node.qualified_name for node in shared}) == 2
+        assert {node.line_start for node in shared} == {2, 5}
+        assert {edge.target_qualified for edge in contains if edge.kind == "CONTAINS"} == {
+            node.qualified_name for node in shared
+        }
+
+    def test_robot_resource_import_is_found_by_importers_query(self, tmp_path):
+        from code_review_graph.tools.query import query_graph
+
+        (tmp_path / ".git").mkdir()
+        (tmp_path / ".code-review-graph").mkdir()
+        robot = tmp_path / "suite.robot"
+        robot.write_text(
+            "*** Settings ***\n"
+            "Resource    keywords.resource\n"
+            "*** Test Cases ***\n"
+            "A test\n"
+            "    Log    hello\n",
+            encoding="utf-8",
+        )
+        resource = tmp_path / "keywords.resource"
+        resource.write_text("*** Keywords ***\nA keyword\n    Log    ready\n", encoding="utf-8")
+
+        with GraphStore(tmp_path / ".code-review-graph" / "graph.db") as store:
+            built = full_build(tmp_path, store)
+            assert built["errors"] == []
+
+        result = query_graph("importers_of", str(resource), repo_root=str(tmp_path))
+        assert result.get("status") == "ok"
+        assert any(item["file"] == robot.as_posix() for item in result.get("results", []))
+
     # --- Shebang detection for extension-less Unix scripts (#237) ---
 
     def _write_shebang_file(self, tmp_path: Path, name: str, content: str) -> Path:
@@ -33,93 +423,74 @@ class TestCodeParser:
 
     def test_detect_shebang_bin_bash(self, tmp_path):
         p = self._write_shebang_file(
-            tmp_path,
-            "deploy",
-            "#!/bin/bash\nfoo() { echo hi; }\n",
+            tmp_path, "deploy", "#!/bin/bash\nfoo() { echo hi; }\n",
         )
         assert self.parser.detect_language(p) == "bash"
 
     def test_detect_shebang_bin_sh_routed_to_bash(self, tmp_path):
         """/bin/sh scripts are parsed through the bash grammar."""
         p = self._write_shebang_file(
-            tmp_path,
-            "install-hook",
-            "#!/bin/sh\necho hello\n",
+            tmp_path, "install-hook", "#!/bin/sh\necho hello\n",
         )
         assert self.parser.detect_language(p) == "bash"
 
     def test_detect_shebang_env_bash(self, tmp_path):
         p = self._write_shebang_file(
-            tmp_path,
-            "runner",
-            "#!/usr/bin/env bash\nfoo() { echo hi; }\n",
+            tmp_path, "runner", "#!/usr/bin/env bash\nfoo() { echo hi; }\n",
         )
         assert self.parser.detect_language(p) == "bash"
 
     def test_detect_shebang_env_python3(self, tmp_path):
         p = self._write_shebang_file(
-            tmp_path,
-            "myapp",
+            tmp_path, "myapp",
             "#!/usr/bin/env python3\ndef main():\n    pass\n",
         )
         assert self.parser.detect_language(p) == "python"
 
     def test_detect_shebang_direct_python(self, tmp_path):
         p = self._write_shebang_file(
-            tmp_path,
-            "tool",
-            "#!/usr/bin/python3\nprint('hi')\n",
+            tmp_path, "tool", "#!/usr/bin/python3\nprint('hi')\n",
         )
         assert self.parser.detect_language(p) == "python"
 
     def test_detect_shebang_node(self, tmp_path):
         p = self._write_shebang_file(
-            tmp_path,
-            "cli",
-            "#!/usr/bin/env node\nconsole.log(1);\n",
+            tmp_path, "cli", "#!/usr/bin/env node\nconsole.log(1);\n",
         )
         assert self.parser.detect_language(p) == "javascript"
 
     def test_detect_shebang_env_dash_s_flag(self, tmp_path):
         """``#!/usr/bin/env -S node --flag`` (Linux -S) resolves to the interpreter."""
         p = self._write_shebang_file(
-            tmp_path,
-            "esm-tool",
-            "#!/usr/bin/env -S node --experimental-vm-modules\nconsole.log('esm');\n",
+            tmp_path, "esm-tool",
+            "#!/usr/bin/env -S node --experimental-vm-modules\n"
+            "console.log('esm');\n",
         )
         assert self.parser.detect_language(p) == "javascript"
 
     def test_detect_shebang_ruby(self, tmp_path):
         p = self._write_shebang_file(
-            tmp_path,
-            "rake-task",
-            "#!/usr/bin/env ruby\nputs 1\n",
+            tmp_path, "rake-task", "#!/usr/bin/env ruby\nputs 1\n",
         )
         assert self.parser.detect_language(p) == "ruby"
 
     def test_detect_shebang_perl(self, tmp_path):
         p = self._write_shebang_file(
-            tmp_path,
-            "cgi-script",
-            "#!/usr/bin/env perl\nprint 1;\n",
+            tmp_path, "cgi-script", "#!/usr/bin/env perl\nprint 1;\n",
         )
         assert self.parser.detect_language(p) == "perl"
 
     def test_detect_shebang_with_trailing_flags(self, tmp_path):
         """``#!/bin/bash -e`` still maps to bash (flags ignored)."""
         p = self._write_shebang_file(
-            tmp_path,
-            "strict",
-            "#!/bin/bash -e\nfoo() { echo hi; }\n",
+            tmp_path, "strict", "#!/bin/bash -e\nfoo() { echo hi; }\n",
         )
         assert self.parser.detect_language(p) == "bash"
 
     def test_detect_shebang_missing_returns_none(self, tmp_path):
         """Extension-less text files without a shebang return None, not bash."""
         p = self._write_shebang_file(
-            tmp_path,
-            "README",
-            "# just a readme, no shebang\nsome content\n",
+            tmp_path, "README", "# just a readme, no shebang\nsome content\n",
         )
         assert self.parser.detect_language(p) is None
 
@@ -139,9 +510,7 @@ class TestCodeParser:
         """A valid shebang to an interpreter we don't route is treated as
         'unknown language' — same as an unmapped extension."""
         p = self._write_shebang_file(
-            tmp_path,
-            "ocaml-script",
-            "#!/usr/bin/env ocaml\nlet x = 1\n",
+            tmp_path, "ocaml-script", "#!/usr/bin/env ocaml\nlet x = 1\n",
         )
         assert self.parser.detect_language(p) is None
 
@@ -192,8 +561,7 @@ class TestCodeParser:
         to zero nodes — stored under the snapshot's (final) file hash.
         """
         p = self._write_shebang_file(
-            tmp_path,
-            "tool",
+            tmp_path, "tool",
             "#!/usr/bin/env python3\n\ndef damaged():\n    return 1\n",
         )
         snapshot = p.read_bytes()
@@ -216,9 +584,7 @@ class TestCodeParser:
     def test_detect_language_without_source_still_probes_disk(self, tmp_path):
         """Path-only callers (file filters) keep the on-disk shebang probe."""
         p = self._write_shebang_file(
-            tmp_path,
-            "runner",
-            "#!/usr/bin/env bash\necho hi\n",
+            tmp_path, "runner", "#!/usr/bin/env bash\necho hi\n",
         )
         assert self.parser.detect_language(p) == "bash"
 
@@ -260,7 +626,7 @@ class Plain:
         widget = next(node for node in nodes if node.name == "Widget")
         plain = next(node for node in nodes if node.name == "Plain")
 
-        expected = ['Component("widget-card")', "dataclass(frozen=True)"]
+        expected = ["Component(\"widget-card\")", "dataclass(frozen=True)"]
         assert widget.kind == "Class"
         assert widget.modifiers == ",".join(expected)
         assert widget.extra["decorators"] == expected
@@ -287,6 +653,50 @@ class Plain:
         import_targets = {e.target for e in imports}
         assert "os" in import_targets
         assert "pathlib" in import_targets
+
+    def test_parse_python_aliased_module_imports(self, tmp_path):
+        source = tmp_path / "aliases.py"
+        source.write_text(
+            "import b as B\nimport a.b as C\nimport x, y as z\n",
+            encoding="utf-8",
+        )
+
+        _, edges = self.parser.parse_file(source)
+
+        import_targets = {e.target for e in edges if e.kind == "IMPORTS_FROM"}
+        assert import_targets == {"a.b", "b", "x", "y"}
+
+    def test_python_aliased_module_is_reported_by_queries(self, tmp_path):
+        from code_review_graph.tools.query import get_impact_radius, query_graph
+
+        (tmp_path / ".git").mkdir()
+        (tmp_path / ".code-review-graph").mkdir()
+        target = tmp_path / "b.py"
+        target.write_text("def hi():\n    return 1\n", encoding="utf-8")
+        importer = tmp_path / "aliased.py"
+        importer.write_text("import b as B\nprint(B.hi())\n", encoding="utf-8")
+
+        store = GraphStore(tmp_path / ".code-review-graph" / "graph.db")
+        parser = CodeParser(tmp_path)
+        for path in (target, importer):
+            nodes, edges = parser.parse_file(path)
+            for node in nodes:
+                store.upsert_node(node)
+            for edge in edges:
+                store.upsert_edge(edge)
+        store.commit()
+        store.close()
+
+        result = query_graph("importers_of", str(target), repo_root=str(tmp_path))
+        assert result.get("status") == "ok"
+        importers = {entry["file"] for entry in result.get("results", [])}
+        assert importer.as_posix() in importers
+
+        impact = get_impact_radius(
+            changed_files=[str(target)], repo_root=str(tmp_path), max_depth=1
+        )
+        assert impact["status"] == "ok"
+        assert importer.as_posix() in impact["impacted_files"]
 
     def test_parse_python_calls(self):
         nodes, edges = self.parser.parse_file(FIXTURES / "sample_python.py")
@@ -324,7 +734,9 @@ class Plain:
         file_path = (FIXTURES / "sample_python.py").as_posix()
 
         # create_auth_service() calls AuthService() — a class defined in the same file
-        auth_service_calls = [e for e in calls if e.target == f"{file_path}::AuthService"]
+        auth_service_calls = [
+            e for e in calls if e.target == f"{file_path}::AuthService"
+        ]
         assert len(auth_service_calls) >= 1
 
     def test_calls_edge_cross_file_resolution(self):
@@ -334,7 +746,9 @@ class Plain:
 
         sample_path = (FIXTURES / "sample_python.py").resolve().as_posix()
         # setup_and_run() calls create_auth_service(), imported from sample_python
-        resolved_calls = [e for e in calls if e.target == f"{sample_path}::create_auth_service"]
+        resolved_calls = [
+            e for e in calls if e.target == f"{sample_path}::create_auth_service"
+        ]
         assert len(resolved_calls) == 1
 
     def test_same_file_calls_resolved(self):
@@ -353,11 +767,8 @@ class Plain:
 
         # guarded_process() calls process_request() — both in the same file,
         # but guarded_process is wrapped in a decorated_definition node
-        resolved = [
-            e
-            for e in calls
-            if e.target == f"{file_path}::process_request" and "guarded_process" in e.source
-        ]
+        resolved = [e for e in calls if e.target == f"{file_path}::process_request"
+                    and "guarded_process" in e.source]
         assert len(resolved) == 1
 
     def test_multiple_calls_to_same_function(self):
@@ -391,8 +802,11 @@ class Plain:
             _, edges = self.parser.parse_file(tmp)
             calls = [e for e in edges if e.kind == "CALLS"]
             module_scope_calls = [e for e in calls if e.source == tmp.as_posix()]
-            assert any("helper" in e.target for e in module_scope_calls), (
-                f"Expected module-scope CALLS edge to helper(); got: {[(e.source, e.target) for e in calls]}"
+            assert any(
+                "helper" in e.target for e in module_scope_calls
+            ), (
+                "Expected module-scope CALLS edge to helper(); "
+                f"got: {[(e.source, e.target) for e in calls]}"
             )
         finally:
             tmp.unlink()
@@ -423,8 +837,11 @@ class Plain:
         try:
             _, edges = self.parser.parse_file(tmp)
             calls = [e for e in edges if e.kind == "CALLS"]
-            assert any("do_work" in e.target and e.source == tmp.as_posix() for e in calls), (
-                f"Expected notebook CALLS edge to do_work(); got: {[(e.source, e.target) for e in calls]}"
+            assert any(
+                "do_work" in e.target and e.source == tmp.as_posix() for e in calls
+            ), (
+                "Expected notebook CALLS edge to do_work(); "
+                f"got: {[(e.source, e.target) for e in calls]}"
             )
         finally:
             tmp.unlink()
@@ -461,7 +878,9 @@ class Plain:
         assert len(tested_by) >= 1, "fixture should yield at least one TESTED_BY edge"
 
         test_file = (FIXTURES / "test_sample.py").as_posix()
-        test_qualified = {f"{test_file}::{n.name}" for n in nodes if n.kind == "Test"}
+        test_qualified = {
+            f"{test_file}::{n.name}" for n in nodes if n.kind == "Test"
+        }
         assert test_qualified, "fixture should yield at least one Test node"
 
         for edge in tested_by:
@@ -472,7 +891,8 @@ class Plain:
                 f"Edge: kind={edge.kind} source={edge.source} target={edge.target}"
             )
             assert edge.source not in test_qualified, (
-                f"TESTED_BY edge points test -> test: {edge.source} -> {edge.target}"
+                f"TESTED_BY edge points test -> test: "
+                f"{edge.source} -> {edge.target}"
             )
 
     def test_recursion_depth_guard(self):
@@ -487,7 +907,6 @@ class Plain:
         source = "\n".join(lines).encode("utf-8")
 
         import tempfile
-
         with tempfile.NamedTemporaryFile(suffix=".py", delete=False) as f:
             f.write(source)
             f.flush()
@@ -544,10 +963,8 @@ class Plain:
         nodes, edges = self.parser.parse_file(FIXTURES / "sample_vue.vue")
         calls = [e for e in edges if e.kind == "CALLS"]
         call_targets = {e.target for e in calls}
-        assert (
-            "log" in call_targets
-            or "console.log" in call_targets
-            or any("log" in t for t in call_targets)
+        assert "log" in call_targets or "console.log" in call_targets or any(
+            "log" in t for t in call_targets
         )
 
     def test_parse_vue_contains_edges(self):
@@ -653,8 +1070,7 @@ class Plain:
         funcs = [n for n in nodes if n.kind == "Function"]
         # Both Animal and Dog define speak(); check Dog's specifically
         dog_speak = next(
-            (f for f in funcs if f.name == "speak" and f.parent_name == "Dog"),
-            None,
+            (f for f in funcs if f.name == "speak" and f.parent_name == "Dog"), None,
         )
         assert dog_speak is not None
 
@@ -733,21 +1149,17 @@ class Plain:
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)
             (root / "outlet.entity.ts").write_text(
-                "export class Outlet {}\n",
-                encoding="utf-8",
+                "export class Outlet {}\n", encoding="utf-8",
             )
             # A decoy at the truncated name: proves a wrong resolution
             # lands here instead of raising or returning None.
             (root / "outlet.ts").write_text(
-                "export const wrongFile = true;\n",
-                encoding="utf-8",
+                "export const wrongFile = true;\n", encoding="utf-8",
             )
             importer = root / "outlet.service.ts"
 
             resolved = self.parser._resolve_module_to_file(
-                "./outlet.entity",
-                str(importer),
-                "typescript",
+                "./outlet.entity", str(importer), "typescript",
             )
 
             assert resolved == str((root / "outlet.entity.ts").resolve()), (
@@ -767,9 +1179,7 @@ class Plain:
             importer = root / "bar.ts"
 
             resolved = self.parser._resolve_module_to_file(
-                "./foo.js",
-                str(importer),
-                "typescript",
+                "./foo.js", str(importer), "typescript",
             )
 
             assert resolved == str((root / "foo.ts").resolve())
@@ -784,19 +1194,15 @@ class Plain:
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)
             (root / "thing.model.dart").write_text(
-                "class Thing {}\n",
-                encoding="utf-8",
+                "class Thing {}\n", encoding="utf-8",
             )
             (root / "thing.dart").write_text(
-                "class WrongFile {}\n",
-                encoding="utf-8",
+                "class WrongFile {}\n", encoding="utf-8",
             )
             importer = root / "consumer.dart"
 
             resolved = self.parser._resolve_module_to_file(
-                "./thing.model",
-                str(importer),
-                "dart",
+                "./thing.model", str(importer), "dart",
             )
 
             assert resolved == str((root / "thing.model.dart").resolve()), (
@@ -821,15 +1227,13 @@ class Plain:
         """describe Test nodes should CONTAIN it/test Test nodes."""
         nodes, edges = self.parser.parse_file(FIXTURES / "sample_vitest.test.ts")
         describe_nodes = [
-            n
-            for n in nodes
+            n for n in nodes
             if n.kind == "Test"
             and (n.name.startswith("describe") or n.name.startswith("describe:"))
         ]
         assert len(describe_nodes) >= 1
         it_tests = [
-            n
-            for n in nodes
+            n for n in nodes
             if n.kind == "Test" and (n.name.startswith("it:") or n.name.startswith("test:"))
         ]
         assert len(it_tests) >= 2
@@ -874,7 +1278,8 @@ class Plain:
         ref_target_names = {e.target.rsplit("::", 1)[-1] for e in refs}
         for callback in ("executor_callback", "filter_callback", "map_callback"):
             assert callback in ref_target_names, (
-                f"Expected REFERENCES edge to {callback}, got targets: {ref_target_names}"
+                f"Expected REFERENCES edge to {callback}, got targets: "
+                f"{ref_target_names}"
             )
 
     def test_python_keyword_callback_reference_emitted(self):
@@ -894,12 +1299,12 @@ class Plain:
             db_path = Path(tmp_dir) / "graph.db"
             store = GraphStore(db_path)
             try:
-                nodes, edges = self.parser.parse_file(FIXTURES / "sample_callback_refs.py")
+                nodes, edges = self.parser.parse_file(
+                    FIXTURES / "sample_callback_refs.py"
+                )
                 store.store_file_nodes_edges(
                     str(FIXTURES / "sample_callback_refs.py"),
-                    nodes,
-                    edges,
-                    "",
+                    nodes, edges, "",
                 )
                 dead = find_dead_code(store)
                 dead_names = {d["name"] for d in dead}
@@ -947,22 +1352,27 @@ class Plain:
         """A file under __tests__/ should be classified as a test file even
         when the filename itself has no .test./.spec. marker."""
         from code_review_graph.parser import _is_test_file
-
         assert _is_test_file("src/__tests__/UserService.ts")
         assert _is_test_file("src\\__tests__\\UserService.ts")
+        assert _is_test_file("/repo/src/__tests__/UserService.ts", "/repo")
         # Negative: __tests__ as a substring without path separators must not match
         assert not _is_test_file("my__tests__notdir.ts")
 
     def test_jest_tests_dir_produces_test_nodes(self):
         """A vitest-style file under __tests__/ should yield Test nodes
-        and TESTED_BY edges, the same as a *.test.ts file."""
+        and TESTED_BY edges, the same as a *.test.ts file.
+
+        The parser is built with the repository root because directory
+        conventions such as ``__tests__/`` are read from the path relative to
+        it; see ``CodeParser._is_test_path``.
+        """
         fixture_path = FIXTURES / "__tests__" / "UserService.ts"
         fixture_code = fixture_path.read_text(encoding="utf-8")
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "src" / "__tests__" / "UserService.ts"
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(fixture_code, encoding="utf-8")
-            nodes, edges = self.parser.parse_file(path)
+            nodes, edges = CodeParser(Path(tmpdir)).parse_file(path)
         tests = [n for n in nodes if n.kind == "Test"]
         test_names = {t.name for t in tests}
         assert any(n.startswith("describe") or n.startswith("describe:") for n in test_names), (
@@ -996,12 +1406,12 @@ class Plain:
             f"Edges: {[(e.kind, e.source, e.target) for e in edges]}"
         )
 
+
     def test_non_test_file_describe_not_special(self):
         """describe() in a non-test file should NOT create Test nodes."""
         import tempfile
-
         code = (
-            b"function describe(name, fn) { fn(); }\n"
+            b'function describe(name, fn) { fn(); }\n'
             b'describe("test", () => { console.log("hello"); });\n'
         )
         with tempfile.NamedTemporaryFile(suffix=".ts", delete=False, prefix="regular_") as f:
@@ -1032,15 +1442,16 @@ class Plain:
         calls = [e for e in edges if e.kind == "CALLS"]
         expected_target = f"{(FIXTURES / 'MarkdownMsg.tsx').resolve().as_posix()}::MarkdownMsg"
         jsx_calls = [
-            e
-            for e in calls
+            e for e in calls
             if e.source == f"{path.as_posix()}::BookWorkspace" and e.target == expected_target
         ]
         assert len(jsx_calls) == 1
 
     def test_tsx_intrinsic_dom_elements_do_not_create_call_edges(self):
         source = (
-            b"export function BookWorkspace() {\n  return <section><div /><span /></section>;\n}\n"
+            b"export function BookWorkspace() {\n"
+            b"  return <section><div /><span /></section>;\n"
+            b"}\n"
         )
         path = FIXTURES / "BookWorkspace.tsx"
 
@@ -1051,7 +1462,9 @@ class Plain:
 
     def test_tsx_member_component_invocation_creates_unqualified_call_edge(self):
         source = (
-            b"export function BookWorkspace() {\n  return <UI.MarkdownMsg text={value} />;\n}\n"
+            b"export function BookWorkspace() {\n"
+            b"  return <UI.MarkdownMsg text={value} />;\n"
+            b"}\n"
         )
         path = FIXTURES / "BookWorkspace.tsx"
 
@@ -1059,8 +1472,7 @@ class Plain:
 
         calls = [e for e in edges if e.kind == "CALLS"]
         jsx_calls = [
-            e
-            for e in calls
+            e for e in calls
             if e.source == f"{path.as_posix()}::BookWorkspace" and e.target == "MarkdownMsg"
         ]
         assert len(jsx_calls) == 1
@@ -1079,8 +1491,7 @@ class Plain:
         calls = [e for e in edges if e.kind == "CALLS"]
         expected_target = f"{(FIXTURES / 'MarkdownMsg.tsx').resolve().as_posix()}::MarkdownMsg"
         jsx_calls = [
-            e
-            for e in calls
+            e for e in calls
             if e.source == f"{path.as_posix()}::BookWorkspace" and e.target == expected_target
         ]
         assert len(jsx_calls) == 1
@@ -1099,8 +1510,7 @@ class Plain:
         calls = [e for e in edges if e.kind == "CALLS"]
         expected_target = f"{(FIXTURES / 'MarkdownMsg.tsx').resolve().as_posix()}::MarkdownMsg"
         jsx_calls = [
-            e
-            for e in calls
+            e for e in calls
             if e.source == f"{path.as_posix()}::BookWorkspace" and e.target == expected_target
         ]
         assert len(jsx_calls) == 1
@@ -1129,11 +1539,11 @@ class Plain:
 
             calls = [e for e in edges if e.kind == "CALLS"]
             expected_target = (
-                f"{(root / 'components' / 'MarkdownMsg.tsx').resolve().as_posix()}::MarkdownMsg"
+                f"{(root / 'components' / 'MarkdownMsg.tsx').resolve().as_posix()}"
+                "::MarkdownMsg"
             )
             jsx_calls = [
-                e
-                for e in calls
+                e for e in calls
                 if e.source == f"{consumer.as_posix()}::BookWorkspace"
                 and e.target == expected_target
             ]
@@ -1163,11 +1573,11 @@ class Plain:
 
             calls = [e for e in edges if e.kind == "CALLS"]
             expected_target = (
-                f"{(root / 'components' / 'MarkdownMsg.tsx').resolve().as_posix()}::MarkdownMsg"
+                f"{(root / 'components' / 'MarkdownMsg.tsx').resolve().as_posix()}"
+                "::MarkdownMsg"
             )
             jsx_calls = [
-                e
-                for e in calls
+                e for e in calls
                 if e.source == f"{consumer.as_posix()}::BookWorkspace"
                 and e.target == expected_target
             ]
@@ -1197,11 +1607,11 @@ class Plain:
 
             calls = [e for e in edges if e.kind == "CALLS"]
             expected_target = (
-                f"{(root / 'components' / 'MarkdownMsg.tsx').resolve().as_posix()}::MarkdownMsg"
+                f"{(root / 'components' / 'MarkdownMsg.tsx').resolve().as_posix()}"
+                "::MarkdownMsg"
             )
             jsx_calls = [
-                e
-                for e in calls
+                e for e in calls
                 if e.source == f"{consumer.as_posix()}::BookWorkspace"
                 and e.target == expected_target
             ]
@@ -1248,7 +1658,10 @@ class Plain:
             expected_target = (
                 f"{(components / 'MarkdownMsg.jsx').resolve().as_posix()}::MarkdownMsg"
             )
-            jsx_calls = [e for e in edges if e.kind == "CALLS" and e.target == expected_target]
+            jsx_calls = [
+                e for e in edges
+                if e.kind == "CALLS" and e.target == expected_target
+            ]
             by_source = {}
             for edge in jsx_calls:
                 by_source[edge.source] = by_source.get(edge.source, 0) + 1
@@ -1285,10 +1698,11 @@ class Plain:
 
             _, edges = self.parser.parse_file(consumer)
 
-            expected_target = f"{(messages / 'MarkdownMsg.jsx').resolve().as_posix()}::MarkdownMsg"
+            expected_target = (
+                f"{(messages / 'MarkdownMsg.jsx').resolve().as_posix()}::MarkdownMsg"
+            )
             jsx_calls = [
-                e
-                for e in edges
+                e for e in edges
                 if e.kind == "CALLS"
                 and e.source == f"{consumer.as_posix()}::BookDashboard"
                 and e.target == expected_target
@@ -1296,37 +1710,73 @@ class Plain:
             assert len(jsx_calls) == 1
 
     def test_junit_annotation_marks_test(self):
-        """Java @Test annotation should mark functions as tests."""
+        """Java @Test annotation should mark functions as tests.
+
+        Both methods live in a test file, so both carry ``is_test``; it is
+        ``kind`` that records what the annotation detector decided.
+        """
         nodes, _ = self.parser.parse_bytes(
             Path("/src/MyTest.java"),
-            b"class MyTest {\n  @Test\n  void verifyBehavior() { }\n  void helperMethod() { }\n}\n",
+            b"class MyTest {\n"
+            b"  @Test\n"
+            b"  void verifyBehavior() { }\n"
+            b"  void helperMethod() { }\n"
+            b"}\n",
         )
-        test_nodes = [n for n in nodes if n.is_test]
-        test_names = {n.name for n in test_nodes}
-        assert "verifyBehavior" in test_names
-        assert "helperMethod" not in test_names
+        by_name = {n.name: n for n in nodes}
+        assert by_name["verifyBehavior"].kind == "Test"
+        assert by_name["helperMethod"].kind == "Function"
+        assert by_name["helperMethod"].is_test is True
+
+    def test_junit_annotation_absent_in_production_file(self):
+        """An unannotated method in a production file is not test code."""
+        nodes, _ = self.parser.parse_bytes(
+            Path("/src/MyService.java"),
+            b"class MyService {\n"
+            b"  void helperMethod() { }\n"
+            b"}\n",
+        )
+        by_name = {n.name: n for n in nodes}
+        assert by_name["helperMethod"].kind == "Function"
+        assert by_name["helperMethod"].is_test is False
 
     def test_kotlin_test_annotation_marks_test(self):
         """Kotlin @Test annotation should mark functions as tests."""
         nodes, _ = self.parser.parse_bytes(
             Path("/src/SampleTest.kt"),
-            b"class SampleTest {\n  @Test fun checkResult() { }\n  fun setup() { }\n}\n",
+            b"class SampleTest {\n"
+            b"  @Test fun checkResult() { }\n"
+            b"  fun setup() { }\n"
+            b"}\n",
         )
-        test_nodes = [n for n in nodes if n.is_test]
-        test_names = {n.name for n in test_nodes}
-        assert "checkResult" in test_names
-        assert "setup" not in test_names
+        by_name = {n.name: n for n in nodes}
+        assert by_name["checkResult"].kind == "Test"
+        assert by_name["setup"].kind == "Function"
+        assert by_name["setup"].is_test is True
 
     def test_detects_test_functions(self):
         """Functions with test-like names should be marked is_test=True."""
         nodes, _ = self.parser.parse_bytes(
             Path("/src/test_example.py"),
-            b"def test_something(): pass\ndef helper(): pass\n",
+            b"def test_something(): pass\n"
+            b"def helper(): pass\n",
         )
-        test_nodes = [n for n in nodes if n.is_test]
-        test_names = {n.name for n in test_nodes}
-        assert "test_something" in test_names
-        assert "helper" not in test_names
+        by_name = {n.name: n for n in nodes}
+        assert by_name["test_something"].kind == "Test"
+        # `helper` is not a test by name, but it is test code: it lives in
+        # a test file and exists only to serve the tests there.
+        assert by_name["helper"].kind == "Function"
+        assert by_name["helper"].is_test is True
+
+    def test_production_helper_is_not_test_code(self):
+        """The same helper in a production file stays production code."""
+        nodes, _ = self.parser.parse_bytes(
+            Path("/src/example.py"),
+            b"def helper(): pass\n",
+        )
+        by_name = {n.name: n for n in nodes}
+        assert by_name["helper"].kind == "Function"
+        assert by_name["helper"].is_test is False
 
     def test_c_dead_guard_if0_omits_dead_edges(self):
         """CALLS edges inside ``#if 0`` / ``#elif 0`` blocks in C are
@@ -1430,6 +1880,31 @@ class Plain:
         # Total: exactly 5 live edges
         assert len(calls) == 5
 
+    def test_rust_dead_guard_if_false_omits_dead_edges(self):
+        """CALLS edges inside ``if false`` blocks in Rust are never emitted.
+
+        Rust's if is an ``if_expression`` and its false literal is a
+        ``boolean_literal``, neither of which the Go/TS walk matches, so
+        without a Rust case every such call is kept. The else branch and
+        ``if true`` stay live.
+        """
+        _nodes, edges = self.parser.parse_file(
+            FIXTURES / "sample_dead_guard.rs",
+        )
+        calls = [e for e in edges if e.kind == "CALLS"]
+
+        def hits(name):
+            return [e for e in calls if e.target.split("::")[-1] == name]
+
+        assert len(hits("live_helper")) == 1
+        assert hits("dead_false_call") == []
+        assert hits("dead_in_consequence") == []
+        assert len(hits("live_in_else")) == 1
+        assert len(hits("live_final_else")) == 1
+        assert len(hits("some_condition")) == 1
+        assert len(hits("live_in_if_true")) == 1
+        assert len(calls) == 5
+
     def test_dead_guard_covers_declarations_nested_in_dead_branch(self):
         """A function or class declared inside a dead branch is never
         evaluated, so calls in its body are dead. This matches what the
@@ -1450,7 +1925,10 @@ class Plain:
                 encoding="utf-8",
             )
             _nodes, edges = self.parser.parse_file(src)
-        targets = {e.target.split("::")[-1] for e in edges if e.kind == "CALLS"}
+        targets = {
+            e.target.split("::")[-1]
+            for e in edges if e.kind == "CALLS"
+        }
         # Dead: declared inside the never-evaluated branch.
         assert "dead_in_fn" not in targets
         assert "dead_in_class" not in targets
@@ -1466,8 +1944,10 @@ class Plain:
         cases = [
             (
                 "sample_dead_guard.c",
-                {"dead_in_if0", "dead_in_wrapped", "dead_in_elif0", "dead_in_elifblock"},
-                {"live_helper", "live_in_else", "live_in_elif", "live_in_if1"},
+                {"dead_in_if0", "dead_in_wrapped", "dead_in_elif0",
+                 "dead_in_elifblock"},
+                {"live_helper", "live_in_else", "live_in_elif",
+                 "live_in_if1"},
             ),
             (
                 "sample_dead_guard.go",
@@ -1483,8 +1963,7 @@ class Plain:
         for fixture, dead, live in cases:
             nodes, edges = self.parser.parse_file(FIXTURES / fixture)
             with tempfile.NamedTemporaryFile(
-                suffix=".db",
-                delete=False,
+                suffix=".db", delete=False,
             ) as handle:
                 db_path = handle.name
             try:
@@ -1494,13 +1973,20 @@ class Plain:
                     for edge in edges:
                         store.upsert_edge(edge)
                     store.commit()
-                    targets = {t.split("::")[-1] for t in store.get_all_call_targets()}
+                    targets = {
+                        t.split("::")[-1]
+                        for t in store.get_all_call_targets()
+                    }
             finally:
                 Path(db_path).unlink(missing_ok=True)
             for name in dead:
-                assert name not in targets, f"{fixture}: dead target {name} leaked into the store"
+                assert name not in targets, (
+                    f"{fixture}: dead target {name} leaked into the store"
+                )
             for name in live:
-                assert name in targets, f"{fixture}: live target {name} missing from the store"
+                assert name in targets, (
+                    f"{fixture}: live target {name} missing from the store"
+                )
 
 
 class TestDeadGuardHelpers:
@@ -1687,7 +2173,9 @@ class TestDeadGuardHelpers:
     def test_c_else_live(self):
         from code_review_graph.parser import _is_in_static_dead_guard
 
-        root, _ = self._parse("c", b"void f() {\n#if 0\na();\n#else\nb();\n#endif\n}\n")
+        root, _ = self._parse(
+            "c", b"void f() {\n#if 0\na();\n#else\nb();\n#endif\n}\n"
+        )
         call_b = self._find_call(root, b"b")
         assert _is_in_static_dead_guard(call_b) is False
 
@@ -1705,6 +2193,155 @@ class TestDeadGuardHelpers:
         call = self._find_call(root, b"g")
         assert _is_in_static_dead_guard(call) is False
 
+    # --- _is_in_rust_dead_guard ---
+
+    def test_rust_if_false_dead(self):
+        from code_review_graph.parser import _is_in_rust_dead_guard
+
+        root, _ = self._parse("rust", b"fn f() { if false { g(); } }")
+        call = self._find_call(root, b"g")
+        assert _is_in_rust_dead_guard(call) is True
+
+    def test_rust_else_branch_live(self):
+        from code_review_graph.parser import _is_in_rust_dead_guard
+
+        root, _ = self._parse(
+            "rust", b"fn f() { if false { a(); } else { b(); } }"
+        )
+        call_b = self._find_call(root, b"b")
+        assert _is_in_rust_dead_guard(call_b) is False
+
+    def test_rust_if_true_live(self):
+        from code_review_graph.parser import _is_in_rust_dead_guard
+
+        root, _ = self._parse("rust", b"fn f() { if true { g(); } }")
+        call = self._find_call(root, b"g")
+        assert _is_in_rust_dead_guard(call) is False
+
+    def test_rust_no_guard_live(self):
+        from code_review_graph.parser import _is_in_rust_dead_guard
+
+        root, _ = self._parse("rust", b"fn f() { g(); }")
+        call = self._find_call(root, b"g")
+        assert _is_in_rust_dead_guard(call) is False
+
+    def test_rust_compound_condition_live(self):
+        """Only a literal ``false`` is dead: ``false && false`` is left alone."""
+        from code_review_graph.parser import _is_in_rust_dead_guard
+
+        root, _ = self._parse(
+            "rust", b"fn f() { if false && false { g(); } }"
+        )
+        call = self._find_call(root, b"g")
+        assert _is_in_rust_dead_guard(call) is False
+
+    def test_rust_value_position_if_false_dead(self):
+        """A ``let`` binding's ``if`` is the same node shape as a statement."""
+        from code_review_graph.parser import _is_in_rust_dead_guard
+
+        root, _ = self._parse(
+            "rust", b"fn f() { let x = if false { g() } else { 1 }; }"
+        )
+        call = self._find_call(root, b"g")
+        assert _is_in_rust_dead_guard(call) is True
+
+    def test_rust_impl_inside_if_false_keeps_method_calls(self):
+        """A method declared inside ``if false`` still runs when it is called.
+
+        Rust impl blocks are non-local: an ``impl`` written inside a branch
+        still applies to the type, so ``S::run()`` outside the branch reaches
+        the method. The guard around the declaration says nothing about calls
+        in the body, and dropping them reports live targets as dead code.
+        """
+        from code_review_graph.parser import _is_in_rust_dead_guard
+
+        root, _ = self._parse(
+            "rust",
+            b"struct S;\n"
+            b"fn main() {\n"
+            b"    if false {\n"
+            b"        impl S { fn run() { live(); } }\n"
+            b"    }\n"
+            b"    S::run();\n"
+            b"}\n",
+        )
+        call = self._find_call(root, b"live")
+        assert call is not None
+        assert _is_in_rust_dead_guard(call) is False
+
+    def test_rust_impl_associated_const_kept(self):
+        """An impl const is non-local too: its initialiser is reachable.
+
+        There is no ``function_item`` between the call and the guard here, so
+        a boundary placed on the function would still drop this live edge.
+        """
+        from code_review_graph.parser import _is_in_rust_dead_guard
+
+        root, _ = self._parse(
+            "rust",
+            b"struct S;\n"
+            b"fn main() {\n"
+            b"    if false { impl S { const X: i32 = g(); } }\n"
+            b"    let _ = S::X;\n"
+            b"}\n",
+        )
+        call = self._find_call(root, b"g")
+        assert call is not None
+        assert _is_in_rust_dead_guard(call) is False
+
+    def test_rust_block_scoped_item_under_guard_stays_dead(self):
+        """A local fn, mod or trait in a dead branch stays unreachable."""
+        from code_review_graph.parser import _is_in_rust_dead_guard
+
+        cases = {
+            "local fn": b"fn f() { if false { fn inner() { g(); } } }",
+            "mod": b"fn f() { if false { mod m { fn n() { g(); } } } }",
+            "trait": b"fn f() { if false { trait T { fn d() { g(); } } } }",
+        }
+        for label, source in cases.items():
+            root, _ = self._parse("rust", source)
+            call = self._find_call(root, b"g")
+            assert call is not None, label
+            assert _is_in_rust_dead_guard(call) is True, label
+
+    def test_rust_parenthesized_false_dead(self):
+        """``if (false)`` is the same branch with the literal parenthesised."""
+        from code_review_graph.parser import _is_in_rust_dead_guard
+
+        root, _ = self._parse("rust", b"fn f() { if (false) { g(); } }")
+        call = self._find_call(root, b"g")
+        assert call is not None
+        assert _is_in_rust_dead_guard(call) is True
+
+    def test_rust_guard_inside_method_body_still_dead(self):
+        """Ending the walk at a function boundary keeps the guards inside it."""
+        from code_review_graph.parser import _is_in_rust_dead_guard
+
+        root, _ = self._parse(
+            "rust", b"impl S { fn run() { if false { g(); } } }"
+        )
+        call = self._find_call(root, b"g")
+        assert call is not None
+        assert _is_in_rust_dead_guard(call) is True
+
+    def test_rust_dead_guard_keeps_impl_method_edges(self):
+        """``parse_file`` emits the callee of a method declared under a guard.
+
+        Both edges matter: the method is called from outside the dead branch,
+        which is why its body is live rather than merely present.
+        """
+        self.parser = CodeParser()
+        _nodes, edges = self.parser.parse_file(
+            FIXTURES / "sample_dead_guard_impl.rs",
+        )
+        pairs = {
+            (e.source.split("::")[-1], e.target.split("::")[-1])
+            for e in edges
+            if e.kind == "CALLS"
+        }
+        assert ("main", "S.run") in pairs
+        assert ("S.run", "live_helper") in pairs
+
     # --- _extract_calls integration ---
 
     def test_extract_calls_skips_dead_go(self):
@@ -1714,7 +2351,8 @@ class TestDeadGuardHelpers:
             FIXTURES / "sample_dead_guard.go",
         )
         dead = [
-            e for e in edges if e.kind == "CALLS" and e.target.split("::")[-1] == "dead_false_call"
+            e for e in edges
+            if e.kind == "CALLS" and e.target.split("::")[-1] == "dead_false_call"
         ]
         assert dead == []
 
@@ -1725,7 +2363,8 @@ class TestDeadGuardHelpers:
             FIXTURES / "sample_dead_guard.ts",
         )
         dead = [
-            e for e in edges if e.kind == "CALLS" and e.target.split("::")[-1] == "dead_false_call"
+            e for e in edges
+            if e.kind == "CALLS" and e.target.split("::")[-1] == "dead_false_call"
         ]
         assert dead == []
 
@@ -1735,7 +2374,23 @@ class TestDeadGuardHelpers:
         nodes, edges = self.parser.parse_file(
             FIXTURES / "sample_dead_guard.c",
         )
-        dead = [e for e in edges if e.kind == "CALLS" and e.target.split("::")[-1] == "dead_in_if0"]
+        dead = [
+            e for e in edges
+            if e.kind == "CALLS" and e.target.split("::")[-1] == "dead_in_if0"
+        ]
+        assert dead == []
+
+    def test_extract_calls_skips_dead_rust(self):
+        """_extract_calls returns True (skip) for a dead Rust call."""
+        self.parser = CodeParser()
+        nodes, edges = self.parser.parse_file(
+            FIXTURES / "sample_dead_guard.rs",
+        )
+        dead = [
+            e for e in edges
+            if e.kind == "CALLS"
+            and e.target.split("::")[-1] == "dead_false_call"
+        ]
         assert dead == []
 
     def test_extract_calls_keeps_live(self):
@@ -1744,7 +2399,10 @@ class TestDeadGuardHelpers:
         nodes, edges = self.parser.parse_file(
             FIXTURES / "sample_dead_guard.go",
         )
-        live = [e for e in edges if e.kind == "CALLS" and e.target.split("::")[-1] == "live_helper"]
+        live = [
+            e for e in edges
+            if e.kind == "CALLS" and e.target.split("::")[-1] == "live_helper"
+        ]
         assert len(live) == 1
 
 
@@ -1820,14 +2478,19 @@ class TestValueReferences:
         nodes, edges = self.parser.parse_file(FIXTURES / "sample_map_dispatch.ts")
         refs = [e for e in edges if e.kind == "REFERENCES"]
         # The register(handleCreate) call is inside 'dispatch'
-        dispatch_refs = [e for e in refs if "dispatch" in e.source and "handleCreate" in e.target]
+        dispatch_refs = [
+            e for e in refs
+            if "dispatch" in e.source and "handleCreate" in e.target
+        ]
         assert len(dispatch_refs) >= 1
 
     def test_no_references_for_unknown_identifiers(self):
         """Identifiers not in defined_names or import_map should NOT emit REFERENCES."""
         nodes, edges = self.parser.parse_bytes(
             Path("/test/example.ts"),
-            b"function outer() {\n  const map = { key: unknownFunc };\n}\n",
+            b"function outer() {\n"
+            b"  const map = { key: unknownFunc };\n"
+            b"}\n",
         )
         refs = [e for e in edges if e.kind == "REFERENCES"]
         ref_targets = {e.target for e in refs}
@@ -1837,7 +2500,10 @@ class TestValueReferences:
         """All-uppercase identifiers should NOT emit REFERENCES (likely constants)."""
         nodes, edges = self.parser.parse_bytes(
             Path("/test/example.ts"),
-            b"const MAX_SIZE = 100;\nfunction outer() {\n  const arr = [MAX_SIZE];\n}\n",
+            b"const MAX_SIZE = 100;\n"
+            b"function outer() {\n"
+            b"  const arr = [MAX_SIZE];\n"
+            b"}\n",
         )
         refs = [e for e in edges if e.kind == "REFERENCES"]
         ref_targets = {e.target for e in refs}
@@ -1847,7 +2513,6 @@ class TestValueReferences:
         """REFERENCES edges should have resolved (qualified) targets for local funcs."""
         nodes, edges = self.parser.parse_file(FIXTURES / "sample_map_dispatch.ts")
         refs = [e for e in edges if e.kind == "REFERENCES"]
-        file_path = (FIXTURES / "sample_map_dispatch.ts").as_posix()
         # At least some targets should be fully qualified
         qualified_refs = [e for e in refs if "::" in e.target]
         assert len(qualified_refs) > 0
@@ -1866,26 +2531,39 @@ class TestModuleScopeCalls:
         self.parser = CodeParser()
 
     def test_python_top_level_call_attributes_to_file(self):
-        source = b"def worker():\n    return 1\n\nworker()\n"
+        source = (
+            b"def worker():\n"
+            b"    return 1\n"
+            b"\n"
+            b"worker()\n"
+        )
         path = FIXTURES / "module_scope_py.py"
         _, edges = self.parser.parse_bytes(path, source)
 
         calls = [e for e in edges if e.kind == "CALLS"]
         top_level = [
-            e for e in calls if e.source == path.as_posix() and e.target.endswith("worker")
+            e for e in calls
+            if e.source == path.as_posix() and e.target.endswith("worker")
         ]
         assert len(top_level) == 1
         # Edge originates at the call site (line 4), not the def (line 1).
         assert top_level[0].line == 4
 
     def test_python_if_main_block_call_attributes_to_file(self):
-        source = b"def run_job():\n    return 1\n\nif __name__ == '__main__':\n    run_job()\n"
+        source = (
+            b"def run_job():\n"
+            b"    return 1\n"
+            b"\n"
+            b"if __name__ == '__main__':\n"
+            b"    run_job()\n"
+        )
         path = FIXTURES / "module_scope_cli.py"
         _, edges = self.parser.parse_bytes(path, source)
 
         calls = [e for e in edges if e.kind == "CALLS"]
         top_level = [
-            e for e in calls if e.source == path.as_posix() and e.target.endswith("run_job")
+            e for e in calls
+            if e.source == path.as_posix() and e.target.endswith("run_job")
         ]
         assert len(top_level) == 1
         # Edge originates inside the `if __name__` block (line 5).
@@ -1895,12 +2573,19 @@ class TestModuleScopeCalls:
         # Bare top-level JSX expression statement exercises the
         # _extract_jsx_child path specifically (not a value-reference
         # fallback from the `const element = ...` assignment).
-        source = b"import App from './App';\n\n<App />;\n"
+        source = (
+            b"import App from './App';\n"
+            b"\n"
+            b"<App />;\n"
+        )
         path = FIXTURES / "module_scope_entry.tsx"
         _, edges = self.parser.parse_bytes(path, source)
 
         calls = [e for e in edges if e.kind == "CALLS"]
-        top_level = [e for e in calls if e.source == path.as_posix() and e.target.endswith("App")]
+        top_level = [
+            e for e in calls
+            if e.source == path.as_posix() and e.target.endswith("App")
+        ]
         assert len(top_level) == 1
         # Edge originates at the JSX site (line 3), not the import (line 1).
         assert top_level[0].line == 3
@@ -1908,14 +2593,21 @@ class TestModuleScopeCalls:
     def test_r_top_level_call_attributes_to_file(self):
         # R scripts are overwhelmingly module-scope by convention; this is
         # the highest-leverage language for the fix after Python.
-        source = b"worker <- function() {\n  1\n}\n\nworker()\n"
+        source = (
+            b"worker <- function() {\n"
+            b"  1\n"
+            b"}\n"
+            b"\n"
+            b"worker()\n"
+        )
         path = FIXTURES / "module_scope_sample.R"
         _, edges = self.parser.parse_bytes(path, source)
 
         top_level = [
-            e
-            for e in edges
-            if e.kind == "CALLS" and e.source == path.as_posix() and e.target.endswith("worker")
+            e for e in edges
+            if e.kind == "CALLS"
+            and e.source == path.as_posix()
+            and e.target.endswith("worker")
         ]
         assert len(top_level) == 1
 
@@ -1927,9 +2619,10 @@ class TestModuleScopeCalls:
         _, edges = self.parser.parse_bytes(path, source)
 
         top_level = [
-            e
-            for e in edges
-            if e.kind == "CALLS" and e.source == path.as_posix() and e.target.endswith("puts")
+            e for e in edges
+            if e.kind == "CALLS"
+            and e.source == path.as_posix()
+            and e.target.endswith("puts")
         ]
         assert len(top_level) == 1
 
@@ -1975,6 +2668,8 @@ ExtensionID PlaybackExtension::ID() const { return {}; }
         ]
 
 
+
+
 class TestCppScopedFunctionName:
     """Regression tests for C++ scoped function name extraction.
 
@@ -1985,7 +2680,10 @@ class TestCppScopedFunctionName:
         """bufferlist OSDService::get_inc_map(...) should extract 'get_inc_map'."""
         src = tmp_path / "osd_service.cpp"
         src.write_text(
-            "bufferlist OSDService::get_inc_map(epoch_t e) {\n  bufferlist bl;\n  return bl;\n}\n"
+            "bufferlist OSDService::get_inc_map(epoch_t e) {\n"
+            "  bufferlist bl;\n"
+            "  return bl;\n"
+            "}\n"
         )
         p = CodeParser()
         nodes, _ = p.parse_file(src)
@@ -1997,7 +2695,9 @@ class TestCppScopedFunctionName:
         """std::string OSDMap::get_pool_name(...) should extract 'get_pool_name'."""
         src = tmp_path / "osd_map.cpp"
         src.write_text(
-            'std::string OSDMap::get_pool_name(int64_t pool_id) const {\n  return "";\n}\n'
+            "std::string OSDMap::get_pool_name(int64_t pool_id) const {\n"
+            '  return "";\n'
+            "}\n"
         )
         p = CodeParser()
         nodes, _ = p.parse_file(src)
@@ -2008,7 +2708,11 @@ class TestCppScopedFunctionName:
     def test_scoped_function_with_primitive_return_still_works(self, tmp_path):
         """int OSD::handle_osd_map(...) was already correct; verify no regression."""
         src = tmp_path / "osd.cpp"
-        src.write_text("int OSD::handle_osd_map(MOSDMap *m) {\n  return 0;\n}\n")
+        src.write_text(
+            "int OSD::handle_osd_map(MOSDMap *m) {\n"
+            "  return 0;\n"
+            "}\n"
+        )
         p = CodeParser()
         nodes, _ = p.parse_file(src)
         fns = [n for n in nodes if n.kind == "Function"]
@@ -2019,7 +2723,9 @@ class TestCppScopedFunctionName:
         """static std::string _make_key(...) should extract '_make_key'."""
         src = tmp_path / "util.cpp"
         src.write_text(
-            "static std::string _make_key(const std::string& prefix) {\n  return prefix;\n}\n"
+            "static std::string _make_key(const std::string& prefix) {\n"
+            "  return prefix;\n"
+            "}\n"
         )
         p = CodeParser()
         nodes, _ = p.parse_file(src)
@@ -2031,7 +2737,9 @@ class TestCppScopedFunctionName:
         """string RGWDedupProcessor::get_obj_fingerprint(...) should extract the method name."""
         src = tmp_path / "rgw_dedup.cpp"
         src.write_text(
-            'string RGWDedupProcessor::get_obj_fingerprint(const rgw_obj& obj) {\n  return "";\n}\n'
+            "string RGWDedupProcessor::get_obj_fingerprint(const rgw_obj& obj) {\n"
+            '  return "";\n'
+            "}\n"
         )
         p = CodeParser()
         nodes, _ = p.parse_file(src)
@@ -2056,7 +2764,9 @@ class TestJsMemberAssignedFunctions:
     def test_js_object_method_assignment_captured(self):
         nodes, _ = self.parser.parse_bytes(
             Path("/test/application.js"),
-            b"app.handle = function handle(req, res, next) {\n  next();\n};\n",
+            b"app.handle = function handle(req, res, next) {\n"
+            b"  next();\n"
+            b"};\n",
         )
         fns = {n.name for n in nodes if n.kind == "Function"}
         assert "app.handle" in fns
@@ -2064,7 +2774,9 @@ class TestJsMemberAssignedFunctions:
     def test_js_arrow_member_assignment_captured(self):
         nodes, _ = self.parser.parse_bytes(
             Path("/test/router.js"),
-            b"router.dispatch = (req, res) => {\n  return res;\n};\n",
+            b"router.dispatch = (req, res) => {\n"
+            b"  return res;\n"
+            b"};\n",
         )
         fns = {n.name for n in nodes if n.kind == "Function"}
         assert "router.dispatch" in fns
@@ -2087,8 +2799,7 @@ class TestJsMemberAssignedFunctions:
             b"app.handle = function handle(req, res) {};\n",
         )
         contains = [
-            e
-            for e in edges
+            e for e in edges
             if e.kind == "CONTAINS" and e.target == f"{path.as_posix()}::app.handle"
         ]
         assert len(contains) == 1
@@ -2098,7 +2809,8 @@ class TestJsMemberAssignedFunctions:
         """``obj.prop = <non-function>`` must not create a Function node."""
         nodes, _ = self.parser.parse_bytes(
             Path("/test/config.js"),
-            b"app.settings = { trust_proxy: false };\napp.locals = {};\n",
+            b"app.settings = { trust_proxy: false };\n"
+            b"app.locals = {};\n",
         )
         fns = {n.name for n in nodes if n.kind == "Function"}
         assert "app.settings" not in fns
@@ -2109,13 +2821,15 @@ class TestJsMemberAssignedFunctions:
         path = Path("/test/local_assignments.js")
         nodes, edges = self.parser.parse_bytes(
             path,
-            b"function a() { x.run = function () {}; }\nfunction b() { x.run = function () {}; }\n",
+            b"function a() { x.run = function () {}; }\n"
+            b"function b() { x.run = function () {}; }\n",
         )
         functions = [n for n in nodes if n.kind == "Function"]
         assert {n.name for n in functions} == {"a", "b"}
         assert all(n.name != "x.run" for n in functions)
         assert all(
-            not (e.kind == "CONTAINS" and e.target == f"{path.as_posix()}::x.run") for e in edges
+            not (e.kind == "CONTAINS" and e.target == f"{path.as_posix()}::x.run")
+            for e in edges
         )
 
     def test_sibling_top_level_blocks_do_not_share_member_identity(self):
@@ -2129,7 +2843,8 @@ class TestJsMemberAssignedFunctions:
         functions = [n for n in nodes if n.kind == "Function"]
         assert all(n.name != "x.run" for n in functions)
         assert all(
-            not (e.kind == "CONTAINS" and e.target == f"{path.as_posix()}::x.run") for e in edges
+            not (e.kind == "CONTAINS" and e.target == f"{path.as_posix()}::x.run")
+            for e in edges
         )
 
     def test_dynamic_receiver_assignment_is_not_a_stable_definition(self):
@@ -2142,7 +2857,10 @@ class TestJsMemberAssignedFunctions:
         functions = [n for n in nodes if n.kind == "Function"]
         assert all(n.name != "factory().handle" for n in functions)
         assert all(
-            not (e.kind == "CONTAINS" and e.target == f"{path.as_posix()}::factory().handle")
+            not (
+                e.kind == "CONTAINS"
+                and e.target == f"{path.as_posix()}::factory().handle"
+            )
             for e in edges
         )
 
@@ -2151,9 +2869,13 @@ class TestJsMemberAssignedFunctions:
         path = Path("/test/dynamic_call.js")
         _, edges = self.parser.parse_bytes(
             path,
-            b"factory().handle = function () {};\nfunction start() { factory().handle(); }\n",
+            b"factory().handle = function () {};\n"
+            b"function start() { factory().handle(); }\n",
         )
-        calls = [e for e in edges if e.kind == "CALLS" and e.source == f"{path.as_posix()}::start"]
+        calls = [
+            e for e in edges
+            if e.kind == "CALLS" and e.source == f"{path.as_posix()}::start"
+        ]
         assert len(calls) == 2
         handle_call = next(e for e in calls if e.target == "handle")
         assert "member_call" not in handle_call.extra
@@ -2163,11 +2885,13 @@ class TestJsMemberAssignedFunctions:
         path = Path("/test/application.js")
         _, edges = self.parser.parse_bytes(
             path,
-            b"function helper() { return 1; }\napp.handle = function handle() {\n  helper();\n};\n",
+            b"function helper() { return 1; }\n"
+            b"app.handle = function handle() {\n"
+            b"  helper();\n"
+            b"};\n",
         )
         calls = [
-            e
-            for e in edges
+            e for e in edges
             if e.kind == "CALLS"
             and e.source == f"{path.as_posix()}::app.handle"
             and e.target.endswith("helper")
@@ -2179,9 +2903,13 @@ class TestJsMemberAssignedFunctions:
         path = Path("/test/application.js")
         _, edges = self.parser.parse_bytes(
             path,
-            b"app.handle = function () {};\nfunction start() { app.handle(); }\n",
+            b"app.handle = function () {};\n"
+            b"function start() { app.handle(); }\n",
         )
-        calls = [e for e in edges if e.kind == "CALLS" and e.source == f"{path.as_posix()}::start"]
+        calls = [
+            e for e in edges
+            if e.kind == "CALLS" and e.source == f"{path.as_posix()}::start"
+        ]
         assert len(calls) == 1
         assert calls[0].target == f"{path.as_posix()}::app.handle"
 
@@ -2190,9 +2918,13 @@ class TestJsMemberAssignedFunctions:
         path = Path("/test/application.js")
         _, edges = self.parser.parse_bytes(
             path,
-            b"app.handle = function () {};\nfunction start() { app?.handle(); }\n",
+            b"app.handle = function () {};\n"
+            b"function start() { app?.handle(); }\n",
         )
-        calls = [e for e in edges if e.kind == "CALLS" and e.source == f"{path.as_posix()}::start"]
+        calls = [
+            e for e in edges
+            if e.kind == "CALLS" and e.source == f"{path.as_posix()}::start"
+        ]
         assert len(calls) == 1
         assert calls[0].target == f"{path.as_posix()}::app.handle"
 
@@ -2205,7 +2937,8 @@ class TestJsMemberAssignedFunctions:
         monkeypatch.setenv("CRG_SERIAL_PARSE", "1")
         source = tmp_path / "application.js"
         source.write_text(
-            "app.handle = function () { return 1; };\nfunction start() { return app.handle(); }\n",
+            "app.handle = function () { return 1; };\n"
+            "function start() { return app.handle(); }\n",
             encoding="utf-8",
         )
         member_qn = f"{source.as_posix()}::app.handle"
@@ -2217,7 +2950,9 @@ class TestJsMemberAssignedFunctions:
 
             member = store.get_node(member_qn)
             callers = [
-                edge for edge in store.get_edges_by_target(member_qn) if edge.kind == "CALLS"
+                edge
+                for edge in store.get_edges_by_target(member_qn)
+                if edge.kind == "CALLS"
             ]
 
         assert member is not None
@@ -2225,8 +2960,6 @@ class TestJsMemberAssignedFunctions:
         assert member.name == "app.handle"
         assert len(callers) == 1
         assert callers[0].source_qualified == caller_qn
-
-
 class TestTypeScriptTypeDeclarations:
     """TS interfaces / type aliases / enums are graph nodes, and type positions
     are dependencies.
@@ -2289,7 +3022,11 @@ class TestTypeScriptTypeDeclarations:
 
             _, edges = self.parser.parse_file(use)
 
-            refs = {(e.source, e.target) for e in edges if e.kind == "REFERENCES"}
+            refs = {
+                (e.source, e.target)
+                for e in edges
+                if e.kind == "REFERENCES"
+            }
             summarize = f"{use.as_posix()}::summarize"
             assert (summarize, f"{types.resolve().as_posix()}::Finding") in refs
             assert (summarize, f"{types.resolve().as_posix()}::Verdict") in refs
@@ -2309,13 +3046,18 @@ class TestTypeScriptTypeDeclarations:
 
             _, edges = self.parser.parse_file(use)
 
-            refs = {(edge.source, edge.target) for edge in edges if edge.kind == "REFERENCES"}
+            refs = {
+                (edge.source, edge.target)
+                for edge in edges
+                if edge.kind == "REFERENCES"
+            }
             assert (
                 f"{use.as_posix()}::summarize",
                 f"{types.resolve().as_posix()}::Finding",
             ) in refs
             assert not any(
-                target == f"{types.resolve().as_posix()}::ImportedFinding" for _, target in refs
+                target == f"{types.resolve().as_posix()}::ImportedFinding"
+                for _, target in refs
             )
 
     def test_type_argument_inside_a_generic_is_a_reference(self):
@@ -2375,7 +3117,8 @@ class TestTypeScriptTypeDeclarations:
             root = Path(tmp_dir)
             base = root / "base.ts"
             base.write_text(
-                "export class Base {}\nexport interface Findable { id: string }\n",
+                "export class Base {}\n"
+                "export interface Findable { id: string }\n",
                 encoding="utf-8",
             )
             impl = root / "impl.ts"
@@ -2389,7 +3132,9 @@ class TestTypeScriptTypeDeclarations:
 
             _, edges = self.parser.parse_file(impl)
 
-            inherits = {(e.source, e.target) for e in edges if e.kind == "INHERITS"}
+            inherits = {
+                (e.source, e.target) for e in edges if e.kind == "INHERITS"
+            }
             assert (f"{impl.as_posix()}::Impl", "Base") in inherits
             assert (f"{impl.as_posix()}::Impl", "Findable") in inherits
 
@@ -2453,16 +3198,20 @@ class TestTypeScriptTypeDeclarations:
 
             _, edges = self.parser.parse_file(wrapper)
 
-            inherits = [edge for edge in edges if edge.kind == "INHERITS" and edge.target == "Box"]
+            inherits = [
+                edge for edge in edges
+                if edge.kind == "INHERITS" and edge.target == "Box"
+            ]
             references = [
-                edge
-                for edge in edges
-                if edge.kind == "REFERENCES" and edge.target == f"{base.resolve().as_posix()}::Box"
+                edge for edge in edges
+                if edge.kind == "REFERENCES"
+                and edge.target == f"{base.resolve().as_posix()}::Box"
             ]
             assert len(inherits) == 2
             assert references == []
             assert any(
-                edge.kind == "REFERENCES" and edge.target == f"{base.resolve().as_posix()}::Payload"
+                edge.kind == "REFERENCES"
+                and edge.target == f"{base.resolve().as_posix()}::Payload"
                 for edge in edges
             )
 
@@ -2487,3 +3236,268 @@ class TestTypeScriptTypeDeclarations:
                 and e.target == f"{types.resolve().as_posix()}::Finding"
                 for e in edges
             )
+
+
+class TestJsGeneratorFunctions:
+    """Generator functions in JS/TS are Function nodes like any other function.
+
+    ``function* gen() {}`` parses as ``generator_function_declaration`` and
+    ``const gen = function* () {}`` as ``generator_function``. Neither node type
+    was listed, so a generator produced no node and its calls were attributed
+    to the enclosing file instead.
+    """
+
+    def setup_method(self):
+        self.parser = CodeParser()
+
+    @pytest.mark.parametrize("filename", ["gen.js", "gen.ts", "gen.tsx"])
+    def test_generator_declaration_is_a_function(self, filename):
+        path = Path("/test") / filename
+        nodes, edges = self.parser.parse_bytes(
+            path,
+            b"export function* ids(start) {\n"
+            b"  yield nextId(start);\n"
+            b"}\n",
+        )
+        fns = [n for n in nodes if n.kind == "Function"]
+        assert [f.name for f in fns] == ["ids"]
+        assert (fns[0].line_start, fns[0].line_end) == (1, 3)
+        qn = f"{path.as_posix()}::ids"
+        assert any(
+            e.kind == "CONTAINS" and e.source == path.as_posix() and e.target == qn
+            for e in edges
+        )
+        calls = [e for e in edges if e.kind == "CALLS" and e.target == "nextId"]
+        assert [e.source for e in calls] == [qn]
+
+    def test_async_generator_declaration_is_a_function(self):
+        nodes, _ = self.parser.parse_bytes(
+            Path("/test/stream.js"),
+            b"async function* pages() {\n"
+            b"  yield await fetchPage();\n"
+            b"}\n",
+        )
+        assert {n.name for n in nodes if n.kind == "Function"} == {"pages"}
+
+    @pytest.mark.parametrize("filename", ["gen.js", "gen.ts"])
+    def test_generator_expressions_assigned_to_names_are_functions(self, filename):
+        path = Path("/test") / filename
+        nodes, edges = self.parser.parse_bytes(
+            path,
+            b"const walk = function* (tree) {\n"
+            b"  yield visit(tree);\n"
+            b"};\n"
+            b"app.items = function* () {\n"
+            b"  yield load();\n"
+            b"};\n",
+        )
+        fns = {n.name for n in nodes if n.kind == "Function"}
+        assert fns == {"walk", "app.items"}
+        sources = {e.target: e.source for e in edges if e.kind == "CALLS"}
+        assert sources["visit"] == f"{path.as_posix()}::walk"
+        assert sources["load"] == f"{path.as_posix()}::app.items"
+
+    @pytest.mark.parametrize("value", [b"function* () { yield visit(); }", b"() => visit()"])
+    @pytest.mark.parametrize("function_first", [True, False])
+    def test_values_beside_a_function_keep_their_calls(self, value, function_first):
+        """A declaration that mixes a function and a value keeps the value's calls."""
+        parts = [b"walk = " + value, b"result = setup()"]
+        if not function_first:
+            parts.reverse()
+        path = Path("/test/gen.js")
+        nodes, edges = self.parser.parse_bytes(path, b"const " + b", ".join(parts) + b";\n")
+        assert {n.name for n in nodes if n.kind == "Function"} == {"walk"}
+        sources = {e.target: e.source for e in edges if e.kind == "CALLS"}
+        assert sources["visit"] == f"{path.as_posix()}::walk"
+        assert sources["setup"] == path.as_posix()
+
+
+class TestTypeScriptAbstractClasses:
+    """TS/TSX ``abstract class`` declarations are graph nodes, like concrete ones.
+
+    Tree-sitter gives an abstract class its own node type,
+    ``abstract_class_declaration``, and ``_CLASS_TYPES`` listed only
+    ``class_declaration``. An abstract base therefore contributed no Class node
+    and no Function nodes for its concrete methods, so shared behaviour hosted on
+    a base class was invisible to the graph even though every subclass was
+    indexed. See: #1031
+    """
+
+    def setup_method(self):
+        self.parser = CodeParser()
+
+    BASE_SOURCE = (
+        "export abstract class BaseService {\n"
+        "  abstract fetch(id: string): string;\n\n"
+        "  describe(): string {\n"
+        "    return 'base';\n"
+        "  }\n"
+        "}\n"
+    )
+
+    IMPL_SOURCE = (
+        "import { BaseService } from './base';\n\n"
+        "export class RealService extends BaseService {\n"
+        "  fetch(id: string): string {\n"
+        "    return id;\n"
+        "  }\n"
+        "}\n"
+    )
+
+    def _project(self, root: Path) -> tuple[Path, Path]:
+        base = root / "base.ts"
+        base.write_text(self.BASE_SOURCE, encoding="utf-8")
+        impl = root / "impl.ts"
+        impl.write_text(self.IMPL_SOURCE, encoding="utf-8")
+        return base, impl
+
+    def test_abstract_class_becomes_a_node(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base, _ = self._project(Path(tmp_dir))
+
+            nodes, _ = self.parser.parse_file(base)
+
+            classes = {n.name for n in nodes if n.kind == "Class"}
+            assert "BaseService" in classes
+
+    def test_concrete_method_of_an_abstract_class_is_contained_by_it(self):
+        """The class node is what gives its methods a parent, so a missing
+        abstract class also loses the methods hanging off it."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base, _ = self._project(Path(tmp_dir))
+
+            nodes, edges = self.parser.parse_file(base)
+
+            describe = [
+                n for n in nodes if n.kind == "Function" and n.name == "describe"
+            ]
+            assert len(describe) == 1
+            assert any(
+                e.kind == "CONTAINS"
+                and e.source == f"{base.as_posix()}::BaseService"
+                and e.target == f"{base.as_posix()}::BaseService.describe"
+                for e in edges
+            )
+
+    def test_abstract_class_in_tsx_becomes_a_node(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            panel = Path(tmp_dir) / "panel.tsx"
+            panel.write_text(
+                "export abstract class BasePanel {\n"
+                "  abstract title(): string;\n"
+                "}\n",
+                encoding="utf-8",
+            )
+
+            nodes, _ = self.parser.parse_file(panel)
+
+            assert "BasePanel" in {n.name for n in nodes if n.kind == "Class"}
+
+    def test_abstract_base_is_reachable_in_a_built_graph(self):
+        """Blast radius: the base and its concrete method are addressable by
+        qualified name once the whole project is built, not just the subclass."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            base, impl = self._project(root)
+            base_qn = f"{base.resolve().as_posix()}::BaseService"
+            impl_qn = f"{impl.resolve().as_posix()}::RealService"
+
+            with GraphStore(root / "graph.db") as store:
+                built = full_build(root, store)
+                assert built["errors"] == []
+
+                assert store.get_node(base_qn) is not None
+                assert store.get_node(f"{base_qn}.describe") is not None
+                assert store.get_node(impl_qn) is not None
+
+    def test_abstract_method_is_a_node_and_catches_this_calls(self):
+        """``this.step()`` in the base must land on a real node, not a phantom."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            for name in ("base.ts", "panel.tsx"):
+                path = Path(tmp_dir) / name
+                path.write_text(
+                    "export abstract class Base {\n"
+                    "  abstract step(): void;\n"
+                    "  run() { this.step(); }\n"
+                    "}\n",
+                    encoding="utf-8",
+                )
+
+                nodes, edges = self.parser.parse_file(path)
+
+                step = [n for n in nodes if n.name == "step"]
+                assert [n.kind for n in step] == ["Function"]
+                assert step[0].parent_name == "Base"
+                assert step[0].extra["abstract"] is True
+                assert any(
+                    e.kind == "CALLS"
+                    and e.source == f"{path.as_posix()}::Base.run"
+                    and e.target == f"{path.as_posix()}::Base.step"
+                    for e in edges
+                )
+
+    def test_subclass_method_called_through_abstract_base_is_not_dead(self):
+        """Indexing the base bound ``this.step()`` to it, so the override check
+        has to find the abstract declaration or the override reads as unused."""
+        from code_review_graph.refactor import find_dead_code
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir).resolve()
+            (root / "shapes.ts").write_text(
+                "export abstract class Middle {\n"
+                "  abstract step(): void;\n"
+                "  abstract unused(): void;\n"
+                "  run() { this.step(); }\n"
+                "}\n"
+                "export class Leaf extends Middle {\n"
+                "  step() {}\n"
+                "  unused() {}\n"
+                "  orphan() {}\n"
+                "}\n",
+                encoding="utf-8",
+            )
+
+            with GraphStore(root / "graph.db") as store:
+                assert full_build(root, store)["errors"] == []
+                dead = {d["qualified_name"] for d in find_dead_code(store, root=root)}
+
+            shapes = f"{(root / 'shapes.ts').as_posix()}"
+            assert f"{shapes}::Leaf.step" not in dead
+            # A signature has no body to delete; its implementations stay reportable.
+            assert f"{shapes}::Middle.unused" not in dead
+            assert f"{shapes}::Leaf.orphan" in dead
+class TestParserCacheAndUnreachableVisitorDirect:
+    def test_clear_caches_and_unreachable_visitor_direct(self):
+        parser = CodeParser()
+        parser.clear_caches(release_memory=False)
+        _clear_parser_probe_cache()
+
+        src = (
+            "from typing import TYPE_CHECKING\n"
+            "import typing as t\n"
+            "if TYPE_CHECKING:\n"
+            "    dead_call()\n"
+            "class C:\n"
+            "    def f(self):\n"
+            "        for x in [1]:\n"
+            "            with ctx():\n"
+            "                try:\n"
+            "                    live_call()\n"
+            "                except Exception:\n"
+            "                    err_call()\n"
+        )
+        tree = ast.parse(src)
+        tc_names, tc_mods = _python_type_checking_aliases(tree)
+        assert "TYPE_CHECKING" in tc_names
+        assert "t" in tc_mods
+
+        visitor = _PythonUnreachableCallVisitor(tc_names, tc_mods)
+        visitor.visit_Module(tree)
+        if_node = next(n for n in tree.body if isinstance(n, ast.If))
+        cls_node = next(n for n in tree.body if isinstance(n, ast.ClassDef))
+        fn_node = next(n for n in cls_node.body if isinstance(n, ast.FunctionDef))
+        visitor.visit_If(if_node)
+        visitor.visit_ClassDef(cls_node)
+        visitor._visit_function(fn_node)
+        visitor._visit_statements(tree.body, dead=False)
+        assert (4, 4) in visitor.positions

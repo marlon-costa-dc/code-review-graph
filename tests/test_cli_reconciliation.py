@@ -29,10 +29,7 @@ from code_review_graph import cli
     ],
 )
 def test_quiet_build_and_update_suppress_summary_and_info_logs(
-    command,
-    result,
-    capsys,
-    caplog,
+    command, result, capsys, caplog, tmp_path,
 ):
     """``--quiet`` must silence progress logs as well as the final summary."""
 
@@ -40,7 +37,7 @@ def test_quiet_build_and_update_suppress_summary_and_info_logs(
         logging.getLogger("code_review_graph.test_progress").info("parsing progress")
         return result
 
-    argv = ["code-review-graph", command, "--repo", "repo-root", "--quiet"]
+    argv = ["code-review-graph", command, "--repo", str(tmp_path), "--quiet"]
     with caplog.at_level(logging.INFO):
         with patch.object(sys, "argv", argv):
             with patch("code_review_graph.graph.GraphStore", return_value=MagicMock()):
@@ -106,6 +103,9 @@ def test_status_json_is_the_only_stdout_and_includes_current_sha(capsys):
         "current_sha": "current-sha",
         "svn_branch": None,
         "svn_revision": None,
+        # Freshness metadata cannot express "half built": this reports
+        # whether the last build finished its post-processing.
+        "build_incomplete": False,
     }
     assert output.count("\n") == 1
 
@@ -135,9 +135,7 @@ def test_status_quiet_prints_nothing(capsys):
 
 
 def test_status_missing_graph_exits_without_creating_data_tree(
-    tmp_path,
-    monkeypatch,
-    capsys,
+    tmp_path, monkeypatch, capsys,
 ):
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -160,10 +158,7 @@ def test_status_missing_graph_exits_without_creating_data_tree(
     ["status", "detect-changes", "visualize", "wiki", "watch"],
 )
 def test_read_only_commands_missing_graph_do_not_create_empty_db(
-    command,
-    tmp_path,
-    monkeypatch,
-    capsys,
+    command, tmp_path, monkeypatch, capsys,
 ):
     """#803: read-only consumers must not poison a repo with empty graph.db."""
     repo = tmp_path / "repo"
@@ -202,10 +197,7 @@ def test_read_only_commands_missing_graph_do_not_create_empty_db(
 
 @pytest.mark.parametrize("command", ["visualize", "wiki", "watch", "status"])
 def test_read_only_commands_data_dir_option_is_read_only(
-    command,
-    tmp_path,
-    monkeypatch,
-    capsys,
+    command, tmp_path, monkeypatch, capsys,
 ):
     """Explicit --data-dir must not create dirs/registry when the graph is missing."""
     repo = tmp_path / "repo"
@@ -260,9 +252,7 @@ def test_status_preserves_legacy_graph_migration(tmp_path, monkeypatch, capsys):
 
 
 def test_status_external_data_dir_does_not_migrate_unrelated_legacy_graph(
-    tmp_path,
-    monkeypatch,
-    capsys,
+    tmp_path, monkeypatch, capsys,
 ):
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -327,9 +317,7 @@ def test_status_data_dir_option_is_read_only(tmp_path, monkeypatch, capsys):
 
 
 def test_status_default_data_dir_override_does_not_migrate_legacy_graph(
-    tmp_path,
-    monkeypatch,
-    capsys,
+    tmp_path, monkeypatch, capsys,
 ):
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -359,9 +347,7 @@ def test_status_default_data_dir_override_does_not_migrate_legacy_graph(
 
 
 def test_enrich_command_reads_stdin_and_respects_external_data_dir(
-    tmp_path,
-    monkeypatch,
-    capsys,
+    tmp_path, monkeypatch, capsys,
 ):
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -416,9 +402,7 @@ def _dead_items():
 
 
 def test_dead_code_uses_project_root_external_data_and_reports_total(
-    tmp_path,
-    monkeypatch,
-    capsys,
+    tmp_path, monkeypatch, capsys,
 ):
     repo = tmp_path / "repo"
     subdir = repo / "src" / "nested"
@@ -502,7 +486,8 @@ def test_dead_code_missing_graph_exits_nonzero(tmp_path, monkeypatch, capsys):
     repo = tmp_path / "repo"
     repo.mkdir()
     (repo / ".git").mkdir()
-    monkeypatch.setenv("CRG_DATA_DIR", str(tmp_path / "missing-data"))
+    data_dir = tmp_path / "missing-data"
+    monkeypatch.setenv("CRG_DATA_DIR", str(data_dir))
     argv = ["code-review-graph", "dead-code", "--repo", str(repo)]
 
     with patch.object(sys, "argv", argv):
@@ -511,3 +496,4 @@ def test_dead_code_missing_graph_exits_nonzero(tmp_path, monkeypatch, capsys):
 
     assert exc_info.value.code == 1
     assert "No graph found" in capsys.readouterr().err
+    assert not data_dir.exists()

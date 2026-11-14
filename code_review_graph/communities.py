@@ -6,13 +6,21 @@ optional) with a file-based grouping fallback when igraph is not installed.
 
 from __future__ import annotations
 
+import importlib.util
 import logging
 import random
 import re
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, namedtuple
+from collections.abc import Sequence
+from pathlib import Path
 from typing import Any
 
+from .constants import env_int
 from .graph import GraphEdge, GraphNode, GraphStore, _sanitize_name
+
+_CommunityEdge = namedtuple(
+    "_CommunityEdge", ("kind", "source_qualified", "target_qualified")
+)
 
 # Fixed seed for igraph's RNG so Leiden community detection is reproducible
 # across runs. Without this, two builds of the same graph produce different
@@ -30,13 +38,15 @@ _SLUG_MAX_LEN = 30
 # Optional igraph import
 # ---------------------------------------------------------------------------
 
-try:
-    import igraph as ig  # type: ignore[import-untyped]
+IGRAPH_AVAILABLE = importlib.util.find_spec("igraph") is not None
+ig: Any = None
 
-    IGRAPH_AVAILABLE = True
-except ImportError:
-    ig = None  # type: ignore[assignment]
-    IGRAPH_AVAILABLE = False
+#: Metadata key naming the algorithm behind the stored communities, and its
+#: values. Risk scores weigh callers from other communities, so a report has
+#: to be able to say which grouping it was scored against.
+DETECTOR_METADATA_KEY = "community_detector"
+DETECTOR_LEIDEN = "leiden"
+DETECTOR_FILE = "file"
 
 # ---------------------------------------------------------------------------
 # Edge weight mapping
@@ -53,60 +63,15 @@ EDGE_WEIGHTS: dict[str, float] = {
 }
 
 # Common words to filter when generating community names
-_COMMON_WORDS = frozenset(
-    {
-        "get",
-        "set",
-        "self",
-        "init",
-        "new",
-        "create",
-        "update",
-        "delete",
-        "add",
-        "remove",
-        "make",
-        "build",
-        "from",
-        "to",
-        "for",
-        "with",
-        "the",
-        "and",
-        "test",
-        "main",
-        "run",
-        "do",
-        "is",
-        "has",
-        "on",
-        "of",
-        "in",
-        "at",
-        "by",
-        "my",
-        "this",
-        "that",
-        "all",
-        "none",
-        "should",
-        "when",
-        "then",
-        "given",
-        "return",
-        "returns",
-        "raise",
-        "raises",
-        "expect",
-        "expected",
-        "assert",
-        "tests",
-        "be",
-        "it",
-        "if",
-        "not",
-    }
-)
+_COMMON_WORDS = frozenset({
+    "get", "set", "self", "init", "new", "create", "update", "delete",
+    "add", "remove", "make", "build", "from", "to", "for", "with",
+    "the", "and", "test", "main", "run", "do", "is", "has", "on",
+    "of", "in", "at", "by", "my", "this", "that", "all", "none",
+    "should", "when", "then", "given", "return", "returns", "raise",
+    "raises", "expect", "expected", "assert", "tests", "be", "it", "if",
+    "not",
+})
 
 
 # ---------------------------------------------------------------------------
@@ -231,7 +196,7 @@ def _to_slug(s: str) -> str:
 
 def _compute_cohesion_batch(
     community_member_qns: list[set[str]],
-    all_edges: list[GraphEdge],
+    all_edges: Sequence[GraphEdge | _CommunityEdge],
 ) -> list[float]:
     """Compute cohesion for multiple communities in a single O(edges) pass.
 
@@ -276,7 +241,7 @@ def _compute_cohesion_batch(
     return results
 
 
-def _build_adjacency(edges: list[GraphEdge]) -> dict[str, list[str]]:
+def _build_adjacency(edges: Sequence[GraphEdge | _CommunityEdge]) -> dict[str, list[str]]:
     """Build adjacency list from edges (one pass over all edges)."""
     adj: dict[str, list[str]] = defaultdict(list)
     for e in edges:
@@ -287,7 +252,7 @@ def _build_adjacency(edges: list[GraphEdge]) -> dict[str, list[str]]:
 
 def _compute_cohesion(
     member_qns: set[str],
-    all_edges: list[GraphEdge],
+    all_edges: Sequence[GraphEdge | _CommunityEdge],
     adj: dict[str, list[str]] | None = None,
 ) -> float:
     """Compute cohesion: internal_edges / (internal_edges + external_edges).
@@ -307,7 +272,7 @@ def _reassign_test_nodes(
     clusters: list[list[int]],
     idx_to_node: dict[int, GraphNode],
     qn_to_idx: dict[str, int],
-    edges: list[GraphEdge],
+    edges: Sequence[GraphEdge | _CommunityEdge],
     resolution_nodes: list[GraphNode] | None = None,
 ) -> list[list[int]]:
     """Move tests to the community containing most unique tested subjects.
@@ -317,13 +282,19 @@ def _reassign_test_nodes(
     result deterministic without repeated linear-time list removals.
     """
     vertex_to_cluster = {
-        vertex: cluster_id for cluster_id, cluster in enumerate(clusters) for vertex in cluster
+        vertex: cluster_id
+        for cluster_id, cluster in enumerate(clusters)
+        for vertex in cluster
     }
 
     names_to_qns: dict[str, str | None] = {}
     nodes_for_resolution = resolution_nodes or list(idx_to_node.values())
     for node in nodes_for_resolution:
-        names_to_qns[node.name] = None if node.name in names_to_qns else node.qualified_name
+        names_to_qns[node.name] = (
+            None
+            if node.name in names_to_qns
+            else node.qualified_name
+        )
 
     def _resolve(endpoint: str) -> int | None:
         exact = qn_to_idx.get(endpoint)
@@ -348,7 +319,9 @@ def _reassign_test_nodes(
         if source_is_test == target_is_test:
             continue
 
-        test_index, subject_index = (source, target) if source_is_test else (target, source)
+        test_index, subject_index = (
+            (source, target) if source_is_test else (target, source)
+        )
         subjects_by_test[test_index].add(subject_index)
 
     target_by_test: dict[int, int] = {}
@@ -367,9 +340,15 @@ def _reassign_test_nodes(
 
         highest_vote = max(votes.values())
         tied_clusters = sorted(
-            cluster_id for cluster_id, vote_count in votes.items() if vote_count == highest_vote
+            cluster_id
+            for cluster_id, vote_count in votes.items()
+            if vote_count == highest_vote
         )
-        target_cluster = current_cluster if current_cluster in tied_clusters else tied_clusters[0]
+        target_cluster = (
+            current_cluster
+            if current_cluster in tied_clusters
+            else tied_clusters[0]
+        )
         target_by_test[test_index] = target_cluster
 
     reassigned: list[list[int]] = [[] for _ in clusters]
@@ -381,9 +360,36 @@ def _reassign_test_nodes(
     return reassigned
 
 
+def _load_igraph() -> bool:
+    """Import igraph lazily; a failed import disables the package for good.
+
+    ``find_spec("igraph")`` only proves the package directory exists. The
+    import itself can still fail when a native dependency is missing, so the
+    flag is cleared here and every caller falls back to file-based grouping
+    instead of returning an empty community set.
+    """
+    global ig, IGRAPH_AVAILABLE
+    if not IGRAPH_AVAILABLE:
+        return False
+    if ig is not None:
+        return True
+    try:
+        import igraph as _ig  # type: ignore[import-untyped]
+        # A native build can import and still fail on first attribute access,
+        # so touch the type we need while the handlers are still in scope.
+        _ig.Graph
+    except (ImportError, OSError, AttributeError) as exc:
+        # A missing native library surfaces as OSError, not ImportError.
+        logger.warning("igraph import failed (%s); using file-based communities", exc)
+        IGRAPH_AVAILABLE = False
+        return False
+    ig = _ig
+    return True
+
+
 def _detect_leiden(
     nodes: list[GraphNode],
-    edges: list[GraphEdge],
+    edges: Sequence[GraphEdge | _CommunityEdge],
     min_size: int,
     adj: dict[str, list[str]] | None = None,
 ) -> list[dict[str, Any]]:
@@ -393,7 +399,7 @@ def _detect_leiden(
     and skips the recursive sub-community splitting pass that caused
     exponential blow-up on large repos (>100k nodes).
     """
-    if ig is None:
+    if not _load_igraph():
         return []
 
     qn_to_idx: dict[str, int] = {}
@@ -423,7 +429,10 @@ def _detect_leiden(
                 weights.append(EDGE_WEIGHTS.get(e.kind, 0.5))
 
     if not edge_list:
-        return _detect_file_based(nodes, edges, min_size, adj=adj)
+        fallback = _detect_file_based(nodes, edges, min_size, adj=adj)
+        for comm in fallback:
+            comm["detector"] = DETECTOR_FILE
+        return fallback
 
     g.add_edges(edge_list)
     g.es["weight"] = weights
@@ -432,19 +441,15 @@ def _detect_leiden(
     # coarser clusters on large repos.  Default resolution=1.0 produces
     # thousands of tiny communities for 30k+ node graphs.
     import math
-
     n_nodes = g.vcount()
     resolution = max(0.05, 1.0 / math.log10(max(n_nodes, 10)))
 
     logger.info(
         "Running Leiden on %d nodes, %d edges...",
-        g.vcount(),
-        g.ecount(),
+        g.vcount(), g.ecount(),
     )
 
-    import os
-
-    seed = int(os.environ.get("CRG_LEIDEN_SEED", _LEIDEN_SEED))
+    seed = env_int("CRG_LEIDEN_SEED", _LEIDEN_SEED)
     # Deterministic seeding for benchmark reproducibility — community
     # detection is not a security-sensitive context. nosec B311.
     ig.set_random_number_generator(random.Random(seed))  # nosec B311
@@ -485,18 +490,16 @@ def _detect_leiden(
         dominant_lang = lang_counts.most_common(1)[0][0] if lang_counts else ""
         name = _generate_community_name(members)
 
-        communities.append(
-            {
-                "name": name,
-                "level": 0,
-                "size": len(members),
-                "cohesion": round(cohesion, 4),
-                "dominant_language": dominant_lang,
-                "description": f"Community of {len(members)} nodes",
-                "members": [m.qualified_name for m in members],
-                "member_qns": member_qns,
-            }
-        )
+        communities.append({
+            "name": name,
+            "level": 0,
+            "size": len(members),
+            "cohesion": round(cohesion, 4),
+            "dominant_language": dominant_lang,
+            "description": f"Community of {len(members)} nodes",
+            "members": [m.qualified_name for m in members],
+            "member_qns": member_qns,
+        })
 
     logger.info("Community detection complete: %d communities", len(communities))
     return communities
@@ -509,7 +512,7 @@ def _detect_leiden(
 
 def _detect_file_based(
     nodes: list[GraphNode],
-    edges: list[GraphEdge],
+    edges: Sequence[GraphEdge | _CommunityEdge],
     min_size: int,
     adj: dict[str, list[str]] | None = None,
 ) -> list[dict[str, Any]]:
@@ -579,18 +582,16 @@ def _detect_file_based(
         dominant_lang = lang_counts.most_common(1)[0][0] if lang_counts else ""
         name = _generate_community_name(members)
 
-        communities.append(
-            {
-                "name": name,
-                "level": 0,
-                "size": len(members),
-                "cohesion": round(cohesion, 4),
-                "dominant_language": dominant_lang,
-                "description": f"Directory-based community: {dir_path}",
-                "members": [m.qualified_name for m in members],
-                "member_qns": member_qns,
-            }
-        )
+        communities.append({
+            "name": name,
+            "level": 0,
+            "size": len(members),
+            "cohesion": round(cohesion, 4),
+            "dominant_language": dominant_lang,
+            "description": f"Directory-based community: {dir_path}",
+            "members": [m.qualified_name for m in members],
+            "member_qns": member_qns,
+        })
 
     return communities
 
@@ -603,7 +604,7 @@ def _detect_file_based(
 def _split_oversized(
     communities: list[dict],
     nodes: list[GraphNode],
-    edges: list[GraphEdge],
+    edges: Sequence[GraphEdge | _CommunityEdge],
     threshold_pct: float = 0.25,
     min_split_size: int = 10,
 ) -> list[dict]:
@@ -612,16 +613,21 @@ def _split_oversized(
     Uses Leiden on the subgraph of oversized communities. If igraph is
     not available, returns communities unchanged.
     """
-    if not IGRAPH_AVAILABLE:
+    if not _load_igraph():
         return communities
 
-    total = sum(c.get("size", len(c.get("members", []))) for c in communities)
+    total = sum(
+        c.get("size", len(c.get("members", [])))
+        for c in communities
+    )
     if total == 0:
         return communities
 
     threshold = max(int(total * threshold_pct), min_split_size)
     result: list[dict] = []
-    next_id = max((c.get("id", 0) for c in communities), default=0) + 1
+    next_id = max(
+        (c.get("id", 0) for c in communities), default=0
+    ) + 1
 
     for comm in communities:
         members = set(comm.get("members", []))
@@ -630,9 +636,16 @@ def _split_oversized(
             continue
 
         # Build subgraph for this community
-        member_nodes = [n for n in nodes if n.qualified_name in members]
+        member_nodes = [
+            n for n in nodes
+            if n.qualified_name in members
+        ]
         member_edges = [
-            e for e in edges if (e.source_qualified in members and e.target_qualified in members)
+            e for e in edges
+            if (
+                e.source_qualified in members
+                and e.target_qualified in members
+            )
         ]
 
         if len(member_nodes) < min_split_size:
@@ -640,7 +653,10 @@ def _split_oversized(
             continue
 
         # Run Leiden on subgraph
-        qn_to_idx = {n.qualified_name: i for i, n in enumerate(member_nodes)}
+        qn_to_idx = {
+            n.qualified_name: i
+            for i, n in enumerate(member_nodes)
+        }
         idx_to_node = {i: node for i, node in enumerate(member_nodes)}
         # GraphStore preserves one edge per call site. Leiden needs one stable
         # edge per vertex pair so duplicate call sites cannot bias a split.
@@ -669,9 +685,7 @@ def _split_oversized(
                 directed=False,
             )
             g.es["weight"] = ig_weights
-            import os
-
-            seed = int(os.environ.get("CRG_LEIDEN_SEED", _LEIDEN_SEED))
+            seed = env_int("CRG_LEIDEN_SEED", _LEIDEN_SEED)
             # Deterministic seeding for benchmark reproducibility — community
             # detection is not a security-sensitive context. nosec B311.
             ig.set_random_number_generator(random.Random(seed))  # nosec B311
@@ -693,7 +707,9 @@ def _split_oversized(
                 resolution_nodes=nodes,
             )
             sub_communities = [
-                [idx_to_node[idx] for idx in cluster] for cluster in reassigned_clusters if cluster
+                [idx_to_node[idx] for idx in cluster]
+                for cluster in reassigned_clusters
+                if cluster
             ]
 
             if len(sub_communities) <= 1:
@@ -703,11 +719,14 @@ def _split_oversized(
             parent_id = comm.get("id", 0)
             comm_name = comm.get("name", "")
             sub_member_qns = [
-                {node.qualified_name for node in sub_nodes} for sub_nodes in sub_communities
+                {node.qualified_name for node in sub_nodes}
+                for sub_nodes in sub_communities
             ]
             cohesions = _compute_cohesion_batch(sub_member_qns, edges)
 
-            for sub_nodes, member_qns, cohesion in zip(sub_communities, sub_member_qns, cohesions):
+            for sub_nodes, member_qns, cohesion in zip(
+                sub_communities, sub_member_qns, cohesions
+            ):
                 generated_name = _generate_community_name(sub_nodes)
                 if generated_name in {"", "empty", "cluster"}:
                     generated_name = f"{comm_name}-{next_id}"
@@ -719,21 +738,27 @@ def _split_oversized(
                     "members": [node.qualified_name for node in sub_nodes],
                     "size": len(member_qns),
                     "cohesion": cohesion,
-                    "dominant_language": comm.get("dominant_language"),
-                    "description": (f"Split from {comm_name}"),
+                    "dominant_language": comm.get(
+                        "dominant_language"
+                    ),
+                    "description": (
+                        f"Split from {comm_name}"
+                    ),
                 }
                 result.append(sub_comm)
                 next_id += 1
 
             logger.info(
-                "Split oversized community '%s' (%d members) into %d",
+                "Split oversized community '%s' "
+                "(%d members) into %d",
                 comm_name,
                 len(members),
                 len(sub_communities),
             )
         except Exception:
             logger.warning(
-                "Failed to split community '%s', keeping as-is",
+                "Failed to split community '%s', "
+                "keeping as-is",
                 comm.get("name", ""),
                 exc_info=True,
             )
@@ -747,13 +772,19 @@ def _dedupe_community_names(
     nodes: list[GraphNode],
 ) -> None:
     """Disambiguate exact duplicate names while keeping the largest unchanged."""
-    communities_by_name: dict[str, list[tuple[int, dict[str, Any]]]] = defaultdict(list)
+    communities_by_name: dict[str, list[tuple[int, dict[str, Any]]]] = (
+        defaultdict(list)
+    )
     for position, community in enumerate(communities):
-        communities_by_name[community.get("name", "")].append((position, community))
+        communities_by_name[community.get("name", "")].append(
+            (position, community)
+        )
 
     nodes_by_qn = {node.qualified_name: node for node in nodes}
     taken_names = {
-        community.get("name", "") for community in communities if community.get("name", "")
+        community.get("name", "")
+        for community in communities
+        if community.get("name", "")
     }
 
     for base_name, duplicates in communities_by_name.items():
@@ -802,7 +833,9 @@ def _dedupe_community_names(
 # ---------------------------------------------------------------------------
 
 
-def detect_communities(store: GraphStore, min_size: int = 2) -> list[dict[str, Any]]:
+def detect_communities(
+    store: GraphStore, min_size: int = 2
+) -> list[dict[str, Any]]:
     """Detect communities in the code graph.
 
     Uses the Leiden algorithm via igraph if available, otherwise falls back to
@@ -816,33 +849,44 @@ def detect_communities(store: GraphStore, min_size: int = 2) -> list[dict[str, A
         List of community dicts with keys: name, level, size, cohesion,
         dominant_language, description, members, member_qns.
     """
+    # Detection reads only kind and endpoints, so skip building a GraphEdge
+    # (and decoding its JSON extra) for every edge in the graph.
+    all_edges: Sequence[GraphEdge | _CommunityEdge] = [
+        _CommunityEdge(row[0], row[1], row[2])
+        for row in store._conn.execute(
+            "SELECT kind, source_qualified, target_qualified FROM edges"
+        ).fetchall()
+    ]
     # Gather all nodes (exclude File nodes to focus on code entities)
-    all_edges = store.get_all_edges()
     unique_nodes = store.get_all_nodes(exclude_files=True)
 
-    # Build adjacency index once for fast cohesion computation
-    adj = _build_adjacency(all_edges)
-
-    logger.info(
+    logger.debug(
         "Loaded %d unique nodes, %d edges",
-        len(unique_nodes),
-        len(all_edges),
+        len(unique_nodes), len(all_edges),
     )
 
-    if IGRAPH_AVAILABLE:
+    if _load_igraph():
         logger.info("Detecting communities with Leiden algorithm (igraph)")
-        results = _detect_leiden(unique_nodes, all_edges, min_size, adj=adj)
+        results = _detect_leiden(unique_nodes, all_edges, min_size)
+        detector = DETECTOR_LEIDEN
     else:
-        logger.info("igraph not available, using file-based community detection")
-        results = _detect_file_based(unique_nodes, all_edges, min_size, adj=adj)
+        logger.info(
+            'Tip: pip install "code-review-graph[communities]" for finer communities '
+            "(grouping by file for now)."
+        )
+        results = _detect_file_based(unique_nodes, all_edges, min_size)
+        detector = DETECTOR_FILE
 
     # Split oversized communities
     results = _split_oversized(
-        results,
-        unique_nodes,
-        all_edges,
+        results, unique_nodes, all_edges,
     )
     _dedupe_community_names(results, unique_nodes)
+    # Which algorithm made each community, for store_communities to record.
+    # Leiden falls back to file grouping on a graph with no usable edges and
+    # tags those itself; the parts of a split community are Leiden's.
+    for comm in results:
+        comm.setdefault("detector", detector)
 
     # Convert member_qns (internal set) to a list for serialization safety,
     # then strip it from the returned dicts to avoid leaking internal state.
@@ -854,45 +898,153 @@ def detect_communities(store: GraphStore, min_size: int = 2) -> list[dict[str, A
     return results
 
 
+def capture_community_assignments(
+    store: GraphStore,
+    file_paths: list[str],
+) -> dict[str, int]:
+    """Capture ``qualified_name -> community_id`` for nodes in *file_paths*.
+
+    Must run **before** node replacement so assignments can be remapped onto
+    the new node rows after IDs churn (#569).
+    """
+    if not file_paths:
+        return {}
+
+    conn = store._conn
+    mapping: dict[str, int] = {}
+    for i in range(0, len(file_paths), _SQL_BATCH):
+        batch = file_paths[i:i + _SQL_BATCH]
+        placeholders = ",".join("?" * len(batch))
+        rows = conn.execute(
+            f"SELECT qualified_name, community_id FROM nodes "  # nosec B608
+            f"WHERE community_id IS NOT NULL AND file_path IN ({placeholders})",
+            batch,
+        ).fetchall()
+        for qn, cid in rows:
+            if qn and cid is not None:
+                mapping[qn] = int(cid)
+    return mapping
+
+
+def remap_community_assignments(
+    store: GraphStore,
+    community_by_qn: dict[str, int],
+) -> int:
+    """Re-apply captured community IDs onto current nodes by qualified name.
+
+    Returns the number of nodes updated.
+    """
+    if not community_by_qn:
+        return 0
+
+    conn = store._conn
+    updated = 0
+    items = list(community_by_qn.items())
+    if conn.in_transaction:
+        logger.warning("Rolling back uncommitted transaction before BEGIN IMMEDIATE")
+        conn.rollback()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        for qn, cid in items:
+            cur = conn.execute(
+                "UPDATE nodes SET community_id = ? WHERE qualified_name = ?",
+                (cid, qn),
+            )
+            if cur.rowcount:
+                updated += cur.rowcount
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    return updated
+
+
+def purge_empty_communities(store: GraphStore) -> int:
+    """Delete community rows that no longer have any assigned nodes.
+
+    Also refreshes ``size`` for communities that still have members so
+    incremental deletion stays consistent with a fresh full rebuild.
+    Returns the number of empty community rows removed.
+    """
+    conn = store._conn
+    if conn.in_transaction:
+        logger.warning("Rolling back uncommitted transaction before BEGIN IMMEDIATE")
+        conn.rollback()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        # Refresh sizes from live node assignments.
+        conn.execute(
+            "UPDATE communities SET size = ("
+            "SELECT COUNT(*) FROM nodes "
+            "WHERE nodes.community_id = communities.id)"
+        )
+        cur = conn.execute(
+            "DELETE FROM communities WHERE id NOT IN ("
+            "SELECT DISTINCT community_id FROM nodes "
+            "WHERE community_id IS NOT NULL)"
+        )
+        deleted = cur.rowcount if cur.rowcount is not None and cur.rowcount >= 0 else 0
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    return deleted
+
+
 def incremental_detect_communities(
     store: GraphStore,
     changed_files: list[str],
     min_size: int = 2,
+    repo_root: str | Path | None = None,
+    force: bool = False,
 ) -> int:
     """Re-detect communities only if changed files affect existing communities.
 
     If no existing communities contain nodes from changed files, skips
-    re-detection entirely (the common case for small changes). Otherwise
-    re-runs full community detection.
+    re-detection unless changed files contain unassigned code nodes. That
+    happens for a file new to the graph, which was in no community to be
+    affected, and for a re-parsed file whose nodes were inserted without
+    their old assignment. In that case, re-run full community detection to
+    assign the new nodes, as a clean build would.
 
     Args:
         store: The GraphStore instance.
         changed_files: List of file paths that have changed.
         min_size: Minimum number of nodes for a community to be included.
+        repo_root: Optional repo root used to expand relative/absolute paths.
+        force: When True, always re-run detection (used after pre-replacement
+            capture showed communities were affected even if path matching
+            would otherwise miss them).
 
     Returns:
         Number of communities detected, or 0 if skipped.
     """
-    if not changed_files:
+    if not changed_files and not force:
         return 0
 
+    from .flows import expand_changed_file_paths
+
+    expanded = expand_changed_file_paths(store, changed_files, repo_root=repo_root)
     conn = store._conn
 
     # Check if any communities are affected (batch to stay under SQLite limit)
     affected_count = 0
-    for i in range(0, len(changed_files), _SQL_BATCH):
-        batch = changed_files[i : i + _SQL_BATCH]
+    unassigned_count = 0
+    for i in range(0, len(expanded), _SQL_BATCH):
+        batch = expanded[i:i + _SQL_BATCH]
         placeholders = ",".join("?" * len(batch))
         row = conn.execute(
-            f"SELECT COUNT(DISTINCT community_id) FROM nodes "  # nosec B608
-            f"WHERE community_id IS NOT NULL AND file_path IN ({placeholders})",
+            f"SELECT COUNT(DISTINCT community_id), "  # nosec B608
+            f"SUM(CASE WHEN community_id IS NULL AND kind != 'File' "
+            f"THEN 1 ELSE 0 END) FROM nodes "
+            f"WHERE file_path IN ({placeholders})",
             batch,
         ).fetchone()
         if row:
-            affected_count += row[0]
-    affected = (affected_count,) if affected_count else None
+            affected_count += row[0] or 0
+            unassigned_count += row[1] or 0
 
-    if not affected or affected[0] == 0:
+    if not force and affected_count == 0 and unassigned_count == 0:
         return 0  # No communities affected, skip
 
     # Re-run full community detection (correct and fast enough)
@@ -900,7 +1052,9 @@ def incremental_detect_communities(
     return store_communities(store, communities)
 
 
-def store_communities(store: GraphStore, communities: list[dict[str, Any]]) -> int:
+def store_communities(
+    store: GraphStore, communities: list[dict[str, Any]]
+) -> int:
     """Store detected communities in the database.
 
     Clears existing communities and community_id assignments, then inserts
@@ -948,13 +1102,27 @@ def store_communities(store: GraphStore, communities: list[dict[str, Any]]) -> i
             # Batch update community_id on member nodes
             member_qns = comm.get("members", [])
             for j in range(0, len(member_qns), _SQL_BATCH):
-                batch = member_qns[j : j + _SQL_BATCH]
+                batch = member_qns[j:j + _SQL_BATCH]
                 placeholders = ",".join("?" * len(batch))
                 conn.execute(
                     f"UPDATE nodes SET community_id = ? WHERE qualified_name IN ({placeholders})",  # nosec B608
                     [community_id] + batch,
                 )
             count += 1
+
+        # Recorded in the same transaction as the communities it describes,
+        # so the two cannot disagree. Communities from a caller that does not
+        # say how they were made leave no record rather than a guessed one.
+        tags = [comm.get("detector") for comm in communities]
+        if tags and all(tags):
+            conn.execute(
+                "INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)",
+                (DETECTOR_METADATA_KEY, "+".join(sorted({str(t) for t in tags}))),
+            )
+        else:
+            conn.execute(
+                "DELETE FROM metadata WHERE key = ?", (DETECTOR_METADATA_KEY,),
+            )
 
         conn.commit()
     except BaseException:
@@ -964,7 +1132,10 @@ def store_communities(store: GraphStore, communities: list[dict[str, Any]]) -> i
 
 
 def get_communities(
-    store: GraphStore, sort_by: str = "size", min_size: int = 0
+    store: GraphStore,
+    sort_by: str = "size",
+    min_size: int = 0,
+    members_by_community: dict[int, list[str]] | None = None,
 ) -> list[dict[str, Any]]:
     """Retrieve stored communities from the database.
 
@@ -972,6 +1143,8 @@ def get_communities(
         store: The GraphStore instance.
         sort_by: Column to sort by ("size", "cohesion", "name").
         min_size: Minimum community size to include.
+        members_by_community: Members to report for each community id, for a
+            caller that only wants some of them. Saves one query per community.
 
     Returns:
         List of community dicts.
@@ -993,20 +1166,25 @@ def get_communities(
     communities: list[dict[str, Any]] = []
     for row in rows:
         # Fetch member qualified names for this community
-        member_qns = [_sanitize_name(qn) for qn in store.get_community_member_qns(row["id"])]
-
-        communities.append(
-            {
-                "id": row["id"],
-                "name": _sanitize_name(row["name"]),
-                "level": row["level"],
-                "cohesion": row["cohesion"],
-                "size": row["size"],
-                "dominant_language": row["dominant_language"] or "",
-                "description": _sanitize_name(row["description"] or ""),
-                "members": member_qns,
-            }
+        member_qns = (
+            [
+                _sanitize_name(qn)
+                for qn in store.get_community_member_qns(row["id"])
+            ]
+            if members_by_community is None
+            else members_by_community.get(row["id"], [])
         )
+
+        communities.append({
+            "id": row["id"],
+            "name": _sanitize_name(row["name"]),
+            "level": row["level"],
+            "cohesion": row["cohesion"],
+            "size": row["size"],
+            "dominant_language": row["dominant_language"] or "",
+            "description": _sanitize_name(row["description"] or ""),
+            "members": member_qns,
+        })
 
     return communities
 
@@ -1055,18 +1233,20 @@ def get_architecture_overview(store: GraphStore) -> dict[str, Any]:
             continue
         src_comm = node_to_community.get(e.source_qualified)
         tgt_comm = node_to_community.get(e.target_qualified)
-        if src_comm is not None and tgt_comm is not None and src_comm != tgt_comm:
+        if (
+            src_comm is not None
+            and tgt_comm is not None
+            and src_comm != tgt_comm
+        ):
             pair = (min(src_comm, tgt_comm), max(src_comm, tgt_comm))
             cross_counts[pair] += 1
-            cross_edges.append(
-                {
-                    "source_community": src_comm,
-                    "target_community": tgt_comm,
-                    "edge_kind": e.kind,
-                    "source": _sanitize_name(e.source_qualified),
-                    "target": _sanitize_name(e.target_qualified),
-                }
-            )
+            cross_edges.append({
+                "source_community": src_comm,
+                "target_community": tgt_comm,
+                "edge_kind": e.kind,
+                "source": _sanitize_name(e.source_qualified),
+                "target": _sanitize_name(e.target_qualified),
+            })
 
     # Generate warnings for high coupling, skipping test-dominated pairs.
     warnings: list[str] = []
@@ -1079,7 +1259,10 @@ def get_architecture_overview(store: GraphStore) -> dict[str, Any]:
             # between test and production code is expected, not architectural.
             if _is_test_community(name1) or _is_test_community(name2):
                 continue
-            warnings.append(f"High coupling ({count} edges) between '{name1}' and '{name2}'")
+            warnings.append(
+                f"High coupling ({count} edges) between "
+                f"'{name1}' and '{name2}'"
+            )
 
     return {
         "communities": communities,

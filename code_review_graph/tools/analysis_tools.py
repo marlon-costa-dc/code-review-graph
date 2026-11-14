@@ -11,13 +11,7 @@ from ..analysis import (
     find_surprising_connections,
     generate_suggested_questions,
 )
-from ._common import (
-    _bounded,
-    _get_store_for_read,
-    _not_built_response,
-    _shown_of,
-    _validate_positive_int,
-)
+from ._common import _bounded, _get_store, _shown_of, _validate_positive_int
 
 # The ranking helpers already score every candidate before slicing, so asking
 # for "all" costs nothing extra and lets the tool report an honest ``total``.
@@ -33,7 +27,9 @@ _MAX_GAPS_PER_CATEGORY = 50
 _MINIMAL_HUB_FIELDS = ("name", "kind", "total_degree")
 _MINIMAL_BRIDGE_FIELDS = ("name", "kind", "betweenness")
 _MINIMAL_SURPRISE_FIELDS = ("source", "target", "edge_kind", "surprise_score")
-_MINIMAL_GAP_FIELDS = ("name", "qualified_name", "community_id", "size", "degree")
+_MINIMAL_GAP_FIELDS = (
+    "name", "qualified_name", "community_id", "size", "degree", "load_time",
+)
 
 
 def _project(rows: list[dict[str, Any]], fields: tuple[str, ...]) -> list[dict[str, Any]]:
@@ -64,28 +60,27 @@ def get_hub_nodes_func(
     """
     _validate_positive_int(top_n, "top_n")
 
-    store, _root, not_built = _get_store_for_read(repo_root or None)
-    if store is None:
-        return not_built if not_built is not None else _not_built_response()
+    store, _root = _get_store(repo_root or None)
     try:
         hubs, total, truncated = _bounded(
-            find_hub_nodes(store, top_n=_FETCH_ALL),
-            top_n,
-            _MAX_HUB_NODES,
+            find_hub_nodes(store, top_n=_FETCH_ALL), top_n, _MAX_HUB_NODES,
         )
         if detail_level == "minimal":
             hubs = _project(hubs, _MINIMAL_HUB_FIELDS)
         return {
             "status": "ok",
-            "summary": (f"{total} hub node(s) ranked by degree" + _shown_of(len(hubs), total)),
+            "summary": (
+                f"{total} hub node(s) ranked by degree"
+                + _shown_of(len(hubs), total)
+            ),
             "hub_nodes": hubs,
             "count": len(hubs),
             "total": total,
             "truncated": truncated,
             "next_tool_suggestions": [
-                "get_impact_radius -- check blast radius of a hub",
-                "query_graph callers_of -- see what calls a hub",
-                "get_bridge_nodes -- find architectural chokepoints",
+                "get_impact_radius_tool -- check blast radius of a hub",
+                "query_graph_tool callers_of -- see what calls a hub",
+                "get_bridge_nodes_tool -- find architectural chokepoints",
             ],
         }
     finally:
@@ -115,30 +110,27 @@ def get_bridge_nodes_func(
     """
     _validate_positive_int(top_n, "top_n")
 
-    store, _root, not_built = _get_store_for_read(repo_root or None)
-    if store is None:
-        return not_built if not_built is not None else _not_built_response()
+    store, _root = _get_store(repo_root or None)
     try:
         bridges, total, truncated = _bounded(
-            find_bridge_nodes(store, top_n=_FETCH_ALL),
-            top_n,
-            _MAX_BRIDGE_NODES,
+            find_bridge_nodes(store, top_n=_FETCH_ALL), top_n, _MAX_BRIDGE_NODES,
         )
         if detail_level == "minimal":
             bridges = _project(bridges, _MINIMAL_BRIDGE_FIELDS)
         return {
             "status": "ok",
             "summary": (
-                f"{total} bridge node(s) ranked by betweenness" + _shown_of(len(bridges), total)
+                f"{total} bridge node(s) ranked by betweenness"
+                + _shown_of(len(bridges), total)
             ),
             "bridge_nodes": bridges,
             "count": len(bridges),
             "total": total,
             "truncated": truncated,
             "next_tool_suggestions": [
-                "get_hub_nodes -- find most connected nodes",
-                "get_impact_radius -- check blast radius",
-                "detect_changes -- see if bridges are affected",
+                "get_hub_nodes_tool -- find most connected nodes",
+                "get_impact_radius_tool -- check blast radius",
+                "detect_changes_tool -- see if bridges are affected",
             ],
         }
     finally:
@@ -154,7 +146,8 @@ def get_knowledge_gaps_func(
 
     Finds: isolated nodes (disconnected), thin communities
     (< 3 members), untested hotspots (high-degree, no tests),
-    and single-file communities.
+    single-file communities, and import cycles (files that
+    import each other).
 
     Args:
         repo_root: Repository root (auto-detected if omitted).
@@ -170,28 +163,18 @@ def get_knowledge_gaps_func(
     """
     _validate_positive_int(max_per_category, "max_per_category")
 
-    store, _root, not_built = _get_store_for_read(repo_root or None)
-    if store is None:
-        return not_built if not_built is not None else _not_built_response()
+    store, root = _get_store(repo_root or None)
     try:
-        raw = find_knowledge_gaps(store)
-        categories = (
-            ("isolated_nodes", raw["isolated_nodes"]),
-            ("thin_communities", raw["thin_communities"]),
-            ("untested_hotspots", raw["untested_hotspots"]),
-            ("single_file_communities", raw["single_file_communities"]),
-        )
+        raw = find_knowledge_gaps(store, repo_root=root)
         # Totals must come from the untruncated lists: the summary counts are
         # the whole point of the tool, and capping them would hide the gap.
-        totals = {category: len(rows) for category, rows in categories}
+        totals = {category: len(rows) for category, rows in raw.items()}
 
         gaps: dict[str, list[dict[str, Any]]] = {}
         truncated = False
-        for category, rows in categories:
+        for category, rows in raw.items():
             visible, _total, cut = _bounded(
-                rows,
-                max_per_category,
-                _MAX_GAPS_PER_CATEGORY,
+                rows, max_per_category, _MAX_GAPS_PER_CATEGORY,
             )
             if detail_level == "minimal":
                 visible = _project(visible, _MINIMAL_GAP_FIELDS)
@@ -206,9 +189,9 @@ def get_knowledge_gaps_func(
             "total_gaps": total,
             "truncated": truncated,
             "next_tool_suggestions": [
-                "refactor dead_code -- find unused symbols",
-                "get_hub_nodes -- find high-impact nodes",
-                "get_suggested_questions -- review prompts",
+                "refactor_tool dead_code -- find unused symbols",
+                "get_hub_nodes_tool -- find high-impact nodes",
+                "get_suggested_questions_tool -- review prompts",
             ],
         }
     finally:
@@ -237,9 +220,7 @@ def get_surprising_connections_func(
     """
     _validate_positive_int(top_n, "top_n")
 
-    store, _root, not_built = _get_store_for_read(repo_root or None)
-    if store is None:
-        return not_built if not_built is not None else _not_built_response()
+    store, _root = _get_store(repo_root or None)
     try:
         surprises, total, truncated = _bounded(
             find_surprising_connections(store, top_n=_FETCH_ALL),
@@ -259,9 +240,9 @@ def get_surprising_connections_func(
             "total": total,
             "truncated": truncated,
             "next_tool_suggestions": [
-                "get_architecture_overview -- community structure",
-                "query_graph callers_of -- trace the coupling",
-                "get_bridge_nodes -- find chokepoints",
+                "get_architecture_overview_tool -- community structure",
+                "query_graph_tool callers_of -- trace the coupling",
+                "get_bridge_nodes_tool -- find chokepoints",
             ],
         }
     finally:
@@ -284,15 +265,11 @@ def get_suggested_questions_func(
     Args:
         repo_root: Repository root (auto-detected if omitted).
     """
-    store, _root, not_built = _get_store_for_read(repo_root or None)
-    if store is None:
-        return not_built if not_built is not None else _not_built_response()
+    store, _root = _get_store(repo_root or None)
     try:
         questions = generate_suggested_questions(store)
         by_priority: dict[str, list[dict[str, Any]]] = {
-            "high": [],
-            "medium": [],
-            "low": [],
+            "high": [], "medium": [], "low": [],
         }
         for q in questions:
             prio = q.get("priority", "medium")
@@ -301,11 +278,13 @@ def get_suggested_questions_func(
         return {
             "questions": questions,
             "count": len(questions),
-            "by_priority": {k: len(v) for k, v in by_priority.items()},
+            "by_priority": {
+                k: len(v) for k, v in by_priority.items()
+            },
             "next_tool_suggestions": [
-                "get_knowledge_gaps -- structural weaknesses",
-                "detect_changes -- risk-scored review",
-                "get_architecture_overview -- community map",
+                "get_knowledge_gaps_tool -- structural weaknesses",
+                "detect_changes_tool -- risk-scored review",
+                "get_architecture_overview_tool -- community map",
             ],
         }
     finally:
