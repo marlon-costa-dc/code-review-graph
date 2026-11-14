@@ -3774,6 +3774,19 @@ class _WatchDebouncer(threading.Thread):
                 self._callback(events)
 
 
+def _publish_watch_projection(repo_root: Path, store: GraphStore, follow: bool | None) -> None:
+    database = os.environ.get("CRG_SHARED_FILE_SUMMARY_DB")
+    if database:
+        from .graph_generations import publish_indexed_checkout
+
+        profile = repr((
+            "watch", follow_symlinks_enabled(follow), _RECURSE_SUBMODULES,
+            os.environ.get("CRG_ENABLE_ENRICHMENT"),
+            os.environ.get("CRG_DISABLE_ENRICHMENT"),
+        ))
+        publish_indexed_checkout(Path(database), repo_root, store, profile_digest=profile)
+
+
 def _raise_watch_update_errors(result: dict, context: str) -> None:
     """Fail the watch boundary when an incremental update reports errors."""
     errors = result.get("errors") or []
@@ -5021,14 +5034,15 @@ def _create_watch_handler(
                         links_changed = links_changed or ignore_patterns is not patterns_before
                         if links_changed or contents_changed:
                             files_updated += self._reconcile_followed()
-                    if on_files_updated is not None and (
+                    if (
                         files_updated > 0
                         # A project file change parses nothing but can rebind
                         # C# calls in unchanged files; the binder marks flows.
                         or (changed_files and store.get_metadata("csharp_flows_dirty") == "1")
                     ):
-                        postprocess_result = on_files_updated(store)
-                        _raise_watch_postprocess_warnings(postprocess_result)
+                        if on_files_updated is not None:
+                            _raise_watch_postprocess_warnings(on_files_updated(store))
+                        _publish_watch_projection(repo_root, store, follow)
                 except BaseException as exc:
                     self.failure = exc
                 finally:
@@ -5296,6 +5310,7 @@ def _watch(
                         if initial["files_updated"] > 0 and on_files_updated is not None:
                             postprocess_result = on_files_updated(store)
                             _raise_watch_postprocess_warnings(postprocess_result)
+                        _publish_watch_projection(repo_root, store, follow_symlinks)
                     finally:
                         write_lock.release()
             finally:
