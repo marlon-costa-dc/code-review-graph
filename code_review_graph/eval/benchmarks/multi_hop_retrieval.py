@@ -68,7 +68,7 @@ def run(repo_path: Path, store, config: dict) -> list[dict]:
                 provider=config.get("_embedding_provider"),
                 model=config.get("_embedding_model"),
             )
-        except Exception as exc:  # noqa: BLE001 — benchmark must not abort the runner
+        except Exception as exc:
             logger.warning("hybrid_search failed on %s: %s", task_id, exc)
             hits = []
 
@@ -106,7 +106,7 @@ def run(repo_path: Path, store, config: dict) -> list[dict]:
                 repo_root=repo_root,
                 detail_level="standard",
             )
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning(
                 "query_graph(%s) failed on %s: %s",
                 traversal,

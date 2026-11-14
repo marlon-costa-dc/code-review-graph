@@ -40,7 +40,7 @@ def _run_in_thread(
     def run() -> None:
         try:
             results.append(target())
-        except BaseException as exc:  # noqa: BLE001 - captured for test assertion
+        except BaseException as exc:
             errors.append(exc)
 
     thread = threading.Thread(target=run)

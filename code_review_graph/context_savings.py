@@ -154,7 +154,7 @@ def verify_with_tiktoken(
     an agent would actually consume.
     """
     try:
-        import tiktoken  # type: ignore[import-untyped]
+        import tiktoken
     except ImportError:
         return None
 

@@ -57,7 +57,7 @@ def _has_column(conn: sqlite3.Connection, table: str, column: str) -> bool:
     """Check if a column exists in a table."""
     if table not in _KNOWN_TABLES:
         raise ValueError(f"Unknown table: {table}")
-    cursor = conn.execute(f"PRAGMA table_info({table})")  # noqa: S608
+    cursor = conn.execute(f"PRAGMA table_info({table})")
     columns = [row[1] if isinstance(row, tuple) else row["name"] for row in cursor]
     return column in columns
 

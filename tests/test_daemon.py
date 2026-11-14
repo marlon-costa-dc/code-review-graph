@@ -397,19 +397,19 @@ class _FakeKernel32:
         self.wait_calls: list[tuple] = []
         self.closed: list = []
 
-    def OpenProcess(self, access, inherit, pid):  # noqa: N802 - Win32 name
+    def OpenProcess(self, access, inherit, pid):
         self.open_calls.append((access, inherit, pid))
         return self._handle
 
-    def WaitForSingleObject(self, handle, timeout_ms):  # noqa: N802
+    def WaitForSingleObject(self, handle, timeout_ms):
         self.wait_calls.append((handle, timeout_ms))
         return self._wait_result
 
-    def CloseHandle(self, handle):  # noqa: N802
+    def CloseHandle(self, handle):
         self.closed.append(handle)
         return 1
 
-    def GetLastError(self):  # noqa: N802
+    def GetLastError(self):
         return self._last_error
 
 

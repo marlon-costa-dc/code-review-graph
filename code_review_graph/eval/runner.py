@@ -10,9 +10,9 @@ from datetime import date
 from pathlib import Path
 
 try:
-    import yaml  # type: ignore[import-untyped]
+    import yaml
 except ImportError:
-    yaml = None  # type: ignore[assignment]
+    yaml = None
 
 from code_review_graph.eval.benchmarks import (
     agent_baseline,

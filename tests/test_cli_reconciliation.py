@@ -11,7 +11,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-import code_review_graph.graph  # noqa: F401 - imported so unittest.mock can patch it
+import code_review_graph.graph
 from code_review_graph import cli
 
 

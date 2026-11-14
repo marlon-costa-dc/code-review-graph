@@ -274,7 +274,7 @@ def check_server_boot(repo_root: Path) -> CheckResult:
     """
     try:
         from . import main as server_main
-    except Exception as exc:  # noqa: BLE001 — import can fail many ways
+    except Exception as exc:
         return CheckResult(
             name="server",
             ok=False,
@@ -300,7 +300,7 @@ def check_server_boot(repo_root: Path) -> CheckResult:
     )
 
 
-def _count_registered_tools(server_main) -> int:  # type: ignore[no-untyped-def]
+def _count_registered_tools(server_main) -> int:
     """Count registered FastMCP tools without booting the event loop.
 
     FastMCP >=3 exposes an async ``list_tools``.  We run it on a short-lived
@@ -324,7 +324,7 @@ def _count_registered_tools(server_main) -> int:  # type: ignore[no-untyped-def]
         # No loop running — safe to use asyncio.run directly.
         try:
             return _runner()
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.debug("list_tools failed: %s", exc)
             return 0
 
@@ -334,7 +334,7 @@ def _count_registered_tools(server_main) -> int:  # type: ignore[no-untyped-def]
     try:
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
             return pool.submit(_runner).result()
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.debug("list_tools (threaded) failed: %s", exc)
         return 0
 
@@ -465,7 +465,7 @@ def latest_token_savings(repo_root: Path) -> str | None:
         original_tokens = estimate_file_tokens(repo_root, changed)
         attach_context_savings(result, original_tokens=original_tokens)
         return format_context_savings(result.get("context_savings"))
-    except Exception as exc:  # noqa: BLE001 — proof line is purely best-effort
+    except Exception as exc:
         logger.debug("latest_token_savings failed: %s", exc)
         return None
 

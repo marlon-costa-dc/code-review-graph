@@ -147,7 +147,7 @@ def forget_files(
             reparsed.append(file_path)
         except (OSError, PermissionError) as exc:
             logger.warning("Could not re-parse referrer %s: %s", file_path, exc)
-        except Exception as exc:  # noqa: BLE001 - a parser failure is non-fatal
+        except Exception as exc:
             logger.warning("Error re-parsing referrer %s: %s", file_path, exc)
 
     # 4. Re-run repository-wide Python import resolution. A forgotten file can
@@ -156,7 +156,7 @@ def forget_files(
     #    re-parsing alone cannot discover this transition.
     try:
         resolve_python_imports(store)
-    except Exception as exc:  # noqa: BLE001 - resolver failure is non-fatal
+    except Exception as exc:
         logger.warning("Python import resolver failed after forget: %s", exc)
 
     # 5. Re-run the shared post-processing pipeline. store_flows and

@@ -512,7 +512,7 @@ def _merge_yaml_mcp_server(
     entry is already present, and None when the edit was refused to avoid
     data loss (the reason is printed).
     """
-    import yaml  # type: ignore[import-untyped]
+    import yaml
 
     raw = ""
     if config_path.exists():

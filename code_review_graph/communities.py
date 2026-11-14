@@ -31,11 +31,11 @@ _SLUG_MAX_LEN = 30
 # ---------------------------------------------------------------------------
 
 try:
-    import igraph as ig  # type: ignore[import-untyped]
+    import igraph as ig
 
     IGRAPH_AVAILABLE = True
 except ImportError:
-    ig = None  # type: ignore[assignment]
+    ig = None
     IGRAPH_AVAILABLE = False
 
 # ---------------------------------------------------------------------------
