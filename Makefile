@@ -1,6 +1,6 @@
 SHELL := /bin/sh
 
-.PHONY: setup gen upg lint fix types mypy mod test
+.PHONY: setup gen upg lint fix types mypy mod test test-release
 
 setup:
 	uv sync --locked --extra dev
@@ -28,3 +28,6 @@ mod:
 
 test:
 	uv run --locked --extra dev pytest tests
+
+test-release:
+	uv run --locked --extra dev pytest tests/test_release_provenance.py -q --tb=short
