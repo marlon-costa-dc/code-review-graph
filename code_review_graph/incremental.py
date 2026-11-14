@@ -5182,6 +5182,28 @@ def watch(
     follow_symlinks: bool | None = None,
     startup_lock: threading.Lock | None = None,
 ) -> None:
+    """Run a filesystem observer, with exclusive checkout ownership on POSIX."""
+    from .daemon import watch_health_path
+
+    repo_root = _canonical_repo_root(repo_root)
+    owner_path = watch_health_path(repo_root).with_suffix(".lock")
+    owner = WriteLock(store.db_path, owner_path=owner_path)
+    if not owner.acquire():
+        raise RuntimeError(f"Another watcher already owns {repo_root}")
+    try:
+        _watch(repo_root, store, on_files_updated, stop_event, follow_symlinks, startup_lock)
+    finally:
+        owner.release()
+
+
+def _watch(
+    repo_root: Path,
+    store: GraphStore,
+    on_files_updated: Optional[Callable],
+    stop_event: threading.Event | None,
+    follow_symlinks: bool | None,
+    startup_lock: threading.Lock | None,
+) -> None:
     """Watch for file changes and auto-update the graph.
 
     Uses a one-second debounce to batch rapid-fire saves into a single update.
@@ -5211,10 +5233,6 @@ def watch(
     from watchdog.events import DirCreatedEvent, DirDeletedEvent
     from watchdog.observers import Observer
 
-    # One boundary, once: ``--repo .`` reaches here relative, and every path
-    # comparison below — stored file paths, watch keys, event paths — assumes
-    # they are all spelled the same way.
-    repo_root = _canonical_repo_root(repo_root)
     # Refuse a graph built for another root before anything can queue a write
     # to it.  Startup reconciliation checks this too, but only once the
     # observer below is running: a batch captured meanwhile waits on the

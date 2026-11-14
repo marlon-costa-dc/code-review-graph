@@ -7,11 +7,37 @@ import sys
 import pytest
 
 from code_review_graph import cli
-from code_review_graph.graph import CorruptGraphDatabaseError
+from code_review_graph.daemon import watch_health_path
+from code_review_graph.graph import CorruptGraphDatabaseError, GraphStore
+from code_review_graph.incremental import watch
 from code_review_graph.locking import WriteLock
 from code_review_graph.tools.build import build_or_update_graph, run_postprocess
 
 pytestmark = pytest.mark.skipif(sys.platform == "win32", reason="POSIX flock")
+
+
+def test_watch_refuses_existing_checkout_owner_and_releases_after_failure(tmp_path, monkeypatch):
+    from code_review_graph import incremental
+
+    db = tmp_path / "graph.db"
+    owner_path = watch_health_path(tmp_path).with_suffix(".lock")
+    owner = WriteLock(db, owner_path=owner_path)
+
+    def fail_watch(*args):
+        raise RuntimeError("observer setup failed")
+
+    monkeypatch.setattr(incremental, "_watch", fail_watch)
+    with GraphStore(db) as store:
+        assert owner.acquire()
+        try:
+            with pytest.raises(RuntimeError, match="already owns"):
+                watch(tmp_path, store)
+        finally:
+            owner.release()
+        with pytest.raises(RuntimeError, match="observer setup failed"):
+            watch(tmp_path, store)
+    assert owner.acquire()
+    owner.release()
 
 
 @pytest.mark.parametrize("blocking", [False, True])

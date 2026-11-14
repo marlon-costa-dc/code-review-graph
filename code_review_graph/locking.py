@@ -136,9 +136,10 @@ class WriteLock:
     the overlap testable without spawning a second process.
     """
 
-    def __init__(self, db_path: Path) -> None:
+    def __init__(self, db_path: Path, *, owner_path: Path | None = None) -> None:
         self.db_path = db_path
-        self.path = write_lock_path(db_path)
+        self.path = owner_path if owner_path is not None else write_lock_path(db_path)
+        self._strict = owner_path is not None
         self._handle: Any = None
 
     @property
@@ -160,6 +161,8 @@ class WriteLock:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             handle = open(self.path, "a+", encoding="utf-8")  # noqa: SIM115
         except OSError as exc:
+            if self._strict:
+                raise
             # A lock file we cannot even open must not fail the build: losing
             # the guard degrades to the old behaviour, which is what the user
             # asked for anyway.
@@ -171,6 +174,8 @@ class WriteLock:
         try:
             acquired = _flock(handle, blocking)
         except OSError as exc:
+            if self._strict:
+                raise
             # No lock support is not a competing writer, and it must not fail
             # the build either. Degrade like a lock file that cannot be opened.
             logger.warning("Cannot lock %s: %s", self.path, exc)
