@@ -1287,7 +1287,7 @@ class WatchDaemon:
         # Build initial graph for repos that lack a database
         for repo in targets.values():
             db_path = get_db_path(Path(repo.path), read_only=True)
-            if not db_path.exists():
+            if not db_path.exists() and self._existing_watcher(repo) is None:
                 self._initial_build(repo)
 
         # Spawn a watcher child for every repo
@@ -1372,7 +1372,7 @@ class WatchDaemon:
                 repo = desired[alias]
                 registry.register(repo.path, alias=repo.alias, data_dir=repo.data_dir or None)
                 db_path = get_db_path(Path(repo.path), read_only=True)
-                if not db_path.exists():
+                if not db_path.exists() and self._existing_watcher(repo) is None:
                     repos_needing_build.append(repo)
 
             for repo in repos_needing_build:
@@ -1579,6 +1579,8 @@ class WatchDaemon:
                 proc = self._children.get(alias)
                 if proc is None or proc.poll() is not None:
                     self._children.pop(alias, None)
+                    if self._existing_watcher(repo) is not None:
+                        continue
                     state = self._restarts.get(alias, {})
                     now = time.monotonic()
                     if now < float(state.get("next_attempt", 0.0)):
