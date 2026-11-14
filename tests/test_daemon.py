@@ -825,7 +825,9 @@ class TestWatchDaemon:
             daemon.reconcile(config)
 
             # beta should have been registered in the registry
-            mock_registry.register.assert_called_once_with(config.repos[1].path, alias="beta")
+            mock_registry.register.assert_called_once_with(
+                config.repos[1].path, alias="beta", data_dir=None
+            )
 
             # beta should have been built (no graph.db)
             assert mock_run.call_count == 1
@@ -864,7 +866,9 @@ class TestWatchDaemon:
             daemon.reconcile(config)
 
             # beta should have been registered
-            mock_registry.register.assert_called_once_with(config.repos[1].path, alias="beta")
+            mock_registry.register.assert_called_once_with(
+                config.repos[1].path, alias="beta", data_dir=None
+            )
 
             # No build should have been triggered (graph.db exists)
             mock_run.assert_not_called()
@@ -979,7 +983,7 @@ class TestWatchDaemon:
 
             # alpha should be registered at the new path
             mock_registry.register.assert_called_once_with(
-                str(new_repo), alias="alpha"
+                str(new_repo), alias="alpha", data_dir=None
             )
 
             # alpha should be built (new path has no graph.db)

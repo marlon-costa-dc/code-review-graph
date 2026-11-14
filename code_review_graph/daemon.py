@@ -320,7 +320,15 @@ def load_config(path: Path | None = None) -> DaemonConfig:
             continue
 
         seen_aliases.add(alias)
-        repos.append(WatchRepo(path=str(repo_path), alias=alias))
+        repos.append(
+            WatchRepo(
+                path=str(repo_path),
+                alias=alias,
+                data_dir=entry.get("data_dir", ""),
+                recurse_submodules=entry.get("recurse_submodules", False),
+                embedding=entry.get("embedding", ""),
+            )
+        )
 
     return DaemonConfig(
         session_name=session_name,
@@ -1306,7 +1314,7 @@ class WatchDaemon:
         to_update: set[str] = {
             alias
             for alias in desired.keys() & current
-            if desired[alias].path != self._current_repos[alias].path
+            if desired[alias] != self._current_repos[alias]
         }
 
         # Register new/updated repos and build graphs *before* acquiring
