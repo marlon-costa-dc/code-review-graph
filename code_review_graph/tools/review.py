@@ -441,6 +441,7 @@ def get_review_context(
     detail_level: str = "standard",
     max_results: int | None = None,
     max_files: int | None = None,
+    max_tokens: int = 0,
 ) -> dict[str, Any]:
     """Generate a focused review context from changed files.
 
@@ -461,6 +462,7 @@ def get_review_context(
         max_files: Optional maximum files to list and emit snippets for.
             Source snippets also share an 800-line budget, with omissions
             explicitly reported.
+        max_tokens: Optional target response budget for source snippets; zero disables it.
 
     Returns:
         Structured review context with subgraph, source snippets, and
@@ -477,6 +479,8 @@ def get_review_context(
     if max_files is not None:
         _validate_positive_int(max_files, "max_files")
     _validate_positive_int(max_lines_per_file, "max_lines_per_file")
+    if type(max_tokens) is not int or max_tokens < 0:
+        raise ValueError("max_tokens must be a non-negative integer")
 
     store, root = _get_store(repo_root)
     try:
@@ -753,6 +757,32 @@ def get_review_context(
             "summary": "\n".join(summary_parts),
             "context": context,
         }
+        if max_tokens and context.get("source_snippets"):
+            snippets = context.pop("source_snippets")
+            remaining = max_tokens - estimate_tokens(result)
+            kept = {}
+            for path, snippet in snippets.items():
+                cost = estimate_tokens({path: snippet})
+                if cost <= remaining:
+                    kept[path] = snippet
+                    remaining -= cost
+            context["source_snippets"] = kept
+            dropped = len(snippets) - len(kept)
+            if dropped:
+                context["truncated"] = context["source_truncated"] = True
+                regions = context["source_regions"]
+                for path in snippets.keys() - kept.keys():
+                    shown, total = regions["incomplete"].get(
+                        path, [len(granted.get(path, ())), len(regions_by_file.get(path, ()))],
+                    )
+                    regions["shown"] -= shown
+                    if total:
+                        regions["incomplete"][path] = [0, total]
+                note = f"Token budget ({max_tokens}) reached: omitted source for {dropped} file(s)."
+                result["omitted"] = {
+                    "source_files": dropped, "max_tokens": max_tokens, "note": note,
+                }
+                result["summary"] += "\n  - " + note
         attach_context_savings(result, original_tokens=original_tokens, call=history_call)
         return result
     except ChangeDiscoveryError as exc:

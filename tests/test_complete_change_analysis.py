@@ -88,11 +88,13 @@ def _detect(big_change: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
 
 
 def _review(big_change: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
-    return crg_main.get_review_context_tool(
-        repo_root=big_change["root"],
-        changed_files=big_change["files"],
-        detail_level="standard",
-        **kwargs,
+    return asyncio.run(
+        crg_main.get_review_context_tool(
+            repo_root=big_change["root"],
+            changed_files=big_change["files"],
+            detail_level="standard",
+            **kwargs,
+        )
     )
 
 
@@ -236,6 +238,7 @@ class TestCallerLimitsAreExact:
         assert context["truncated"] is True
 
     def test_review_context_token_budget_reports_omissions(self, big_change):
+        baseline = _review(big_change)["context"]
         result = _review(big_change, max_tokens=5_000)
 
         assert result["context"]["truncated"] is True
@@ -243,8 +246,10 @@ class TestCallerLimitsAreExact:
         assert omitted["source_files"] > 0
         assert omitted["note"] in result["summary"]
         assert len(result["context"]["source_snippets"]) + omitted["source_files"] == len(
-            big_change["files"]
+            baseline["source_snippets"]
         )
+        assert result["context"]["graph"] == baseline["graph"]
+        assert result["context"]["source_regions"]["shown"] < baseline["source_regions"]["shown"]
 
     @pytest.mark.parametrize(
         ("tool", "kwargs"),

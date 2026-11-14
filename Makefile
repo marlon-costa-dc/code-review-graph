@@ -67,4 +67,4 @@ test-read-guard:
 
 .PHONY: test-review-budget
 test-review-budget:
-	uv run --locked --extra dev pytest tests/test_complete_change_analysis.py::TestCallerLimitsAreExact::test_detect_changes_token_budget_reports_omissions tests/test_complete_change_analysis.py::TestCallerLimitsAreExact::test_detect_changes_limits_above_former_ceilings -q --tb=short
+	uv run --locked --extra dev pytest tests/test_complete_change_analysis.py -k "token_budget or limits_above_former_ceilings and detect" -q --tb=short

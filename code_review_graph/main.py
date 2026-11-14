@@ -651,6 +651,7 @@ async def get_review_context_tool(
     detail_level: str = "standard",
     max_results: int | None = None,
     max_files: int | None = None,
+    max_tokens: int = 0,
 ) -> dict:
     """Generate a focused, token-efficient review context for code changes.
 
@@ -669,7 +670,8 @@ async def get_review_context_tool(
         max_results: Maximum graph nodes per list and edges to return.
             Default: 50. Each list reports its untruncated ``*_total``.
         max_files: Maximum files listed and given source snippets.
-            Default: 25. Snippets share an 800-line budget.
+            Snippets share an 800-line budget.
+        max_tokens: Optional target response budget for source snippets.
     """
     root = _resolve_repo_root(repo_root)
     return await _offload(
@@ -678,7 +680,7 @@ async def get_review_context_tool(
             changed_files=changed_files, max_depth=max_depth,
             include_source=include_source, max_lines_per_file=max_lines_per_file,
             repo_root=root, base=base, detail_level=detail_level,
-            max_results=max_results, max_files=max_files,
+            max_results=max_results, max_files=max_files, max_tokens=max_tokens,
         ),
         root,
     )
