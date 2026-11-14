@@ -1270,9 +1270,8 @@ class TestMultiHopDependents:
 
     def test_one_hop_finds_b_not_a(self, chain):
         repo, store = chain
-        assert store.get_dependent_files([str(repo / "c.ts")], max_hops=1) == [
-            (repo / "b.ts").as_posix()
-        ]
+        dependents = store.get_dependent_files([str(repo / "c.ts")], max_hops=1)
+        assert dependents == [(repo / "b.ts").as_posix()]
 
     def test_two_hops_finds_b_and_a(self, chain):
         repo, store = chain
@@ -1441,7 +1440,7 @@ class TestMultiHopDependents:
         assert (member.parent / ".git").is_file()
         with GraphStore(tmp_path / "submodule.db") as store:
             full_build(repo, store, recurse_submodules=True)
-            assert store.get_dependent_files([str(repo / "c.ts")]) == [member.as_posix()]
+            assert store.get_dependent_files([(repo / "c.ts").as_posix()]) == [member.as_posix()]
             original = member.read_bytes()
             (repo / "c.ts").write_text("export function c() { return 2; }", encoding="utf-8")
             result = incremental_update(repo, store, changed_files=["c.ts"])
