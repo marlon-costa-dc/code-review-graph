@@ -390,7 +390,9 @@ the CLI, MCP server, and watcher service. Build each checkout with
 `code-review-graph build --repo /path/to/checkout`. Existing per-checkout
 databases are left intact; the shared file is populated from source. Use
 `--repo` or the MCP `repo_root` to select the checkout. Do not combine the
-shared setting with a per-command `--data-dir`.
+shared setting with a per-command `--data-dir`. Launch the VS Code extension
+host with the same setting to read the selected workspace checkout from the
+shared database.
 
 The watcher uses the same completion record as CLI and MCP refreshes.
 A checkout, input snapshot and indexing profile must match before a
