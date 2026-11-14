@@ -230,13 +230,14 @@ class _CheckoutActivity:
     branch_ref: str | None
     last_active: float
     last_event: float
+    idle_stamp: bytes | None = None
 
 
 def _watch_targets(
     repos: list[WatchRepo], activity: dict[str, _CheckoutActivity],
 ) -> dict[str, WatchRepo]:
     """Expand opted-in roots without inheriting a parent's database directory."""
-    from .multi_worktree import discover_worktrees
+    from .multi_worktree import discover_worktrees, worktree_edit_stamp
 
     targets = {repo.alias: repo for repo in repos}
     roots = {Path(repo.path).resolve() for repo in repos}
@@ -269,12 +270,17 @@ def _watch_targets(
                 elif event > previous.last_event:
                     current = replace(
                         previous, last_active=max(previous.last_active, event), last_event=event,
+                        idle_stamp=None,
                     )
                 else:
                     current = previous
-                discovered[alias] = current
                 if now - current.last_active >= repo.activity_ttl_seconds:
-                    continue
+                    stamp = worktree_edit_stamp(checkout.root)
+                    if current.idle_stamp is None or stamp == current.idle_stamp:
+                        discovered[alias] = replace(current, idle_stamp=stamp)
+                        continue
+                    current = replace(current, last_active=now, idle_stamp=None)
+                discovered[alias] = current
             targets[alias] = replace(
                 repo, path=path, alias=alias, data_dir="", discover_worktrees=False,
                 activity_ttl_seconds=0,

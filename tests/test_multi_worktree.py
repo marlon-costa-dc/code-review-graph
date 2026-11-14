@@ -140,6 +140,15 @@ def test_daemon_expires_idle_worktree_and_readmits_new_revision(tmp_path: Path) 
         daemon.reconcile()
         assert start.call_count == 3
         assert start.call_args.args[0].path == str(linked.resolve())
+        dirty = linked / "README.md"
+        dirty.write_text("first edit\n", encoding="utf-8")
+        clock[0] = 129.0
+        daemon.reconcile()
+        assert set(daemon._current_repos) == {parent.alias}
+        dirty.write_text("second edit without a commit\n", encoding="utf-8")
+        daemon.reconcile()
+        assert start.call_count == 4
+        assert start.call_args.args[0].path == str(linked.resolve())
 
 
 def test_authorizer_accepts_linked_worktree_and_rejects_other_repo(tmp_path: Path) -> None:

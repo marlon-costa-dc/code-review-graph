@@ -431,7 +431,8 @@ a process-wide `CRG_DATA_DIR` override is incompatible with this option.
 Worktree membership changes are picked up without editing `watch.toml`.
 An optional `activity_ttl_seconds` retires discovered watchers after inactivity.
 File events and branch or HEAD changes renew activity; health heartbeats do
-not. A branch or HEAD change reactivates an expired checkout. Explicitly
+not. A branch or HEAD change, or new edits detected in dirty files,
+reactivates an expired checkout. Explicitly
 configured watchers do not expire, and expiry leaves the graph on disk.
 
 Watcher entry points sharing a `CRG_HOME` claim the canonical

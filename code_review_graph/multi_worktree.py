@@ -106,6 +106,24 @@ class WorktreeCheckout:
     branch_ref: str | None
 
 
+def worktree_edit_stamp(repo_root: Path) -> bytes:
+    """Fingerprint dirty paths and stat metadata without reading file contents."""
+    import hashlib
+
+    paths = _run_git(
+        repo_root, "ls-files", "-z", "--modified", "--deleted", "--others", "--exclude-standard",
+    )
+    digest = hashlib.sha256()
+    for name in sorted(set(paths.split("\0")) - {""}):
+        digest.update(os.fsencode(name) + b"\0")
+        try:
+            stat = (repo_root / name).lstat()
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        digest.update(f"{stat.st_mtime_ns}:{stat.st_ctime_ns}:{stat.st_size}\0".encode())
+    return digest.digest()
+
+
 def discover_worktrees(repo_root: Path) -> tuple[WorktreeCheckout, ...]:
     """Read live checkouts and their revisions in one Git invocation."""
     checkouts: list[WorktreeCheckout] = []
