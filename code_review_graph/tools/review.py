@@ -40,21 +40,11 @@ from ._common import (
 
 logger = logging.getLogger(__name__)
 
-# Hard ceilings shared by the review tools. All three walk the full impact
-# radius of a change set, so on a whole-repo diff every list below is
-# proportional to the repository, not to the change. The numbers are set
-# from measured cost per row against a 5.6k-node graph:
-#   node dict ~60 tok, node+risk_score ~118 tok, test gap ~85 tok,
-#   source line ~10 tok, flow with full steps ~980 tok, flow metadata ~18 tok.
-_MAX_REVIEW_NODES = 100
-_MAX_REVIEW_EDGES = 150
-_MAX_REVIEW_FILES = 200
+# Source presentation budgets; structural analysis is complete by default.
 _MAX_REVIEW_SOURCE_LINES = 800
 _MAX_LINES_PER_FILE = 500
-_MAX_CHANGED_FUNCTIONS = 100
 _MAX_DETECT_SOURCE_LINES = 600
-# Symbols a diff deleted, each with up to three users: ~180 tokens a row.
-_MAX_REMOVED_SYMBOLS = 25
+_MAX_UNMATCHED_PATHS_SHOWN = 200
 
 # The source budget above used to be spent first come first served over the
 # changed-file list, which is the order Git happened to emit. One
@@ -505,7 +495,8 @@ def get_review_context(
             store, root, changed_files,
         )
         shown_unmatched, unmatched_total, unmatched_cut = _bounded(
-            unmatched_files, 5 if detail_level == "minimal" else max_files, None,
+            unmatched_files, 5 if detail_level == "minimal" else max_files,
+            _MAX_UNMATCHED_PATHS_SHOWN,
         )
         original_tokens = estimate_file_tokens(root, changed_files)
         history_call = CallInfo(
@@ -751,13 +742,14 @@ def get_review_context(
         if unmatched_files:
             summary_parts.append(_unmatched_file_warning(unmatched_files))
 
+        summary = "\n".join(summary_parts)
         result = {
             "status": "ok",
             "risk": risk,
             "unmatched_files": shown_unmatched,
             "unmatched_files_total": unmatched_total,
             "unmatched_files_truncated": unmatched_cut,
-            "summary": "\n".join(summary_parts),
+            "summary": summary,
             "context": context,
         }
         if max_tokens and context.get("source_snippets"):
@@ -785,7 +777,7 @@ def get_review_context(
                 result["omitted"] = {
                     "source_files": dropped, "max_tokens": max_tokens, "note": note,
                 }
-                result["summary"] += "\n  - " + note
+                result["summary"] = summary + "\n  - " + note
         attach_context_savings(result, original_tokens=original_tokens, call=history_call)
         return result
     except ChangeDiscoveryError as exc:
@@ -1232,8 +1224,8 @@ def detect_changes_func(
                 "summary": analysis.get("summary", ""),
                 "risk_score": analysis.get("risk_score", 0.0),
                 "changed_file_count": len(changed_files),
-                "changed_yaml_path_count": len(analysis.get("changed_yaml_paths", [])),
-                "changed_json_path_count": len(analysis.get("changed_json_paths", [])),
+                "changed_yaml_path_count": analysis.get("changed_yaml_paths_total", 0),
+                "changed_json_path_count": analysis.get("changed_json_paths_total", 0),
                 "test_gap_count": len(analysis.get("test_gaps", [])),
                 "removed_symbol_count": analysis.get("removed_symbols_total", 0),
                 "review_priorities": top_priorities,
@@ -1274,6 +1266,10 @@ def detect_changes_func(
             removed_total = analysis.get("removed_symbols_total", len(removed))
             removed_cut = removed_cut or removed_total > len(removed)
             funcs_total = analysis["changed_functions_total"]
+            yaml_paths_total = analysis.get("changed_yaml_paths_total", yaml_paths_total)
+            json_paths_total = analysis.get("changed_json_paths_total", json_paths_total)
+            yaml_paths_cut = len(yaml_paths) < yaml_paths_total
+            json_paths_cut = len(json_paths) < json_paths_total
             if include_source:
                 source_clipped = any(
                     "source" not in func or func.get("source_truncated", False) for func in funcs
@@ -1283,8 +1279,6 @@ def detect_changes_func(
                 funcs_cut or gaps_cut or flows_cut or files_cut or yaml_paths_cut
                 or json_paths_cut
                 or removed_cut
-                or bool(analysis.get("yaml_paths_truncated"))
-                or bool(analysis.get("json_paths_truncated"))
                 or source_clipped
             )
             summary = analysis.get("summary", "")
@@ -1316,8 +1310,10 @@ def detect_changes_func(
                 "changed_functions_total": funcs_total,
                 "changed_yaml_paths": yaml_paths,
                 "changed_yaml_paths_total": yaml_paths_total,
+                "yaml_paths_truncated": yaml_paths_cut,
                 "changed_json_paths": json_paths,
                 "changed_json_paths_total": json_paths_total,
+                "json_paths_truncated": json_paths_cut,
                 "test_gaps": gaps,
                 "test_gaps_total": gaps_total,
                 "removed_symbols": removed,

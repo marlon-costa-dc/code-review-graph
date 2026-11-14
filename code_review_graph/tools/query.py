@@ -1060,27 +1060,20 @@ def query_graph(
             f"resolution must be one of {list(QUERY_RESOLUTIONS)}, got {resolution!r}"
         )
 
+    if pattern not in _QUERY_PATTERNS:
+        return _error_response(
+            f"Unknown pattern '{pattern}'. Available: {list(_QUERY_PATTERNS.keys())}"
+        )
+    if pattern == "path_to" and not to:
+        return _error_response("path_to needs to: the node or file to reach.")
+
     store, root, not_built = _get_store_for_read(repo_root)
     if not_built is not None:
         return not_built
     assert store is not None and root is not None
     try:
-        if pattern not in _QUERY_PATTERNS:
-            return {
-                "status": "error",
-                "error": (
-                    f"Unknown pattern '{pattern}'. "
-                    f"Available: {list(_QUERY_PATTERNS.keys())}"
-                ),
-            }
-
         minimal = detail_level == "minimal"
-        if pattern == "path_to":
-            if not to:
-                return {
-                    "status": "error",
-                    "error": "path_to needs to: the node or file to reach.",
-                }
+        if pattern == "path_to" and to:
             return _query_route(store, root, target, to, minimal)
         response_limit = min(max_results, 5) if minimal else max_results
         results: list[dict[str, Any]] = []

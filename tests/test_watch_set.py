@@ -165,7 +165,7 @@ class TestWatchManifestCli:
 
 
 class TestQueuedWatcherLiveness:
-    def test_dead_observer_while_queued_fails_the_watcher(self, tmp_path):
+    def test_dead_observer_while_queued_fails_the_watcher(self, tmp_path, monkeypatch):
         """A watcher waiting for another repository's build still dies loudly."""
         from watchdog.observers import Observer
 
@@ -174,12 +174,13 @@ class TestQueuedWatcherLiveness:
         repo, data_dir = _repo(tmp_path, "queued")
         startup_lock = threading.Lock()
         observer = Observer()
+        monkeypatch.setattr("watchdog.observers.Observer", lambda: observer)
         failures: list[BaseException] = []
 
         def run() -> None:
             with GraphStore(data_dir / "graph.db") as store:
                 try:
-                    watch(repo, store, observer=observer, startup_lock=startup_lock)
+                    watch(repo, store, startup_lock=startup_lock)
                 except BaseException as failure:  # surfaced to the test thread
                     failures.append(failure)
 

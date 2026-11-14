@@ -35,8 +35,13 @@ jobs:
           python - <<'PY'
           import os
           import re
-          import tomllib
+          import sys
           from pathlib import Path
+
+          if sys.version_info < (3, 11):
+              import tomli as tomllib
+          else:
+              import tomllib
 
           version = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
           expected_tag = "v" + version.replace("+dc.", "-dc.")
