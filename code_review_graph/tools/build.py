@@ -260,6 +260,7 @@ def _run_postprocess(
     build_result["postprocess_level"] = postprocess
 
     if postprocess == "none":
+        store.set_metadata("postprocess_level", "none")
         _run_embedding_refresh(
             store,
             build_result,
@@ -383,6 +384,8 @@ def _run_postprocess(
             model=embedding_model,
         )
         build_result["postprocess_timing"] = timing
+        if not warnings:
+            store.set_metadata("postprocess_level", postprocess)
         return warnings
 
     # -- Expensive: flows + communities (only for "full") --
@@ -683,7 +686,10 @@ def build_or_update_graph(
                 # communities were interrupted; honor the requested level in
                 # that case so a default update can finish the full repair.
                 pending = previous_state == POSTPROCESS_PENDING
-                postprocess_level = postprocess if pending else "minimal"
+                previous_level = store.get_metadata("postprocess_level")
+                upgrade = postprocess == "full" and previous_level in {"none", "minimal"}
+                repair = pending or upgrade
+                postprocess_level = postprocess if repair else "minimal"
                 build_result = {
                     **result,
                     "status": "ok",
@@ -702,18 +708,20 @@ def build_or_update_graph(
                     # The run that left the marker may have changed nodes. A
                     # complete graph has no resolver or embedding work to do,
                     # and hooks run this path after every edit.
-                    embedding_provider=embedding_provider if pending else None,
-                    embedding_model=embedding_model if pending else None,
-                    skip_resolvers=not pending,
+                    embedding_provider=embedding_provider if repair else None,
+                    embedding_model=embedding_model if repair else None,
+                    skip_resolvers=not repair,
                 )
                 if warnings:
                     build_result["warnings"] = warnings
                 if build_result.get("postprocess_failed"):
                     build_result["status"] = "partial"
-                if not build_result.get("postprocess_contended"):
+                if not warnings and not build_result.get("postprocess_contended"):
+                    if previous_level == "full" and not repair:
+                        store.set_metadata("postprocess_level", previous_level)
                     store.set_metadata(BUILD_STATE_KEY, BUILD_COMPLETE)
                 build_result["repaired_interrupted_build"] = interrupted
-                if not pending and embedding_provider and embedding_model:
+                if not repair and embedding_provider and embedding_model:
                     from code_review_graph.embeddings import has_embeddings
 
                     if not has_embeddings(store):
@@ -789,7 +797,7 @@ def build_or_update_graph(
         # genuinely what its freshness metadata claims.  A stage that lost the
         # write lock keeps the marker set so the next run redoes it, rather
         # than leaving an empty FTS index behind a "complete" verdict.
-        if not build_result.get("postprocess_contended") and postprocess != "none":
+        if build_result["status"] == "ok" and not warnings and postprocess != "none":
             store.set_metadata(BUILD_STATE_KEY, BUILD_COMPLETE)
         elif postprocess == "none" and failed:
             # A partial update can store some changed rows while another file

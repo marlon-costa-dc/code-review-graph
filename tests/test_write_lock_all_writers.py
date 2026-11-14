@@ -383,6 +383,26 @@ def test_watch_reuses_graph_rows_already_refreshed_by_command(repo):
     assert postprocessed == []
 
 
+def test_full_refresh_completes_a_minimal_build_without_source_edits(repo):
+    from code_review_graph.tools.build import build_or_update_graph
+
+    subprocess.run(
+        ["git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+         "-c", "commit.gpgsign=false", "commit", "-qm", "fixture"],
+        cwd=repo, check=True, capture_output=True,
+    )
+    minimal = build_or_update_graph(True, str(repo), postprocess="minimal")
+    assert minimal["status"] == "ok"
+    full = build_or_update_graph(repo_root=str(repo))
+    assert full["status"] == "ok"
+    assert full["files_updated"] == 0
+    assert "flows_detected" in full
+    repeated = build_or_update_graph(repo_root=str(repo))
+    assert repeated["status"] == "ok"
+    assert repeated["files_updated"] == 0
+    assert "flows_detected" not in repeated
+
+
 def test_watch_batch_retried_behind_a_writer_is_counted_once(repo, held):
     with GraphStore(incremental.get_db_path(repo)) as store:
         handler = incremental._create_watch_handler(repo, store, None)
