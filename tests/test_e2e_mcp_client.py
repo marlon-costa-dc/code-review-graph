@@ -385,20 +385,43 @@ async def test_mcp_shared_file_summary_isolates_sibling_worktrees(tmp_path, monk
             read, write, read_timeout_seconds=read_timeout(CALL_TIMEOUT),
         ) as session:
             await asyncio.wait_for(session.initialize(), timeout=CALL_TIMEOUT)
-            for root, name in ((repo, "left_symbol"), (sibling, "right_symbol")):
-                build = _payload(await _call(session, "build_or_update_graph_tool", {
-                    "full_rebuild": True, "postprocess": "none", "repo_root": str(root),
-                }))
-                assert build["status"] == "ok"
+            async def query(root: Path, name: str) -> int:
                 result = _payload(await _call(session, "query_graph_tool", {
                     "pattern": "file_summary", "target": relative_path, "repo_root": str(root),
                 }))
                 assert result["status"] == "ok"
-                assert result["generation"] == build["shared_generation"]
                 assert [row["name"] for row in result["results"]
                         if row["kind"] == "Function"] == [name]
                 assert all(_posix(row["file_path"]) == (root / relative_path).as_posix()
                            for row in result["results"])
+                return int(result["generation"])
+
+            async def refresh(root: Path, *, full: bool) -> int:
+                build = _payload(await _call(session, "build_or_update_graph_tool", {
+                    "full_rebuild": full, "postprocess": "none", "repo_root": str(root),
+                }))
+                assert build["status"] == "ok"
+                return int(build["shared_generation"])
+
+            left, right = await asyncio.gather(
+                refresh(repo, full=True), refresh(sibling, full=True),
+            )
+            assert left != right
+            assert await query(repo, "left_symbol") == left
+            assert await query(sibling, "right_symbol") == right
+
+            source = sibling / relative_path
+            source.write_text("def right_wip(): return 42\n", encoding="utf-8")
+            wip = await refresh(sibling, full=False)
+            assert wip not in {left, right}
+            assert await query(sibling, "right_wip") == wip
+            assert await query(repo, "left_symbol") == left
+            assert await refresh(sibling, full=False) == wip
+
+            _git(sibling, "checkout", "--", relative_path)
+            assert await refresh(sibling, full=False) == right
+            assert await query(sibling, "right_symbol") == right
+            assert await query(repo, "left_symbol") == left
 
 
 async def test_mcp_multi_worktree_routes_parallel_graphs(tmp_path: Path) -> None:
