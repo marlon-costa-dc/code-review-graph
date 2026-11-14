@@ -16,10 +16,6 @@ Use the code-review-graph MCP tools to find your way around the codebase.
 5. Call `find_large_functions_tool` to find oversized functions.
 6. Call `list_graph_stats_tool` only when you need node, edge and language counts.
 
-## Graph Freshness
-
-- If `get_minimal_context_tool` returns `status: not_ready`, or `code-review-graph status` reports a commit other than `HEAD`, refresh the graph with the build-graph skill before trusting any result.
-
 ## Token Efficiency Rules
 - Call `get_minimal_context_tool(task="<your task>")` before any other graph tool.
 - Pass `detail_level="minimal"` unless it is not enough. Minimal drops source, so leave `semantic_search_nodes_tool(include_source=True)` and `get_review_context_tool` at standard.

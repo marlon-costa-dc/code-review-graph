@@ -15,10 +15,6 @@ Trace a bug through the knowledge graph before reading source.
 4. Call `detect_changes_tool` to check whether a recent change caused the issue.
 5. Call `get_impact_radius_tool` on the suspect files to see what a fix would affect.
 
-## Graph Freshness
-
-- If `get_minimal_context_tool` returns `status: not_ready`, or `code-review-graph status` reports a commit other than `HEAD`, refresh the graph with the build-graph skill before trusting any result.
-
 ## Token Efficiency Rules
 - Call `get_minimal_context_tool(task="<your task>")` before any other graph tool.
 - Pass `detail_level="minimal"` unless it is not enough. Minimal drops source, so leave `semantic_search_nodes_tool(include_source=True)` and `get_review_context_tool` at standard.

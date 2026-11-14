@@ -7,6 +7,7 @@ setup:
 
 gen:
 	uv run --locked --extra dev python scripts/generate_documentary_skills.py
+	uv run --locked --extra dev python -c 'from pathlib import Path; from code_review_graph.skills import generate_skills; generate_skills(Path.cwd(), Path("skills"))'
 
 upg:
 	uv lock --upgrade
@@ -35,3 +36,7 @@ test-release:
 .PHONY: test-notebooks
 test-notebooks:
 	uv run --locked --extra dev pytest tests/test_notebook.py -q --tb=short
+
+.PHONY: test-skills
+test-skills:
+	uv run --locked --extra dev pytest tests/test_skill_template_schema_sync.py tests/test_skills.py -q --tb=short
