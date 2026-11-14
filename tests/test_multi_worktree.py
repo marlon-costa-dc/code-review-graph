@@ -81,6 +81,14 @@ def test_daemon_reconciles_linked_worktree_membership(tmp_path: Path) -> None:
     config = DaemonConfig(repos=[configured])
     daemon = WatchDaemon(config=config)
 
+    def tick() -> None:
+        with (
+            patch.object(daemon, "_check_health", side_effect=daemon._health_stop.set),
+            patch.object(daemon._health_stop, "wait", return_value=False),
+        ):
+            daemon._health_loop()
+        daemon._health_stop.clear()
+
     with (
         patch.object(daemon, "_initial_build"),
         patch.object(daemon, "_start_watcher") as start,
@@ -88,15 +96,15 @@ def test_daemon_reconciles_linked_worktree_membership(tmp_path: Path) -> None:
     ):
         daemon.reconcile(config)
         _git(repo, "worktree", "add", "-q", "-b", "review", str(linked))
-        daemon.reconcile(config)
+        tick()
         discovered = start.call_args.args[0]
         assert discovered.path == str(linked.resolve())
         assert discovered.data_dir == ""
 
-        daemon.reconcile(config)
+        tick()
         assert start.call_count == 2
         _git(repo, "worktree", "remove", str(linked))
-        daemon.reconcile(config)
+        tick()
         assert daemon._current_repos == {configured.alias: configured}
 
 

@@ -1261,6 +1261,7 @@ class WatchDaemon:
         self._health_thread: threading.Thread | None = None
         self._health_stop: threading.Event = threading.Event()
         self._lock: threading.Lock = threading.Lock()
+        self._reconcile_lock = threading.Lock()
         self._restarts: dict[str, dict[str, float]] = {}
         self._windows_job: _WindowsJob | None = (
             _WindowsJob() if sys.platform == "win32" else None
@@ -1330,6 +1331,12 @@ class WatchDaemon:
                 self._windows_job.close()
 
     def reconcile(self, new_config: DaemonConfig | None = None) -> None:
+        """Serialize configuration reloads and periodic worktree discovery."""
+        with self._reconcile_lock:
+            if not self._health_stop.is_set():
+                self._reconcile(new_config)
+
+    def _reconcile(self, new_config: DaemonConfig | None) -> None:
         """Reconcile running watchers with the (possibly updated) config.
 
         Child processes are started, stopped, or restarted to match the
@@ -1349,6 +1356,8 @@ class WatchDaemon:
             for alias in desired.keys() & current
             if desired[alias] != self._current_repos[alias]
         }
+        if not (to_add or to_remove or to_update):
+            return
 
         # Register new/updated repos and build graphs *before* acquiring
         # the lock so that long-running builds don't block health checks.
@@ -1367,9 +1376,13 @@ class WatchDaemon:
                     repos_needing_build.append(repo)
 
             for repo in repos_needing_build:
+                if self._health_stop.is_set():
+                    return
                 self._initial_build(repo)
 
         with self._lock:
+            if self._health_stop.is_set():
+                return
             # Remove stale watchers
             for alias in to_remove:
                 proc = self._children.pop(alias, None)
@@ -1393,8 +1406,9 @@ class WatchDaemon:
                 self._start_watcher(repo)
                 self._current_repos[alias] = repo
 
-        # Persist updated state
-        self._save_state()
+            # Persist under the child lock so shutdown cannot clear the state
+            # and then have an in-flight reconciliation recreate it.
+            self._save_state()
 
         logger.info(
             "Reconcile complete — added: %d, removed: %d, updated: %d",
@@ -1518,6 +1532,11 @@ class WatchDaemon:
             self._health_stop.wait(_HEALTH_CHECK_INTERVAL)
             if self._health_stop.is_set():
                 break
+            if any(repo.discover_worktrees for repo in self._config.repos):
+                try:
+                    self.reconcile()
+                except (RuntimeError, ValueError, OSError):
+                    logger.exception("Periodic worktree reconciliation failed")
             self._check_health()
 
     def _restart_delay(self, alias: str) -> float:

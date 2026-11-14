@@ -423,11 +423,11 @@ The daemon spawns one `code-review-graph watch` child process per repo with
 repos are added or removed. A health check every 30 seconds restarts dead
 watchers. No tmux or screen is needed.
 
-With `discover_worktrees`, startup and configuration reconciliation include
+With `discover_worktrees`, startup, configuration reloads, and periodic health checks include
 live linked checkouts found by Git. Explicitly configured checkouts keep their
 own options. Discovered checkouts do not inherit the parent graph directory;
 a process-wide `CRG_DATA_DIR` override is incompatible with this option.
-Worktree membership changes are picked up at the next configuration reconciliation.
+Worktree membership changes are picked up without editing `watch.toml`.
 
 ## MCP Tools
 
