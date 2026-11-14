@@ -82,6 +82,18 @@ def initialize_bindings(conn: sqlite3.Connection) -> None:
         ) WITHOUT ROWID
     """)
     conn.execute("""
+        CREATE TABLE IF NOT EXISTS generation_symbols (
+            generation INTEGER NOT NULL REFERENCES graph_generations(id) ON DELETE CASCADE,
+            file_path TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            name TEXT NOT NULL,
+            line_start INTEGER NOT NULL,
+            line_end INTEGER NOT NULL,
+            PRIMARY KEY (generation, file_path, symbol)
+        ) WITHOUT ROWID
+    """)
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS checkout_bindings (
             checkout TEXT PRIMARY KEY,
             generation INTEGER NOT NULL REFERENCES graph_generations(id),
@@ -130,6 +142,18 @@ def ensure_indexed_generation(
         "ON CONFLICT(generation, file_version) DO NOTHING",
         ((generation, path, digest) for path, digest in versions),
     )
+    root = repo_root.resolve()
+    for path in files:
+        conn.executemany(
+            "INSERT INTO generation_symbols VALUES (?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(generation, file_path, symbol) DO NOTHING",
+            (
+                (generation, path, node.qualified_name.split("::", 1)[-1],
+                 node.kind, node.name, node.line_start, node.line_end)
+                for node in store.iter_nodes_by_file(str(root / path))
+                if node.kind != "File"
+            ),
+        )
     return generation
 
 
@@ -141,6 +165,22 @@ def read_checkout_manifest(conn: sqlite3.Connection, checkout: str) -> dict[str,
         "JOIN indexed_file_versions AS version ON version.id = files.file_version "
         "WHERE binding.checkout = ?", (checkout,),
     ).fetchall())
+
+
+def read_checkout_symbols(
+    conn: sqlite3.Connection, checkout_root: Path, relative_path: str,
+) -> list[tuple[Path, str, str, int, int]]:
+    """Read a bound file's symbols and render paths under its checkout."""
+    root = checkout_root.resolve()
+    rows = conn.execute(
+        "SELECT symbols.file_path, symbols.kind, symbols.name, "
+        "symbols.line_start, symbols.line_end FROM checkout_bindings AS binding "
+        "JOIN generation_symbols AS symbols ON symbols.generation = binding.generation "
+        "WHERE binding.checkout = ? AND symbols.file_path = ? "
+        "ORDER BY symbols.line_start, symbols.symbol",
+        (str(root), relative_path),
+    )
+    return [(root / path, kind, name, start, end) for path, kind, name, start, end in rows]
 
 
 def read_binding(conn: sqlite3.Connection, checkout: str) -> tuple[int, int] | None:

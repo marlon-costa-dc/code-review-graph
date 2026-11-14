@@ -19,6 +19,7 @@ from code_review_graph.graph_generations import (
     initialize_bindings,
     publish_binding,
     read_checkout_manifest,
+    read_checkout_symbols,
 )
 from code_review_graph.incremental import full_build, get_db_path, incremental_update
 from code_review_graph.multi_worktree import (
@@ -86,12 +87,12 @@ def test_indexed_content_identity_reuses_sibling_content_and_tracks_wip(tmp_path
         assert ensure_indexed_generation(
             shared, repository="repo", profile_digest="default", repo_root=linked, store=right,
         ) == generation
-        assert publish_binding(shared, "left", generation, expected_revision=0)
-        assert publish_binding(shared, "right", generation, expected_revision=0)
+        assert publish_binding(shared, str(repo.resolve()), generation, expected_revision=0)
+        assert publish_binding(shared, str(linked.resolve()), generation, expected_revision=0)
         shared.commit()
-        original = read_checkout_manifest(shared, "left")
+        original = read_checkout_manifest(shared, str(repo.resolve()))
         assert "app.py" in original
-        assert read_checkout_manifest(shared, "right") == original
+        assert read_checkout_manifest(shared, str(linked.resolve())) == original
         (linked / "app.py").write_text("def edited(): return 2\n", encoding="utf-8")
         assert incremental_update(linked, right, changed_files=["app.py"])["errors"] == []
         assert indexed_content_identity(linked, right) != base
@@ -100,12 +101,18 @@ def test_indexed_content_identity_reuses_sibling_content_and_tracks_wip(tmp_path
             shared, repository="repo", profile_digest="default", repo_root=linked, store=right,
         )
         assert edited != generation
-        assert publish_binding(shared, "right", edited, expected_revision=1)
+        assert publish_binding(shared, str(linked.resolve()), edited, expected_revision=1)
         shared.commit()
-        assert read_checkout_manifest(shared, "left") == original
-        assert read_checkout_manifest(shared, "right")["app.py"] != original["app.py"]
+        assert read_checkout_manifest(shared, str(repo.resolve())) == original
+        assert read_checkout_manifest(shared, str(linked.resolve()))["app.py"] != original["app.py"]
         (total_versions,) = shared.execute("SELECT COUNT(*) FROM indexed_file_versions").fetchone()
         assert total_versions == len(original) + 1
+        assert read_checkout_symbols(shared, repo, "app.py") == [
+            (repo / "app.py", "Function", "original", 1, 1),
+        ]
+        assert read_checkout_symbols(shared, linked, "app.py") == [
+            (linked / "app.py", "Function", "edited", 1, 1),
+        ]
         (shared_files,) = shared.execute(
             "SELECT COUNT(*) FROM generation_files AS original "
             "JOIN generation_files AS edited USING (file_version) "
