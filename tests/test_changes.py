@@ -245,6 +245,23 @@ class TestChanges:
         # Untested gets 0.30, tested gets 0.05 for test coverage component.
         assert untested_score > tested_score
 
+    def test_risk_score_test_lifecycle_method_has_no_untested_penalty(self):
+        """A lifecycle method in test code has no coverage to lack (#865)."""
+        self._add_func("setUp", path="tests/test_a.py", line_start=1, line_end=10)
+        node = self.store.get_node("tests/test_a.py::setUp")
+        assert node is not None
+
+        assert compute_risk_score(self.store, node) == 0.0
+
+    def test_risk_score_production_lifecycle_name_keeps_untested_penalty(self):
+        """The exemption is a name, so production code keeps its coverage risk."""
+        for name, path in (("__init__", "service.py"), ("setUp", "installer.py")):
+            self._add_func(name, path=path, line_start=1, line_end=10)
+            node = self.store.get_node(f"{path}::{name}")
+            assert node is not None
+
+            assert compute_risk_score(self.store, node) == pytest.approx(0.30)
+
     def test_risk_score_security_keywords_boost(self):
         """Functions with security keywords score higher."""
         self._add_func("process_data", path="a.py")
@@ -353,9 +370,48 @@ class TestChanges:
         assert "summary" in result
         assert "risk_score" in result
         assert "changed_functions" in result
+        assert "changed_yaml_paths" in result
         assert "affected_flows" in result
         assert "test_gaps" in result
         assert "review_priorities" in result
+
+    def test_yaml_changes_use_occurrence_ranges_without_test_gap_scoring(self):
+        node = NodeInfo(
+            kind="YamlPath",
+            name="$.services[*].metadata.tier",
+            file_path="config.yml",
+            line_start=2,
+            line_end=100,
+            language="yaml",
+            identity_name="yaml:0:$.services[*].metadata.tier",
+            extra={
+                "schema_path": "$.services[*].metadata.tier",
+                "value_type": "str",
+                "occurrence_count": 2,
+                "range_samples": [[2, 10], [90, 100]],
+                "lines_truncated": False,
+            },
+        )
+        self.store.upsert_node(node, file_hash="yaml")
+        self.store.commit()
+
+        assert map_changes_to_nodes(self.store, {"config.yml": [(50, 50)]}) == []
+        result = analyze_changes(
+            self.store,
+            changed_files=["config.yml"],
+            changed_ranges={"config.yml": [(95, 95)]},
+        )
+
+        assert result["changed_functions"] == []
+        assert result["test_gaps"] == []
+        yaml_path = result["changed_yaml_paths"][0]
+        assert yaml_path["name"] == "$.services[*].metadata.tier"
+        assert yaml_path["yaml"]["schema_path"] == "$.services[*].metadata.tier"
+        assert yaml_path["yaml"]["value_type"] == "str"
+        assert yaml_path["yaml"]["occurrence_count"] == 2
+        assert "schema_path" not in yaml_path
+        assert "value_type" not in yaml_path
+        assert "1 changed YAML path(s)" in result["summary"]
 
     def test_analyze_changes_risk_score_range(self):
         """Overall risk score is between 0 and 1."""
@@ -469,9 +525,11 @@ class TestChanges:
             changed_ranges={"app.py": [(1, 20)]},
         )
         priorities = result["review_priorities"]
-        if len(priorities) >= 2:
-            for i in range(len(priorities) - 1):
-                assert priorities[i]["risk_score"] >= priorities[i + 1]["risk_score"]
+
+        assert len(priorities) >= 2
+
+        risk_scores = [priority["risk_score"] for priority in priorities]
+        assert risk_scores == sorted(risk_scores, reverse=True)
 
     def test_analyze_changes_fallback_no_ranges(self):
         """Falls back to all nodes in files when no ranges provided."""
@@ -494,17 +552,19 @@ class TestChanges:
         """detect_changes_func returns clean result when no changes detected."""
         from code_review_graph.tools import detect_changes_func
 
-        # Patch _get_store to use our test store,
-        # and get_changed_files/get_staged_and_unstaged to return empty.
+        # Patch _get_store to use our test store, and change discovery to
+        # come back empty.
         with (
-            patch("code_review_graph.tools.review._get_store_for_read") as mock_get_store,
-            patch("code_review_graph.tools.review.get_changed_files", return_value=[]),
-            patch("code_review_graph.tools.review.get_staged_and_unstaged", return_value=[]),
+            patch("code_review_graph.tools.review._get_store") as mock_get_store,
+            patch(
+                "code_review_graph.tools.review.discover_review_changes",
+                return_value=([], "HEAD~1"),
+            ),
             # Prevent the tool from closing our shared store, then restore the
             # real method so teardown releases the database handle on Windows.
             patch.object(self.store, "close"),
         ):
-            mock_get_store.return_value = (self.store, Path("/fake/repo"), None)
+            mock_get_store.return_value = (self.store, Path("/fake/repo"))
 
             result = detect_changes_func(base="HEAD~1", repo_root="/fake/repo")
             assert result["status"] == "ok"
@@ -513,6 +573,107 @@ class TestChanges:
             assert result["test_gaps"] == []
         assert getattr(self.store.close, "__func__", None) is GraphStore.close
 
+    def test_detect_changes_tool_reports_an_undiscoverable_diff_as_an_error(self):
+        """The MCP tool must not flatten "could not look" into the all-clear.
+
+        ``test_detect_changes_tool_no_changes`` above pins what a genuinely
+        clean tree looks like: ``status: ok`` and an empty analysis. A git
+        that could not be run has to be distinguishable from that, or a
+        client cannot tell a reviewed pull request from an unreviewed one.
+        """
+        from code_review_graph.errors import ChangeDiscoveryError
+        from code_review_graph.tools import detect_changes_func
+
+        with (
+            patch("code_review_graph.tools.review._get_store") as mock_get_store,
+            patch(
+                "code_review_graph.tools.review.discover_review_changes",
+                side_effect=ChangeDiscoveryError(
+                    "could not determine the changes: git could not be run"
+                ),
+            ),
+            patch.object(self.store, "close"),
+        ):
+            mock_get_store.return_value = (self.store, Path("/fake/repo"))
+
+            result = detect_changes_func(base="HEAD~1", repo_root="/fake/repo")
+
+        assert result["status"] == "error"
+        assert "could not determine the changes" in result["error"]
+
+    def test_detect_changes_tool_asks_for_a_working_vcs(self):
+        """The distinction is requested at the call, not hoped for.
+
+        ``discover_review_changes`` is the chain now, and it passes
+        ``require_vcs=True`` to all three of its steps; that wiring is pinned
+        by ``test_incremental.TestDiscoverReviewChanges``. What this test
+        keeps is the end of the contract that matters here: the tool goes
+        through the chain rather than calling raw git helpers that report a
+        failure as an empty list.
+        """
+        from code_review_graph.tools import detect_changes_func
+
+        with (
+            patch("code_review_graph.tools.review._get_store") as mock_get_store,
+            patch(
+                "code_review_graph.tools.review.discover_review_changes",
+                return_value=([], "HEAD~1"),
+            ) as discover,
+            patch(
+                "code_review_graph.tools.review.get_changed_files",
+                create=True,
+            ) as raw_changed,
+            patch.object(self.store, "close"),
+        ):
+            mock_get_store.return_value = (self.store, Path("/fake/repo"))
+            detect_changes_func(base="HEAD~1", repo_root="/fake/repo")
+
+        discover.assert_called_once_with(Path("/fake/repo"), "HEAD~1", notes=[])
+        raw_changed.assert_not_called()
+
+    @pytest.mark.parametrize("func_name,module", [
+        ("detect_changes_func", "review"),
+        ("get_affected_flows_func", "review"),
+        ("get_review_context", "review"),
+        ("get_impact_radius", "query"),
+    ])
+    def test_every_review_tool_reports_a_discovery_failure(
+        self, func_name, module,
+    ):
+        """None of the four may render "could not look" as the all-clear.
+
+        Each one has a "no changed files detected" branch that a client acts
+        on. A discovery failure -- git missing, or a budget exhausted -- says
+        nothing about the working tree, so it has to arrive as
+        ``status: error`` instead (#262).
+        """
+        import importlib
+
+        from code_review_graph.errors import ChangeDiscoveryError
+
+        tools_module = importlib.import_module(
+            f"code_review_graph.tools.{module}"
+        )
+        func = getattr(tools_module, func_name)
+
+        with (
+            patch(f"code_review_graph.tools.{module}._get_store") as mock_get_store,
+            patch(
+                f"code_review_graph.tools.{module}.discover_review_changes",
+                side_effect=ChangeDiscoveryError(
+                    "could not determine the changes: git timed out after 5s."
+                ),
+            ),
+            patch.object(self.store, "close"),
+        ):
+            mock_get_store.return_value = (self.store, Path("/fake/repo"))
+            result = func(repo_root="/fake/repo")
+
+        assert result["status"] == "error", func_name
+        assert "could not determine the changes" in result["error"]
+        # And it must not read like the clean-tree answer.
+        assert "No changed files detected" not in str(result.get("summary", ""))
+
     def test_detect_changes_tool_with_changes(self):
         """detect_changes_func returns full analysis for changed files."""
         from code_review_graph.tools import detect_changes_func
@@ -520,15 +681,18 @@ class TestChanges:
         self._add_func("my_func", path="/fake/repo/app.py", line_start=1, line_end=10)
 
         with (
-            patch("code_review_graph.tools.review._get_store_for_read") as mock_get_store,
-            patch("code_review_graph.tools.review.get_changed_files", return_value=["app.py"]),
+            patch("code_review_graph.tools.review._get_store") as mock_get_store,
+            patch(
+                "code_review_graph.tools.review.discover_review_changes",
+                return_value=(["app.py"], "HEAD~1"),
+            ),
             patch(
                 "code_review_graph.tools.review.parse_git_diff_ranges",
                 return_value={"app.py": [(1, 10)]},
             ),
             patch.object(self.store, "close"),
         ):
-            mock_get_store.return_value = (self.store, Path("/fake/repo"), None)
+            mock_get_store.return_value = (self.store, Path("/fake/repo"))
 
             result = detect_changes_func(base="HEAD~1", repo_root="/fake/repo")
             assert result["status"] == "ok"
@@ -538,9 +702,51 @@ class TestChanges:
             assert "review_priorities" in result
         assert getattr(self.store.close, "__func__", None) is GraphStore.close
 
+    def test_detect_changes_tool_uses_one_resolved_review_base(self):
+        """File discovery and line ranges must use the same merge base.
 
-class TestAnalyzeChangesFunctionBound:
-    """The change analysis is complete unless CRG_MAX_CHANGED_FUNCS opts in."""
+        Discovery resolves the base itself and hands it back, so the line
+        ranges have to be read against the ref discovery actually used, not
+        against the raw ``origin/main`` the caller passed. The chain's own
+        end of this contract is covered by
+        ``test_incremental.TestDiscoverReviewChanges``.
+        """
+        from code_review_graph.tools import detect_changes_func
+
+        self._add_func("my_func", path="/fake/repo/app.py", line_start=1, line_end=10)
+
+        with (
+            patch("code_review_graph.tools.review._get_store") as mock_get_store,
+            patch(
+                "code_review_graph.tools.review.discover_review_changes",
+                return_value=(["app.py"], "merge-base-sha"),
+            ) as discover,
+            patch(
+                "code_review_graph.tools.review.resolve_review_base",
+            ) as resolve,
+            patch(
+                "code_review_graph.tools.review.parse_diff_ranges",
+                return_value={"app.py": [(1, 10)]},
+            ) as parse_ranges,
+            patch.object(self.store, "close"),
+        ):
+            root = Path("/fake/repo")
+            mock_get_store.return_value = (self.store, root)
+
+            result = detect_changes_func(base="origin/main", repo_root=str(root))
+
+        assert result["status"] == "ok"
+        discover.assert_called_once_with(root, "origin/main", notes=[])
+        # Resolving again outside the chain would spend the discovery budget
+        # a second time and could pick a different ref. require_vcs is the
+        # chain's own business now; TestDiscoverReviewChanges pins it.
+        resolve.assert_not_called()
+        parse_ranges.assert_called_once_with(str(root), "merge-base-sha")
+        assert getattr(self.store.close, "__func__", None) is GraphStore.close
+
+
+class TestAnalyzeChangesFunctionCap:
+    """Regression tests for O(N) slowdown when PR touches many functions."""
 
     def setup_method(self):
         self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
@@ -560,50 +766,26 @@ class TestAnalyzeChangesFunctionBound:
             self.store.upsert_node(node, file_hash="abc")
         self.store.commit()
 
-    def test_every_changed_function_is_analysed_by_default(self, monkeypatch):
-        """More changed functions than the former 500 default are all kept."""
-        monkeypatch.delenv("CRG_MAX_CHANGED_FUNCS", raising=False)
-        self._add_funcs(620)
-
-        result = analyze_changes(self.store, changed_files=["app.py"])
-
-        assert len(result["changed_functions"]) == 620
-        assert result["changed_functions_total"] == 620
-        assert len(result["test_gaps"]) == 620
-        assert result["functions_truncated"] is False
-        assert "CRG_MAX_CHANGED_FUNCS" not in result["summary"]
-
-    def test_opt_in_bound_is_reported_with_total(self, monkeypatch):
-        """An explicit CRG_MAX_CHANGED_FUNCS cut states what it omitted."""
+    def test_changed_funcs_capped(self, monkeypatch):
+        """analyze_changes processes at most CRG_MAX_CHANGED_FUNCS functions."""
         monkeypatch.setenv("CRG_MAX_CHANGED_FUNCS", "10")
         self._add_funcs(20)
 
         result = analyze_changes(self.store, changed_files=["app.py"])
 
         assert len(result["changed_functions"]) == 10
-        assert result["changed_functions_total"] == 20
         assert result["functions_truncated"] is True
-        assert "limited to 10 of 20 changed functions" in result["summary"]
         assert "CRG_MAX_CHANGED_FUNCS" in result["summary"]
 
-    def test_opt_in_bound_above_count_cuts_nothing(self, monkeypatch):
+    def test_no_truncation_below_cap(self, monkeypatch):
+        """analyze_changes processes all functions when count is below cap."""
         monkeypatch.setenv("CRG_MAX_CHANGED_FUNCS", "50")
         self._add_funcs(5)
 
         result = analyze_changes(self.store, changed_files=["app.py"])
 
         assert len(result["changed_functions"]) == 5
-        assert result["changed_functions_total"] == 5
         assert result["functions_truncated"] is False
-
-    @pytest.mark.parametrize("raw", ["0", "-3", "many"])
-    def test_invalid_opt_in_bound_raises(self, monkeypatch, raw):
-        """A malformed bound fails loudly instead of selecting another bound."""
-        monkeypatch.setenv("CRG_MAX_CHANGED_FUNCS", raw)
-        self._add_funcs(3)
-
-        with pytest.raises(ValueError):
-            analyze_changes(self.store, changed_files=["app.py"])
 
 
 class TestAnalyzeChangesInternalParseRemap:
@@ -852,15 +1034,17 @@ class TestRiskScoreChurn:
 
         baseline = analyze_changes(self.store, **kwargs)
         with patch(
-            "code_review_graph.changes.compute_file_churn",
-            return_value={"app.py": 10},
+            "code_review_graph.changes.compute_file_churn_with_status",
+            return_value=({"app.py": 10}, "ok"),
         ):
             churned = analyze_changes(self.store, include_churn=True, **kwargs)
 
         assert churned["risk_score"] - baseline["risk_score"] == pytest.approx(0.15)
 
     def test_analyze_changes_does_not_compute_churn_by_default(self, tmp_path):
-        with patch("code_review_graph.changes.compute_file_churn") as churn:
+        with patch(
+            "code_review_graph.changes.compute_file_churn_with_status",
+        ) as churn:
             analyze_changes(
                 self.store,
                 changed_files=["app.py"],

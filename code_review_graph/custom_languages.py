@@ -32,12 +32,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-import tree_sitter_language_pack as tslp
-
 if sys.version_info >= (3, 11):
     import tomllib
 else:
-    import tomli as tomllib
+    try:
+        import tomli as tomllib  # type: ignore[no-redef]
+    except ImportError:
+        tomllib = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
 
@@ -149,6 +150,13 @@ def _load_uncached(
     builtin_extensions: Mapping[str, str],
     builtin_languages: frozenset[str],
 ) -> dict[str, CustomLanguage]:
+    if tomllib is None:
+        logger.warning(
+            "%s found but TOML parsing requires the 'tomli' package on "
+            "Python < 3.11 — no custom languages loaded",
+            config_path,
+        )
+        return {}
     try:
         raw = config_path.read_bytes()
     except (OSError, PermissionError) as exc:
@@ -321,7 +329,9 @@ def _validate_entry(
     # Probe the grammar last (it is the expensive check).  Parser objects
     # themselves are created lazily by CodeParser._get_parser.
     try:
-        tslp.get_language(grammar)  # type: ignore[arg-type]
+        import tree_sitter_language_pack as _tslp
+
+        globals().setdefault("tslp", _tslp).get_language(grammar)  # type: ignore[arg-type]
     except (LookupError, ValueError, ImportError, OSError) as exc:
         logger.warning(
             "%s: custom language %r: grammar %r is not available in "
@@ -341,3 +351,12 @@ def _validate_entry(
         comment=comment,
         name_field=name_field,
     )
+
+
+def __getattr__(name: str):
+    if name == "tslp":
+        import tree_sitter_language_pack as _tslp
+
+        globals()["tslp"] = _tslp
+        return _tslp
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

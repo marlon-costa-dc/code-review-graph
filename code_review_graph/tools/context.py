@@ -5,10 +5,15 @@ from __future__ import annotations
 import logging
 import sqlite3
 import subprocess
-from pathlib import Path
 from typing import Any
 
-from ..incremental import get_db_path
+from ..errors import ChangeDiscoveryError
+from ..incremental import (
+    discover_review_changes,
+    get_db_path,
+    graph_holds_commits,
+    resolve_review_base,
+)
 from ..parser import normalize_file_path
 from ._common import _get_store, _resolve_root, compact_response, graph_provenance
 
@@ -21,29 +26,8 @@ def _not_ready(reason: str, summary: str) -> dict[str, Any]:
         "status": "not_ready",
         "reason": reason,
         "summary": summary,
-        "next_tool_suggestions": ["build_or_update_graph"],
+        "next_tool_suggestions": ["build_or_update_graph_tool"],
     }
-
-
-def _has_git_changes(root: Path, base: str) -> bool:
-    """Quick check for uncommitted or diffed changes."""
-    try:
-        result = subprocess.run(
-            ["git", "diff", "--name-only", base, "--"],
-            capture_output=True, stdin=subprocess.DEVNULL, text=True,
-            cwd=str(root), timeout=10,
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            return True
-        # Also check staged/unstaged
-        result2 = subprocess.run(
-            ["git", "status", "--porcelain"],
-            capture_output=True, stdin=subprocess.DEVNULL, text=True,
-            cwd=str(root), timeout=10,
-        )
-        return bool(result2.stdout.strip())
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return False
 
 
 def get_minimal_context(
@@ -87,7 +71,14 @@ def get_minimal_context(
             )
 
         provenance = graph_provenance(str(root))
-        if provenance and provenance.get("head_matches_build") is False:
+        if (
+            provenance
+            and provenance.get("head_matches_build") is False
+            # The pre-commit hook updates the graph before the commit
+            # exists, so it records the parent. A graph that already holds
+            # every file the newer commits changed is current.
+            and not graph_holds_commits(root, store, str(provenance.get("built_at_sha", "")))
+        ):
             return _not_ready(
                 "stale_graph",
                 "The graph was built at a different Git commit. "
@@ -99,30 +90,52 @@ def get_minimal_context(
         risk_score = 0.0
         top_affected: list[str] = []
         test_gap_count = 0
-        if changed_files or _has_git_changes(root, base):
+        churn_status = "off"
+        discovery_failed = ""
+        # CLAUDE.md tells agents to call this tool first, so its git work is
+        # the first thing a slow repository blocks on -- and it used to run
+        # resolve_review_base (2 x 30s) + two hardcoded 10s probes +
+        # get_changed_files (30s) before answering anything. One
+        # discover_review_changes call replaces all five subprocesses with
+        # three on the short discovery budget, which is the whole point of
+        # #262: this is the entry point, so it cannot be the exception.
+        try:
+            if changed_files:
+                files: list[str] | None = changed_files
+                base = resolve_review_base(root, base)
+            else:
+                files, base = discover_review_changes(root, base)
+        except ChangeDiscoveryError as exc:
+            # Never silently "no changes": that is the answer an agent acts
+            # on. Say the lookup failed and carry on with the other sections.
+            discovery_failed = str(exc)
+            logger.warning("Change discovery failed in get_minimal_context: %s", exc)
+            files = None
+        if files:
             try:
                 from ..changes import analyze_changes
-                from ..incremental import get_changed_files as _get_changed
 
-                files = changed_files
-                if not files:
-                    files = _get_changed(root, base)
-                if files:
-                    abs_files = [normalize_file_path(root / f) for f in files]
-                    analysis = analyze_changes(
-                        store, abs_files, repo_root=str(root), base=base,
-                    )
-                    risk_score = analysis.get("risk_score", 0.0)
-                    risk = (
-                        "high" if risk_score > 0.7
-                        else "medium" if risk_score > 0.4
-                        else "low"
-                    )
-                    top_affected = [
-                        f.get("name", "")
-                        for f in analysis.get("changed_functions", [])[:5]
-                    ]
-                    test_gap_count = len(analysis.get("test_gaps", []))
+                abs_files = [normalize_file_path(root / f) for f in files]
+                analysis = analyze_changes(
+                    store, abs_files, repo_root=str(root), base=base,
+                    # Same reason as detect_changes: without this the
+                    # change-frequency term is pinned at zero for every
+                    # agent-driven review. The git log behind it is
+                    # memoised per commit, bounded, and fails soft.
+                    include_churn=True,
+                )
+                risk_score = analysis.get("risk_score", 0.0)
+                churn_status = analysis.get("churn_status", "off")
+                risk = (
+                    "high" if risk_score > 0.7
+                    else "medium" if risk_score > 0.4
+                    else "low"
+                )
+                top_affected = [
+                    f.get("name", "")
+                    for f in analysis.get("changed_functions", [])[:5]
+                ]
+                test_gap_count = len(analysis.get("test_gaps", []))
             except (
                 ImportError, OSError, ValueError,
                 sqlite3.Error, subprocess.SubprocessError,
@@ -151,20 +164,26 @@ def get_minimal_context(
 
         # 5. Suggest next tools based on task keywords
         task_lower = task.lower()
+        # Registered tool names, which all end in ``_tool``: a client can
+        # only call a name exactly as the server lists it.
         if any(w in task_lower for w in ("review", "pr", "merge", "diff")):
-            suggestions = ["detect_changes", "get_affected_flows", "get_review_context"]
+            suggestions = [
+                "detect_changes_tool", "get_affected_flows_tool", "get_review_context_tool",
+            ]
         elif any(w in task_lower for w in ("debug", "bug", "error", "fix")):
-            suggestions = ["semantic_search_nodes", "query_graph", "get_flow"]
+            suggestions = ["semantic_search_nodes_tool", "query_graph_tool", "get_flow_tool"]
         elif any(w in task_lower for w in ("refactor", "rename", "dead", "clean")):
-            suggestions = ["refactor", "find_large_functions", "get_architecture_overview"]
+            suggestions = [
+                "refactor_tool", "find_large_functions_tool", "get_architecture_overview_tool",
+            ]
         elif any(w in task_lower for w in ("onboard", "understand", "explore", "arch")):
             suggestions = [
-                "get_architecture_overview", "list_communities", "list_flows",
+                "get_architecture_overview_tool", "list_communities_tool", "list_flows_tool",
             ]
         else:
             suggestions = [
-                "detect_changes", "semantic_search_nodes",
-                "get_architecture_overview",
+                "detect_changes_tool", "semantic_search_nodes_tool",
+                "get_architecture_overview_tool",
             ]
 
         # Build summary
@@ -176,6 +195,18 @@ def get_minimal_context(
             summary_parts.append(f"Risk: {risk} ({risk_score:.2f}).")
         if test_gap_count:
             summary_parts.append(f"{test_gap_count} test gaps.")
+        if discovery_failed:
+            # Same contract as the churn note below: a degraded run must not
+            # read like a healthy one.
+            summary_parts.append(f"Degraded: {discovery_failed}")
+        if churn_status == "unavailable":
+            # The score above is missing a term worth up to 0.15. Saying so
+            # costs a handful of tokens; not saying so makes a degraded run
+            # indistinguishable from a healthy one.
+            summary_parts.append(
+                "Degraded: change-frequency risk unavailable (git history "
+                "too slow); risk excludes churn."
+            )
 
         return compact_response(
             summary=" ".join(summary_parts),

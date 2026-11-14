@@ -20,7 +20,8 @@ _DERIVED_FLAG = "spring_event_resolved"
 def _clear_derived_event_data(store: GraphStore) -> tuple[int, int]:
     """Remove event nodes and derived calls before rebuilding the relation."""
     call_rows = store._conn.execute(
-        "SELECT id, extra FROM edges WHERE kind = 'CALLS'"
+        "SELECT id, extra FROM edges WHERE kind = 'CALLS' "
+        "AND extra LIKE '%\"spring_event_resolved\"%'"
     ).fetchall()
     derived_ids: list[tuple[int]] = []
     for row in call_rows:
@@ -37,7 +38,8 @@ def _clear_derived_event_data(store: GraphStore) -> tuple[int, int]:
         "DELETE FROM nodes WHERE kind = 'Event' AND file_path = ?",
         (_EVENT_NODE_FILE,),
     ).rowcount
-    store.commit()
+    if derived_ids or removed_nodes:
+        store.commit()
     return len(derived_ids), removed_nodes
 
 
@@ -110,7 +112,11 @@ def resolve_spring_events(store: GraphStore) -> dict[str, int]:
                 emitted += 1
 
     store.commit()
-    logger.info(
+    # Most repositories have no Spring events at all; a line of zeros on
+    # every build says nothing, so it is DEBUG unless something was found.
+    found = bool(event_types or emitted or removed_calls)
+    logger.log(
+        logging.INFO if found else logging.DEBUG,
         "Spring event resolver: indexed %d events and emitted %d CALLS edges",
         len(event_types),
         emitted,

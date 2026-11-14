@@ -8,9 +8,12 @@ stdio event loop stays responsive during long-running operations.
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import inspect
+import textwrap
 import threading
+import time
 
 import pytest
 
@@ -22,35 +25,13 @@ from code_review_graph.http_origin_guard import LoopbackOriginGuard
 
 @pytest.fixture(autouse=True)
 def _isolate_crg_tools_env(monkeypatch):
-    """Always strip CRG_TOOLS / CRG_DETAIL_LEVEL so that any test invoking
-    ``crg_main.main`` does not accidentally permanently shrink the global tool
-    registry when the suite runs under a developer environment that exports
+    """Always strip CRG_TOOLS so that any test invoking ``crg_main.main``
+    does not accidentally permanently shrink the global tool registry
+    when the suite runs under a developer environment that exports
     ``CRG_TOOLS``.  Without this the snapshot/restore in
     ``TestApplyToolFilter._restore_tools`` only sees the already-filtered
     set and cannot restore the dropped tools."""
     monkeypatch.delenv("CRG_TOOLS", raising=False)
-    monkeypatch.delenv("CRG_DETAIL_LEVEL", raising=False)
-
-
-@pytest.fixture(autouse=True)
-def _restore_tool_registry():
-    """Snapshot the full tool registry before each test and restore after.
-
-    ``main()`` now trims to the lean set by default (and ``_apply_tool_filter``
-    removes tools permanently via ``remove_tool``), so any test that starts the
-    server would otherwise leave the global registry shrunk for every later
-    test.  Re-register anything that was dropped, and reset the detail-level
-    override."""
-    import asyncio
-
-    original = asyncio.run(crg_main.mcp.list_tools())
-    saved_override = crg_main._detail_level_override
-    yield
-    crg_main._detail_level_override = saved_override
-    current_names = {t.name for t in asyncio.run(crg_main.mcp.list_tools())}
-    for tool in original:
-        if tool.name not in current_names:
-            crg_main.mcp.add_tool(tool)
 
 
 class TestResolveRepoRoot:
@@ -169,29 +150,6 @@ class TestServeMainTransport:
             crg_main.main(transport="streamable-http", host="127.0.0.1", port=None)
 
 
-class TestFindProjectRoot:
-    """Lightweight server root detection mirrors the canonical helper."""
-
-    def test_old_style_svn_uses_topmost_working_copy_root(self, tmp_path):
-        root = tmp_path / "repo"
-        child = root / "subdir" / "nested"
-        child.mkdir(parents=True)
-        for path in (root, root / "subdir", child):
-            (path / ".svn").mkdir()
-
-        assert crg_main._find_project_root(child) == root
-
-    def test_git_takes_precedence_over_nested_svn(self, tmp_path):
-        root = tmp_path / "repo"
-        child = root / "subdir"
-        child.mkdir(parents=True)
-        (root / ".git").mkdir()
-        (root / ".git" / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
-        (child / ".svn").mkdir()
-
-        assert crg_main._find_project_root(child) == root
-
-
 class TestLongRunningToolsAreAsync:
     """Long-running MCP tools must be registered as coroutines so the
     asyncio event loop stays responsive while the work runs in a
@@ -200,13 +158,45 @@ class TestLongRunningToolsAreAsync:
     ``embed_graph_tool`` — see #46, #136.
     """
 
+    #: Every tool that can reach Git discovery, a graph traversal, FTS,
+    #: an embedding provider or the filesystem, i.e. everything that can
+    #: hold the stdio loop for seconds. Only ``get_docs_section_tool``
+    #: (one bundled Markdown read) and ``list_repos_tool`` (one small
+    #: JSON read) are allowed to stay synchronous; ``test_no_new_sync_tool``
+    #: below fails if that list ever grows.
     HEAVY_TOOLS = {
         "build_or_update_graph_tool",
         "run_postprocess_tool",
         "embed_graph_tool",
         "detect_changes_tool",
         "generate_wiki_tool",
+        "get_minimal_context_tool",
+        "get_impact_radius_tool",
+        "query_graph_tool",
+        "get_review_context_tool",
+        "semantic_search_nodes_tool",
+        "list_graph_stats_tool",
+        "find_large_functions_tool",
+        "list_flows_tool",
+        "get_flow_tool",
+        "get_affected_flows_tool",
+        "list_communities_tool",
+        "get_community_tool",
+        "get_architecture_overview_tool",
+        "refactor_tool",
+        "apply_refactor_tool",
+        "get_wiki_page_tool",
+        "get_hub_nodes_tool",
+        "get_bridge_nodes_tool",
+        "get_knowledge_gaps_tool",
+        "get_surprising_connections_tool",
+        "get_suggested_questions_tool",
+        "traverse_graph_tool",
+        "cross_repo_search_tool",
     }
+
+    #: The only tools allowed to run inline on the event loop.
+    SYNC_TOOLS = {"get_docs_section_tool", "list_repos_tool"}
 
     HEAVY_TOOL_IMPLS = {
         "build_or_update_graph_tool": "build_or_update_graph",
@@ -252,9 +242,21 @@ class TestLongRunningToolsAreAsync:
         )
 
     def test_heavy_tool_source_uses_to_thread(self):
-        """Defense in depth: the source of every heavy tool wrapper must
-        literally call asyncio.to_thread so we don't accidentally turn
-        a tool async without offloading the blocking work."""
+        """Defense in depth: every heavy tool must hand its blocking work
+        to ``_offload``, and ``_offload`` must really run it off the loop.
+
+        The offload used to be copy-pasted into each wrapper, so this
+        checked each wrapper for a literal ``asyncio.to_thread``. There is
+        one implementation now (#262), so the check is in two halves:
+        every wrapper delegates, and the thing they delegate to threads."""
+        offload_source = inspect.getsource(crg_main._run_off_loop)
+        assert "anyio.to_thread.run_sync" in offload_source, (
+            "_offload must thread its work through anyio.to_thread.run_sync; "
+            "it is the single place every heavy tool relies on to stay off "
+            "the stdio event loop. anyio and not asyncio.to_thread: see "
+            "test_the_offload_uses_the_same_limiter_fastmcp_does. "
+            "See #46, #136, #262."
+        )
         for tool_name in self.HEAVY_TOOLS:
             fn = getattr(crg_main, tool_name, None)
             assert fn is not None, f"{tool_name} not found on module"
@@ -262,11 +264,36 @@ class TestLongRunningToolsAreAsync:
             # through the wrapper to find the underlying source.
             underlying = getattr(fn, "fn", None) or fn
             source = inspect.getsource(underlying)
-            assert "asyncio.to_thread" in source, (
-                f"{tool_name} must call asyncio.to_thread to offload its "
-                f"blocking work; otherwise Windows MCP clients will hang. "
-                f"See #46, #136."
+            assert "_offload(" in source, (
+                f"{tool_name} must hand its blocking work to _offload; "
+                f"otherwise it runs inline and MCP clients see a hang. "
+                f"See #46, #136, #262."
             )
+
+    def test_no_new_sync_tool(self):
+        """A newly added tool is async unless it is deliberately trivial.
+
+        The failure this guards is silent: a tool added as a plain ``def``
+        works in every test that calls it directly and only misbehaves as
+        an unbounded, inline MCP call. Adding one fails here instead."""
+        registered = {
+            name for name in dir(crg_main)
+            if name.endswith("_tool") and not name.startswith("_")
+        }
+        sync = {
+            name for name in registered
+            if not asyncio.iscoroutinefunction(
+                getattr(getattr(crg_main, name), "fn", None) or getattr(crg_main, name)
+            )
+        }
+        assert sync == self.SYNC_TOOLS, (
+            "tools running inline on the event loop changed; either offload "
+            f"the new one via _offload or justify it in SYNC_TOOLS: {sorted(sync)}"
+        )
+        assert registered == self.HEAVY_TOOLS | self.SYNC_TOOLS, (
+            "the registered tool set changed; update HEAVY_TOOLS/SYNC_TOOLS: "
+            f"{sorted(registered ^ (self.HEAVY_TOOLS | self.SYNC_TOOLS))}"
+        )
 
     @pytest.mark.parametrize("tool_name,impl_name", HEAVY_TOOL_IMPLS.items())
     @pytest.mark.asyncio
@@ -298,7 +325,9 @@ class TestLongRunningToolsAreAsync:
         assert all(tid != event_loop_thread for tid in provenance_threads)
 
     @pytest.mark.asyncio
-    async def test_detect_changes_timeout_uses_error_response_shape(self, monkeypatch):
+    async def test_detect_changes_timeout_uses_error_response_shape(
+        self, monkeypatch
+    ):
         async def fake_wait_for(coro, timeout):
             coro.close()
             raise asyncio.TimeoutError
@@ -314,6 +343,278 @@ class TestLongRunningToolsAreAsync:
         assert result["status"] == "error"
         assert "timed out after 1s" in result["error"]
         assert result["summary"] == result["error"]
+
+    @pytest.mark.parametrize("tool_name,impl_name", [
+        ("get_impact_radius_tool", "get_impact_radius"),
+        ("get_review_context_tool", "get_review_context"),
+        ("get_minimal_context_tool", "get_minimal_context"),
+        ("semantic_search_nodes_tool", "semantic_search_nodes"),
+        ("query_graph_tool", "query_graph"),
+        ("get_affected_flows_tool", "get_affected_flows_func"),
+    ])
+    @pytest.mark.asyncio
+    async def test_offloaded_tool_runs_its_body_off_the_event_loop(
+        self, tool_name, impl_name, monkeypatch,
+    ):
+        """The work itself, not just the wrapper, must leave the loop thread."""
+        loop_thread = threading.get_ident()
+        body_threads: list[int] = []
+
+        def fake_impl(*args, **kwargs):
+            body_threads.append(threading.get_ident())
+            return {"status": "ok"}
+
+        monkeypatch.delenv("CRG_TOOL_TIMEOUT", raising=False)
+        monkeypatch.setattr(crg_main, impl_name, fake_impl)
+        monkeypatch.setattr(
+            crg_main, "with_provenance", lambda result, repo_root=None: result,
+        )
+        tool = getattr(crg_main, tool_name)
+        underlying = getattr(tool, "fn", None) or tool
+        kwargs = {}
+        if tool_name == "query_graph_tool":
+            kwargs = {"pattern": "callers_of", "target": "x"}
+        elif tool_name == "semantic_search_nodes_tool":
+            kwargs = {"query": "x"}
+
+        result = await underlying(**kwargs)
+
+        assert result == {"status": "ok"}
+        assert body_threads and all(tid != loop_thread for tid in body_threads)
+
+    @pytest.mark.asyncio
+    async def test_a_slow_tool_leaves_the_event_loop_answerable(self, monkeypatch):
+        """The whole point of #262, asserted against a running event loop.
+
+        A tool body that blocks for seconds must not stop the loop from
+        making progress: that is the difference between a slow answer and a
+        client-side MCP -32001 on every other request in flight. A test that
+        only checks ``iscoroutinefunction`` would pass on a wrapper that
+        awaited its blocking work inline.
+        """
+        started = threading.Event()
+        release = threading.Event()
+
+        def blocking_impl(*args, **kwargs):
+            started.set()
+            release.wait(30)
+            return {"status": "ok"}
+
+        monkeypatch.delenv("CRG_TOOL_TIMEOUT", raising=False)
+        monkeypatch.setattr(crg_main, "get_impact_radius", blocking_impl)
+        monkeypatch.setattr(
+            crg_main, "with_provenance", lambda result, repo_root=None: result,
+        )
+        tool = crg_main.get_impact_radius_tool
+        underlying = getattr(tool, "fn", None) or tool
+
+        slow = asyncio.create_task(underlying())
+        try:
+            assert await asyncio.to_thread(started.wait, 10)
+            # The loop is free: this sleep resolves on schedule while the
+            # tool is still outstanding.
+            began = time.monotonic()
+            await asyncio.sleep(0.05)
+            elapsed = time.monotonic() - began
+            assert elapsed < 2.0, (
+                f"the event loop was blocked for {elapsed:.2f}s while a tool "
+                "body ran; it must be offloaded via _offload"
+            )
+            assert not slow.done()
+        finally:
+            release.set()
+        assert (await slow)["status"] == "ok"
+
+    @pytest.mark.parametrize("tool_name", [
+        "get_impact_radius_tool",
+        "get_review_context_tool",
+        "get_affected_flows_tool",
+        "get_minimal_context_tool",
+        "detect_changes_tool",
+    ])
+    @pytest.mark.asyncio
+    async def test_tool_timeout_returns_a_named_error_not_an_exception(
+        self, tool_name, monkeypatch,
+    ):
+        """Every offloaded tool answers on timeout, and names itself.
+
+        An MCP client that gets a structured error can say what happened; one
+        that gets nothing reports -32001 and the user has no idea which tool
+        or which budget was involved (#262).
+        """
+        async def fake_wait_for(coro, timeout):
+            coro.close()
+            raise asyncio.TimeoutError
+
+        monkeypatch.setenv("CRG_TOOL_TIMEOUT", "7")
+        monkeypatch.setattr(crg_main.asyncio, "wait_for", fake_wait_for)
+        monkeypatch.setattr(
+            crg_main, "with_provenance", lambda result, repo_root=None: result,
+        )
+        tool = getattr(crg_main, tool_name)
+        underlying = getattr(tool, "fn", None) or tool
+
+        result = await underlying()
+
+        assert result["status"] == "error"
+        assert result["error"] == result["summary"]
+        assert f"{tool_name} timed out after 7s" in result["error"]
+        assert "CRG_TOOL_TIMEOUT" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_detect_changes_keeps_its_own_timeout_advice(self, monkeypatch):
+        """Folding seven copies into one helper must not lose the specifics."""
+        async def fake_wait_for(coro, timeout):
+            coro.close()
+            raise asyncio.TimeoutError
+
+        monkeypatch.setenv("CRG_TOOL_TIMEOUT", "1")
+        monkeypatch.setattr(crg_main.asyncio, "wait_for", fake_wait_for)
+
+        underlying = (
+            getattr(crg_main.detect_changes_tool, "fn", None)
+            or crg_main.detect_changes_tool
+        )
+        result = await underlying()
+
+        assert "CRG_MAX_CHANGED_FUNCS" in result["error"]
+        assert "CRG_MAX_TRANSITIVE_FRONTIER" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_unset_tool_timeout_leaves_the_call_unbounded(self, monkeypatch):
+        """Historical default: no ceiling unless one was asked for."""
+        waited: list[float] = []
+
+        async def fake_wait_for(coro, timeout):
+            waited.append(timeout)
+            return await coro
+
+        monkeypatch.delenv("CRG_TOOL_TIMEOUT", raising=False)
+        monkeypatch.setattr(crg_main.asyncio, "wait_for", fake_wait_for)
+        monkeypatch.setattr(
+            crg_main, "get_impact_radius", lambda **kw: {"status": "ok"},
+        )
+        monkeypatch.setattr(
+            crg_main, "with_provenance", lambda result, repo_root=None: result,
+        )
+        underlying = (
+            getattr(crg_main.get_impact_radius_tool, "fn", None)
+            or crg_main.get_impact_radius_tool
+        )
+
+        assert (await underlying())["status"] == "ok"
+        assert waited == [], "no timeout must be applied when the budget is 0"
+
+        monkeypatch.setenv("CRG_TOOL_TIMEOUT", "0")
+        assert (await underlying())["status"] == "ok"
+        assert waited == []
+
+    #: Offloaded, but never bounded by ``CRG_TOOL_TIMEOUT``. Each either
+    #: writes (graph.db, embeddings, the wiki tree, the source tree itself)
+    #: or legitimately runs for minutes, and ``asyncio.wait_for`` cancels the
+    #: await rather than the worker thread -- so a "timeout" here reports
+    #: failure to the client while the write goes on regardless.
+    UNBOUNDED_TOOLS = {
+        "build_or_update_graph_tool": "build_or_update_graph",
+        "run_postprocess_tool": "run_postprocess",
+        "embed_graph_tool": "embed_graph",
+        "generate_wiki_tool": "generate_wiki_func",
+        "apply_refactor_tool": "apply_refactor_func",
+    }
+
+    @pytest.mark.parametrize("tool_name,impl_name", UNBOUNDED_TOOLS.items())
+    @pytest.mark.asyncio
+    async def test_writing_tools_are_never_cut_short_by_the_tool_timeout(
+        self, tool_name, impl_name, monkeypatch,
+    ):
+        """These were unbounded before the shared helper existed, and stay so.
+
+        ``CRG_TOOL_TIMEOUT`` is exactly what #262 tells a user to set to keep
+        review calls responsive. If that also aborted their build, the
+        documented remedy would be a new bug -- and the abandoned worker would
+        keep writing graph.db while the client was told the call failed, so a
+        retry would run a second update against the same database.
+        """
+        waited: list[float] = []
+
+        async def fake_wait_for(coro, timeout):
+            waited.append(timeout)
+            return await coro
+
+        monkeypatch.setenv("CRG_TOOL_TIMEOUT", "1")
+        monkeypatch.setattr(crg_main.asyncio, "wait_for", fake_wait_for)
+        monkeypatch.setattr(
+            crg_main, impl_name, lambda *a, **kw: {"status": "ok"},
+        )
+        monkeypatch.setattr(
+            crg_main, "with_provenance", lambda result, repo_root=None: result,
+        )
+        tool = getattr(crg_main, tool_name)
+        underlying = getattr(tool, "fn", None) or tool
+        kwargs = {"refactor_id": "x"} if tool_name == "apply_refactor_tool" else {}
+
+        assert (await underlying(**kwargs))["status"] == "ok"
+        assert waited == [], (
+            f"{tool_name} must not be bounded by CRG_TOOL_TIMEOUT: a timeout "
+            "cannot stop its worker, only stop waiting for it"
+        )
+
+    @pytest.mark.parametrize("bad", ["", "   ", "abc", "2.5", "30s", "-1"])
+    @pytest.mark.asyncio
+    async def test_an_unusable_tool_timeout_does_not_break_every_tool(
+        self, bad, monkeypatch,
+    ):
+        """One bad env var must not take the whole server down.
+
+        ``int(os.environ.get(...))`` here used to raise before any work ran.
+        The README calls this "Timeout in seconds", so "2.5" is a plausible
+        thing to write, and an MCP config with ``"env": {"...": ""}`` produces
+        the empty string for free. #912's env_int warns and falls back.
+        """
+        monkeypatch.setenv("CRG_TOOL_TIMEOUT", bad)
+        monkeypatch.setattr(
+            crg_main, "get_impact_radius", lambda **kw: {"status": "ok"},
+        )
+        monkeypatch.setattr(
+            crg_main, "with_provenance", lambda result, repo_root=None: result,
+        )
+        underlying = (
+            getattr(crg_main.get_impact_radius_tool, "fn", None)
+            or crg_main.get_impact_radius_tool
+        )
+
+        assert (await underlying())["status"] == "ok"
+
+    def test_the_offload_uses_the_same_limiter_fastmcp_does(self):
+        """``asyncio.to_thread``'s executor is smaller than anyio's limiter.
+
+        A plain ``def`` tool body is dispatched by FastMCP through anyio's
+        default thread limiter (40 slots). Rewriting these tools as
+        ``async def`` and threading them with ``asyncio.to_thread`` moves them
+        onto its default executor, capped at ``min(32, cpu_count + 4)`` -- 8
+        slots on a 4-core Windows box. Queueing sooner than staging did would
+        be the opposite of the point of #262.
+        """
+        # The docstring explains the contrast, so read the code, not the prose.
+        tree = ast.parse(textwrap.dedent(inspect.getsource(crg_main._run_off_loop)))
+        func = tree.body[0]
+        statements = [
+            node for node in func.body
+            if not (isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant))
+        ]
+        body = "\n".join(ast.unparse(node) for node in statements)
+        assert "anyio.to_thread.run_sync" in body
+        assert "asyncio.to_thread" not in body
+        # abandon_on_cancel: without it, cancelling the await blocks until the
+        # thread finishes anyway and the timeout could never fire.
+        assert "abandon_on_cancel=True" in body
+
+    def test_the_shared_timeout_hint_names_no_argument_as_universal(self):
+        """Several bounded tools accept none of changed_files / max_depth /
+        max_results. Advice naming a parameter the caller cannot pass is
+        worse than no advice, so the shared message stays hedged."""
+        assert "whichever of" in crg_main._TIMEOUT_HINT
+        assert "CRG_TOOL_TIMEOUT" in crg_main._TIMEOUT_HINT
 
     def test_regression_guard_does_not_depend_on_fastmcp_internals(self):
         """Regression guard for #239 bug 3: ensure the async guards above
@@ -346,10 +647,7 @@ class TestLongRunningToolsAreAsync:
         # function bodies (not the docstrings) so an explanatory comment
         # mentioning an old API name doesn't trip this guard.
         forbidden_mcp_attrs = {
-            "get_tools",
-            "_tools",
-            "tool_manager",
-            "_tool_manager",
+            "get_tools", "_tools", "tool_manager", "_tool_manager",
         }
         for guard_fn in (
             self.test_heavy_tools_are_coroutines,
@@ -407,21 +705,39 @@ class TestGraphBackedToolProvenanceCoverage:
         self, category, tool_names,
     ):
         assert tool_names, f"{category} must name at least one tool"
+        # ``_offload`` stamps provenance for every tool that routes through
+        # it, so a wrapper attaches provenance either directly or by
+        # delegating without opting out. See #262.
+        assert "with_provenance" in inspect.getsource(crg_main._offload)
         for tool_name in tool_names:
             tool = getattr(crg_main, tool_name, None)
             assert tool is not None, f"{category}: missing {tool_name}"
             underlying = getattr(tool, "fn", None) or tool
-            assert "with_provenance" in inspect.getsource(underlying), (
+            source = inspect.getsource(underlying)
+            attaches = "with_provenance" in source or (
+                "_offload(" in source and "provenance=False" not in source
+            )
+            assert attaches, (
                 f"{category}: {tool_name} does not attach graph provenance"
             )
 
-    @pytest.mark.parametrize("tool_name", [
-        "get_docs_section_tool", "list_repos_tool", "cross_repo_search_tool",
+    @pytest.mark.parametrize(("tool_name", "offloads"), [
+        ("get_docs_section_tool", False),
+        ("list_repos_tool", False),
+        ("cross_repo_search_tool", True),
     ])
-    def test_non_single_repository_tools_do_not_claim_one_graph(self, tool_name):
+    def test_non_single_repository_tools_do_not_claim_one_graph(
+        self, tool_name, offloads,
+    ):
         tool = getattr(crg_main, tool_name)
         underlying = getattr(tool, "fn", None) or tool
-        assert "with_provenance" not in inspect.getsource(underlying)
+        source = inspect.getsource(underlying)
+        assert "with_provenance" not in source
+        # Offloading must not smuggle provenance in through the back door:
+        # a tool that spans several repositories, or none, has no single
+        # graph whose freshness it could report.
+        assert ("_offload(" in source) is offloads
+        assert ("provenance=False" in source) is offloads
 
 class TestApplyToolFilter:
     """Tests for _apply_tool_filter (``serve --tools`` / ``CRG_TOOLS``).
@@ -444,7 +760,9 @@ class TestApplyToolFilter:
 
         original = asyncio.run(crg_main.mcp.list_tools())
         yield
-        current_names = {t.name for t in asyncio.run(crg_main.mcp.list_tools())}
+        current_names = {
+            t.name for t in asyncio.run(crg_main.mcp.list_tools())
+        }
         for tool in original:
             if tool.name not in current_names:
                 crg_main.mcp.add_tool(tool)
@@ -459,37 +777,12 @@ class TestApplyToolFilter:
         return {t.name for t in await crg_main.mcp.list_tools()}
 
     @pytest.mark.asyncio
-    async def test_default_exposes_all_tools(self):
-        """With nothing specified, the server exposes EVERY tool (upstream
-        behavior). Token-lean mode is opt-in via --tools lean / CRG_TOOLS=lean."""
+    async def test_no_filter_keeps_all_tools(self):
+        """When neither --tools nor CRG_TOOLS is set, all tools remain."""
         before = await self._tool_names()
         crg_main._apply_tool_filter(None)
         after = await self._tool_names()
-        assert after == before
-        assert len(after) == 30
-        # The curated lean set stays available as an explicit opt-in.
-        assert len(crg_main.LEAN_TOOLS) == 7
-
-    @pytest.mark.asyncio
-    async def test_all_keyword_restores_full_set(self):
-        """``--tools all`` (or CRG_TOOLS=all) keeps every registered tool."""
-        before = await self._tool_names()
-        assert len(before) == 30
-        crg_main._apply_tool_filter("all")
-        after = await self._tool_names()
-        assert after == before
-        assert len(after) == 30
-
-    @pytest.mark.asyncio
-    async def test_all_keyword_case_insensitive(self):
-        before = await self._tool_names()
-        crg_main._apply_tool_filter("ALL")
-        assert await self._tool_names() == before
-
-    @pytest.mark.asyncio
-    async def test_lean_keyword_uses_curated_set(self):
-        crg_main._apply_tool_filter("lean")
-        assert await self._tool_names() == set(crg_main.LEAN_TOOLS)
+        assert before == after
 
     @pytest.mark.asyncio
     async def test_filter_via_argument(self):
@@ -508,13 +801,6 @@ class TestApplyToolFilter:
         assert remaining == {"query_graph_tool"}
 
     @pytest.mark.asyncio
-    async def test_env_var_all_restores_full_set(self, monkeypatch):
-        before = await self._tool_names()
-        monkeypatch.setenv("CRG_TOOLS", "all")
-        crg_main._apply_tool_filter(None)
-        assert await self._tool_names() == before
-
-    @pytest.mark.asyncio
     async def test_argument_takes_precedence_over_env(self, monkeypatch):
         """CLI --tools wins over CRG_TOOLS env var."""
         monkeypatch.setenv("CRG_TOOLS", "list_repos_tool")
@@ -523,27 +809,8 @@ class TestApplyToolFilter:
         assert remaining == {"query_graph_tool"}
 
     @pytest.mark.asyncio
-    async def test_unknown_names_ignored_gracefully(self):
-        """Unknown tool names don't error; only the valid ones survive."""
-        crg_main._apply_tool_filter(
-            "query_graph_tool,this_tool_does_not_exist,another_bogus_tool"
-        )
-        remaining = await self._tool_names()
-        assert remaining == {"query_graph_tool"}
-
-    @pytest.mark.asyncio
-    async def test_all_unknown_names_removes_everything(self):
-        """A spec of only-unknown names is honoured (removes all real tools).
-
-        This is intentional: the names were explicit, just wrong. It is the
-        caller's responsibility to pass real names; we never *expand* output.
-        """
-        crg_main._apply_tool_filter("nonexistent_a,nonexistent_b")
-        assert await self._tool_names() == set()
-
-    @pytest.mark.asyncio
-    async def test_empty_string_keeps_all(self):
-        """An explicit empty string should not remove all tools."""
+    async def test_empty_string_is_noop(self):
+        """An empty string should not remove all tools."""
         before = await self._tool_names()
         crg_main._apply_tool_filter("")
         after = await self._tool_names()
@@ -556,126 +823,35 @@ class TestApplyToolFilter:
         remaining = await self._tool_names()
         assert remaining == {"query_graph_tool", "semantic_search_nodes_tool"}
 
-    def test_stderr_notice_printed_when_trimming(self, capsys):
-        """Trimming to lean prints a one-line stderr notice; stdout stays clean."""
-        crg_main._apply_tool_filter("query_graph_tool")
-        captured = capsys.readouterr()
-        assert captured.out == ""  # stdout must stay clean for JSON-RPC
-        assert "lean tool mode" in captured.err
-        assert "--tools all" in captured.err
 
-    def test_no_stderr_notice_when_keeping_all(self, capsys):
-        """``all`` keeps everything and prints nothing."""
-        crg_main._apply_tool_filter("all")
-        captured = capsys.readouterr()
-        assert captured.out == ""
-        assert captured.err == ""
+class TestMainLazyAttrsAndPromptsDirect:
+    def test_resolve_attr_getattr_and_prompts_direct(self, monkeypatch, tmp_path):
+        assert callable(crg_main._resolve_attr("get_docs_section"))
+        assert callable(crg_main.__getattr__("review_changes_prompt"))
+        with pytest.raises(AttributeError):
+            crg_main.__getattr__("nonexistent_main_attr")
 
-    def test_lean_tools_are_all_registered(self):
-        """Every name in LEAN_TOOLS must be a real registered tool."""
-        import asyncio
+        res = asyncio.run(
+            crg_main._offload(
+                "unit_test_tool",
+                lambda: {"status": "ok"},
+                None,
+                provenance=False,
+            )
+        )
+        assert res["status"] == "ok"
 
-        registered = {t.name for t in asyncio.run(crg_main.mcp.list_tools())}
-        for name in crg_main.LEAN_TOOLS:
-            assert name in registered, f"LEAN_TOOLS lists unknown tool {name!r}"
+        docs_res = crg_main.get_docs_section_tool("usage")
+        assert isinstance(docs_res, dict)
 
+        monkeypatch.setattr(
+            crg_main, "list_repos_func", lambda: {"repos": []}, raising=False
+        )
+        repos_res = crg_main.list_repos_tool()
+        assert repos_res == {"repos": []}
 
-class TestResolveDetailLevel:
-    """Server-wide detail-level override (``CRG_DETAIL_LEVEL`` / --detail)."""
-
-    @pytest.fixture(autouse=True)
-    def _reset_override(self, monkeypatch):
-        original = crg_main._detail_level_override
-        monkeypatch.delenv("CRG_DETAIL_LEVEL", raising=False)
-        crg_main._detail_level_override = None
-        yield
-        crg_main._detail_level_override = original
-
-    def test_no_override_returns_argument(self):
-        assert crg_main._resolve_detail_level("standard") == "standard"
-        assert crg_main._resolve_detail_level("minimal") == "minimal"
-
-    def test_module_override_wins(self):
-        crg_main._detail_level_override = "minimal"
-        assert crg_main._resolve_detail_level("standard") == "minimal"
-
-    def test_env_override_wins(self, monkeypatch):
-        monkeypatch.setenv("CRG_DETAIL_LEVEL", "standard")
-        assert crg_main._resolve_detail_level("minimal") == "standard"
-
-    def test_module_override_beats_env(self, monkeypatch):
-        monkeypatch.setenv("CRG_DETAIL_LEVEL", "standard")
-        crg_main._detail_level_override = "minimal"
-        assert crg_main._resolve_detail_level("standard") == "minimal"
-
-    def test_unknown_override_ignored(self, monkeypatch):
-        """An invalid override never silently expands output."""
-        monkeypatch.setenv("CRG_DETAIL_LEVEL", "bogus")
-        assert crg_main._resolve_detail_level("minimal") == "minimal"
-
-    def test_override_is_case_insensitive(self, monkeypatch):
-        monkeypatch.setenv("CRG_DETAIL_LEVEL", "  MINIMAL  ")
-        assert crg_main._resolve_detail_level("standard") == "minimal"
-
-
-class TestMcpWrapperDefaults:
-    """The MCP tool wrappers default to ``minimal`` so the token moat holds."""
-
-    @staticmethod
-    def _wrapper(name):
-        fn = getattr(crg_main, name)
-        return getattr(fn, "fn", None) or fn
-
-    def test_query_graph_tool_defaults_minimal(self):
-        sig = inspect.signature(self._wrapper("query_graph_tool"))
-        assert sig.parameters["detail_level"].default == "minimal"
-
-    def test_semantic_search_defaults_minimal(self):
-        sig = inspect.signature(self._wrapper("semantic_search_nodes_tool"))
-        assert sig.parameters["detail_level"].default == "minimal"
-
-    def test_impact_radius_defaults_minimal(self):
-        sig = inspect.signature(self._wrapper("get_impact_radius_tool"))
-        assert sig.parameters["detail_level"].default == "minimal"
-
-    def test_detect_changes_defaults_minimal(self):
-        sig = inspect.signature(self._wrapper("detect_changes_tool"))
-        assert sig.parameters["detail_level"].default == "minimal"
-
-    def test_query_graph_tool_has_max_results_cap(self):
-        sig = inspect.signature(self._wrapper("query_graph_tool"))
-        assert "max_results" in sig.parameters
-        assert sig.parameters["max_results"].default == 100
-
-    def test_review_tools_are_complete_by_default(self):
-        """Change analysis applies no limit unless the caller passes one."""
-        limits = {
-            "get_review_context_tool": ("max_results", "max_files"),
-            "detect_changes_tool": ("max_results", "max_flows"),
-        }
-        for name, limit_names in limits.items():
-            sig = inspect.signature(self._wrapper(name))
-            assert sig.parameters["max_tokens"].default == 0
-            for limit_name in limit_names:
-                assert sig.parameters[limit_name].default is None
-
-
-class TestServeDetailFlag:
-    """``serve --detail`` sets the module-level override before the loop."""
-
-    @pytest.fixture(autouse=True)
-    def _reset(self):
-        original = crg_main._detail_level_override
-        yield
-        crg_main._detail_level_override = original
-
-    def test_detail_flag_sets_override(self, monkeypatch):
-        monkeypatch.setattr(crg_main.mcp, "run", lambda **kw: None)
-        crg_main.main(repo_root=None, detail_level="minimal")
-        assert crg_main._detail_level_override == "minimal"
-
-    def test_invalid_detail_flag_ignored(self, monkeypatch):
-        monkeypatch.setattr(crg_main.mcp, "run", lambda **kw: None)
-        crg_main._detail_level_override = None
-        crg_main.main(repo_root=None, detail_level="loud")
-        assert crg_main._detail_level_override is None
+        assert isinstance(crg_main.review_changes(base="HEAD~1"), list)
+        assert isinstance(crg_main.architecture_map(), list)
+        assert isinstance(crg_main.debug_issue(description="bug"), list)
+        assert isinstance(crg_main.onboard_developer(), list)
+        assert isinstance(crg_main.pre_merge_check(base="HEAD~1"), list)

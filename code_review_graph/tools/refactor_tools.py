@@ -15,8 +15,7 @@ from ..refactor import (
 )
 from ._common import (
     _bounded,
-    _get_store_for_read,
-    _not_built_response,
+    _get_store,
     _shown_of,
     _validate_positive_int,
     _validate_repo_root,
@@ -86,9 +85,7 @@ def refactor_func(
         }
     _validate_positive_int(max_results, "max_results")
 
-    store, root, not_built = _get_store_for_read(repo_root)
-    if store is None or root is None:
-        return not_built if not_built is not None else _not_built_response()
+    store, root = _get_store(repo_root)
     try:
         if mode == "rename":
             if not old_name or not new_name:
@@ -112,7 +109,7 @@ def refactor_func(
             )
             if detail_level == "minimal":
                 edits = _project(edits, _MINIMAL_EDIT_FIELDS)
-            result = {
+            result: dict[str, Any] = {
                 "status": "ok",
                 "summary": (
                     f"Rename preview: {old_name} -> {new_name}, "
@@ -127,7 +124,7 @@ def refactor_func(
                 "truncated": truncated,
             }
             result["_hints"] = generate_hints(
-                "refactor", result, get_session()
+                "refactor_tool", result, get_session()
             )
             return result
 
@@ -152,7 +149,7 @@ def refactor_func(
                 "truncated": truncated,
             }
             result["_hints"] = generate_hints(
-                "refactor", result, get_session()
+                "refactor_tool", result, get_session()
             )
             return result
 
@@ -173,7 +170,7 @@ def refactor_func(
                 "truncated": truncated,
             }
             result["_hints"] = generate_hints(
-                "refactor", result, get_session()
+                "refactor_tool", result, get_session()
             )
             return result
 

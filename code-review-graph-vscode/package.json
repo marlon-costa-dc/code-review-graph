@@ -2,7 +2,7 @@
   "name": "code-review-graph",
   "displayName": "Code Review Graph",
   "description": "Visualize code dependencies, blast radius, and review context from your code-review-graph database directly in VS Code.",
-  "version": "0.2.2",
+  "version": "0.4.0",
   "publisher": "tirth8205",
   "license": "MIT",
   "icon": "media/icons/icon.png",
@@ -171,7 +171,7 @@
           "type": "string",
           "default": "",
           "scope": "machine",
-          "description": "Path to the code-review-graph CLI binary. Leave empty to use the bundled version or the one found on PATH."
+          "description": "Path to the code-review-graph CLI binary. Leave empty to run code-review-graph from your PATH. The extension does not include the CLI, so install it first."
         },
         "codeReviewGraph.autoUpdate": {
           "type": "boolean",
@@ -184,65 +184,6 @@
           "minimum": 1,
           "maximum": 10,
           "description": "Maximum depth for blast radius traversal."
-        },
-        "codeReviewGraph.graphTheme": {
-          "type": "string",
-          "default": "auto",
-          "enum": [
-            "auto",
-            "light",
-            "dark"
-          ],
-          "description": "Color theme for the graph visualization. 'auto' follows the VS Code theme."
-        },
-        "codeReviewGraph.treeView.showFunctions": {
-          "type": "boolean",
-          "default": true,
-          "description": "Show function nodes in the tree view."
-        },
-        "codeReviewGraph.treeView.showClasses": {
-          "type": "boolean",
-          "default": true,
-          "description": "Show class nodes in the tree view."
-        },
-        "codeReviewGraph.treeView.showFiles": {
-          "type": "boolean",
-          "default": true,
-          "description": "Show file nodes in the tree view."
-        },
-        "codeReviewGraph.treeView.showTypes": {
-          "type": "boolean",
-          "default": true,
-          "description": "Show type nodes in the tree view."
-        },
-        "codeReviewGraph.treeView.showTests": {
-          "type": "boolean",
-          "default": true,
-          "description": "Show test nodes in the tree view."
-        },
-        "codeReviewGraph.graph.defaultEdges": {
-          "type": "array",
-          "default": [
-            "CALLS",
-            "IMPORTS_FROM",
-            "INHERITS",
-            "IMPLEMENTS",
-            "TESTED_BY",
-            "DEPENDS_ON"
-          ],
-          "items": {
-            "type": "string",
-            "enum": [
-              "CALLS",
-              "IMPORTS_FROM",
-              "INHERITS",
-              "IMPLEMENTS",
-              "CONTAINS",
-              "TESTED_BY",
-              "DEPENDS_ON"
-            ]
-          },
-          "description": "Edge types shown by default in the graph visualization."
         },
         "codeReviewGraph.graph.maxNodes": {
           "type": "number",
@@ -292,16 +233,15 @@
     "watch": "node esbuild.mjs --watch",
     "package": "vsce package",
     "lint": "tsc --noEmit",
-    "test": "node --experimental-vm-modules node_modules/@vscode/test-electron/out/runTest.js"
+    "test": "esbuild test/sqlite.test.ts --bundle --platform=node --format=cjs --target=node18 --external:better-sqlite3 --outfile=out/test/sqlite.test.js --log-level=warning && node --test out/test/sqlite.test.js"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",
     "@types/d3": "^7.4.3",
     "@types/node": "^20.11.0",
     "@types/vscode": "^1.85.0",
-    "@vscode/test-electron": "^2.3.8",
-    "@vscode/vsce": "^3.9.2",
-    "esbuild": "^0.28.1",
+    "@vscode/vsce": "^2.22.0",
+    "esbuild": "^0.20.0",
     "typescript": "^5.3.3"
   },
   "dependencies": {

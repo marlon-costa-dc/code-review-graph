@@ -7,13 +7,8 @@ from typing import Any
 
 from ..flows import get_flow_by_id, get_flows
 from ..hints import generate_hints, get_session
-from ._common import (
-    _bounded,
-    _get_store_for_read,
-    _not_built_response,
-    _shown_of,
-    _validate_positive_int,
-)
+from ..incremental import followed_files, path_within_repo
+from ._common import _bounded, _get_store, _shown_of, _validate_positive_int
 
 # ---------------------------------------------------------------------------
 # Tool 10: list_flows  [EXPLORE]
@@ -58,9 +53,7 @@ def list_flows(
     """
     _validate_positive_int(limit, "limit")
 
-    store, root, not_built = _get_store_for_read(repo_root)
-    if store is None or root is None:
-        return not_built if not_built is not None else _not_built_response()
+    store, root = _get_store(repo_root)
     try:
         # Count every matching flow, then keep the bounded prefix — the same
         # "count all, return a prefix" contract query.py uses for max_results.
@@ -101,7 +94,7 @@ def list_flows(
             "truncated": truncated,
         }
         result["_hints"] = generate_hints(
-            "list_flows", result, get_session()
+            "list_flows_tool", result, get_session()
         )
         return result
     except Exception as exc:
@@ -148,9 +141,7 @@ def get_flow(
     _validate_positive_int(max_steps, "max_steps")
     _validate_positive_int(max_source_lines, "max_source_lines")
 
-    store, root, not_built = _get_store_for_read(repo_root)
-    if store is None or root is None:
-        return not_built if not_built is not None else _not_built_response()
+    store, root = _get_store(repo_root)
     try:
         flow: dict | None = None
 
@@ -183,6 +174,7 @@ def get_flow(
         # line budget so a deep flow cannot inline the whole call chain.
         if include_source:
             budget = min(max_source_lines, _MAX_FLOW_SOURCE_LINES)
+            followed = followed_files(store)
             for step in steps:
                 if budget <= 0:
                     flow["truncated"] = True
@@ -192,9 +184,13 @@ def get_flow(
                 if fp is not None and not fp.is_absolute():
                     fp = root / fp
                 file_path = fp
-                if file_path and file_path.is_file():
+                if (
+                    file_path
+                    and file_path.is_file()
+                    and path_within_repo(root, file_path, followed)
+                ):
                     try:
-                        lines = file_path.read_text(
+                        lines = file_path.read_text(encoding="utf-8",
                             errors="replace"
                         ).splitlines()
                         start = max(
@@ -224,7 +220,7 @@ def get_flow(
             "flow": flow,
         }
         result["_hints"] = generate_hints(
-            "get_flow", result, get_session()
+            "get_flow_tool", result, get_session()
         )
         return result
     except Exception as exc:

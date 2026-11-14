@@ -12,6 +12,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from code_review_graph.graph import GraphStore
 from code_review_graph.incremental import full_build
 from code_review_graph.tools.query import get_impact_radius, query_graph
@@ -26,7 +28,20 @@ def _build(tmp_path: Path, files: dict[str, str]) -> GraphStore:
     graph_dir.mkdir(exist_ok=True)
     store = GraphStore(graph_dir / "graph.db")
     full_build(tmp_path, store)
+    _BUILT.append(store)
     return store
+
+
+# Stores the helper above built for the running test. The helper hands its
+# store to the test, so the module closes it once the test is done.
+_BUILT: list[GraphStore] = []
+
+
+@pytest.fixture(autouse=True)
+def _close_built_stores():
+    yield
+    while _BUILT:
+        _BUILT.pop().close()
 
 
 def _calls(store: GraphStore) -> list[dict]:
@@ -173,7 +188,7 @@ def test_impact_radius_of_definition_file_includes_caller(tmp_path: Path) -> Non
 
 def test_unresolved_external_scoped_call_is_left_untouched(tmp_path: Path) -> None:
     # ``Vec::new`` / ``String::from`` are stdlib types with no in-graph node —
-    # the edge must stay a raw, directly-extracted target.
+    # the edge must stay a raw target that says it names no node.
     store = _build(
         tmp_path,
         {
@@ -186,13 +201,13 @@ def test_unresolved_external_scoped_call_is_left_untouched(tmp_path: Path) -> No
     )
     external = [c for c in _calls(store) if c["target_qualified"] == "Vec::new"]
     assert len(external) == 1
-    assert external[0]["confidence_tier"] == "EXTRACTED"
+    assert external[0]["confidence_tier"] == "UNRESOLVED"
 
 
 def test_case_sensitive_identifiers_are_not_conflated(tmp_path: Path) -> None:
     # Rust is case-sensitive: a call to ``Mailer::send`` must NOT resolve to a
     # differently-cased definition ``Mailer::Send``. The edge must stay a raw,
-    # directly-extracted target rather than a bogus resolved caller.
+    # target that says it names no node, rather than a bogus resolved caller.
     store = _build(
         tmp_path,
         {
@@ -212,7 +227,7 @@ def test_case_sensitive_identifiers_are_not_conflated(tmp_path: Path) -> None:
     )
     dangling = [c for c in _calls(store) if c["target_qualified"] == "Mailer::send"]
     assert len(dangling) == 1
-    assert dangling[0]["confidence_tier"] == "EXTRACTED"
+    assert dangling[0]["confidence_tier"] == "UNRESOLVED"
     # And nothing falsely resolved onto the capital-S ``Send`` definition.
     assert not any(
         c["target_qualified"].endswith("Mailer.Send")
@@ -372,4 +387,4 @@ def test_multi_segment_module_path_is_left_untouched(tmp_path: Path) -> None:
         if c["target_qualified"] == "crate::mailer::Mailer::dispatch"
     ]
     assert len(multi) == 1
-    assert multi[0]["confidence_tier"] == "EXTRACTED"
+    assert multi[0]["confidence_tier"] == "UNRESOLVED"

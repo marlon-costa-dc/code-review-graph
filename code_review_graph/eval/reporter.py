@@ -72,11 +72,28 @@ def generate_markdown_report(results: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+def _newest_runs(results_dir: Path, prefix: str) -> list[Path]:
+    """Return each repo's newest ``<repo>_<prefix>_<date>.csv``.
+
+    Every run writes a new dated file and leaves the old ones in place, so
+    reading them all would mix old numbers into the report. ISO dates sort
+    as text, so the largest name is the newest run.
+    """
+    newest: dict[str, Path] = {}
+    marker = f"_{prefix}_"
+    for p in results_dir.glob(f"*{marker}*.csv"):
+        repo, _, stamp = p.stem.rpartition(marker)
+        kept = newest.get(repo)
+        if kept is None or stamp > kept.stem.rpartition(marker)[2]:
+            newest[repo] = p
+    return [newest[repo] for repo in sorted(newest)]
+
+
 def _read_csvs(results_dir: Path, prefix: str) -> list[dict[str, str]]:
-    """Read all CSV files matching a prefix from the results directory."""
+    """Read the newest run of one benchmark for each repo in the folder."""
     rows: list[dict[str, str]] = []
-    for p in sorted(results_dir.glob(f"*_{prefix}_*.csv")):
-        with open(p, newline="") as f:
+    for p in _newest_runs(results_dir, prefix):
+        with open(p, encoding="utf-8", newline="") as f:
             reader = csv.DictReader(f)
             rows.extend(reader)
     return rows
@@ -139,9 +156,7 @@ def median_token_reduction(results_dir: str | Path) -> dict[str, Any]:
         ]
 
     reductions = [
-        pct
-        for naive, graph in pairs
-        if (pct := _row_reduction_percent(naive, graph)) is not None
+        pct for naive, graph in pairs if (pct := _row_reduction_percent(naive, graph)) is not None
     ]
 
     if not reductions:
@@ -171,8 +186,12 @@ def median_token_reduction_table(results_dir: str | Path) -> str:
     """
     stats = median_token_reduction(results_dir)
     headers = [
-        "Metric", "Source", "Questions (n)", "Median reduction",
-        "Min", "Max",
+        "Metric",
+        "Source",
+        "Questions (n)",
+        "Median reduction",
+        "Min",
+        "Max",
     ]
 
     def _fmt(value: Any) -> str:
@@ -192,8 +211,8 @@ def median_token_reduction_table(results_dir: str | Path) -> str:
 def generate_full_report(results_dir: str | Path) -> str:
     """Generate a full markdown evaluation report from CSV result files.
 
-    Reads all CSV files in *results_dir*, groups them by benchmark type,
-    and produces a markdown report with methodology notes and per-benchmark
+    Reads the newest CSV per repo and benchmark in *results_dir*, groups
+    them by benchmark type, and produces a markdown report with methodology notes and per-benchmark
     result tables.
 
     Args:
@@ -216,8 +235,13 @@ def generate_full_report(results_dir: str | Path) -> str:
         "(files co-changed in the same commit, seed excluded)."
     )
     lines.append(
-        "Rows with `status=error` are kept for forensics but excluded "
-        "from all aggregates."
+        "Rows with `status=error` are kept for forensics but excluded from all aggregates."
+    )
+    lines.append(
+        "Incremental fidelity compares an incrementally updated graph "
+        "against a clean rebuild of the same tree; `status=known_failure` "
+        "marks a divergence that is already recorded in "
+        "`incremental_fidelity.KNOWN_FAILURES`."
     )
     lines.append("")
 
@@ -229,6 +253,7 @@ def generate_full_report(results_dir: str | Path) -> str:
         "search_quality",
         "build_performance",
         "multi_hop_retrieval",
+        "incremental_fidelity",
     ]
 
     for btype in benchmark_types:
@@ -275,20 +300,27 @@ def generate_readme_tables(results_dir: str | Path) -> str:
         lines.append("### Token Efficiency")
         lines.append("")
         headers = [
-            "Repo", "Files", "Naive Tokens", "Standard Tokens",
-            "Graph Tokens", "Naive/Graph", "Std/Graph",
+            "Repo",
+            "Files",
+            "Naive Tokens",
+            "Standard Tokens",
+            "Graph Tokens",
+            "Naive/Graph",
+            "Std/Graph",
         ]
         table_rows = []
         for r in te_rows:
-            table_rows.append([
-                r.get("repo", "-"),
-                r.get("changed_files", "-"),
-                r.get("naive_tokens", "-"),
-                r.get("standard_tokens", "-"),
-                r.get("graph_tokens", "-"),
-                r.get("naive_to_graph_ratio", "-"),
-                r.get("standard_to_graph_ratio", "-"),
-            ])
+            table_rows.append(
+                [
+                    r.get("repo", "-"),
+                    r.get("changed_files", "-"),
+                    r.get("naive_tokens", "-"),
+                    r.get("standard_tokens", "-"),
+                    r.get("graph_tokens", "-"),
+                    r.get("naive_to_graph_ratio", "-"),
+                    r.get("standard_to_graph_ratio", "-"),
+                ]
+            )
         lines.append(_md_table(headers, table_rows))
         lines.append("")
 
@@ -333,23 +365,17 @@ def generate_readme_tables(results_dir: str | Path) -> str:
         table_rows = []
         for repo, d in sorted(repo_data.items()):
             mrr_vals = mrr_accum.get(repo, [])
-            mrr = (
-                str(round(sum(mrr_vals) / len(mrr_vals), 3))
-                if mrr_vals
-                else "-"
-            )
+            mrr = str(round(sum(mrr_vals) / len(mrr_vals), 3)) if mrr_vals else "-"
             f1_vals = f1_accum.get(repo, [])
-            f1 = (
-                str(round(sum(f1_vals) / len(f1_vals), 3))
-                if f1_vals
-                else "-"
+            f1 = str(round(sum(f1_vals) / len(f1_vals), 3)) if f1_vals else "-"
+            table_rows.append(
+                [
+                    repo,
+                    f1,
+                    str(d.get("recall", "-")),
+                    mrr,
+                ]
             )
-            table_rows.append([
-                repo,
-                f1,
-                str(d.get("recall", "-")),
-                mrr,
-            ])
         lines.append(_md_table(headers, table_rows))
         lines.append("")
 
@@ -359,18 +385,46 @@ def generate_readme_tables(results_dir: str | Path) -> str:
         lines.append("### Agent Baseline (grep top-k vs graph query)")
         lines.append("")
         headers = [
-            "Repo", "Question", "Baseline Tokens", "Graph Tokens",
-            "Baseline/Graph", "Status",
+            "Repo",
+            "Question",
+            "Baseline Tokens",
+            "Graph Tokens",
+            "Baseline/Graph",
+            "Status",
         ]
         table_rows = []
         for r in ab_rows:
+            table_rows.append(
+                [
+                    r.get("repo", "-"),
+                    r.get("question", "-"),
+                    r.get("baseline_tokens", "-"),
+                    r.get("graph_tokens", "-"),
+                    r.get("baseline_to_graph_ratio", "-"),
+                    r.get("status", "ok") or "ok",
+                ]
+            )
+        lines.append(_md_table(headers, table_rows))
+        lines.append("")
+
+    # Table B3: Incremental Fidelity (incremental update vs clean rebuild)
+    if_rows = _read_csvs(results_dir, "incremental_fidelity")
+    if if_rows:
+        lines.append("### Incremental Fidelity (update vs clean rebuild)")
+        lines.append("")
+        headers = [
+            "Repo", "Edit", "Status", "Differing Rows", "Worst Table",
+            "Seconds",
+        ]
+        table_rows = []
+        for r in if_rows:
             table_rows.append([
                 r.get("repo", "-"),
-                r.get("question", "-"),
-                r.get("baseline_tokens", "-"),
-                r.get("graph_tokens", "-"),
-                r.get("baseline_to_graph_ratio", "-"),
-                r.get("status", "ok") or "ok",
+                r.get("edit_kind", "-"),
+                r.get("status", "-"),
+                r.get("total_differing_rows", "-"),
+                r.get("worst_table", "-") or "-",
+                r.get("seconds", "-"),
             ])
         lines.append(_md_table(headers, table_rows))
         lines.append("")
@@ -383,13 +437,15 @@ def generate_readme_tables(results_dir: str | Path) -> str:
         headers = ["Repo", "Files", "Nodes", "Flow Det. (s)", "Search (ms)"]
         table_rows = []
         for r in bp_rows:
-            table_rows.append([
-                r.get("repo", "-"),
-                r.get("file_count", "-"),
-                r.get("node_count", "-"),
-                r.get("flow_detection_seconds", "-"),
-                r.get("search_avg_ms", "-"),
-            ])
+            table_rows.append(
+                [
+                    r.get("repo", "-"),
+                    r.get("file_count", "-"),
+                    r.get("node_count", "-"),
+                    r.get("flow_detection_seconds", "-"),
+                    r.get("search_avg_ms", "-"),
+                ]
+            )
         lines.append(_md_table(headers, table_rows))
         lines.append("")
 

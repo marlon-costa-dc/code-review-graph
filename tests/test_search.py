@@ -157,10 +157,10 @@ class TestHybridSearch:
         merged = rrf_merge([], [])
         assert merged == []
 
-    # --- Explicit keyword search ---
+    # --- Fallback to keyword search ---
 
-    def test_keyword_mode(self):
-        """Keyword LIKE matching is available only when explicitly selected."""
+    def test_fallback_to_keyword(self):
+        """Works without FTS index by falling back to keyword LIKE matching."""
         # Do NOT rebuild FTS index — drop it if it exists
         try:
             self.store._conn.execute("DROP TABLE IF EXISTS nodes_fts")
@@ -168,7 +168,7 @@ class TestHybridSearch:
         except Exception:
             pass
 
-        results = hybrid_search(self.store, "authenticate", mode="keyword")
+        results = hybrid_search(self.store, "authenticate")
         assert len(results) > 0
         names = [r["name"] for r in results]
         assert "authenticate" in names
@@ -261,37 +261,22 @@ class TestHybridSearch:
         assert len(results) > 0
 
     def test_out_mode_keyword(self):
-        """_out_mode records explicitly selected keyword retrieval."""
+        """_out_mode is 'keyword' when FTS table is absent and no embeddings."""
         self.store._conn.execute("DROP TABLE IF EXISTS nodes_fts")
         self.store._conn.commit()
         out: list[str] = []
-        results = hybrid_search(
-            self.store, "authenticate", mode="keyword", _out_mode=out
-        )
+        results = hybrid_search(self.store, "authenticate", _out_mode=out)
         assert out == ["keyword"]
         assert len(results) > 0
 
     def test_out_mode_keyword_no_results(self):
-        """_out_mode records keyword even when it returns no results."""
+        """_out_mode is 'none' when keyword fallback also returns 0 results."""
         self.store._conn.execute("DROP TABLE IF EXISTS nodes_fts")
         self.store._conn.commit()
         out: list[str] = []
-        results = hybrid_search(
-            self.store,
-            "xyzzy_nonexistent_abc123",
-            mode="keyword",
-            _out_mode=out,
-        )
+        results = hybrid_search(self.store, "xyzzy_nonexistent_abc123", _out_mode=out)
         assert results == []
-        assert out == ["keyword"]
-
-    def test_missing_fts_table_fails_loud(self):
-        self.store._conn.execute("DROP TABLE IF EXISTS nodes_fts")
-        self.store._conn.commit()
-        import pytest
-
-        with pytest.raises(Exception, match="nodes_fts"):
-            hybrid_search(self.store, "authenticate", mode="fts")
+        assert out == ["none"]
 
     def test_out_mode_semantic(self, monkeypatch):
         """_out_mode is 'semantic' when only embeddings contribute."""
@@ -301,16 +286,12 @@ class TestHybridSearch:
             "SELECT id FROM nodes WHERE name = 'authenticate'"
         ).fetchone()[0]
 
-        def fake_emb(
-            store, query, limit=50, model=None, provider=None, diagnostics=None,
-        ):
+        def fake_emb(store, query, limit=50, model=None, provider=None, kind=None):
             return [(node_id, 0.9)]
 
         monkeypatch.setattr(search_mod, "_embedding_search", fake_emb)
         out: list[str] = []
-        results = hybrid_search(
-            self.store, "authenticate", mode="semantic", _out_mode=out
-        )
+        results = hybrid_search(self.store, "authenticate", _out_mode=out)
         assert out == ["semantic"]
         assert len(results) > 0
 
@@ -323,9 +304,7 @@ class TestHybridSearch:
             "SELECT id FROM nodes WHERE name = 'authenticate'"
         ).fetchone()[0]
 
-        def fake_emb(
-            store, query, limit=50, model=None, provider=None, diagnostics=None,
-        ):
+        def fake_emb(store, query, limit=50, model=None, provider=None, kind=None):
             return [(node_id, 0.9)]
 
         monkeypatch.setattr(search_mod, "_embedding_search", fake_emb)
@@ -360,3 +339,84 @@ class TestHybridSearch:
         # Verify search still works after double-rebuild.
         results = hybrid_search(self.store, "auth")
         assert isinstance(results, list)
+
+
+class TestTestFileRanking:
+    """Production code should outrank test code for a production question.
+
+    A test that merely names the same symbol scores as well on keywords as
+    the implementation, so a two-line stub under tests/ could come back
+    first. That is what these tests pin.
+    """
+
+    def setup_method(self):
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.tmp.close()
+        self.store = GraphStore(self.tmp.name)
+        nodes = [
+            NodeInfo(
+                kind="Function", name="dispatch_request",
+                file_path="src/app.py", line_start=100, line_end=140,
+                language="python",
+            ),
+            NodeInfo(
+                kind="Test", name="dispatch_request",
+                file_path="tests/test_views.py", line_start=10, line_end=11,
+                language="python",
+            ),
+        ]
+        for node in nodes:
+            self.store.upsert_node(node, file_hash="abc123")
+        self.store._conn.commit()
+        rebuild_fts_index(self.store)
+
+    def teardown_method(self):
+        self.store.close()
+        Path(self.tmp.name).unlink(missing_ok=True)
+
+    def _paths(self, query, **kw):
+        return [r["file_path"] for r in hybrid_search(self.store, query, **kw)]
+
+    def test_production_symbol_outranks_test_symbol(self):
+        paths = self._paths("dispatch_request")
+        assert paths, "expected at least one hit"
+        assert paths[0] == "src/app.py"
+
+    def test_test_intent_lifts_the_penalty(self):
+        """A test-shaped query must not demote test code.
+
+        Lifting the penalty does not promote tests above production code, so
+        this compares the test symbol's standing against the same query
+        without the intent word rather than asserting it ranks first.
+        """
+        def ratio(query):
+            scores = {
+                r["file_path"]: r["score"]
+                for r in hybrid_search(self.store, query)
+            }
+            return scores["tests/test_views.py"] / scores["src/app.py"]
+
+        assert ratio("dispatch_request fixture") > ratio("dispatch_request")
+
+    def test_test_directories_count_when_the_root_is_known(self):
+        """The graph stores absolute paths; tests/helpers.py is still test code."""
+        self.store.upsert_node(NodeInfo(
+            kind="Function", name="dispatch_request",
+            file_path="/repo/tests/helpers.py", line_start=1, line_end=2,
+            language="python",
+        ), file_hash="abc123")
+        self.store._conn.commit()
+        rebuild_fts_index(self.store)
+
+        def score(**kw):
+            return {
+                r["file_path"]: r["score"]
+                for r in hybrid_search(self.store, "dispatch_request", **kw)
+            }["/repo/tests/helpers.py"]
+
+        assert score(repo_root="/repo") < score()
+
+    def test_kind_filter_test_is_not_penalised(self):
+        """kind="Test" is an explicit request for test code."""
+        paths = self._paths("dispatch_request", kind="Test")
+        assert paths == ["tests/test_views.py"]

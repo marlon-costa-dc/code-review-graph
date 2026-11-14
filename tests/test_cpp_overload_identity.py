@@ -3,8 +3,6 @@
 from pathlib import Path
 from unittest.mock import patch
 
-import pytest
-
 from code_review_graph.graph import GraphStore
 from code_review_graph.incremental import CPP_IDENTITY_VERSION, incremental_update
 from code_review_graph.parser import CodeParser, EdgeInfo, NodeInfo
@@ -141,7 +139,12 @@ void caller() { process(1); }
         "candidates": [int_overload, double_overload],
         "candidate_count": 2,
         "candidates_truncated": False,
+        # An overload set was never bound to one node, so the row says so and
+        # carries the line the unresolved call is written at.
+        "target_resolution": "unresolved",
+        "call_site": {"line": 3, "file": prefix},
     }]
+    assert callees["resolution_split"] == {"direct": 0, "unresolved": 1}
     assert callees["edges"][0]["ambiguous_targets"] == [
         int_overload,
         double_overload,
@@ -510,7 +513,7 @@ namespace Beta { void process(int value) {} }
         store.close()
 
 
-def test_cpp_nested_class_and_function_keys_use_complete_scope(
+def test_cpp_nested_class_keys_stay_legacy_while_function_scope_is_complete(
     tmp_path: Path,
 ):
     source_path, store = _index_source(
@@ -525,7 +528,7 @@ def test_cpp_nested_class_and_function_keys_use_complete_scope(
     prefix = source_path.as_posix()
     outer = f"{prefix}::Outer"
     inner = f"{prefix}::Outer.Inner"
-    deep = f"{prefix}::Outer.Inner.Deep"
+    deep = f"{prefix}::Inner.Deep"
     run = f"{prefix}::Outer.Inner.Deep.run()"
 
     try:
@@ -676,7 +679,7 @@ def test_cross_file_bare_call_is_not_claimed_by_each_exact_overload(
         assert callers["results"] == []
 
 
-def test_failed_cpp_identity_upgrade_propagates_without_marking_complete(tmp_path: Path):
+def test_failed_cpp_identity_upgrade_remains_pending_and_retries(tmp_path: Path):
     source_path = tmp_path / "run.cpp"
     source_path.write_text("void run(int value) {}\n", encoding="utf-8")
     legacy_qn = f"{source_path.as_posix()}::run"
@@ -703,11 +706,25 @@ def test_failed_cpp_identity_upgrade_propagates_without_marking_complete(tmp_pat
                 side_effect=RuntimeError("simulated parse failure"),
             ),
         ):
-            with pytest.raises(RuntimeError, match="simulated parse failure"):
-                incremental_update(tmp_path, store, changed_files=[])
+            failed = incremental_update(tmp_path, store, changed_files=[])
 
+        assert failed["identity_rebuild"] is True
+        assert failed["errors"]
         assert store.get_metadata("cpp_identity_version") is None
         assert store.get_node(legacy_qn) is not None
+
+        with patch(
+            "code_review_graph.incremental.get_all_tracked_files",
+            return_value=["run.cpp"],
+        ):
+            retried = incremental_update(tmp_path, store, changed_files=[])
+
+        assert retried.get("identity_rebuild") is None
+        assert retried["files_updated"] == 1
+        assert retried["errors"] == []
+        assert store.get_metadata("cpp_identity_version") == CPP_IDENTITY_VERSION
+        assert store.get_node(legacy_qn) is None
+        assert store.get_node(f"{source_path.as_posix()}::run(int)") is not None
     finally:
         store.close()
 
@@ -1043,15 +1060,35 @@ def test_missing_scoped_candidate_rechecks_when_definition_appears(tmp_path: Pat
     finally:
         store.close()
 
+def _reindex_cpp_source(store, parser, path: Path, source: str) -> None:
+    path.write_text(source, encoding="utf-8")
+    nodes, edges = parser.parse_file(path)
+    store.store_file_nodes_edges(str(path), nodes, edges)
+
+
+def _get_scoped_call_edges(store, caller: str):
+    call = next(
+        edge
+        for edge in store.get_edges_by_source(caller)
+        if edge.kind == "CALLS"
+    )
+    tested_by = next(
+        edge
+        for edge in store.get_edges_by_target(caller)
+        if edge.kind == "TESTED_BY"
+    )
+    return call, tested_by
 
 def test_cross_file_scoped_resolution_rechecks_candidate_changes(tmp_path: Path):
     callee_path = tmp_path / "callee.cpp"
     caller_path = tmp_path / "caller.cpp"
+
     callee_path.write_text("void A::run(int value) {}\n", encoding="utf-8")
     caller_path.write_text(
         "void test_caller() { A::run(1); }\n",
         encoding="utf-8",
     )
+
     store = GraphStore(tmp_path / "graph.db")
     parser = CodeParser()
     caller = f"{caller_path.as_posix()}::test_caller()"
@@ -1061,75 +1098,57 @@ def test_cross_file_scoped_resolution_rechecks_candidate_changes(tmp_path: Path)
             nodes, edges = parser.parse_file(path)
             store.store_file_nodes_edges(str(path), nodes, edges)
 
+        # First: the call resolves to A::run(int).
         assert store.resolve_cpp_scoped_call_targets() == 1
-        call = next(
-            edge
-            for edge in store.get_edges_by_source(caller)
-            if edge.kind == "CALLS"
-        )
+
+        call, tested_by = _get_scoped_call_edges(store, caller)
+
         assert call.target_qualified == f"{callee_path.as_posix()}::A.run(int)"
         assert call.extra["cpp_scoped_target"] == "A::run"
-        tested_by = next(
-            edge
-            for edge in store.get_edges_by_target(caller)
-            if edge.kind == "TESTED_BY"
-        )
         assert tested_by.source_qualified == f"{callee_path.as_posix()}::A.run(int)"
         assert tested_by.extra == call.extra
 
-        callee_path.write_text(
+        # Second: two overloads make it ambiguous.
+        _reindex_cpp_source(
+            store,
+            parser,
+            callee_path,
             "void A::run(int value) {}\nvoid A::run(double value) {}\n",
-            encoding="utf-8",
         )
-        nodes, edges = parser.parse_file(callee_path)
-        store.store_file_nodes_edges(str(callee_path), nodes, edges)
 
         assert store.resolve_cpp_scoped_call_targets() == 0
-        call = next(
-            edge
-            for edge in store.get_edges_by_source(caller)
-            if edge.kind == "CALLS"
-        )
+
+        call, tested_by = _get_scoped_call_edges(store, caller)
+
         assert call.target_qualified == "A::run"
         assert call.extra["ambiguous_target_count"] == 2
-        tested_by = next(
-            edge
-            for edge in store.get_edges_by_target(caller)
-            if edge.kind == "TESTED_BY"
-        )
         assert tested_by.source_qualified == "A::run"
         assert tested_by.extra == call.extra
 
-        callee_path.write_text(
+        # Third: the call resolves to A::run(double).
+        _reindex_cpp_source(
+            store,
+            parser,
+            callee_path,
             "void A::run(double value) {}\n",
-            encoding="utf-8",
         )
-        nodes, edges = parser.parse_file(callee_path)
-        store.store_file_nodes_edges(str(callee_path), nodes, edges)
 
         assert store.resolve_cpp_scoped_call_targets() == 1
-        call = next(
-            edge
-            for edge in store.get_edges_by_source(caller)
-            if edge.kind == "CALLS"
-        )
+
+        call, tested_by = _get_scoped_call_edges(store, caller)
+
         assert call.target_qualified == f"{callee_path.as_posix()}::A.run(double)"
         assert call.extra["cpp_scoped_target"] == "A::run"
         assert "ambiguous_targets" not in call.extra
         assert "ambiguous_target_count" not in call.extra
         assert "ambiguous_targets_truncated" not in call.extra
-        tested_by = next(
-            edge
-            for edge in store.get_edges_by_target(caller)
-            if edge.kind == "TESTED_BY"
-        )
         assert tested_by.source_qualified == f"{callee_path.as_posix()}::A.run(double)"
         assert tested_by.extra == call.extra
     finally:
         store.close()
 
 
-def test_non_cpp_failure_propagates_during_cpp_identity_migration(tmp_path: Path):
+def test_non_cpp_failure_does_not_repeat_cpp_identity_migration(tmp_path: Path):
     cpp_path = tmp_path / "run.cpp"
     python_path = tmp_path / "broken.py"
     cpp_path.write_text("void run(int value) {}\n", encoding="utf-8")
@@ -1160,10 +1179,17 @@ def test_non_cpp_failure_propagates_during_cpp_identity_migration(tmp_path: Path
             ),
             patch.object(CodeParser, "parse_bytes", new=parse_with_python_failure),
         ):
-            with pytest.raises(RuntimeError, match=r"simulated non-C\+\+ parse failure"):
-                incremental_update(tmp_path, store, changed_files=[])
+            migrated = incremental_update(tmp_path, store, changed_files=[])
 
-        assert store.get_metadata("cpp_identity_version") is None
+        assert migrated["identity_rebuild"] is True
+        assert migrated["errors"] == [
+            {"file": "broken.py", "error": "simulated non-C++ parse failure"},
+        ]
+        assert store.get_metadata("cpp_identity_version") == CPP_IDENTITY_VERSION
+        assert store.get_node(f"{cpp_path.as_posix()}::run(int)") is not None
+
+        no_retry = incremental_update(tmp_path, store, changed_files=[])
+        assert no_retry.get("identity_rebuild") is None
     finally:
         store.close()
 
