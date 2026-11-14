@@ -394,6 +394,10 @@ async def test_mcp_shared_file_summary_isolates_sibling_worktrees(tmp_path, monk
                         if row["kind"] == "Function"] == [name]
                 assert all(_posix(row["file_path"]) == (root / relative_path).as_posix()
                            for row in result["results"])
+                head = subprocess.check_output(
+                    ["git", "-C", str(root), "rev-parse", "HEAD"], text=True,
+                ).strip()
+                assert result["indexed_commit"] == head
                 return int(result["generation"])
 
             async def refresh(root: Path, *, full: bool) -> int:
@@ -422,6 +426,11 @@ async def test_mcp_shared_file_summary_isolates_sibling_worktrees(tmp_path, monk
             assert await refresh(sibling, full=False) == right
             assert await query(sibling, "right_symbol") == right
             assert await query(repo, "left_symbol") == left
+
+            _git(repo, "commit", "--only", "--allow-empty", "-qm", "same indexed content")
+            assert await refresh(repo, full=False) == left
+            assert await query(repo, "left_symbol") == left
+            assert await query(sibling, "right_symbol") == right
 
 
 async def test_mcp_multi_worktree_routes_parallel_graphs(tmp_path: Path) -> None:

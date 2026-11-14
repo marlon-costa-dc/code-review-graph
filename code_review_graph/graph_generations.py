@@ -110,7 +110,8 @@ def initialize_bindings(conn: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS checkout_bindings (
             checkout TEXT PRIMARY KEY,
             generation INTEGER NOT NULL REFERENCES graph_generations(id),
-            revision INTEGER NOT NULL CHECK (revision > 0)
+            revision INTEGER NOT NULL CHECK (revision > 0),
+            indexed_commit TEXT
         )
     """)
 
@@ -248,8 +249,16 @@ def read_binding(conn: sqlite3.Connection, checkout: str) -> tuple[int, int] | N
     return (row[0], row[1]) if row is not None else None
 
 
+def read_indexed_commit(conn: sqlite3.Connection, checkout: str) -> str | None:
+    row = conn.execute(
+        "SELECT indexed_commit FROM checkout_bindings WHERE checkout = ?", (checkout,),
+    ).fetchone()
+    return row[0] if row is not None else None
+
+
 def publish_binding(
     conn: sqlite3.Connection, checkout: str, generation: int, *, expected_revision: int,
+    indexed_commit: str | None = None,
 ) -> bool:
     """Publish once for the expected revision (zero means an unbound checkout).
 
@@ -260,14 +269,16 @@ def publish_binding(
         raise RuntimeError("Checkout publication requires a write transaction")
     if expected_revision == 0:
         cursor = conn.execute(
-            "INSERT INTO checkout_bindings VALUES (?, ?, 1) ON CONFLICT(checkout) DO NOTHING",
-            (checkout, generation),
+            "INSERT INTO checkout_bindings VALUES (?, ?, 1, ?) "
+            "ON CONFLICT(checkout) DO NOTHING",
+            (checkout, generation, indexed_commit),
         )
     else:
         cursor = conn.execute(
-            "UPDATE checkout_bindings SET generation = ?, revision = revision + 1 "
+            "UPDATE checkout_bindings SET generation = ?, revision = revision + 1, "
+            "indexed_commit = ? "
             "WHERE checkout = ? AND revision = ?",
-            (generation, checkout, expected_revision),
+            (generation, indexed_commit, checkout, expected_revision),
         )
     return cursor.rowcount == 1
 
@@ -296,9 +307,14 @@ def publish_indexed_checkout(
                 conn, repository=str(repository), profile_digest=profile_digest,
                 repo_root=root, store=store,
             )
-            if current is None or current[0] != generation:
+            indexed_commit = store.get_metadata("git_head_sha")
+            if (
+                current is None or current[0] != generation
+                or read_indexed_commit(conn, str(root)) != indexed_commit
+            ):
                 if not publish_binding(
                     conn, str(root), generation, expected_revision=current[1] if current else 0,
+                    indexed_commit=indexed_commit,
                 ):
                     raise RuntimeError("Shared checkout binding changed during publication")
             conn.commit()

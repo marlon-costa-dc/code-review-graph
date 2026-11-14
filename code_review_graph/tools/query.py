@@ -37,7 +37,7 @@ from ..graph import (
     import_scope_ancestors,
     node_to_dict,
 )
-from ..graph_generations import read_binding, read_checkout_nodes
+from ..graph_generations import read_binding, read_checkout_nodes, read_indexed_commit
 from ..hints import generate_hints, get_session
 from ..incremental import (
     discover_review_changes,
@@ -1035,6 +1035,7 @@ def _shared_file_summary(
         if binding is None:
             return {"status": "not_built", "error": "No shared generation for this checkout"}
         nodes = read_checkout_nodes(conn, root, relative)
+        indexed_commit = read_indexed_commit(conn, str(root))
     results = [node_to_dict(node) for node in nodes[:min(limit, 5) if minimal else limit]]
     if minimal:
         results = [{k: row[k] for k in ("name", "kind", "file_path")} for row in results]
@@ -1043,7 +1044,7 @@ def _shared_file_summary(
         "description": _QUERY_PATTERNS["file_summary"],
         "summary": f"Found {len(nodes)} result(s) for file_summary('{target}')",
         "result_count": len(nodes), "results_omitted": len(nodes) - len(results),
-        "results": results, "generation": binding[0],
+        "results": results, "generation": binding[0], "indexed_commit": indexed_commit,
     }
     if not minimal:
         response["edges"] = []
