@@ -2484,7 +2484,7 @@ def _git_hooks_dir(repo_root: Path, *, required: bool = False) -> Path | None:
     return git_dir / "hooks"
 
 
-def install_git_hook(repo_root: Path) -> Path | None:
+def install_git_hook(repo_root: Path, *, required: bool = True) -> Path | None:
     """Install a git pre-commit hook that prints a risk summary before each commit.
 
     Called automatically by ``code-review-graph install``.
@@ -2507,7 +2507,7 @@ def install_git_hook(repo_root: Path) -> Path | None:
     Detection relies only on ``git rev-parse --absolute-git-dir`` (Git 2.13),
     not on newer options.
     """
-    hooks_dir = _git_hooks_dir(repo_root, required=True)
+    hooks_dir = _git_hooks_dir(repo_root, required=required)
     if hooks_dir is None:
         return None
 

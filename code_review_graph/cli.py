@@ -784,7 +784,7 @@ def _plan_integrations(
         and target in ("all", "claude", "qoder", "codex")
         and _git_hooks_dir(repo_root) is not None
     ):
-        git_hook = install_git_hook(repo_root)
+        git_hook = install_git_hook(repo_root, required=False)
         if git_hook:
             say(f"Installed git pre-commit hook in {shown(git_hook)}")
         for sync_hook in install_git_sync_hooks(repo_root):

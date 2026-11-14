@@ -56,3 +56,7 @@ test-watch-locks:
 .PHONY: test-freshness
 test-freshness:
 	uv run --locked --extra dev pytest tests/test_freshness_metadata.py tests/test_tools.py -q --tb=short
+
+.PHONY: test-install
+test-install:
+	uv run --locked --extra dev pytest tests/test_cli_install.py tests/test_steering_hook.py tests/test_installer_ownership.py tests/test_install_outputs_are_ignored.py -q --tb=short
