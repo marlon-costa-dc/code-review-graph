@@ -8,14 +8,16 @@ input. Readers resolve the binding in the same read transaction as the rows.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import sqlite3
 from collections.abc import Mapping
+from dataclasses import asdict
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from .graph import GraphStore
+    from .graph import GraphNode, GraphStore
 
 
 def content_identity(files: Mapping[str, str]) -> str:
@@ -86,10 +88,7 @@ def initialize_bindings(conn: sqlite3.Connection) -> None:
             generation INTEGER NOT NULL REFERENCES graph_generations(id) ON DELETE CASCADE,
             file_path TEXT NOT NULL,
             symbol TEXT NOT NULL,
-            kind TEXT NOT NULL,
-            name TEXT NOT NULL,
-            line_start INTEGER NOT NULL,
-            line_end INTEGER NOT NULL,
+            payload TEXT NOT NULL,
             PRIMARY KEY (generation, file_path, symbol)
         ) WITHOUT ROWID
     """)
@@ -155,18 +154,25 @@ def ensure_indexed_generation(
         ((generation, path, digest) for path, digest in versions),
     )
     root = repo_root.resolve()
+    prefix = root.as_posix().rstrip("/") + "/"
     for path in files:
         conn.executemany(
-            "INSERT INTO generation_symbols VALUES (?, ?, ?, ?, ?, ?, ?) "
+            "INSERT INTO generation_symbols VALUES (?, ?, ?, ?) "
             "ON CONFLICT(generation, file_path, symbol) DO NOTHING",
             (
-                (generation, path, node.qualified_name.split("::", 1)[-1],
-                 node.kind, node.name, node.line_start, node.line_end)
+                (generation, path, node.qualified_name.removeprefix(prefix),
+                 json.dumps({
+                     **asdict(node),
+                     "file_path": path,
+                     "qualified_name": node.qualified_name.removeprefix(prefix),
+                     "parent_name": (node.parent_name.removeprefix(prefix)
+                                     if node.parent_name else node.parent_name),
+                     "qualified_parent": bool(node.parent_name
+                                              and node.parent_name.startswith(prefix)),
+                 }))
                 for node in store.iter_nodes_by_file(str(root / path))
-                if node.kind != "File"
             ),
         )
-        prefix = root.as_posix().rstrip("/") + "/"
         conn.executemany(
             "INSERT INTO generation_edges VALUES (?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(generation, file_path, ordinal) DO NOTHING",
@@ -189,20 +195,29 @@ def read_checkout_manifest(conn: sqlite3.Connection, checkout: str) -> dict[str,
     ).fetchall())
 
 
-def read_checkout_symbols(
+def read_checkout_nodes(
     conn: sqlite3.Connection, checkout_root: Path, relative_path: str,
-) -> list[tuple[Path, str, str, int, int]]:
-    """Read a bound file's symbols and render paths under its checkout."""
+) -> list[GraphNode]:
+    """Read a bound file's native nodes, projecting paths under its checkout."""
+    from .graph import GraphNode
+
     root = checkout_root.resolve()
     rows = conn.execute(
-        "SELECT symbols.file_path, symbols.kind, symbols.name, "
-        "symbols.line_start, symbols.line_end FROM checkout_bindings AS binding "
+        "SELECT symbols.payload FROM checkout_bindings AS binding "
         "JOIN generation_symbols AS symbols ON symbols.generation = binding.generation "
-        "WHERE binding.checkout = ? AND symbols.file_path = ? "
-        "ORDER BY symbols.line_start, symbols.symbol",
+        "WHERE binding.checkout = ? AND symbols.file_path = ? ORDER BY symbols.symbol",
         (str(root), relative_path),
     )
-    return [(root / path, kind, name, start, end) for path, kind, name, start, end in rows]
+    nodes = []
+    prefix = root.as_posix().rstrip("/") + "/"
+    for (payload,) in rows:
+        fields = json.loads(payload)
+        fields["file_path"] = (root / fields["file_path"]).as_posix()
+        fields["qualified_name"] = prefix + fields["qualified_name"]
+        if fields.pop("qualified_parent"):
+            fields["parent_name"] = prefix + fields["parent_name"]
+        nodes.append(GraphNode(**fields))
+    return nodes
 
 
 def read_checkout_edges(

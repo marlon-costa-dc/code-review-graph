@@ -20,7 +20,7 @@ from code_review_graph.graph_generations import (
     publish_binding,
     read_checkout_edges,
     read_checkout_manifest,
-    read_checkout_symbols,
+    read_checkout_nodes,
 )
 from code_review_graph.incremental import full_build, get_db_path, incremental_update
 from code_review_graph.multi_worktree import (
@@ -108,12 +108,12 @@ def test_indexed_content_identity_reuses_sibling_content_and_tracks_wip(tmp_path
         assert read_checkout_manifest(shared, str(linked.resolve()))["app.py"] != original["app.py"]
         (total_versions,) = shared.execute("SELECT COUNT(*) FROM indexed_file_versions").fetchone()
         assert total_versions == len(original) + 1
-        assert read_checkout_symbols(shared, repo, "app.py") == [
-            (repo / "app.py", "Function", "original", 1, 1),
-        ]
-        assert read_checkout_symbols(shared, linked, "app.py") == [
-            (linked / "app.py", "Function", "edited", 1, 1),
-        ]
+        for checkout, store in ((repo, left), (linked, right)):
+            source = store.get_nodes_by_file(str(checkout / "app.py"))
+            actual = read_checkout_nodes(shared, checkout, "app.py")
+            assert sorted(actual, key=lambda node: node.qualified_name) == sorted(
+                source, key=lambda node: node.qualified_name,
+            )
         for checkout, expected, excluded in (
             (repo, "first_target", "second_target"),
             (linked, "second_target", "first_target"),
