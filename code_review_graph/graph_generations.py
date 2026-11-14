@@ -67,11 +67,18 @@ def initialize_bindings(conn: sqlite3.Connection) -> None:
         )
     """)
     conn.execute("""
-        CREATE TABLE IF NOT EXISTS generation_files (
-            generation INTEGER NOT NULL REFERENCES graph_generations(id) ON DELETE CASCADE,
+        CREATE TABLE IF NOT EXISTS indexed_file_versions (
+            id INTEGER PRIMARY KEY,
             path TEXT NOT NULL,
             digest TEXT NOT NULL,
-            PRIMARY KEY (generation, path)
+            UNIQUE (path, digest)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS generation_files (
+            generation INTEGER NOT NULL REFERENCES graph_generations(id) ON DELETE CASCADE,
+            file_version INTEGER NOT NULL REFERENCES indexed_file_versions(id),
+            PRIMARY KEY (generation, file_version)
         ) WITHOUT ROWID
     """)
     conn.execute("""
@@ -111,10 +118,17 @@ def ensure_indexed_generation(
     """Persist the indexed manifest in the pending publication transaction."""
     files = indexed_file_manifest(repo_root, store)
     generation = ensure_generation(conn, repository, content_identity(files), profile_digest)
+    versions = [(path, digest.lower()) for path, digest in files.items()]
     conn.executemany(
-        "INSERT INTO generation_files (generation, path, digest) VALUES (?, ?, ?) "
-        "ON CONFLICT(generation, path) DO NOTHING",
-        ((generation, path, digest.lower()) for path, digest in files.items()),
+        "INSERT INTO indexed_file_versions (path, digest) VALUES (?, ?) "
+        "ON CONFLICT(path, digest) DO NOTHING",
+        versions,
+    )
+    conn.executemany(
+        "INSERT INTO generation_files (generation, file_version) "
+        "SELECT ?, id FROM indexed_file_versions WHERE path = ? AND digest = ? "
+        "ON CONFLICT(generation, file_version) DO NOTHING",
+        ((generation, path, digest) for path, digest in versions),
     )
     return generation
 
@@ -122,8 +136,9 @@ def ensure_indexed_generation(
 def read_checkout_manifest(conn: sqlite3.Connection, checkout: str) -> dict[str, str]:
     """Read only the indexed paths bound to this checkout, in one statement."""
     return dict(conn.execute(
-        "SELECT files.path, files.digest FROM checkout_bindings AS binding "
+        "SELECT version.path, version.digest FROM checkout_bindings AS binding "
         "JOIN generation_files AS files ON files.generation = binding.generation "
+        "JOIN indexed_file_versions AS version ON version.id = files.file_version "
         "WHERE binding.checkout = ?", (checkout,),
     ).fetchall())
 

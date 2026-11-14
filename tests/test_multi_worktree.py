@@ -104,6 +104,15 @@ def test_indexed_content_identity_reuses_sibling_content_and_tracks_wip(tmp_path
         shared.commit()
         assert read_checkout_manifest(shared, "left") == original
         assert read_checkout_manifest(shared, "right")["app.py"] != original["app.py"]
+        (total_versions,) = shared.execute("SELECT COUNT(*) FROM indexed_file_versions").fetchone()
+        assert total_versions == len(original) + 1
+        (shared_files,) = shared.execute(
+            "SELECT COUNT(*) FROM generation_files AS original "
+            "JOIN generation_files AS edited USING (file_version) "
+            "WHERE original.generation = ? AND edited.generation = ?",
+            (generation, edited),
+        ).fetchone()
+        assert shared_files == len(original) - 1
         assert indexed_content_identity(repo, left) == base
         with pytest.raises(ValueError):
             indexed_content_identity(repo, right)
