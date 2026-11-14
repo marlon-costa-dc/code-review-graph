@@ -367,6 +367,22 @@ def test_watch_batch_waits_out_another_writer_and_is_not_lost(repo, held):
             handler.stop()
 
 
+def test_watch_reuses_graph_rows_already_refreshed_by_command(repo):
+    event = _edit(repo, "updatedByCommand")
+    db = incremental.get_db_path(repo)
+    postprocessed = []
+    with GraphStore(db) as watcher_store:
+        handler = incremental._create_watch_handler(repo, watcher_store, postprocessed.append)
+        with GraphStore(db) as command_store:
+            changed = incremental.incremental_update(repo, command_store, changed_files=["keep.py"])
+            assert changed["files_updated"] == 1
+        handler.process([event])
+        handler.raise_if_failed()
+
+    assert "updatedByCommand" in _names(repo, repo / "keep.py")
+    assert postprocessed == []
+
+
 def test_watch_batch_retried_behind_a_writer_is_counted_once(repo, held):
     with GraphStore(incremental.get_db_path(repo)) as store:
         handler = incremental._create_watch_handler(repo, store, None)

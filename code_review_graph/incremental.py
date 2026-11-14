@@ -3489,7 +3489,9 @@ def incremental_update(
     lifecycle_paths = expand_changed_file_paths(
         store, lifecycle_inputs, repo_root=repo_root,
     )
-    community_by_qn = capture_community_assignments(store, lifecycle_paths)
+    community_by_qn = (
+        capture_community_assignments(store, lifecycle_paths) if lifecycle_paths else {}
+    )
     cleared_entry_qns: set[str] = set()
     flow_node_ids: dict[int, str] = {}
 
@@ -3577,10 +3579,11 @@ def incremental_update(
 
     # Remap surviving community IDs onto replacement nodes, drop orphan flow
     # rows, and remove community rows that no longer have any members.
-    remap_community_assignments(store, community_by_qn)
-    remap_flow_node_ids(store, flow_node_ids)
-    purge_orphan_flow_data(store)
-    purge_empty_communities(store)
+    if reconcile_stale or parsed_files or removed_files:
+        remap_community_assignments(store, community_by_qn)
+        remap_flow_node_ids(store, flow_node_ids)
+        purge_orphan_flow_data(store)
+        purge_empty_communities(store)
 
     flow_entry_point_qns = sorted(cleared_entry_qns)
     communities_were_affected = (
