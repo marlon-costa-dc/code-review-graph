@@ -14,6 +14,7 @@
 <p align="center">
   <strong>A local code knowledge graph that gives AI coding tools precise review context over MCP.</strong>
 </p>
+<p align="center">Managed fork: <code>main</code> mirrors upstream; <code>dc-use</code> integrates local changes and publishes <code>-dc.N</code> releases.</p>
 <p align="center">
   <a href="README.md">English</a> |
   <a href="README.zh-CN.md">简体中文</a> |

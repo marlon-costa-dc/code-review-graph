@@ -58,7 +58,7 @@ jobs:
       - name: Checksums
         run: |
           cd dist
-          sha256sum * > SHA256SUMS.txt
+          sha256sum -- * > SHA256SUMS.txt
 
       - name: Upload release assets
         env:
