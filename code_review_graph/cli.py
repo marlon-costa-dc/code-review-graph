@@ -3489,6 +3489,13 @@ def _dispatch() -> None:
                     print(f"  [{kind}] {name}  ({file_path}:{line})")
 
         elif args.command == "status":
+            from .tools._common import _graph_is_built
+
+            if store.checkout is not None and not _graph_is_built(store):
+                print("No committed graph for this checkout. Run `code-review-graph build` first.",
+                      file=sys.stderr)
+                raise SystemExit(1)
+
             from .build_state import BUILD_IN_PROGRESS, read_build_state
             from .tools.build import build_was_interrupted
 

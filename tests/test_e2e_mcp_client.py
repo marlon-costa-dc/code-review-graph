@@ -501,7 +501,7 @@ def pause(self, path, source):
     result = real_parse(self, path, source)
     if Path(path).name == "core.py" and not entered.exists():
         entered.touch()
-        until = time.monotonic() + 15
+        until = time.monotonic() + 60
         while not resume.exists() and time.monotonic() < until:
             time.sleep(0.02)
         if not resume.exists():
@@ -517,12 +517,34 @@ main()
         env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
     ) as child:
         try:
-            deadline = time.monotonic() + 15
+            deadline = time.monotonic() + 60
             while not entered.exists() and child.poll() is None and time.monotonic() < deadline:
                 await asyncio.sleep(.02)
             assert entered.exists()
+            if outcome == "new-edit":
+                status = subprocess.run(
+                    [sys.executable, "-m", "code_review_graph", "status", "--json",
+                     "--repo", str(repo)],
+                    env=env, capture_output=True, text=True, timeout=15, check=False,
+                )
+                assert status.returncode == 1 and "No committed graph" in status.stderr
             params = _server_params(repo, crg_home)
-            params.env = env
+            params.env = {**env, "TEST_REFRESH_WAITER": str(tmp_path / "waiting")}
+            waiter = """
+import os
+from pathlib import Path
+from code_review_graph.cli import main
+from code_review_graph.tools import build
+
+previous = build._previous_refresh
+def mark(*args):
+    result = previous(*args)
+    Path(os.environ["TEST_REFRESH_WAITER"]).touch()
+    return result
+build._previous_refresh = mark
+main()
+"""
+            params.args = ["-c", waiter, *params.args[2:]]
             async with stdio_client(params) as (read, write):
                 async with ClientSession(
                     read, write, read_timeout_seconds=read_timeout(CALL_TIMEOUT),
@@ -533,10 +555,11 @@ main()
                         "postprocess": "minimal" if outcome == "different-profile" else "none",
                         "wait_for_lock": True,
                     }))
-                    # The worker waits behind our gated parser. Leave a bounded
-                    # scheduling window before releasing or killing its owner.
-                    await asyncio.sleep(.5)
-                    assert not join.done()
+                    deadline = time.monotonic() + 45
+                    while not (tmp_path / "waiting").exists():
+                        assert not join.done() and child.poll() is None
+                        assert time.monotonic() < deadline
+                        await asyncio.sleep(.02)
                     if outcome == "crash":
                         child.kill()
                     else:
