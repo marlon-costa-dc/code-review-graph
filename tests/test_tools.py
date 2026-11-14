@@ -2371,9 +2371,6 @@ class TestBuildPostprocessResolvesBareEndpoints:
         self.store.set_metadata(BUILD_STATE_KEY, POSTPROCESS_PENDING)
         self.store.close()
         result = build_module.run_postprocess(
-            flows=False,
-            communities=False,
-            fts=False,
             repo_root=str(self.repo),
         )
 

@@ -52,3 +52,7 @@ test-worktrees:
 .PHONY: test-watch-locks
 test-watch-locks:
 	uv run --locked --extra dev pytest tests/test_write_lock.py tests/test_write_lock_all_writers.py -q --tb=short
+
+.PHONY: test-freshness
+test-freshness:
+	uv run --locked --extra dev pytest tests/test_freshness_metadata.py tests/test_tools.py -q --tb=short

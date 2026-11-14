@@ -1055,10 +1055,17 @@ def run_postprocess(
                 "Post-processing ran, but the graph is missing files from an "
                 "unfinished build. Run a full build to repair it."
             )
-        else:
-            if not result.get("postprocess_contended"):
-                store.set_metadata(BUILD_STATE_KEY, BUILD_COMPLETE)
+        elif warnings:
+            store.set_metadata(BUILD_STATE_KEY, POSTPROCESS_PENDING)
+            result["status"] = "partial"
+            result["summary"] = "Post-processing has unresolved warnings."
+        elif fts and flows and communities:
+            store.set_metadata("postprocess_level", "full")
+            store.set_metadata(BUILD_STATE_KEY, BUILD_COMPLETE)
             result["summary"] = "Post-processing complete."
+        else:
+            # A selective repair must not promote an incomplete generation.
+            result["summary"] = "Selected post-processing steps complete."
         if warnings:
             result["warnings"] = warnings
         return result
