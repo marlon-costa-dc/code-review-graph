@@ -1361,6 +1361,10 @@ def _handle_build_update(args, repo_root: Path, embedding_refresh_kwargs) -> Non
         finally:
             logging.disable(previous_disable)
         _exit_if_contended(result)
+        if result.get("refresh_reused"):
+            if not args.quiet:
+                print(result["summary"])
+            return
         parsed = result.get("files_parsed", 0)
         nodes = result.get("total_nodes", 0)
         edges = result.get("total_edges", 0)
@@ -1416,7 +1420,9 @@ def _handle_build_update(args, repo_root: Path, embedding_refresh_kwargs) -> Non
             sys.exit(1)
         nodes = result.get("total_nodes", 0)
         edges = result.get("total_edges", 0)
-        if not args.quiet:
+        if not args.quiet and result.get("refresh_reused"):
+            print(result["summary"])
+        elif not args.quiet:
             if result.get("build_type") == "full":
                 # No usable incremental base (fresh/legacy graph, or the
                 # last-synced commit was lost to a rewrite/shallow clone),

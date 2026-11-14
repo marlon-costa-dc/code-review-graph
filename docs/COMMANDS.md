@@ -470,14 +470,19 @@ postprocess: str = "full"            # "full", "minimal" (signatures + FTS), or 
 recurse_submodules: bool | None      # None falls back to CRG_RECURSE_SUBMODULES
 embedding_provider: str | None       # Refresh an existing embedding index; needs embedding_model
 embedding_model: str | None          # Exact model for embedding_provider
+wait_for_lock: bool = False          # Join a matching in-flight CLI/MCP build or update
 ```
 If some files fail to parse, `status` is `"partial"` and the `summary` names
 them. Their previous graph rows are kept.
 
 One write runs per repository at a time. When another write to the graph is
 running, this tool, `run_postprocess_tool` and `embed_graph_tool`
-return at once with `status: "contended"`, `skipped: true` and the `holder_pid`;
-retry once it ends. An embedding refresh on a graph with no embeddings yet embeds
+return at once with `status: "contended"`, `skipped: true` and the `holder_pid`.
+CLI `--wait` and MCP `wait_for_lock` can reuse a completed, equivalent
+build or update with `refresh_reused: true`. A failed or killed writer
+does not provide an eligible completion. The operating system releases the
+lock when the writer dies; the PID text in the lock file is diagnostic only.
+An embedding refresh on a graph with no embeddings yet embeds
 nothing and sets `embeddings_refresh_skipped: true`; run `embed_graph_tool` once
 first.
 

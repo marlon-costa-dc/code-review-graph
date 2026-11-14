@@ -389,6 +389,7 @@ async def build_or_update_graph_tool(
     recurse_submodules: Optional[bool] = None,
     embedding_provider: Optional[str] = None,
     embedding_model: Optional[str] = None,
+    wait_for_lock: bool = False,
 ) -> dict:
     """Build or incrementally update the code knowledge graph.
 
@@ -400,8 +401,8 @@ async def build_or_update_graph_tool(
     editor-save hook is already building, this returns
     immediately with ``status="contended"``, ``skipped=true`` and the
     ``holder_pid`` that owns the work, rather than queueing a second parse of
-    the same files behind it; retry once that build finishes. From a shell,
-    ``code-review-graph update --wait`` blocks instead of skipping.
+    the same files behind it. Set ``wait_for_lock`` to wait and reuse an
+    equivalent completed refresh when available. The CLI option is ``--wait``.
 
     Args:
         full_rebuild: If True, re-parse all files. Default: False (incremental).
@@ -420,6 +421,7 @@ async def build_or_update_graph_tool(
             the result sets embeddings_refresh_skipped; run embed_graph_tool first.
         embedding_model: Exact model for an explicit post-build embedding
             refresh. Must be supplied with embedding_provider. Default: disabled.
+        wait_for_lock: Wait for an active writer instead of returning contention.
     """
     # The blocking full_build / incremental_update work runs on a worker
     # thread via _offload so the stdio event loop stays responsive. Without
@@ -435,6 +437,7 @@ async def build_or_update_graph_tool(
             postprocess=postprocess, recurse_submodules=recurse_submodules,
             embedding_provider=embedding_provider,
             embedding_model=embedding_model,
+            wait_for_lock=wait_for_lock,
         ),
         root,
         # Writes graph.db for as long as the repository takes. A timeout

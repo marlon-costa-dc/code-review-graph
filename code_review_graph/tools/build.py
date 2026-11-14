@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import os
 import sqlite3
 import time
+from contextlib import closing
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +25,7 @@ from ..build_state import (
 from ..constants import normalize_file_path
 from ..incremental import (
     VERIFIED_FILE_COUNT_KEY,
+    _git_branch_info,
     _prepare_db_path,
     collect_all_files,
     detect_vcs,
@@ -35,8 +39,49 @@ from ..locking import WriteLock, write_lock_path
 from ._common import _get_store, _resolve_root
 
 _UPDATE_REQUIRES_GRAPH = "incremental update requires an existing graph; run build explicitly"
+_REFRESH_REQUEST = "cooperative_refresh_request"
 
 logger = logging.getLogger(__name__)
+
+
+def _refresh_request(
+    root: Path, recurse: bool | None, follow: bool | None, profile: tuple[Any, ...],
+) -> str:
+    """Identify the worktree snapshot and resolved request before waiting."""
+    from ..custom_languages import CONFIG_RELATIVE_PATH
+
+    paths = set(collect_all_files(root, recurse, follow))
+    paths.update(path for path in (
+        CONFIG_RELATIVE_PATH.as_posix(), ".code-review-graphignore",
+    ) if (root / path).is_file())
+    def stamp(path: str) -> tuple[str, int, int, str]:
+        with (root / path).open("rb") as source:
+            state = os.fstat(source.fileno())
+            digest = hashlib.sha256()
+            for block in iter(lambda: source.read(128 * 1024), b""):
+                digest.update(block)
+        return path, state.st_mtime_ns, state.st_ctime_ns, digest.hexdigest()
+
+    payload = (
+        _git_branch_info(root),
+        profile,
+        [stamp(path) for path in sorted(paths)],
+    )
+    return hashlib.sha256(json.dumps(payload).encode()).hexdigest()
+
+
+def _previous_refresh(db_path: Path) -> str | None:
+    if not db_path.is_file():
+        return None
+    with closing(sqlite3.connect(db_path.as_uri() + "?mode=ro", uri=True)) as conn:
+        if not conn.execute(
+            "SELECT 1 FROM sqlite_schema WHERE name='metadata' AND type='table'",
+        ).fetchone():
+            return None
+        row = conn.execute(
+            "SELECT value FROM metadata WHERE key=?", (_REFRESH_REQUEST,),
+        ).fetchone()
+        return row[0] if row else None
 
 _PARTIAL_GRAPH_MIN_FILES = 8
 _PARTIAL_GRAPH_MAX_COVERAGE = 0.25
@@ -567,11 +612,25 @@ def build_or_update_graph(
     """
     root = _resolve_root(repo_root)
     db_path = get_db_path(root, read_only=True)
-    lock, contended = _lock_or_skip(db_path, wait_for_lock)
-    if contended is not None:
-        return contended
+    lock = WriteLock(db_path)
+    waiting = not lock.acquire()
+    if waiting and not wait_for_lock:
+        return _write_skipped_response(db_path, lock.holder_pid())
     store = None
     try:
+        before = None
+        request: str | None = None
+        request_profile: tuple[Any, ...] = ()
+        if wait_for_lock and not embedding_provider and not embedding_model:
+            request_profile = (
+                full_rebuild, base, postprocess, recurse_submodules, enrich, follow_symlinks,
+                tuple(sorted((key, value) for key, value in os.environ.items()
+                             if key.startswith("CRG_"))),
+            )
+            before = _previous_refresh(db_path.resolve()) if waiting else None
+            request = _refresh_request(root, recurse_submodules, follow_symlinks, request_profile)
+        if not lock.acquire(blocking=wait_for_lock):
+            return _write_skipped_response(db_path, lock.holder_pid())
         recovery_reason: str | None = None
         if not full_rebuild and not db_path.is_file():
             raise RuntimeError(_UPDATE_REQUIRES_GRAPH)
@@ -579,6 +638,23 @@ def build_or_update_graph(
         store, root = _get_store(
             str(root), db_path=db_path, recover_corrupt=full_rebuild and recover_corrupt
         )
+        completed = store.get_metadata(_REFRESH_REQUEST)
+        if waiting and request is not None and completed and completed != before:
+            prior = json.loads(completed)
+            if (
+                prior["request"] == request
+                and request == _refresh_request(
+                    root, recurse_submodules, follow_symlinks, request_profile,
+                )
+            ):
+                return {
+                    **prior["result"], "files_parsed": 0, "files_updated": 0,
+                    "refresh_reused": True,
+                    "summary": "Reused the completed refresh for the requested checkout.",
+                }
+        if completed:
+            store.set_metadata(_REFRESH_REQUEST, "")
+
         def publish(result: dict[str, Any]) -> dict[str, Any]:
             shared = os.environ.get("CRG_SHARED_FILE_SUMMARY_DB")
             if shared and result["status"] == "ok" and not result.get("warnings"):
@@ -593,6 +669,16 @@ def build_or_update_graph(
                 ))
                 result["shared_generation"] = publish_indexed_checkout(
                     Path(shared), root, store, profile_digest=profile,
+                )
+            if (
+                request is not None and result["status"] == "ok" and not result.get("warnings")
+                and request == _refresh_request(
+                    root, recurse_submodules, follow_symlinks, request_profile,
+                )
+            ):
+                store.set_metadata(
+                    _REFRESH_REQUEST,
+                    json.dumps({"request": request, "result": result, "finished": time.time_ns()}),
                 )
             return result
 

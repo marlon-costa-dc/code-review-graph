@@ -28,6 +28,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -363,6 +364,87 @@ async def test_mcp_client_full_review_journey(tmp_path: Path) -> None:
             # this is what keeps the test independent of the host machine.
             assert repos["repos"] == [], repos
             assert repos["summary"].startswith("0 registered repository")
+
+
+@pytest.mark.parametrize("outcome", ["reused", "crash", "different-profile"])
+async def test_cli_and_mcp_complete_a_contended_refresh(tmp_path, outcome):
+    repo = _make_fixture_repo(tmp_path)
+    crg_home = tmp_path / "refresh-home"
+    crg_home.mkdir()
+    env = {**_server_env(crg_home), "CRG_SERIAL_PARSE": "1"}
+    # Keep the production parser and writer; pause the CLI process after
+    # it has taken the kernel lock and started parsing.
+    producer = """
+import sys, time
+from pathlib import Path
+from code_review_graph.cli import main
+from code_review_graph.parser import CodeParser
+
+entered, resume = map(Path, sys.argv[1:3])
+del sys.argv[1:3]
+real_parse = CodeParser.parse_bytes
+def pause(self, *args, **kwargs):
+    if not entered.exists():
+        entered.touch()
+        until = time.monotonic() + 15
+        while not resume.exists() and time.monotonic() < until:
+            time.sleep(0.02)
+        if not resume.exists():
+            raise TimeoutError("fixture never resumed the parser")
+    return real_parse(self, *args, **kwargs)
+CodeParser.parse_bytes = pause
+main()
+"""
+    entered, resume = (tmp_path / name for name in ("entered", "resume"))
+    with subprocess.Popen(
+        [sys.executable, "-c", producer, str(entered), str(resume),
+         "build", "--wait", "--skip-postprocess", "--repo", str(repo)],
+        env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    ) as child:
+        try:
+            deadline = time.monotonic() + 15
+            while not entered.exists() and child.poll() is None and time.monotonic() < deadline:
+                await asyncio.sleep(.02)
+            assert entered.exists()
+            params = _server_params(repo, crg_home)
+            params.env = env
+            async with stdio_client(params) as (read, write):
+                async with ClientSession(
+                    read, write, read_timeout_seconds=read_timeout(CALL_TIMEOUT),
+                ) as session:
+                    await asyncio.wait_for(session.initialize(), timeout=CALL_TIMEOUT)
+                    join = asyncio.create_task(_call(session, "build_or_update_graph_tool", {
+                        "full_rebuild": True,
+                        "postprocess": "minimal" if outcome == "different-profile" else "none",
+                        "wait_for_lock": True,
+                    }))
+                    # The worker waits behind our gated parser. Leave a bounded
+                    # scheduling window before releasing or killing its owner.
+                    await asyncio.sleep(.5)
+                    assert not join.done()
+                    if outcome == "crash":
+                        child.kill()
+                    else:
+                        resume.touch()
+                    result = _payload(await join)
+                    assert result["status"] == "ok", result
+                    if outcome == "reused":
+                        assert result["refresh_reused"] is True, result
+                        assert result["files_parsed"] == 0
+                    else:
+                        assert "refresh_reused" not in result, result
+                        assert result["files_parsed"] > 0
+                    query = _payload(await _call(session, "query_graph_tool", {
+                        "pattern": "file_summary", "target": "pkg/core.py",
+                    }))
+                    assert {node["name"] for node in query["results"]} >= {"compute_total"}
+        finally:
+            resume.touch()
+            stdout, stderr = child.communicate(timeout=20)
+        if outcome != "crash":
+            assert child.returncode == 0, stdout + stderr
+        else:
+            assert child.returncode != 0
 
 
 async def test_mcp_shared_file_summary_isolates_sibling_worktrees(tmp_path, monkeypatch):
