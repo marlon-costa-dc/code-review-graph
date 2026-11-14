@@ -128,8 +128,8 @@ else:
 def read_write_lock_holder(db_path: Path) -> int | None:
     """Return the PID that recorded itself as the lock holder, if any.
 
-    Only meaningful while the lock is actually held: a released lock is
-    truncated by [_WriteLock.release], so an empty file reads as ``None``.
+    Read only after kernel contention. A dead process can leave this text
+    behind, so it never participates in lock acquisition.
     """
     try:
         raw = write_lock_path(db_path).read_text(encoding="utf-8").strip()

@@ -54,6 +54,7 @@ def _refresh_request(
     paths.update(path for path in (
         CONFIG_RELATIVE_PATH.as_posix(), ".code-review-graphignore",
     ) if (root / path).is_file())
+
     def stamp(path: str) -> tuple[str, int, int, str]:
         with (root / path).open("rb") as source:
             state = os.fstat(source.fileno())
