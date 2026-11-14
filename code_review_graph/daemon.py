@@ -276,10 +276,15 @@ def _watch_targets(
                     current = previous
                 if now - current.last_active >= repo.activity_ttl_seconds:
                     stamp = worktree_edit_stamp(checkout.root)
-                    if current.idle_stamp is None or stamp == current.idle_stamp:
-                        discovered[alias] = replace(current, idle_stamp=stamp)
+                    if current.idle_stamp is None:
+                        # Keep the observer through one more reconciliation.
+                        # Edits after this baseline must survive retirement.
+                        current = replace(current, idle_stamp=stamp)
+                    elif stamp == current.idle_stamp:
+                        discovered[alias] = current
                         continue
-                    current = replace(current, last_active=now, idle_stamp=None)
+                    else:
+                        current = replace(current, last_active=now, idle_stamp=None)
                 discovered[alias] = current
             targets[alias] = replace(
                 repo, path=path, alias=alias, data_dir="", discover_worktrees=False,
