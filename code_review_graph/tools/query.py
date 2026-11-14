@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import re
@@ -37,7 +38,12 @@ from ..graph import (
     import_scope_ancestors,
     node_to_dict,
 )
-from ..graph_generations import read_binding, read_checkout_nodes, read_indexed_commit
+from ..graph_generations import (
+    read_binding,
+    read_checkout_nodes,
+    read_generation_file_digest,
+    read_indexed_commit,
+)
 from ..hints import generate_hints, get_session
 from ..incremental import (
     discover_review_changes,
@@ -1025,10 +1031,10 @@ def get_impact_radius(
 def _shared_file_summary(
     database: Path, root: Path, target: str, *, minimal: bool, limit: int,
 ) -> dict[str, Any]:
-    candidate = root / target
-    if not path_within_repo(root, candidate):
+    physical = (root / target).resolve()
+    if not physical.is_relative_to(root):
         raise ValueError("file_summary target is outside the requested checkout")
-    relative = candidate.resolve().relative_to(root).as_posix()
+    relative = physical.relative_to(root).as_posix()
     with closing(sqlite3.connect(database.resolve().as_uri() + "?mode=ro", uri=True)) as conn:
         conn.execute("BEGIN")
         binding = read_binding(conn, str(root))
@@ -1036,6 +1042,19 @@ def _shared_file_summary(
             return {"status": "not_built", "error": "No shared generation for this checkout"}
         nodes = read_checkout_nodes(conn, root, relative)
         indexed_commit = read_indexed_commit(conn, str(root))
+        digest = read_generation_file_digest(conn, binding[0], relative)
+    freshness = "not_indexed"
+    if digest is not None and not physical.is_file():
+        freshness = "missing"
+    elif digest is not None:
+        try:
+            current = hashlib.sha256()
+            with physical.open("rb") as source:
+                for block in iter(lambda: source.read(64 * 1024), b""):
+                    current.update(block)
+            freshness = "matches" if digest == current.hexdigest() else "changed"
+        except (FileNotFoundError, NotADirectoryError, IsADirectoryError):
+            freshness = "missing"
     results = [node_to_dict(node) for node in nodes[:min(limit, 5) if minimal else limit]]
     if minimal:
         results = [{k: row[k] for k in ("name", "kind", "file_path")} for row in results]
@@ -1045,6 +1064,7 @@ def _shared_file_summary(
         "summary": f"Found {len(nodes)} result(s) for file_summary('{target}')",
         "result_count": len(nodes), "results_omitted": len(nodes) - len(results),
         "results": results, "generation": binding[0], "indexed_commit": indexed_commit,
+        "target_freshness": freshness,
     }
     if not minimal:
         response["edges"] = []

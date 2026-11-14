@@ -385,11 +385,12 @@ async def test_mcp_shared_file_summary_isolates_sibling_worktrees(tmp_path, monk
             read, write, read_timeout_seconds=read_timeout(CALL_TIMEOUT),
         ) as session:
             await asyncio.wait_for(session.initialize(), timeout=CALL_TIMEOUT)
-            async def query(root: Path, name: str) -> int:
+            async def query(root: Path, name: str, freshness: str = "matches") -> int:
                 result = _payload(await _call(session, "query_graph_tool", {
                     "pattern": "file_summary", "target": relative_path, "repo_root": str(root),
                 }))
                 assert result["status"] == "ok"
+                assert result["target_freshness"] == freshness
                 assert [row["name"] for row in result["results"]
                         if row["kind"] == "Function"] == [name]
                 assert all(_posix(row["file_path"]) == (root / relative_path).as_posix()
@@ -416,6 +417,7 @@ async def test_mcp_shared_file_summary_isolates_sibling_worktrees(tmp_path, monk
 
             source = sibling / relative_path
             source.write_text("def right_wip(): return 42\n", encoding="utf-8")
+            assert await query(sibling, "right_symbol", "changed") == right
             wip = await refresh(sibling, full=False)
             assert wip not in {left, right}
             assert await query(sibling, "right_wip") == wip

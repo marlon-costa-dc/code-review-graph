@@ -203,6 +203,18 @@ def read_checkout_manifest(conn: sqlite3.Connection, checkout: str) -> dict[str,
     ).fetchall())
 
 
+def read_generation_file_digest(
+    conn: sqlite3.Connection, generation: int, relative_path: str,
+) -> str | None:
+    row = conn.execute(
+        "SELECT version.digest FROM generation_files AS files "
+        "JOIN indexed_file_versions AS version ON version.id = files.file_version "
+        "WHERE files.generation = ? AND version.path = ?",
+        (generation, relative_path),
+    ).fetchone()
+    return row[0] if row is not None else None
+
+
 def read_checkout_nodes(
     conn: sqlite3.Connection, checkout_root: Path, relative_path: str,
 ) -> list[GraphNode]:
