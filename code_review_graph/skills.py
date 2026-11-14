@@ -2440,12 +2440,13 @@ def _exit_warning(hook_path: Path, command: str) -> None:
     )
 
 
-def _git_hooks_dir(repo_root: Path) -> Path | None:
+def _git_hooks_dir(repo_root: Path, *, required: bool = False) -> Path | None:
     """Return the directory git runs hooks from, or None when there is none.
 
     Resolved via ``git rev-parse --git-path hooks`` so linked worktrees,
     submodules and ``core.hooksPath`` are honoured, with the legacy
     ``.git/hooks`` lookup as the fallback when git itself is unavailable.
+    An explicit hook installation requires Git's answer and propagates errors.
     """
     try:
         result = subprocess.run(
@@ -2456,12 +2457,22 @@ def _git_hooks_dir(repo_root: Path) -> Path | None:
             cwd=str(repo_root),
             timeout=10,
             stdin=subprocess.DEVNULL,
+            check=required,
         )
         if result.returncode == 0 and result.stdout.strip():
             # Output is relative to repo_root (".git/hooks", a core.hooksPath
             # value such as ".husky") or absolute (linked worktrees).
-            return repo_root / result.stdout.strip()
+            path = repo_root / result.stdout.strip()
+            if path.resolve() == Path(os.devnull).resolve():
+                if required:
+                    raise RuntimeError("git hooks are disabled by core.hooksPath")
+                return None
+            return path
+        if required:
+            raise RuntimeError("git returned an empty hooks path")
     except (subprocess.TimeoutExpired, OSError) as exc:
+        if required:
+            raise
         logger.warning("git unavailable (%s); falling back to .git/hooks resolution.", exc)
 
     git_dir = repo_root / ".git"
@@ -2487,9 +2498,8 @@ def install_git_hook(repo_root: Path) -> Path | None:
     Creates ``pre-commit`` if it doesn't exist, or appends to an existing
     one — the hook is appended, not overwritten, preserving any hooks
     already there. A hook that ends with a top-level ``exit`` gets the block
-    just before that line, where it still runs. Falls back to the legacy
-    ``.git/hooks`` resolution when git itself is unavailable. Returns None
-    when no hooks directory can be determined. A block written by any past
+    just before that line, where it still runs. Git resolution errors propagate.
+    A block written by any past
     release is upgraded in place, and a hand-edited one is left alone. The
     installed hook skips automatic checks in linked worktrees, where an
     implicit update could build a duplicate graph for a different branch;
@@ -2497,7 +2507,7 @@ def install_git_hook(repo_root: Path) -> Path | None:
     Detection relies only on ``git rev-parse --absolute-git-dir`` (Git 2.13),
     not on newer options.
     """
-    hooks_dir = _git_hooks_dir(repo_root)
+    hooks_dir = _git_hooks_dir(repo_root, required=True)
     if hooks_dir is None:
         return None
 
