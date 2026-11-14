@@ -478,6 +478,17 @@ def test_watch_startup_waits_out_another_writer(repo, held, monkeypatch):
     assert outcome == {}
 
 
+def test_watch_startup_indexes_file_created_while_offline(repo, monkeypatch):
+    source = repo / "offline_new.py"
+    source.write_text("def offlineNew():\n    return 1\n", encoding="utf-8")
+    thread, stop, store, outcome = _run_watch(monkeypatch, repo)
+    try:
+        assert _wait_for(lambda: "offlineNew" in _names(repo, source))
+    finally:
+        _finish(thread, stop, store)
+    assert outcome == {}
+
+
 def test_watch_can_stop_while_startup_waits_for_the_lock(repo, held, monkeypatch):
     (repo / "keep.py").write_text(
         "def keepHelper():\n    return 1\n\ndef neverReconciled():\n    return 2\n",

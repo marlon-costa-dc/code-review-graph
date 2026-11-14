@@ -5285,8 +5285,10 @@ def _watch(
                 write_lock = WriteLock(store.db_path)
                 if _wait_for_watch_write_lock(write_lock, supervisor, stop_event):
                     try:
+                        base = store.get_metadata("git_head_sha")
                         initial = incremental_update(
-                            repo_root, store, changed_files=[], follow_symlinks=follow_symlinks,
+                            repo_root, store, base=base or "HEAD",
+                            follow_symlinks=follow_symlinks,
                         )
                         _raise_watch_update_errors(initial, "initial watch reconciliation")
                         if initial["files_updated"] > 0 and on_files_updated is not None:
