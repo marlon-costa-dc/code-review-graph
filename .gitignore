@@ -111,3 +111,7 @@ PRESENTATION_BRIEF.md
 .cursor/
 .envrc
 .mise.toml
+
+# Gas City
+.beads/*
+!.beads/identity.toml
