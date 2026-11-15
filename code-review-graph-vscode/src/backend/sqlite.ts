@@ -197,8 +197,21 @@ export class SqliteReader {
   private selectCheckoutGeneration(): void {
     if (!this.db || !this.headFile || !this.checkoutKey) return;
     const db = this.db;
+    const checkout = this.checkoutKey;
     const head = readFileSync(this.headFile, 'utf8').trim();
     const ref = head.startsWith('ref: ') ? head.slice(5) : `detached:${head}`;
+    const selected = db.transaction(() => this.readCheckoutGeneration(db, checkout, ref))();
+    this.generationSelected = selected !== null;
+    if (selected) [this.selectedGeneration, this.selectedBinding] = selected;
+  }
+
+  private readCheckoutGeneration(
+    db: DatabaseType,
+    checkout: Buffer,
+    ref: string,
+  ): readonly [number, string] | null {
+    // Metadata, the ref binding and every projected row must survive the same
+    // read snapshot even when a writer rebinds a ref and prunes its old rows.
     const meta = db.prepare(`SELECT key, value FROM ${this.prefix}metadata
       WHERE key IN ('git_branch', 'git_head_sha')`).all() as { key: string; value: string }[];
     const native = Object.fromEntries(meta.map(({ key, value }) => [key, value]));
@@ -206,8 +219,7 @@ export class SqliteReader {
       ? `refs/heads/${native.git_branch}`
       : native.git_head_sha ? `detached:${native.git_head_sha}` : 'unborn';
     if (ref === nativeRef || (nativeRef === 'unborn' && !native.git_head_sha)) {
-      this.generationSelected = false;
-      return;
+      return null;
     }
 
     const hasBindings = db.prepare(
@@ -215,7 +227,7 @@ export class SqliteReader {
     ).get();
     const binding = hasBindings ? db.prepare(
       'SELECT generation_id, head, built_at FROM crg_generation_bindings WHERE checkout=? AND ref=?',
-    ).get(this.checkoutKey, ref) as
+    ).get(checkout, ref) as
       { generation_id: number; head: string; built_at: string } | undefined : undefined;
     if (!binding) {
       throw new Error(`No published graph generation for ${ref}; build this checkout`);
@@ -252,13 +264,11 @@ export class SqliteReader {
         if (db.prepare("SELECT 1 FROM sqlite_schema WHERE name='crg_generation_projection_vectors'").get()) {
           db.prepare(`INSERT INTO crg_selected_embeddings
             SELECT qualified_name FROM crg_generation_projection_vectors WHERE checkout=? AND ref=?`)
-            .run(this.checkoutKey, ref);
+            .run(checkout, ref);
         }
       })();
-      this.selectedGeneration = binding.generation_id;
-      this.selectedBinding = bindingKey;
     }
-    this.generationSelected = true;
+    return [binding.generation_id, bindingKey];
   }
 
   /**

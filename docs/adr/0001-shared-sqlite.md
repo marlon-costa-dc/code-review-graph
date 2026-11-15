@@ -46,7 +46,10 @@ without needing to rescan source files for the input manifest.
 read the published structural generation for the requested checkout. A
 structural query also selects the current ref's generation if the native
 tables were last built on a different ref. The VS Code reader follows the
-same ref and checkout binding. Historical search rebuilds its FTS index from
+same ref and checkout binding in one SQLite snapshot with its payload and
+vector reads, so pruning cannot invalidate the selected generation mid-read.
+Shared-schema migration records incomplete builds as unresolved and retains
+their native rows for repair. Historical search rebuilds its FTS index from
 published nodes and reads the published vector links. Historical flows
 preserve their path through qualified symbols and remap their node IDs to
 the materialized graph. The native graph remains the fast path for its

@@ -133,7 +133,11 @@ def discover_worktrees(repo_root: Path) -> tuple[WorktreeCheckout, ...]:
     checkouts: list[WorktreeCheckout] = []
     output = _run_git(repo_root, "worktree", "list", "--porcelain", "-z")
     for record in output.split("\0\0"):
-        fields = dict(field.partition(" ")[::2] for field in record.split("\0") if field)
+        fields = {
+            key: value
+            for field in record.split("\0") if field
+            for key, _, value in (field.partition(" "),)
+        }
         if "bare" in fields or "prunable" in fields or "worktree" not in fields:
             continue
         candidate = Path(fields["worktree"])

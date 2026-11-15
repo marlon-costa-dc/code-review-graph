@@ -980,7 +980,7 @@ def _clear_parser_probe_cache() -> None:
         _PARSER_PROBE_GRAMMAR_LOCKS.clear()
 
 
-def _load_tree_sitter_parser(grammar: str):
+def _load_tree_sitter_parser(grammar: str) -> Parser | None:
     """Load a probed grammar, suppressing only known availability errors."""
     if not _parser_load_probe_succeeds(grammar):
         return None
@@ -3926,7 +3926,7 @@ class CodeParser:
     def __init__(self, repo_root: Optional[Path] = None) -> None:
         self._repo_root = Path(repo_root).resolve() if repo_root is not None else None
         self._dbt_model_paths_cache: dict[Path, tuple[Path, ...]] = {}
-        self._parsers: dict[str, object] = {}
+        self._parsers: dict[str, Parser] = {}
         self._module_file_cache: dict[str, Optional[str]] = {}
         # Ignore patterns per repository boundary, so a resolver never names
         # a path the build will not index; see :meth:`_path_is_indexed`.
@@ -4002,7 +4002,7 @@ class CodeParser:
                 self._import_types[custom.name] = list(custom.import_node_types)
                 self._call_types[custom.name] = list(custom.call_node_types)
 
-    def _get_parser(self, language: str):  # type: ignore[arg-type]
+    def _get_parser(self, language: str) -> Parser | None:
         if language not in self._parsers:
             # Custom languages map their name onto a packaged grammar.
             custom = self._custom_languages.get(language)
@@ -4875,6 +4875,8 @@ class CodeParser:
                 continue
 
             script_source = raw_text_node.text
+            if script_source is None:
+                raise ValueError("Vue script node has no source bytes")
             line_offset = raw_text_node.start_point[0]  # 0-based line of raw_text start
 
             # Parse the script block with the appropriate JS/TS parser
@@ -5004,6 +5006,8 @@ class CodeParser:
                 continue
 
             script_source = raw_text_node.text
+            if script_source is None:
+                raise ValueError("Svelte script node has no source bytes")
             line_offset = raw_text_node.start_point[0]
 
             script_parser = self._get_parser(script_lang)

@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from . import shared_generations, shared_vectors
+from .build_state import BUILD_STATE_KEY, INCOMPLETE_BUILD_STATES
 from .errors import GraphStoreError
 from .migrations import RETIRED_TABLES
 
@@ -160,7 +161,7 @@ def _migrate_namespaces(conn: CheckoutConnection, tables: set[str], version: int
                 conn.bind(root)
             if not root.is_absolute() or conn._prefix != namespace:
                 reason = "unverified checkout root"
-            elif metadata.get("build_state") == "in-progress":
+            elif metadata.get(BUILD_STATE_KEY) in INCOMPLETE_BUILD_STATES:
                 reason = "incomplete checkout graph"
             else:
                 ref = shared_generations.git_ref(

@@ -635,6 +635,8 @@ def get_review_context(
         # contribute a whole file. The budget now buys whole changed regions,
         # allocated round-robin over the risk-ranked list, so what a reviewer
         # receives is complete hunks rather than the top of a merged window.
+        regions_by_file: dict[str, list[tuple[int, int]]] = {}
+        granted: dict[str, list[tuple[int, int]]] = {}
         if include_source:
             per_file = min(max_lines_per_file, _MAX_LINES_PER_FILE)
             region_cap = min(
@@ -643,7 +645,6 @@ def get_review_context(
             )
             hunks = _diff_hunks(root, base)
             file_lines: dict[str, list[str]] = {}
-            regions_by_file: dict[str, list[tuple[int, int]]] = {}
             snippets: dict[str, str] = {}
             followed = followed_files(store)
             for rel_path in shown_files:

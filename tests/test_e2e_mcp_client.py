@@ -593,8 +593,9 @@ def test_shared_cli_reuses_watcher_reconciliation(tmp_path):
 
 @pytest.mark.e2e
 @pytest.mark.parametrize("legacy_version", [1, 2])
+@pytest.mark.parametrize("pending", [False, True])
 def test_shared_cli_migrate_preserves_native_rows_and_publishes_existing_ref(
-    tmp_path, legacy_version,
+    tmp_path, legacy_version, pending,
 ):
     repo = _make_fixture_repo(tmp_path)
     database = tmp_path / "shared.db"
@@ -617,17 +618,36 @@ def test_shared_cli_migrate_preserves_native_rows_and_publishes_existing_ref(
         for (table,) in tables:
             db.execute(f"DROP TABLE {table}")
         db.execute("UPDATE _crg_shared SET version=?", (legacy_version,))
-    assert f"{legacy_version} → 3; unresolved checkout records: 0" in run("migrate-shared")
-    assert "3 → 3; unresolved checkout records: 0" in run("migrate-shared")
+        (metadata,) = db.execute(
+            "SELECT name FROM sqlite_schema WHERE name GLOB 'crg_*_metadata'",
+        ).fetchone()
+        (nodes,) = db.execute(
+            "SELECT name FROM sqlite_schema WHERE name GLOB 'crg_*_nodes'",
+        ).fetchone()
+        native_rows = db.execute(f"SELECT * FROM {nodes} ORDER BY id").fetchall()
+        if pending:
+            db.execute(
+                f"UPDATE {metadata} SET value=? WHERE key=?",
+                ("postprocess-pending", "build_state"),
+            )
+    unresolved = int(pending)
+    summary = f"unresolved checkout records: {unresolved}"
+    assert f"{legacy_version} → 3; {summary}" in run("migrate-shared")
+    assert f"3 → 3; {summary}" in run("migrate-shared")
+    with sqlite3.connect(database) as db:
+        assert db.execute(f"SELECT * FROM {nodes} ORDER BY id").fetchall() == native_rows
+        bindings = db.execute("SELECT count(*) FROM crg_generation_bindings").fetchone()
+        assert bindings == (1 - unresolved,)
+        assert db.execute("PRAGMA integrity_check").fetchall() == [("ok",)]
+        assert not db.execute("PRAGMA foreign_key_check").fetchall()
+    if pending:
+        return
     current = json.loads(run("query", "imports_of", "pkg/service.py", "--repo", str(repo)))
     historical = json.loads(run(
         "query", "imports_of", "pkg/service.py", "--generation-ref", "refs/heads/main",
         "--repo", str(repo),
     ))
     assert current == before and current["results"] == historical["results"]
-    with sqlite3.connect(database) as db:
-        assert db.execute("PRAGMA integrity_check").fetchall() == [("ok",)]
-        assert not db.execute("PRAGMA foreign_key_check").fetchall()
 
 
 @pytest.mark.e2e
