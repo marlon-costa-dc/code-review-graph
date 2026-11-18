@@ -1,5 +1,19 @@
 # Changelog
 
+## [2.4.0-dc.5] - 2026-11-18
+
+### Fixed
+
+- A graph another migration numbering stamped past v10 without
+  `nodes.symbol` (measured: an algar-oud-mig working graph at schema v15)
+  failed every write with `table nodes has no column named symbol`. Schema
+  v16 replays v10, which decides by the schema itself, so such a graph is
+  repaired on open and every other graph is unchanged. The VS Code extension
+  reads schema v16.
+- The minimum-dependencies job pins the floors `pyproject.toml` declares
+  again (`mcp==1.29.0`, `fastmcp==3.2.4`) after a dependency update had
+  raised them.
+
 ## [2.4.0-dc.4] - 2026-11-16
 
 ### Fixed
