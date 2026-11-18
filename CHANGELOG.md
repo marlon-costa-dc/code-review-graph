@@ -1,5 +1,119 @@
 # Changelog
 
+## [2.4.0-dc.5] - 2026-11-18
+
+### Fixed
+
+- A graph another migration numbering stamped past v10 without
+  `nodes.symbol` (measured: an algar-oud-mig working graph at schema v15)
+  failed every write with `table nodes has no column named symbol`. Schema
+  v16 replays v10, which decides by the schema itself, so such a graph is
+  repaired on open and every other graph is unchanged. The VS Code extension
+  reads schema v16.
+- The minimum-dependencies job pins the floors `pyproject.toml` declares
+  again (`mcp==1.29.0`, `fastmcp==3.2.4`) after a dependency update had
+  raised them.
+- Dead code no longer reports live Python callables:
+  - a function or method passed by name to a library (`match_filter=self._admit_match`,
+    a callback in an options object or wrapper) counts as used;
+  - pytest hook implementations are live;
+  - plugin classes instantiated by a loader are live.
+- Inheritance resolves diamonds and mixins with C3, so a method reached
+  through a shared base binds to the class Python would call.
+- Agent and editor trees (`.claude/`, `.codex/`, `.cursor/` and the like) are
+  never indexed as product code.
+- The test suite keeps its temporary files inside pytest's basetemp and
+  deletes them: each run had left about 800 MB in `TMPDIR`, which filled RAM
+  when `TMPDIR` was on `/dev/shm`.
+- The release workflow publishes an existing tag without re-tagging, and a
+  dispatched run checks out the tag it publishes.
+
+## [2.4.0-dc.4] - 2026-11-16
+
+### Fixed
+
+- Stabilises the integration tip after the dead-code precision work. The full
+  suite is green on 3.10-3.13, minimum declared dependencies and the Windows
+  daemon job, after these repairs:
+  - registry detection accepts only real module paths and path candidates guard
+    an empty base name, so an arbitrary string map no longer crashes the parser;
+  - required read commands refuse a plain `--repo`, and neither the CLI nor the
+    read-only wrapper treats a catch-all graph at the account home as a project
+    boundary;
+  - C++ keeps its overload candidate metadata and other languages report
+    ambiguous bare targets instead of inventing one;
+  - `@Override` stays out of the Python dispatch-hook catalog, keeping flow
+    roots correct while the dedicated override check owns dead code;
+  - C3 is the declared inheritance behaviour (`C(A, B)` resolves through
+    `A` to `Root.m`);
+  - architecture overview emits one id type and no dangling cross-community
+    edge; minimal mode keeps ids like standard mode;
+  - nested method identity keeps its compatible spelling while dead code
+    resolves a Protocol member's owner by exact key and then by unique suffix.
+
+### Changed
+
+- Dead code is measured, not asserted: `make eval-dead-code` gates a reviewed
+  corpus (0 false positives required, recall may not regress). On `flext-infra`
+  (700 files) reports fell from 360 to 26 and the Pydantic model reports from 82
+  to 0, through value references, generated export registries, Pydantic
+  surface hooks and annotation/typing coverage.
+
+## [2.4.0-dc.3] - 2026-11-15
+
+### Changed
+
+- Creating a graph database now initializes its schema in one transaction,
+  reducing disk synchronization while preserving the same schema version.
+
+### Fixed
+
+- Dead-code reports are truthful on FLEXT's OO/MRO/Pydantic code. Measured on
+  `flext-infra` (700 files): 360 reports before, 26 after; Pydantic model
+  classes 82 before, 0 after.
+- A callable handed to a library is used code: bare closures
+  (`map(published)`), `self.method`, conditional branches and nested-call
+  argument lists.
+- Generated export registries (`install_lazy_exports(..., deferred_members=...)`)
+  resolve to their exact targets instead of hiding every lazily exported model.
+- Pydantic surfaces are live: `@computed_field`, `@cached_property`, validators
+  and serializers; a model used as a field type is counted through its
+  annotation; `@override` is no longer Java-only.
+- A nested class method keeps its full scope chain (`Facade.Inner.method`), the
+  same identity as its container; ambiguous bare targets are reported instead of
+  invented, and diamonds/mixins resolve through the C3 order.
+- Ignore rules follow Git semantics (last match wins, `!` re-includes,
+  slash-free rules match at any depth) and read `.gitignore`,
+  `.git/info/exclude` and `core.excludesFile`; agent/editor trees are never
+  indexed.
+- `make eval-dead-code` gates dead-code precision and recall against a reviewed
+  corpus.
+- Indexing deeply nested HTML no longer looks up the parent from the tree
+  root for every opening tag.
+
+### Fixed
+
+- OpenCode version detection now keeps the probe's logs and caches out of
+  the user profile, so `install --dry-run` leaves it unchanged.
+
+## [2.4.0-dc.2] - 2026-11-15
+
+### Fixed
+
+- The VS Code extension now ships the SQLite binding for Electron 43
+  (upstream tirth8205/code-review-graph#1219; fork integration #41).
+- The released hook commands written by v2.4.0-dc.1 are recognised again, so
+  `install` upgrades and `uninstall` removes them instead of stacking a second
+  hook; the release test matrix is green (#42).
+- The minimum declared anyio floor is 4.14.2, so the minimum-dependency job no
+  longer installs the vulnerable 4.8.0 (Dependabot critical; the lock already
+  resolves 4.16.0).
+
+### Internal
+
+- Shared vector queries and checkout deletion are covered by a checkout
+  identity proof (#43).
+
 ## [Unreleased]
 
 ### Added

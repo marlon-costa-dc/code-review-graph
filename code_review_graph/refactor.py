@@ -23,6 +23,7 @@ from collections import deque
 from pathlib import Path, PurePosixPath
 from typing import Any, Optional, Union
 
+from . import liveness_rules
 from .constants import (
     CLAIMED_ENDPOINT_KEY,
     INHERITED_ENDPOINT_KEY,
@@ -39,12 +40,7 @@ logger = logging.getLogger(__name__)
 # Base class names that indicate a framework-managed class (ORM models,
 # Pydantic schemas, settings).  Classes inheriting from these are invoked
 # via metaclass/framework magic and should not be flagged as dead code.
-_FRAMEWORK_BASE_CLASSES = frozenset({
-    "Base", "DeclarativeBase", "Model", "BaseModel", "BaseSettings",
-    "db.Model", "TableBase",
-    # AWS CDK constructs -- instantiated by CDK app wiring, not explicit CALLS.
-    "Stack", "NestedStack", "Construct", "Resource",
-})
+_FRAMEWORK_BASE_CLASSES = liveness_rules.FRAMEWORK_BASE_CLASSES
 
 # Class name suffixes that indicate CDK/IaC constructs.
 # These are instantiated by framework wiring, not direct CALLS edges.
@@ -1952,14 +1948,9 @@ def _csharp_member_scopes(conn: Any) -> dict[str, set[str]]:
     return scopes
 
 
-# Languages whose documents are invoked by an orchestrator, a scheduler or a
-# query engine rather than by a call site. A task, a resource or a statement has
-# no caller in the graph, so "no incoming edge" says nothing about whether it is
-# dead: Ansible playbooks alone produced 740 of algar's reports.
-NON_CODE_SUBJECT_LANGUAGES = frozenset({
-    "ansible", "yaml", "json", "toml", "hcl", "sql", "markdown", "md",
-    "dockerfile", "ini", "xml", "csv",
-})
+# The subject taxonomy lives in one catalog; this alias keeps the old import
+# path working for callers and tests.
+NON_CODE_SUBJECT_LANGUAGES = liveness_rules.NON_CODE_SUBJECT_LANGUAGES
 
 
 def find_dead_code(
@@ -2172,6 +2163,10 @@ def find_dead_code(
         if (node.language or "") in NON_CODE_SUBJECT_LANGUAGES:
             continue
 
+        # A pytest hook implementation is found by name by the plugin manager.
+        if node.kind in ("Function", "Test") and liveness_rules.is_pytest_hook(node.name):
+            continue
+
         # Skip test nodes and anything defined in test files.
         if node.is_test or _in_test_file(node.file_path):
             continue
@@ -2243,10 +2238,20 @@ def find_dead_code(
         if node.kind == "Class":
             if _is_framework_class:
                 continue
+            # A plugin loader instantiates these by name from a plugin folder;
+            # no import or call site ever reaches them.
+            if liveness_rules.is_plugin_entry_class(node.name, node.file_path):
+                continue
             # Fallback: CDK class name suffixes (no INHERITS edge for external bases)
             if any(node.name.endswith(s) for s in _CDK_CLASS_SUFFIXES):
                 continue
         if node.kind == "Function" and _is_framework_class:
+            continue
+        if (
+            node.kind == "Function"
+            and node.parent_name
+            and liveness_rules.is_plugin_entry_class(node.parent_name, node.file_path)
+        ):
             continue
         # Also skip methods whose parent class name matches CDK suffixes
         # (fallback for external base classes without INHERITS edges).
@@ -2395,6 +2400,31 @@ def find_dead_code(
                                 break
                         if has_callers:
                             break
+
+            # A member of a Protocol is a contract, not an implementation: the
+            # runtime never calls the stub body, the consumer or the
+            # implementation does. Reporting it dead would delete the interface.
+            if (
+                not has_callers
+                and node.kind in ("Function", "Test")
+                and node.parent_name
+            ):
+                # Python keys a unique-leaf method with its direct class only,
+                # so the container may be the class node's *suffix*
+                # (``Facade.Protocol`` versus ``Protocol``). Resolve the owner
+                # by exact key first, then by a unique suffix.
+                owners = [f"{node.file_path}::{node.parent_name}"]
+                if owners[0] not in class_bases:
+                    parent = node.parent_name
+                    owners = [
+                        key for key in class_bases
+                        if key.endswith("::" + parent) or key.endswith("." + parent)
+                    ]
+                if any(
+                    "Protocol" in {base.rpartition(".")[2] for base in class_bases.get(owner, ())}
+                    for owner in owners
+                ):
+                    has_callers = True
 
             if not has_callers:
                 if root:

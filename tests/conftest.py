@@ -11,6 +11,10 @@ from __future__ import annotations
 import importlib
 import os
 import pkgutil
+import shutil
+import tempfile
+from pathlib import Path
+from tempfile import mkdtemp
 
 import pytest
 
@@ -26,8 +30,30 @@ for _info in pkgutil.iter_modules(code_review_graph.tools.__path__):
     importlib.import_module(f"code_review_graph.tools.{_info.name}")
 
 
+@pytest.fixture(scope="session", autouse=True)
+def contained_tempdir(tmp_path_factory):
+    """Hold every raw ``tempfile`` directory the suite makes, and delete them.
+
+    Many tests call ``tempfile.mkdtemp()`` and never remove the result, and
+    subprocesses inherit ``TMPDIR``. Without this, each run left hundreds of
+    MB in the caller's temp folder; with ``TMPDIR`` on ``/dev/shm`` that was
+    RAM, and repeated runs filled memory and swap.
+    """
+    root = tmp_path_factory.mktemp("tempfile")
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(tempfile, "tempdir", str(root))
+        patch.setenv("TMPDIR", str(root))
+        yield root
+    shutil.rmtree(root, ignore_errors=True)
+
+
+@pytest.fixture(scope="session")
+def crg_home_parent(tmp_path_factory):
+    return tmp_path_factory.mktemp("crg-isolation")
+
+
 @pytest.fixture(autouse=True)
-def isolated_crg_home(tmp_path_factory, monkeypatch):
+def isolated_crg_home(crg_home_parent, monkeypatch):
     """Redirect the per-user state directory into a temporary directory.
 
     ``~/.code-review-graph`` holds ``registry.json``, ``watch.toml``,
@@ -45,36 +71,38 @@ def isolated_crg_home(tmp_path_factory, monkeypatch):
     Autouse and unconditional: an opt-in fixture would silently stop
     protecting a test the day someone forgets to request it.
     """
-    home = tmp_path_factory.mktemp("crg-home")
-    monkeypatch.setenv("CRG_HOME", str(home))
-    # The Hermes Agent installer resolves its config from ``HERMES_HOME``,
-    # falling back to ``~/.hermes``. That fallback reaches the real user
-    # config in any test that does not also patch ``Path.home()``, so pin
-    # the variable to a temp directory instead of merely clearing it:
-    # unset, a miss would be silently destructive; set, it cannot be.
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path_factory.mktemp("hermes-home")))
+    # The numbered pytest allocator scans its parent on every call. Keep
+    # these directories under one bucket so they also stay out of tmp_path's
+    # numbered-directory scans.
+    root = Path(mkdtemp(dir=crg_home_parent))
+    # Pin explicit installer overrides even when a test patches Path.home.
+    homes = {
+        "CRG_HOME": root / "crg-home",
+        "HERMES_HOME": root / "hermes-home",
+        "DSH_HOME": root / "dsh-home",
+        "HOME": root / "user-home",
+    }
+    for variable, path in homes.items():
+        path.mkdir(mode=0o700)
+        monkeypatch.setenv(variable, str(path))
     # Tests that exercise the Codex default patch Path.home() to a temporary
     # directory; clear an external override so it cannot escape that scope.
     monkeypatch.delenv("CODEX_HOME", raising=False)
-    # DeepSeek Harness reads ``$DSH_HOME/cordis.patch.yml``, falling back to
-    # ``~/.dsh``. ``skills._dsh_home()`` prefers that variable over a patched
-    # ``Path.home()``, so a suite that only fakes the home would still edit
-    # the developer's real patch layer. Pin it here, exactly as the Hermes
-    # variable above.
-    monkeypatch.setenv("DSH_HOME", str(tmp_path_factory.mktemp("dsh-home")))
     # The OpenCode plugin and MiMo config follow ``XDG_CONFIG_HOME`` over a
     # patched ``Path.home()``, so a developer's own setting must not leak in.
     monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
     # A developer who records their own context history (#813) must not
     # have the suite append lines to every scratch repository it builds.
     monkeypatch.delenv("CRG_CONTEXT_HISTORY", raising=False)
+    # Every non-interactive bash a test spawns sources ``BASH_ENV``; a
+    # developer's hook there (direnv, for one) writes to the script's stderr.
+    monkeypatch.delenv("BASH_ENV", raising=False)
     # The installers write user-level configs under the home directory
     # (``~/.codex``, ``~/.continue``, ``~/.qwen`` and more). Point the home
     # at a temp directory, so a test that forgets to patch ``Path.home()``
     # writes there and not into the real one (crg-2lp). ``Path.home()``
     # reads ``HOME`` on POSIX and ``USERPROFILE`` on Windows.
-    user_home = tmp_path_factory.mktemp("user-home")
-    monkeypatch.setenv("HOME", str(user_home))
+    user_home = homes["HOME"]
     monkeypatch.setenv("USERPROFILE", str(user_home))
     # These win over the home when set, so clear them: the folders they
     # name then follow the temp home too.
@@ -86,7 +114,7 @@ def isolated_crg_home(tmp_path_factory, monkeypatch):
         "[user]\n\tname = CRG Test\n\temail = crg-test@example.com\n",
         encoding="utf-8",
     )
-    return home
+    return homes["CRG_HOME"]
 
 
 # Opt-in markers: suites slow or invasive enough that the ordinary run must not
