@@ -1,5 +1,33 @@
 # Changelog
 
+## [2.4.0-dc.5] - 2026-11-18
+
+### Fixed
+
+- A graph another migration numbering stamped past v10 without
+  `nodes.symbol` (measured: an algar-oud-mig working graph at schema v15)
+  failed every write with `table nodes has no column named symbol`. Schema
+  v16 replays v10, which decides by the schema itself, so such a graph is
+  repaired on open and every other graph is unchanged. The VS Code extension
+  reads schema v16.
+- The minimum-dependencies job pins the floors `pyproject.toml` declares
+  again (`mcp==1.29.0`, `fastmcp==3.2.4`) after a dependency update had
+  raised them.
+- Dead code no longer reports live Python callables:
+  - a function or method passed by name to a library (`match_filter=self._admit_match`,
+    a callback in an options object or wrapper) counts as used;
+  - pytest hook implementations are live;
+  - plugin classes instantiated by a loader are live.
+- Inheritance resolves diamonds and mixins with C3, so a method reached
+  through a shared base binds to the class Python would call.
+- Agent and editor trees (`.claude/`, `.codex/`, `.cursor/` and the like) are
+  never indexed as product code.
+- The test suite keeps its temporary files inside pytest's basetemp and
+  deletes them: each run had left about 800 MB in `TMPDIR`, which filled RAM
+  when `TMPDIR` was on `/dev/shm`.
+- The release workflow publishes an existing tag without re-tagging, and a
+  dispatched run checks out the tag it publishes.
+
 ## [2.4.0-dc.4] - 2026-11-16
 
 ### Fixed
