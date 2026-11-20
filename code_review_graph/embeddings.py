@@ -401,10 +401,16 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
         dimension: int | None = None,
         timeout: int = 120,
         batch_size: int | None = None,
+        query_prefix: str = "",
+        document_prefix: str = "",
     ) -> None:
         self._api_key = api_key
         self._base_url = base_url.rstrip("/")
         self._model = model
+        # Task prompts some models expect (e.g. EmbeddingGemma's
+        # "task: search result | query: " / "title: none | text: ").
+        self._query_prefix = query_prefix
+        self._document_prefix = document_prefix
         self._requested_dimension = dimension
         self._dimension = dimension
         self._timeout = timeout
@@ -612,13 +618,14 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
     def embed(self, texts: list[str]) -> list[list[float]]:
         if not texts:
             return []
+        documents = [self._document_prefix + text for text in texts]
         results: list[list[float]] = []
-        for i in range(0, len(texts), self._batch_size):
-            results.extend(self._call_api(texts[i:i + self._batch_size]))
+        for i in range(0, len(documents), self._batch_size):
+            results.extend(self._call_api(documents[i:i + self._batch_size]))
         return results
 
     def embed_query(self, text: str) -> list[float]:
-        return self._call_api([text])[0]
+        return self._call_api([self._query_prefix + text])[0]
 
     @property
     def dimension(self) -> int:
@@ -634,7 +641,12 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
         # and re-using cached embeddings across them silently corrupts
         # semantic ranking. Including the host partitions the embeddings
         # table so switching CRG_OPENAI_BASE_URL triggers a safe re-embed.
-        return f"openai:{self._model}@{self._host_key}"
+        # Prefixes change the vector space too, so they partition it as well.
+        identity = f"openai:{self._model}@{self._host_key}"
+        if self._query_prefix or self._document_prefix:
+            prompts = f"{self._query_prefix}\x1f{self._document_prefix}".encode()
+            identity += f"#prompts-{hashlib.sha256(prompts).hexdigest()[:12]}"
+        return identity
 
 
 class VoyageEmbeddingProvider(EmbeddingProvider):
@@ -958,6 +970,8 @@ def get_provider(
             model=resolved_model,
             dimension=dimension,
             batch_size=batch_size,
+            query_prefix=os.environ.get("CRG_OPENAI_QUERY_PREFIX", ""),
+            document_prefix=os.environ.get("CRG_OPENAI_DOCUMENT_PREFIX", ""),
         )
 
     if name == "minimax":
