@@ -1489,6 +1489,45 @@ class TestIsLocalhostUrl:
 
 
 class TestOpenAIEmbeddingProvider:
+    def test_prefixes_reach_documents_and_queries(self):
+        p = OpenAIEmbeddingProvider(
+            api_key="k",
+            base_url="http://localhost:3000/v1",
+            model="m",
+            query_prefix="task: search result | query: ",
+            document_prefix="title: none | text: ",
+        )
+        with patch(
+            "urllib.request.urlopen",
+            side_effect=[
+                _make_openai_response([[0.1] * 8, [0.2] * 8]),
+                _make_openai_response([[0.3] * 8]),
+            ],
+        ) as mock_urlopen:
+            p.embed(["def a(): pass", "def b(): pass"])
+            p.embed_query("where is a defined?")
+        documents, query = (
+            json.loads(call[0][0].data.decode("utf-8"))["input"]
+            for call in mock_urlopen.call_args_list
+        )
+        assert documents == [
+            "title: none | text: def a(): pass",
+            "title: none | text: def b(): pass",
+        ]
+        assert query == ["task: search result | query: where is a defined?"]
+
+    def test_prefixes_partition_the_vector_space(self):
+        plain = OpenAIEmbeddingProvider(
+            api_key="k", base_url="http://localhost:3000/v1", model="m",
+        )
+        prompted = OpenAIEmbeddingProvider(
+            api_key="k", base_url="http://localhost:3000/v1", model="m",
+            query_prefix="q: ", document_prefix="d: ",
+        )
+        assert plain.name == "openai:m@http://localhost:3000/v1"
+        assert prompted.name.startswith(plain.name + "#prompts-")
+        assert prompted.name != plain.name
+
     def test_name_includes_model(self):
         p = OpenAIEmbeddingProvider(
             api_key="k",
@@ -2291,6 +2330,16 @@ class TestGetProviderOpenAI:
         with patch.dict("os.environ", env, clear=True):
             p = get_provider("openai")
         assert p._dimension == 256
+
+    def test_prefix_env_forwarded(self):
+        env = {
+            **self._MIN_ENV,
+            "CRG_OPENAI_QUERY_PREFIX": "q: ",
+            "CRG_OPENAI_DOCUMENT_PREFIX": "d: ",
+        }
+        with patch.dict("os.environ", env, clear=True):
+            p = get_provider("openai")
+        assert (p._query_prefix, p._document_prefix) == ("q: ", "d: ")
 
     def test_localhost_suppresses_egress_warning(self, capsys):
         with patch.dict("os.environ", self._MIN_ENV, clear=True):
