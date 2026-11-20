@@ -874,6 +874,8 @@ class TestGetProviderValidation:
             model="nomic-embed-text",
             dimension=None,
             batch_size=None,
+            query_prefix="",
+            document_prefix="",
         )
 
     @patch("code_review_graph.embeddings.OpenAIEmbeddingProvider")
