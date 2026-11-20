@@ -3389,18 +3389,17 @@ _CLAUDE_MD_SECTION_END_MARKER = "<!-- /code-review-graph MCP tools -->"
 
 # Shared across every platform instruction file so the wording stays identical.
 _INSTRUCTION_INTRO = """**This project has a knowledge graph. Start with the code-review-graph
-MCP tools to narrow scope, then read the source.** The graph is cheaper than scanning files and
-gives you structural context (callers, dependents, test coverage) that file search cannot."""
+MCP tools to narrow scope, then read the source.** The graph is cheaper than
+scanning files and provides structural context (callers, dependents, tests)."""
 
 _INSTRUCTION_GUARDRAILS = """### Verify in the source
 
-- Answer from `include_source=True, expand_neighbors=True`; read a file only if truncated.
+- Use `include_source=True, expand_neighbors=True`; read files if truncated.
 - Do not change code from graph output alone: for any non-trivial change,
   read the implementation and the relevant tests before concluding.
-- Verify the exact source when touching behavior, database logic, migrations, retries, fallbacks,
-  recovery, or compatibility code.
-- When the graph and the source disagree, the source wins. The graph may be stale.
-- An empty graph result can mean "not indexed" or "not statically visible", not "does not exist"."""
+- Verify source for behavior, DB logic, migrations, retries, fallbacks, compat.
+- When graph and source disagree, the source wins; the graph may be stale.
+- An empty result can mean "not indexed" or "not statically visible", not absent."""
 
 _CLAUDE_MD_SECTION = f"""{_CLAUDE_MD_SECTION_MARKER}
 ## MCP Tools: code-review-graph
