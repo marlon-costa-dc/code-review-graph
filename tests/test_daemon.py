@@ -84,7 +84,6 @@ class TestConfigParsing:
         cfg = load_config(sample_config_file)
         assert cfg.session_name == "test-session"
         assert cfg.log_dir == tmp_path / "logs"
-        assert cfg.poll_interval == 5
         assert len(cfg.repos) == 2
         assert cfg.repos[0].alias == "alpha"
         assert cfg.repos[1].alias == "beta"
@@ -94,7 +93,6 @@ class TestConfigParsing:
         missing = tmp_path / "nonexistent.toml"
         cfg = load_config(missing)
         assert cfg.session_name == "crg-watch"
-        assert cfg.poll_interval == 2
         assert cfg.repos == []
 
     def test_load_config_missing_alias(self, tmp_path):
@@ -176,7 +174,6 @@ class TestConfigParsing:
         original = DaemonConfig(
             session_name="rt-session",
             log_dir=tmp_path / "rt-logs",
-            poll_interval=7,
             repos=[WatchRepo(path=str(repo.resolve()), alias="rt")],
         )
         config_file = tmp_path / "roundtrip.toml"
@@ -185,7 +182,6 @@ class TestConfigParsing:
 
         assert loaded.session_name == original.session_name
         assert loaded.log_dir == original.log_dir
-        assert loaded.poll_interval == original.poll_interval
         assert len(loaded.repos) == 1
         assert loaded.repos[0].alias == "rt"
         assert loaded.repos[0].path == str(repo.resolve())
@@ -197,7 +193,6 @@ class TestConfigParsing:
         config = DaemonConfig(
             session_name='quo"ted',
             log_dir=Path(r"C:\Users\example\logs"),
-            poll_interval=2,
             repos=[WatchRepo(path=r"C:\Users\example\repo", alias="win")],
         )
         parsed = tomllib.loads(_serialize_toml(config))
@@ -213,7 +208,6 @@ class TestConfigParsing:
         config = DaemonConfig(
             session_name=weird,
             log_dir=Path("logs"),
-            poll_interval=2,
             repos=[WatchRepo(path="repo", alias="a\rb")],
         )
         parsed = tomllib.loads(_serialize_toml(config))
@@ -525,17 +519,8 @@ class TestPidAliveWindows:
 
 class TestWatchDaemon:
     @pytest.fixture()
-    def daemon_env(self, tmp_path, monkeypatch):
+    def daemon_env(self, tmp_path):
         """Set up a WatchDaemon with temp repos and graph.db stubs."""
-        # start() watches the config file. The native observer (FSEvents on
-        # macOS) can crash with SIGBUS when tests start and stop it back to
-        # back, so use the polling one, which needs no native code.
-        from watchdog.observers.polling import PollingObserver
-
-        monkeypatch.setattr(
-            "watchdog.observers.Observer", lambda: PollingObserver(timeout=0.05)
-        )
-
         repo_a = tmp_path / "repo-a"
         repo_a.mkdir()
         (repo_a / ".git").mkdir()
@@ -552,7 +537,6 @@ class TestWatchDaemon:
         config = DaemonConfig(
             session_name="test-sess",
             log_dir=tmp_path / "logs",
-            poll_interval=1,
             repos=[
                 WatchRepo(path=str(repo_a), alias="alpha"),
                 WatchRepo(path=str(repo_b), alias="beta"),
@@ -592,27 +576,6 @@ class TestWatchDaemon:
 
         assert exc_info.value.code == 0
         stop.assert_called_once_with()
-
-    @patch("code_review_graph.daemon.subprocess.Popen")
-    @patch("code_review_graph.registry.Registry")
-    def test_start_watches_the_config_with_the_polling_observer(
-        self, mock_registry_cls, mock_popen, daemon_env
-    ):
-        """The native observer (FSEvents on macOS) crashed the suite with
-        SIGBUS when tests started and stopped it back to back (crg-799)."""
-        from watchdog.observers.polling import PollingObserver
-
-        mock_proc = MagicMock()
-        mock_proc.pid = 12345
-        mock_proc.poll.return_value = None
-        mock_popen.return_value = mock_proc
-
-        daemon = daemon_env["daemon"]
-        daemon.start()
-        try:
-            assert isinstance(daemon._config_watcher._observer, PollingObserver)
-        finally:
-            daemon.stop()
 
     @patch("code_review_graph.daemon.subprocess.Popen")
     @patch("code_review_graph.registry.Registry")
@@ -909,7 +872,6 @@ class TestWatchDaemon:
         new_config = DaemonConfig(
             session_name=config.session_name,
             log_dir=config.log_dir,
-            poll_interval=config.poll_interval,
             repos=[config.repos[0]],
         )
         daemon.reconcile(new_config)
@@ -964,7 +926,6 @@ class TestWatchDaemon:
         updated_config = DaemonConfig(
             session_name=config.session_name,
             log_dir=config.log_dir,
-            poll_interval=config.poll_interval,
             repos=[
                 WatchRepo(path=str(new_repo), alias="alpha"),
                 config.repos[1],
