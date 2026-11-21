@@ -114,6 +114,20 @@ def test_prune_detects_orphan_external_data_dirs(
     assert orphan_dir.is_dir()
 
 
+def test_prune_ignores_a_data_dir_never_created_for_a_shared_checkout(
+    live_and_dead: tuple[Path, Path], home: Path, tmp_path: Path
+) -> None:
+    live, _dead = live_and_dead
+    never_created = tmp_path / "shared-checkout-data"
+    registry = Registry(home / "registry.json")
+    registry.register(str(live), data_dir=str(never_created))
+
+    report = prune(registry=registry, apply=True, data_dirs=True)
+
+    assert report.orphan_data_dirs == []
+    assert registry.find_by_path(str(live)) is not None
+
+
 def test_prune_apply_with_data_dirs_removes_orphans(
     live_and_dead: tuple[Path, Path], home: Path, tmp_path: Path
 ) -> None:

@@ -103,13 +103,18 @@ def prune_watch(config_path: Path | None = None) -> tuple[list[str], list[str]]:
 
 
 def find_orphan_data_dirs(registry: Registry) -> list[str]:
-    """Report registered external data dirs that no longer hold a graph."""
+    """Report registered external data dirs that exist but no longer hold a graph.
+
+    A checkout served by the shared database never creates its own data dir,
+    so a registered path that does not exist is not an orphan.
+    """
     orphans: list[str] = []
     for entry in registry.list_repos():
         data_dir = entry.get("data_dir")
         if not data_dir:
             continue
-        if not (Path(data_dir) / "graph.db").is_file():
+        path = Path(data_dir)
+        if path.is_dir() and not (path / "graph.db").is_file():
             orphans.append(str(data_dir))
     return orphans
 
