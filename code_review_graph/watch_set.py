@@ -28,7 +28,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .constants import env_float
 from .daemon import ConfigWatcher
 from .graph import GraphStore
 from .incremental import _WATCH_STOP_TIMEOUT, _WATCH_TICK_SECONDS, watch
@@ -129,9 +128,7 @@ def watch_set(
     retiring: list[_Watcher] = []
     desired: dict[Path, WatchTarget] = {}
     changed = threading.Event()
-    observer = ConfigWatcher(
-        manifest, changed.set, poll_interval=env_float("CRG_WATCH_POLL_INTERVAL", 2.0),
-    )
+    observer = ConfigWatcher(manifest, changed.set)
 
     def run(watcher: _Watcher) -> None:
         store: GraphStore | None = None

@@ -244,7 +244,6 @@ def _handle_status(_args: argparse.Namespace) -> None:
 
     print(f"Name:    {config.session_name}")
     print(f"Log dir: {config.log_dir}")
-    print(f"Poll:    {config.poll_interval}s")
     print()
 
     if not config.repos:

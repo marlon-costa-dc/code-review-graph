@@ -438,10 +438,10 @@ each reported retention budget. Set `CRG_RETENTION_DAYS`,
 Setting any limit to zero retains no unbound artifacts. Compact explicitly
 to reclaim unused SQLite pages on disk.
 
-Workspace manifest changes use native filesystem notifications by default.
-If those notifications are unavailable, the watcher logs why polling is
-in use and how to restore native coverage. Set `CRG_WATCH_POLL_INTERVAL`
-in seconds to adjust the manifest polling interval.
+Workspace manifest changes reach the watcher only through kernel file
+notifications. There is no polling fallback: a host without a native
+notification backend, or with its notification quota exhausted, fails at
+start with the cause.
 
 ## Standalone Daemon CLI (`crg-daemon`)
 
@@ -466,7 +466,6 @@ The daemon reads `~/.code-review-graph/watch.toml` (or `$CRG_HOME/watch.toml`):
 [daemon]
 session_name = "crg-watch"   # logical daemon name
 log_dir = "/home/user/.code-review-graph/logs"   # absolute path; ~ is not expanded (default: ~/.code-review-graph/logs, or $CRG_HOME/logs)
-poll_interval = 2            # seconds between config file polls
 
 [[repos]]
 path = "/home/user/project-a"

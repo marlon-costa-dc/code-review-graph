@@ -10,7 +10,6 @@ No external dependencies beyond Python stdlib — no tmux required.
 
 from __future__ import annotations
 
-import errno
 import hashlib
 import json
 import logging
@@ -337,9 +336,6 @@ class DaemonConfig:
     log_dir: Path = field(default_factory=default_log_dir)
     """Directory for per-repo log files."""
 
-    poll_interval: int = 2
-    """Seconds between file-system polls for config changes."""
-
     repos: list[WatchRepo] = field(default_factory=list)
     """Repositories the daemon watches."""
 
@@ -380,7 +376,6 @@ def load_config(path: Path | None = None) -> DaemonConfig:
     daemon_section: dict[str, Any] = raw.get("daemon", {})
     session_name: str = daemon_section.get("session_name", "crg-watch")
     log_dir = Path(daemon_section.get("log_dir", str(DaemonConfig().log_dir)))
-    poll_interval: int = int(daemon_section.get("poll_interval", 2))
 
     # -- [[repos]] array ----------------------------------------------------
     repos: list[WatchRepo] = []
@@ -441,7 +436,6 @@ def load_config(path: Path | None = None) -> DaemonConfig:
     return DaemonConfig(
         session_name=session_name,
         log_dir=log_dir,
-        poll_interval=poll_interval,
         repos=repos,
     )
 
@@ -494,7 +488,6 @@ def _serialize_toml(config: DaemonConfig) -> str:
         "[daemon]",
         f"session_name = {_toml_str(config.session_name)}",
         f"log_dir = {_toml_str(config.log_dir)}",
-        f"poll_interval = {config.poll_interval}",
     ]
     for repo in config.repos:
         lines.append("")
@@ -1162,8 +1155,8 @@ def read_watch_health(
     updated_at = data.get("updated_at")
     age = time.time() - updated_at if isinstance(updated_at, (int, float)) else None
     data["age"] = age
-    data["stalled"] = bool(
-        data.get("observer_alive") is False or (age is not None and age > stale_after)
+    data["stalled"] = data.get("observer_alive") is False or (
+        age is not None and age > stale_after
     )
     return data
 
@@ -1216,127 +1209,70 @@ class ConfigWatcher:
         self,
         config_path: Path,
         callback: Callable[[], None],
-        poll_interval: float = 2,
     ) -> None:
         self._config_path = config_path
         self._callback = callback
-        self._poll_interval = poll_interval
-        self._observer: Any = None  # watchdog Observer when available
-        self._last_version: tuple[int, int, int] | None = None
-        self._poll_thread: threading.Thread | None = None
-        self._stop_event: threading.Event = threading.Event()
+        self._observer: Any = None
 
     # ------------------------------------------------------------------
     # Public
     # ------------------------------------------------------------------
 
     def start(self) -> None:
-        """Begin watching the config file for modifications."""
-        try:
-            from watchdog.events import FileSystemEventHandler
-            from watchdog.observers import Observer
-            from watchdog.observers.polling import PollingObserver
+        """Begin watching the config file through kernel file notification.
 
-            watcher = self
+        There is no polling fallback: a host without a native watchdog backend,
+        or one whose notification limit is exhausted, fails here loudly.
 
-            class _Handler(FileSystemEventHandler):  # type: ignore[misc]
-                def on_modified(self, event: Any) -> None:
-                    if Path(event.src_path).resolve() == watcher._config_path.resolve():
-                        watcher._on_config_changed()
+        Raises:
+            RuntimeError: if watchdog only offers its polling observer.
+        """
+        from watchdog.events import FileSystemEventHandler
+        from watchdog.observers import Observer
+        from watchdog.observers.polling import PollingObserver
 
-                on_created = on_deleted = on_modified
+        watcher = self
 
-                def on_moved(self, event: Any) -> None:
-                    if any(
-                        Path(path).resolve() == watcher._config_path.resolve()
-                        for path in (event.src_path, event.dest_path)
-                    ):
-                        watcher._on_config_changed()
+        class _Handler(FileSystemEventHandler):  # type: ignore[misc]
+            def on_modified(self, event: Any) -> None:
+                if Path(event.src_path).resolve() == watcher._config_path.resolve():
+                    watcher._on_config_changed()
 
-            handler = _Handler()
-            observer = Observer()
-            if isinstance(observer, PollingObserver):
-                observer = PollingObserver(timeout=self._poll_interval)
-                logger.warning(
-                    "Using polling for %s: no native backend for this platform; "
-                    "to restore native events, use a supported host",
-                    self._config_path,
-                )
-            observer.schedule(
-                handler,
-                str(self._config_path.parent),
-                recursive=False,
+            on_created = on_deleted = on_modified
+
+            def on_moved(self, event: Any) -> None:
+                if any(
+                    Path(path).resolve() == watcher._config_path.resolve()
+                    for path in (event.src_path, event.dest_path)
+                ):
+                    watcher._on_config_changed()
+
+        observer = Observer()
+        if isinstance(observer, PollingObserver):
+            raise RuntimeError(
+                f"no kernel notification backend for {self._config_path}; "
+                "polling is not supported"
             )
-            observer.daemon = True
-            observer.start()
-            self._observer = observer
-            logger.info(
-                "Config watcher started (watchdog) for %s",
-                self._config_path,
-            )
-        except ImportError:
-            self._polling("watchdog is unavailable", "install watchdog for this interpreter")
-        except OSError as exc:
-            if exc.errno in {errno.ENOSPC, errno.EMFILE}:
-                self._polling(str(exc), "raise the OS notification or file-descriptor limit")
-            elif exc.errno in {errno.ENOSYS, errno.ENOTSUP}:
-                self._polling(str(exc), "move the configuration to a native-event filesystem")
-            else:
-                raise
-
-    def _polling(self, reason: str, remedy: str) -> None:
-        logger.warning("Using polling for %s: %s; to restore native events, %s",
-                       self._config_path, reason, remedy)
-        self._start_polling()
+        observer.schedule(_Handler(), str(self._config_path.parent), recursive=False)
+        observer.daemon = True
+        observer.start()
+        self._observer = observer
+        logger.info("Config watcher started (kernel events) for %s", self._config_path)
 
     def is_alive(self) -> bool:
-        """Whether the selected notification backend is still running."""
-        if self._observer is not None:
-            return bool(self._observer.is_alive())
-        return self._poll_thread is not None and self._poll_thread.is_alive()
+        """Whether the kernel notification observer is still running."""
+        return self._observer is not None and bool(self._observer.is_alive())
 
     def stop(self) -> None:
         """Stop watching the config file."""
-        self._stop_event.set()
         if self._observer is not None:
             self._observer.stop()
             self._observer.join(timeout=5)
             self._observer = None
-        if self._poll_thread is not None:
-            self._poll_thread.join(timeout=5)
-            self._poll_thread = None
 
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
-
-    def _start_polling(self) -> None:
-        """Poll file identity, including atomic replacement, when needed."""
-        def version() -> tuple[int, int, int] | None:
-            try:
-                stat = self._config_path.stat()
-            except FileNotFoundError:
-                return None
-            return stat.st_ino, stat.st_mtime_ns, stat.st_size
-
-        self._last_version = version()
-
-        def _poll() -> None:
-            while not self._stop_event.is_set():
-                self._stop_event.wait(self._poll_interval)
-                if self._stop_event.is_set():
-                    break
-                current = version()
-                if current != self._last_version:
-                    self._last_version = current
-                    self._on_config_changed()
-
-        self._poll_thread = threading.Thread(
-            target=_poll,
-            daemon=True,
-            name="config-poller",
-        )
-        self._poll_thread.start()
 
     def _on_config_changed(self) -> None:
         """Handle a detected config file modification."""
@@ -1589,7 +1525,6 @@ class WatchDaemon:
         self._config_watcher = ConfigWatcher(
             config_path=self._config_path,
             callback=self._on_config_change,
-            poll_interval=self._config.poll_interval,
         )
         self._config_watcher.start()
 
@@ -1665,7 +1600,7 @@ class WatchDaemon:
                 state["count"] = 0
         state["count"] = int(state["count"]) + 1
         delay = min(
-            _RESTART_BACKOFF_BASE * (2 ** (int(state["count"]) - 1)),
+            _RESTART_BACKOFF_BASE * (2 ** (state["count"] - 1)),
             _RESTART_BACKOFF_MAX,
         )
         return float(delay)
