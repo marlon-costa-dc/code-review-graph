@@ -708,6 +708,9 @@ Optional settings:
 - `CRG_WATCH_PLAN_DEPTH` (default 3): how deep the planner may split.
 - `CRG_WATCH_SPLIT_MIN_DIRS` (default 4): smallest ignored tree worth its own
   watch.
+- `CRG_WATCH_SETTLE_SECONDS` (default 30): each edit batch rewrites only the
+  edited files' search rows; whole-graph community detection runs once the
+  repository has been quiet this long, not after every batch.
 - `CRG_RESTART_BACKOFF` (default 30s), `CRG_RESTART_BACKOFF_MAX` (default 900s),
   `CRG_RESTART_HEALTHY_AFTER` (default 600s): daemon restart backoff.
 

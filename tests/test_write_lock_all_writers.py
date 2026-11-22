@@ -340,7 +340,7 @@ def _edit(repo, name: str) -> FileModifiedEvent:
 def test_watch_batch_writes_under_the_lock_and_then_lets_go(repo):
     seen = []
 
-    def on_files_updated(_store):
+    def on_files_updated(_store, **_batch):
         seen.append(_lock_is_free(repo))
 
     with GraphStore(incremental.get_db_path(repo)) as store:
@@ -372,7 +372,9 @@ def test_watch_reuses_graph_rows_already_refreshed_by_command(repo):
     db = incremental.get_db_path(repo)
     postprocessed = []
     with GraphStore(db) as watcher_store:
-        handler = incremental._create_watch_handler(repo, watcher_store, postprocessed.append)
+        handler = incremental._create_watch_handler(
+            repo, watcher_store, lambda graph, **_: postprocessed.append(graph),
+        )
         with GraphStore(db) as command_store:
             changed = incremental.incremental_update(repo, command_store, changed_files=["keep.py"])
             assert changed["files_updated"] == 1
@@ -414,7 +416,9 @@ def test_watch_coalesces_edits_after_deferring_a_batch(repo, held, monkeypatch):
     monkeypatch.setattr(incremental._WatchDebouncer, "requeue", signal_requeue)
     postprocessed = []
     with GraphStore(incremental.get_db_path(repo)) as store:
-        handler = incremental._create_watch_handler(repo, store, postprocessed.append)
+        handler = incremental._create_watch_handler(
+            repo, store, lambda graph, **_: postprocessed.append(graph),
+        )
         handler.start()
         try:
             handler.dispatch(_edit(repo, "supersededEdit"))
@@ -448,7 +452,7 @@ def test_watch_can_stop_while_a_batch_waits_for_the_lock(repo, held):
 
 
 def test_watch_batch_failure_still_lets_go_of_the_lock(repo):
-    def failing(_store):
+    def failing(_store, **_batch):
         raise ValueError("post-processing broke")
 
     with GraphStore(incremental.get_db_path(repo)) as store:

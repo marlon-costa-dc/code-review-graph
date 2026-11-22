@@ -3853,6 +3853,10 @@ def incremental_update(
 
 
 _DEBOUNCE_SECONDS = 1
+# Whole-graph community detection (Leiden) costs the same for a one-line edit
+# as for a rebuild, so the watcher runs it once a burst of edits has been
+# quiet this long instead of after every batch.
+_SETTLE_SECONDS = env_float("CRG_WATCH_SETTLE_SECONDS", 30.0)
 
 
 class _WatchDebouncer(threading.Thread):
@@ -3866,12 +3870,23 @@ class _WatchDebouncer(threading.Thread):
     observer starts before startup work, so that event can be the only one.
     Identical immutable events share one queue entry; reconciliation reads the
     current filesystem rather than replaying each notification.
+
+    After a batch, *settle* runs once no event has arrived for *settle_after*
+    seconds; it returns False to be retried after another quiet interval.
     """
 
-    def __init__(self, interval: float, callback: Callable[[list[Any]], None]) -> None:
+    def __init__(
+        self,
+        interval: float,
+        callback: Callable[[list[Any]], None],
+        settle: Callable[[], bool] | None = None,
+        settle_after: float = 0.0,
+    ) -> None:
         super().__init__(name="crg-watch-debouncer", daemon=True)
         self._interval = interval
         self._callback = callback
+        self._settle = settle
+        self._settle_after = settle_after
         self._events: dict[Any, None] = {}
         self._stopping = False
         self._cond = threading.Condition()
@@ -3899,9 +3914,16 @@ class _WatchDebouncer(threading.Thread):
 
     def run(self) -> None:
         with self._cond:
+            unsettled = False
             while True:
                 while not self._events and not self._stopping:
-                    self._cond.wait()
+                    if not unsettled:
+                        self._cond.wait()
+                    elif (
+                        not self._cond.wait(timeout=self._settle_after)
+                        and self._settle is not None
+                    ):
+                        unsettled = not self._settle()
                 if self._interval:
                     # Every further event restarts the quiet interval.
                     while not self._stopping:
@@ -3914,6 +3936,7 @@ class _WatchDebouncer(threading.Thread):
                 # Called with the condition held, as watchdog does: events
                 # arriving meanwhile wait in handle_event for the next batch.
                 self._callback(events)
+                unsettled = self._settle is not None
 
 
 def _raise_watch_update_errors(result: dict, context: str) -> None:
@@ -4886,6 +4909,8 @@ def _create_watch_handler(
             self.failure: BaseException | None = None
             self.last_event_at: float | None = None
             self.events_seen: int = 0
+            # A batch post-processed without community detection.
+            self.unsettled = False
             # Every graph write this watcher makes holds this lock: event
             # batches here, and startup reconciliation and post-processing in
             # watch().  The store's one connection cannot take two writers.
@@ -5186,7 +5211,14 @@ def _create_watch_handler(
                         ):
                             store.invalidate_refresh()
                             if on_files_updated is not None:
-                                _raise_watch_postprocess_warnings(on_files_updated(store))
+                                # Search, flows and the FTS rows of these files
+                                # stay current per batch; community detection
+                                # waits for settle().
+                                _raise_watch_postprocess_warnings(on_files_updated(
+                                    store, changed_files=changed_files or None,
+                                    communities=False,
+                                ))
+                                self.unsettled = True
                                 if store.checkout is not None:
                                     store.set_metadata("postprocess_level", "full")
                                     store.set_metadata(BUILD_STATE_KEY, BUILD_COMPLETE)
@@ -5201,12 +5233,41 @@ def _create_watch_handler(
                 finally:
                     self.write_lock.release()
 
+        def settle(self) -> bool:
+            """Run the whole-graph pass the quiet burst deferred; False retries."""
+            with self.lock:
+                if not self.unsettled or self.failure is not None or on_files_updated is None:
+                    return True
+                if not self.write_lock.acquire():
+                    return False
+                try:
+                    anchor = _git_branch_info(repo_root) if store.checkout is not None else None
+                    # A moved ref is refreshed whole, communities included, by
+                    # the batch that sees it.
+                    if anchor is None or anchor == (
+                        store.get_metadata("git_branch") or "",
+                        store.get_metadata("git_head_sha") or "",
+                    ):
+                        with store.refresh():
+                            store.invalidate_refresh()
+                            _raise_watch_postprocess_warnings(on_files_updated(store))
+                            if anchor is not None:
+                                store.publish_generation(*anchor)
+                    self.unsettled = False
+                except BaseException as exc:
+                    self.failure = exc
+                finally:
+                    self.write_lock.release()
+                return True
+
         def raise_if_failed(self) -> None:
             if self.failure is not None:
                 raise RuntimeError("watch update failed") from self.failure
 
     processor = WatchBatchProcessor()
-    debouncer = _WatchDebouncer(_DEBOUNCE_SECONDS, processor.process)
+    debouncer = _WatchDebouncer(
+        _DEBOUNCE_SECONDS, processor.process, processor.settle, _SETTLE_SECONDS,
+    )
     write_lock_file = write_lock_path(store.db_path)
 
     class GraphUpdateHandler(FileSystemEventHandler):

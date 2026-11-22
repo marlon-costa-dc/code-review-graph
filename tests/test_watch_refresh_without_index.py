@@ -25,11 +25,12 @@ from code_review_graph.postprocessing import run_post_processing
 def _recording_refresh(results: list[dict]):
     """The CLI's watch callback for an explicit refresh pair, keeping each result."""
 
-    def refresh(store: GraphStore) -> dict:
+    def refresh(store: GraphStore, **batch) -> dict:
         result = run_post_processing(
             store,
             embedding_provider="local",
             embedding_model="test-model",
+            **batch,
         )
         results.append(result)
         return result

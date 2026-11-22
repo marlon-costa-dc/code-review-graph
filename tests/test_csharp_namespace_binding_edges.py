@@ -609,9 +609,9 @@ def test_watch_csproj_delete_rebinds_and_refreshes_flows(tmp_path):
     })
     postprocessed = []
 
-    def on_files_updated(store):
+    def on_files_updated(store, **batch):
         postprocessed.append(True)
-        return run_post_processing(store)
+        return run_post_processing(store, **batch)
 
     with _store(tmp_path) as store:
         full_build(tmp_path, store)

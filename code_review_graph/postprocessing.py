@@ -33,6 +33,7 @@ def run_post_processing(
     store: GraphStore,
     *,
     changed_files: Sequence[str] | None = None,
+    communities: bool = True,
     embedding_provider: str | None = None,
     embedding_model: str | None = None,
 ) -> dict[str, Any]:
@@ -46,6 +47,9 @@ def run_post_processing(
         changed_files: Files this update re-parsed, when the caller knows
             them. The FTS5 step then rewrites only those files' index
             entries instead of dropping and repopulating the index.
+        communities: False leaves whole-graph community detection to the
+            caller. The watcher passes it for each edit batch and runs one
+            detection once the repository has been quiet for a while.
         embedding_provider: Exact provider for an explicit embedding
             refresh. Must be supplied with ``embedding_model``.
         embedding_model: Exact model for an explicit embedding refresh.
@@ -63,7 +67,8 @@ def run_post_processing(
     _compute_signatures(store, result, warnings)
     _sync_fts_index(store, result, warnings, changed_files)
     _trace_flows(store, result, warnings)
-    _detect_communities(store, result, warnings)
+    if communities:
+        _detect_communities(store, result, warnings)
     _refresh_embeddings(
         store,
         result,

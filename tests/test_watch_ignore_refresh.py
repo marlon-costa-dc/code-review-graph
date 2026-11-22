@@ -93,7 +93,9 @@ def test_ignore_edit_purges_and_removal_indexes_without_source_event(tmp_path, s
     handler.raise_if_failed()
     assert store.get_nodes_by_file(str(generated)) == []
     assert store.get_nodes_by_file(str(user))
-    callback.assert_called_once_with(store)
+    callback.assert_called_once()
+    assert callback.call_args.args == (store,)
+    assert callback.call_args.kwargs["communities"] is False
 
     config.unlink()
     handler.process([FileDeletedEvent(str(config))])
@@ -152,7 +154,9 @@ def test_adding_keep_indexes_existing_output_without_source_event(tmp_path, stor
     handler.process([FileCreatedEvent(str(config))])
     handler.raise_if_failed()
     assert store.get_nodes_by_file(str(output))
-    callback.assert_called_once_with(store)
+    callback.assert_called_once()
+    assert callback.call_args.args == (store,)
+    assert callback.call_args.kwargs["communities"] is False
 
 
 def test_manifest_removal_indexes_existing_output_without_source_event(tmp_path, store):
