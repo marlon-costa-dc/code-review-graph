@@ -5200,9 +5200,10 @@ def _create_watch_handler(
                                 # stay current per batch; community detection
                                 # waits for settle().
                                 _raise_watch_postprocess_warnings(on_files_updated(
-                                    store, communities=False, entry_point_qns=flow_entries,
+                                    store, communities=False,
                                     changed_files=None if reconcile_full_derivations
                                     else sorted(affected),
+                                    **({"entry_point_qns": flow_entries} if flow_entries else {}),
                                 ))
                                 self.unsettled = True
                                 if store.checkout is not None:
