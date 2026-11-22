@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -82,6 +84,47 @@ def _has_function(data_dir: Path, name: str) -> bool:
 
 
 class TestWatchSet:
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX SIGTERM unwinds the CLI")
+    def test_shutdown_while_waiting_for_shared_writer(self, tmp_path, monkeypatch):
+        database = tmp_path / "shared.db"
+        monkeypatch.setenv("CRG_SHARED_DB", str(database))
+        repo = tmp_path / "cold"
+        repo.mkdir()
+        manifest = tmp_path / "lock.json"
+        _write_manifest(manifest, [(repo, tmp_path / "unused")])
+        entering = tmp_path / "entering-lock"
+        child = """
+import sys
+from pathlib import Path
+from code_review_graph.cli import main
+from code_review_graph.locking import WriteLock
+
+acquire = WriteLock.acquire
+entering = Path(sys.argv[1])
+def notify(lock, **options):
+    entering.touch()
+    return acquire(lock, **options)
+WriteLock.acquire = notify
+sys.argv = ['code-review-graph', 'watch', '--manifest', sys.argv[2]]
+main()
+"""
+        writer = WriteLock(database)
+        assert writer.acquire()
+        try:
+            argv = [sys.executable, "-c", child, str(entering), str(manifest)]
+            with subprocess.Popen(argv) as cli:
+                try:
+                    _until(entering.is_file, "the CLI reaching the held write lock")
+                    cli.terminate()
+                    assert cli.wait(timeout=5) == 0
+                    assert writer.holder_pid() == os.getpid()
+                    assert not database.exists()
+                finally:
+                    if cli.poll() is None:
+                        cli.kill()
+        finally:
+            writer.release()
+
     def test_shutdown_cancels_cold_shared_build(self, tmp_path, monkeypatch):
         from code_review_graph import incremental
         from code_review_graph.postprocessing import run_post_processing

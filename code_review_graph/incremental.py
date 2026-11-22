@@ -5373,8 +5373,8 @@ def _sync_watch_tree(supervisor: _WatchSupervisor, handler: Any) -> None:
 
 def _wait_for_watch_write_lock(
     lock: WriteLock,
-    supervisor: _WatchSupervisor,
     stop_event: threading.Event | None,
+    on_wait: Callable[[], None] | None = None,
 ) -> bool:
     """Take the write lock for startup, waiting out whoever holds it.
 
@@ -5385,7 +5385,8 @@ def _wait_for_watch_write_lock(
     reads as stalled. Returns False if told to stop first.
     """
     while not lock.acquire():
-        supervisor.report_health(observer_alive=True, phase="initial-build")
+        if on_wait is not None:
+            on_wait()
         if stop_event is None:
             time.sleep(_WATCH_LOCK_POLL_SECONDS)
         elif stop_event.wait(_WATCH_LOCK_POLL_SECONDS):
@@ -5557,7 +5558,10 @@ def _watch(
                     supervisor.report_health(observer_alive=True, phase="queued")
             try:
                 write_lock = WriteLock(store.db_path)
-                if _wait_for_watch_write_lock(write_lock, supervisor, stop_event):
+                if _wait_for_watch_write_lock(
+                    write_lock, stop_event,
+                    lambda: supervisor.report_health(observer_alive=True, phase="initial-build"),
+                ):
                     try:
                         if shared_database() is not None:
                             from .tools.build import refresh_shared_watch

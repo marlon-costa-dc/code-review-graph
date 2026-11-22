@@ -31,7 +31,7 @@ from typing import Any
 
 from .daemon import ConfigWatcher
 from .graph import GraphStore
-from .incremental import _WATCH_STOP_TIMEOUT, _WATCH_TICK_SECONDS, watch
+from .incremental import _WATCH_STOP_TIMEOUT, _WATCH_TICK_SECONDS, _wait_for_watch_write_lock, watch
 from .locking import WriteLock
 from .shared_sqlite import shared_database
 
@@ -229,8 +229,8 @@ def watch_set(
         # of these observers can queue a write or spawn parser workers.
         opened: dict[WatchTarget, GraphStore] = {}
         lock = WriteLock(path)
-        if not lock.acquire(blocking=True):
-            raise RuntimeError(f"Cannot open {path}: shared graph writer holds the lock")
+        if not _wait_for_watch_write_lock(lock, stopping):
+            return
         try:
             try:
                 for target in targets:
