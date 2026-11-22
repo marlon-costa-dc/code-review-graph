@@ -15,6 +15,7 @@ from typing import Any
 from .communities import get_communities
 from .flows import get_flows
 from .graph import GraphStore, _sanitize_name
+from .parser import repo_relative_path
 
 
 def _md_cell(value: Any) -> str:
@@ -61,6 +62,7 @@ def _generate_community_page(store: GraphStore, community: dict[str, Any]) -> st
     lang = community.get("dominant_language", "")
     description = community.get("description", "")
 
+    repo_root = store.get_repo_root()
     lines: list[str] = []
     lines.append(f"# {_md_cell(name)}")
     lines.append("")
@@ -103,9 +105,10 @@ def _generate_community_page(store: GraphStore, community: dict[str, Any]) -> st
         for qn in lookup_qns[:50]:
             node = store.get_node(qn)
             if node and node.kind != "File":
+                file_path = repo_relative_path(node.file_path, repo_root) or node.file_path
                 lines.append(
                     f"| {_md_cell(node.name)} | {_md_cell(node.kind)} "
-                    f"| {_md_cell(node.file_path)} "
+                    f"| {_md_cell(file_path)} "
                     f"| {_md_cell(f'{node.line_start}-{node.line_end}')} |"
                 )
                 member_count += 1
@@ -174,7 +177,8 @@ def _generate_community_page(store: GraphStore, community: dict[str, Any]) -> st
             lines.append(f"### {heading}")
             lines.append("")
             for target, count in counts.most_common(15):
-                lines.append(f"- `{_sanitize_name(target)}` ({count} edge(s))")
+                relative = repo_relative_path(target, repo_root) if repo_root else None
+                lines.append(f"- `{_sanitize_name(relative or target)}` ({count} edge(s))")
             if len(counts) > 15:
                 lines.append(f"- *... and {len(counts) - 15} more dependencies.*")
             lines.append("")
