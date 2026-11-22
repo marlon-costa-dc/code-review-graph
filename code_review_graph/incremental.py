@@ -22,6 +22,7 @@ import time
 import unicodedata
 import uuid
 from collections import deque
+from contextvars import ContextVar
 from datetime import datetime
 from functools import lru_cache, partial
 from itertools import islice
@@ -71,6 +72,15 @@ def __getattr__(name: str):
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 _MAX_PARSE_WORKERS = env_int("CRG_PARSE_WORKERS", min(os.cpu_count() or 4, 8))
+_WATCH_CANCELLATION: ContextVar[threading.Event | None] = ContextVar(
+    "crg_watch_cancellation", default=None,
+)
+
+
+def _check_watch_cancelled() -> None:
+    stop = _WATCH_CANCELLATION.get()
+    if stop is not None and stop.is_set():
+        raise KeyboardInterrupt
 
 # Set only while the in-process FastMCP server is using stdio transport.
 # This is deliberately separate from ``sys.stdin.isatty()``: CI, cron, and
@@ -1446,6 +1456,7 @@ def _find_content_mismatches(
     text_files: set[str] = set()
 
     for stored_path, stored_hash in store.get_file_hashes().items():
+        _check_watch_cancelled()
         if only is not None and stored_path not in only:
             continue
         path = Path(stored_path)
@@ -2990,6 +3001,7 @@ def _parse_jobs(
     event_source: _SourceObservation | None = None,
 ) -> Iterable[_ParseResult]:
     def job(path: str) -> _ParseJob:
+        _check_watch_cancelled()
         observation = event_source if path == event_path else None
         if cache is not None and parser.detect_language(root / path, b"") == "python":
             try:
@@ -3003,13 +3015,15 @@ def _parse_jobs(
 
     # Executor.map eagerly queues its inputs on supported Python versions.
     # Bound parser work in flight and source bytes read ahead in the shared store.
+    # An observer that can be retired waits only for its active parser jobs.
+    chunk_size = 1 if _WATCH_CANCELLATION.get() is not None else 20
     jobs = map(job, paths)
-    batch_size = min(_MAX_DEPENDENT_FILES, _MAX_PARSE_WORKERS * 20)
+    batch_size = min(_MAX_DEPENDENT_FILES, _MAX_PARSE_WORKERS * chunk_size)
     while batch := list(islice(jobs, batch_size)):
         if cache is None:
-            yield from executor.map(_parse_single_file, batch, chunksize=20)
+            yield from executor.map(_parse_single_file, batch, chunksize=chunk_size)
             continue
-        for result, new_scopes in executor.map(_parse_shared_job, batch, chunksize=20):
+        for result, new_scopes in executor.map(_parse_shared_job, batch, chunksize=chunk_size):
             if new_scopes is not None:
                 cache.remember(root / result[0], result[4], new_scopes)
             yield result
@@ -3128,6 +3142,7 @@ def full_build(
     if use_serial or file_count < 8:
         # Serial fallback (for debugging or tiny repos)
         for i, rel_path in enumerate(files, 1):
+            _check_watch_cancelled()
             full_path = repo_root / rel_path
             parsed: tuple[list, list, str] | None = None
             try:
@@ -3173,6 +3188,7 @@ def full_build(
                 _parse_jobs(executor, files, repo_root, parser, facts_cache),
                 1,
             ):
+                _check_watch_cancelled()
                 if error:
                     logger.warning("Error parsing %s: %s", rel_path, error)
                     errors.append({"file": rel_path, "error": error})
@@ -3192,6 +3208,7 @@ def full_build(
                 if i % 200 == 0 or i == file_count:
                     logger.info("Progress: %d/%d files parsed", i, file_count)
 
+    _check_watch_cancelled()
     store.set_metadata("last_updated", datetime.now().isoformat())
     store.set_metadata("last_build_type", "full")
     store.set_metadata("intentionally_incomplete", "0")
@@ -3633,6 +3650,7 @@ def incremental_update(
 
     if use_serial or len(to_parse) < 8:
         for rel_path in to_parse:
+            _check_watch_cancelled()
             abs_path = repo_root / rel_path
             try:
                 observation = observe(rel_path)
@@ -3664,6 +3682,7 @@ def incremental_update(
             for rel_path, nodes, edges, error, fhash in _parse_jobs(
                 executor, to_parse, repo_root, parser, facts_cache, event_path, event_source,
             ):
+                _check_watch_cancelled()
                 if error:
                     logger.warning("Error parsing %s: %s", rel_path, error)
                     errors.append({"file": rel_path, "error": error})
@@ -3674,6 +3693,7 @@ def incremental_update(
                 total_nodes += len(nodes)
                 total_edges += len(edges)
 
+    _check_watch_cancelled()
     failed_dependents = dependent_files & {error["file"] for error in errors}
 
     removed_files = 0
@@ -4864,6 +4884,8 @@ def _create_watch_handler(
     """Create the debounced watchdog handler for one repository."""
     from watchdog.events import FileSystemEvent, FileSystemEventHandler
 
+    cancellation = _WATCH_CANCELLATION.get()
+
     ignore_patterns = _load_ignore_patterns(repo_root)
     parser = _get_code_parser_cls()(repo_root)
     lexical_root = Path(os.path.abspath(repo_root))
@@ -5130,6 +5152,8 @@ def _create_watch_handler(
 
         def process(self, events: list[FileSystemEvent]) -> None:
             with self.lock:
+                if cancellation is not None and cancellation.is_set():
+                    return
                 if not self.write_lock.acquire():
                     # Another process is writing this graph. Never wait for it
                     # here: the debouncer calls this with its condition held,
@@ -5144,6 +5168,7 @@ def _create_watch_handler(
                 # from a watcher whose repository is simply quiet.
                 self.last_event_at = time.time()
                 self.events_seen += len(events)
+                token = _WATCH_CANCELLATION.set(cancellation)
                 try:
                     anchor = _git_branch_info(repo_root) if store.checkout is not None else None
                     if anchor is not None and anchor != (
@@ -5196,6 +5221,7 @@ def _create_watch_handler(
                                     store, changed_files=changed_files or None,
                                     communities=False,
                                 ))
+                                _check_watch_cancelled()
                                 self.unsettled = True
                                 if store.checkout is not None:
                                     store.set_metadata("postprocess_level", "full")
@@ -5206,15 +5232,24 @@ def _create_watch_handler(
                                         "Git reference changed during watch publication",
                                     )
                                 store.publish_generation(*anchor)
+                            _check_watch_cancelled()
                 except BaseException as exc:
-                    self.failure = exc
+                    if not (
+                        isinstance(exc, KeyboardInterrupt)
+                        and cancellation is not None and cancellation.is_set()
+                    ):
+                        self.failure = exc
                 finally:
+                    _WATCH_CANCELLATION.reset(token)
                     self.write_lock.release()
 
         def settle(self) -> bool:
             """Run the whole-graph pass the quiet burst deferred; False retries."""
             with self.lock:
-                if not self.unsettled or self.failure is not None or on_files_updated is None:
+                if (
+                    not self.unsettled or self.failure is not None or on_files_updated is None
+                    or (cancellation is not None and cancellation.is_set())
+                ):
                     return True
                 if not self.write_lock.acquire():
                     return False
@@ -5422,9 +5457,14 @@ def watch(
     owner = WriteLock(store.db_path, owner_path=owner_path)
     if not owner.acquire():
         raise RuntimeError(f"Another watcher already owns {repo_root}")
+    cancellation = _WATCH_CANCELLATION.set(stop_event)
     try:
         _watch(repo_root, store, on_files_updated, stop_event, follow_symlinks, startup_lock)
+    except KeyboardInterrupt:
+        if stop_event is None or not stop_event.is_set():
+            raise
     finally:
+        _WATCH_CANCELLATION.reset(cancellation)
         owner.release()
 
 
@@ -5528,6 +5568,7 @@ def _watch(
                                 repo_root, store, base=base or "HEAD",
                                 follow_symlinks=follow_symlinks,
                             )
+                            _check_watch_cancelled()
                             _raise_watch_update_errors(initial, "initial watch reconciliation")
                             if initial["files_updated"] > 0 and on_files_updated is not None:
                                 postprocess_result = on_files_updated(store)
@@ -5540,6 +5581,7 @@ def _watch(
     except BaseException:
         # Outside the lock, so a batch already waiting can finish; stopping the
         # debouncer joins it, and no writer outlives this call.
+        supervisor.clear_health()
         _run_time_boxed(observer.stop, "observer stop")
         if observer_started:
             observer.join(timeout=_WATCH_STOP_TIMEOUT)
@@ -5618,11 +5660,10 @@ def _watch(
                 last_event_at=handler.last_event_at,
                 events_seen=handler.events_seen,
             )
-        supervisor.clear_health()
     except KeyboardInterrupt:
-        supervisor.clear_health()
-        _run_time_boxed(observer.stop, "observer stop")
+        pass
     finally:
+        supervisor.clear_health()
         restore_sigterm()
         _run_time_boxed(observer.stop, "observer stop")
         observer.join(timeout=_WATCH_STOP_TIMEOUT)

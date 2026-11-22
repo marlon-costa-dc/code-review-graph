@@ -82,6 +82,96 @@ def _has_function(data_dir: Path, name: str) -> bool:
 
 
 class TestWatchSet:
+    def test_shutdown_cancels_cold_shared_build(self, tmp_path, monkeypatch):
+        from code_review_graph import incremental
+        from code_review_graph.postprocessing import run_post_processing
+
+        database = tmp_path / "shared.db"
+        monkeypatch.setenv("CRG_SHARED_DB", str(database))
+        repo = tmp_path / "cold"
+        repo.mkdir()
+        for name in ("first", "second", "third"):
+            (repo / f"{name}.py").write_text(f"def {name}(): return 1\n", encoding="utf-8")
+        manifest = tmp_path / "cold.json"
+        _write_manifest(manifest, [(repo, tmp_path / "unused")])
+        stop = threading.Event()
+        entered = threading.Event()
+        resume = threading.Event()
+        own_stops = []
+        parsed = []
+        failures = []
+        watch = watch_set_module.watch
+        parse = incremental._parse_observation
+
+        def own_stop(root, store, **kwargs):
+            own_stops.append(kwargs["stop_event"])
+            watch(root, store, **kwargs)
+
+        def hold_first(parser, path, *args, **kwargs):
+            parsed.append(path.name)
+            if not entered.is_set():
+                entered.set()
+                assert resume.wait(10), "test never resumed the parser"
+            return parse(parser, path, *args, **kwargs)
+
+        def run():
+            try:
+                watch_set(manifest, on_files_updated=run_post_processing, stop_event=stop)
+            except BaseException as exc:
+                failures.append(exc)
+
+        monkeypatch.setattr(watch_set_module, "watch", own_stop)
+        monkeypatch.setattr(incremental, "_parse_observation", hold_first)
+        worker = threading.Thread(target=run, daemon=True)
+        worker.start()
+        try:
+            assert entered.wait(10), "watch never entered the cold build"
+            stop.set()
+            assert own_stops[0].wait(10), "watch never received stop"
+        finally:
+            resume.set()
+            stop.set()
+            worker.join(timeout=10)
+        assert not worker.is_alive()
+        assert failures == []
+        assert len(parsed) == 1
+        with GraphStore(database, checkout=repo, read_only=True) as store:
+            assert not store.has_nodes()
+        assert not watch_health_path(repo).exists()
+
+        stop.clear()
+        restarted = threading.Thread(target=run, daemon=True)
+        restarted.start()
+        try:
+            _until(lambda: _watching(repo), "the restarted checkout")
+            with GraphStore(database, checkout=repo, read_only=True) as store:
+                assert {node.name for node in store.get_all_nodes() if node.kind == "Function"} == {
+                    "first", "second", "third",
+                }
+        finally:
+            stop.set()
+            restarted.join(timeout=10)
+        assert not restarted.is_alive()
+        assert failures == []
+
+    def test_shutdown_keeps_the_first_manifest_failure(self, tmp_path, monkeypatch, caplog):
+        repo, data_dir = _repo(tmp_path, "duplicate")
+        other = tmp_path / "other"
+        other.mkdir()
+        (other / "graph.db").write_bytes((data_dir / "graph.db").read_bytes())
+        manifest = tmp_path / "invalid.json"
+        _write_manifest(manifest, [(repo, data_dir), (repo, other)])
+        stop = watch_set_module.ConfigWatcher.stop
+
+        def fail_after_stop(observer):
+            stop(observer)
+            raise RuntimeError("secondary observer shutdown failure")
+
+        monkeypatch.setattr(watch_set_module.ConfigWatcher, "stop", fail_after_stop)
+        with pytest.raises(ValueError, match="duplicate repository"):
+            watch_set(manifest)
+        assert "secondary observer shutdown failure" in caplog.text
+
     def test_one_process_watches_every_repo_and_follows_the_manifest(self, tmp_path, monkeypatch):
         first, first_data = _repo(tmp_path, "first")
         second, second_data = _repo(tmp_path, "second")

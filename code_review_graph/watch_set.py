@@ -185,9 +185,8 @@ def watch_set(
     stopping = stop_event if stop_event is not None else threading.Event()
     startup_lock = threading.Lock()
     watchers: dict[Path, _Watcher] = {}
-    # Removed from the manifest but still unwinding (a running initial build
-    # does not look at its stop event); reaped on a later tick, never joined
-    # inline, so one slow build cannot stall or tear down the others.
+    # Removed from the manifest but still unwinding. Reap on a later tick so
+    # waiting for a parser batch cannot stall or tear down the other watches.
     retiring: list[_Watcher] = []
     desired: dict[Path, WatchTarget] = {}
     changed = threading.Event()
@@ -206,10 +205,7 @@ def watch_set(
                 startup_lock=startup_lock,
             )
         except BaseException as failure:  # recorded for the main loop to raise
-            # A stop requested while queued behind another repository's
-            # initial build unwinds as KeyboardInterrupt; that is a clean stop.
-            if not (isinstance(failure, KeyboardInterrupt) and watcher.stop.is_set()):
-                watcher.failure = failure
+            watcher.failure = failure
         finally:
             if store is not None:
                 store.close()
@@ -237,6 +233,8 @@ def watch_set(
         try:
             try:
                 for target in targets:
+                    if stopping.is_set():
+                        return
                     try:
                         opened[target] = GraphStore(path, checkout=target.repo)
                     except Exception as exc:
@@ -246,6 +244,8 @@ def watch_set(
             finally:
                 lock.release()
             for target in targets:
+                if stopping.is_set():
+                    return
                 start(target, opened[target])
                 del opened[target]
         finally:
@@ -281,26 +281,31 @@ def watch_set(
     def stop_all(*, report_failures: bool) -> BaseException | None:
         """Stop and join every watcher; return the first problem found.
 
-        Every watcher is joined even when one is stuck, so one slow build
-        never leaves the others running.  Watcher failures are reported only
-        when no failure is already propagating (it is that same failure).
+        Every watcher gets the stop signal before joins use a shared deadline.
+        A watcher failure takes precedence over timeouts during shutdown.
         """
         everyone = [*watchers.values(), *retiring]
         for watcher in everyone:
             watcher.stop.set()
-        first: BaseException | None = None
+        deadline = time.monotonic() + _WATCH_STOP_TIMEOUT * 2
+        timed_out = []
         for watcher in everyone:
             if watcher.thread is not None:
-                watcher.thread.join(timeout=_WATCH_STOP_TIMEOUT * 2)
-                if watcher.thread.is_alive() and first is None:
-                    first = TimeoutError(f"watcher for {watcher.target.repo} did not stop")
-        if report_failures and first is None:
+                watcher.thread.join(timeout=max(0.0, deadline - time.monotonic()))
+                if watcher.thread.is_alive():
+                    timed_out.append(str(watcher.target.repo))
+        timeout = (
+            TimeoutError(f"Watchers did not stop: {', '.join(timed_out)}") if timed_out else None
+        )
+        if report_failures:
             for watcher in everyone:
                 if watcher.failure is not None:
                     first = RuntimeError(f"watch for {watcher.target.repo} failed")
                     first.__cause__ = watcher.failure
-                    break
-        return first
+                    if timeout is not None:
+                        logger.error("Stopping the watchers also failed: %s", timeout)
+                    return first
+        return timeout
 
     previous_handler = None
     if threading.current_thread() is threading.main_thread():
@@ -332,8 +337,13 @@ def watch_set(
     finally:
         active = sys.exc_info()[1]
         try:
-            observer.stop()
             problem = stop_all(report_failures=active is None)
+            try:
+                observer.stop()
+            except Exception:
+                if active is None and problem is None:
+                    raise
+                logger.exception("Stopping the manifest observer also failed")
             if problem is not None:
                 if active is None:
                     raise problem

@@ -7,7 +7,7 @@ import json
 import os
 import time
 from collections import Counter
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from sqlite3 import Connection
 from typing import Any
@@ -233,9 +233,14 @@ def read(
     return binding[1], binding[2], materialize()
 
 
-def restore_rows(conn: Connection, rows: Iterator[tuple[str, dict[str, Any]]]) -> None:
+def restore_rows(
+    conn: Connection, rows: Iterator[tuple[str, dict[str, Any]]],
+    *, check_cancelled: Callable[[], None] | None = None,
+) -> None:
     """Materialize a published generation in a native checkout schema."""
     for kind, row in rows:
+        if check_cancelled is not None:
+            check_cancelled()
         fields = ", ".join(row)
         marks = ", ".join("?" for _ in row)
         conn.execute(

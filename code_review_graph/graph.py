@@ -2207,6 +2207,7 @@ class GraphStore:
 
     def seed_generation(self, base: Path, ref: str, expected_head: str) -> None:
         """Populate this empty checkout from a peer's committed generation."""
+        from .incremental import _check_watch_cancelled
         from .search import rebuild_fts_index
         from .shared_generations import load_projections, read, restore_rows
 
@@ -2217,7 +2218,7 @@ class GraphStore:
         head, _, rows = read(self._conn, base, ref, destination_root=self.checkout)
         if head != expected_head:
             raise GraphStoreError(f"Seed generation for {ref} in {base} changed; refresh the base")
-        restore_rows(self._conn, rows)
+        restore_rows(self._conn, rows, check_cancelled=_check_watch_cancelled)
         if load_projections(
             self._conn, self._conn, base, ref, destination_root=self.checkout,
         ):
