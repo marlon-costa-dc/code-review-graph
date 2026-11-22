@@ -379,7 +379,7 @@ def load_config(path: Path | None = None) -> DaemonConfig:
 
     # -- [[repos]] array ----------------------------------------------------
     repos: list[WatchRepo] = []
-    seen_aliases: set[str] = set()
+    by_alias: dict[str, int] = {}
     seen_paths: dict[Path, str] = {}
 
     for entry in raw.get("repos", []):
@@ -408,30 +408,44 @@ def load_config(path: Path | None = None) -> DaemonConfig:
 
         alias: str = entry.get("alias", "") or repo_path.name
 
-        if alias in seen_aliases:
-            logger.warning("Skipping duplicate alias '%s' for repo %s", alias, repo_path)
-            continue
+        # A duplicated alias resolves to the primary checkout (the one owning
+        # its Git directory), never to whichever linked worktree came first.
+        replaced = by_alias.get(alias)
+        if replaced is not None:
+            kept = Path(repos[replaced].path)
+            if not ((kept / ".git").is_file() and not (repo_path / ".git").is_file()):
+                logger.warning(
+                    "Skipping duplicate alias '%s' for repo %s (kept %s)", alias, repo_path, kept
+                )
+                continue
+            logger.warning(
+                "Alias '%s' resolves to primary checkout %s, not linked worktree %s",
+                alias, repo_path, kept,
+            )
+            del seen_paths[kept]
 
         if repo_path in seen_paths:
             raise ValueError(
                 f"Checkout {repo_path} is configured twice: {seen_paths[repo_path]} and {alias}"
             )
-        seen_aliases.add(alias)
         seen_paths[repo_path] = alias
         ttl = entry.get("activity_ttl_seconds", 0)
         if type(ttl) is not int or ttl < 0:
             raise ValueError(f"Invalid activity_ttl_seconds for {alias}: expected non-negative int")
-        repos.append(
-            WatchRepo(
-                path=str(repo_path),
-                alias=alias,
-                data_dir=entry.get("data_dir", ""),
-                recurse_submodules=entry.get("recurse_submodules", False),
-                embedding=entry.get("embedding", ""),
-                discover_worktrees=entry.get("discover_worktrees", False),
-                activity_ttl_seconds=ttl,
-            )
+        repo = WatchRepo(
+            path=str(repo_path),
+            alias=alias,
+            data_dir=entry.get("data_dir", ""),
+            recurse_submodules=entry.get("recurse_submodules", False),
+            embedding=entry.get("embedding", ""),
+            discover_worktrees=entry.get("discover_worktrees", False),
+            activity_ttl_seconds=ttl,
         )
+        if replaced is None:
+            by_alias[alias] = len(repos)
+            repos.append(repo)
+        else:
+            repos[replaced] = repo
 
     return DaemonConfig(
         session_name=session_name,
