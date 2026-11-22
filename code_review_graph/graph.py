@@ -2214,6 +2214,7 @@ class GraphStore:
 
     def seed_generation(self, base: Path, ref: str, expected_head: str) -> int:
         """Populate this empty checkout from a peer's committed generation."""
+        from .incremental import _check_watch_cancelled
         from .search import rebuild_fts_index
         from .shared_generations import load_projections, seed_rows
 
@@ -2231,12 +2232,16 @@ class GraphStore:
         for name, _ in indexes:
             quoted = name.replace('"', '""')
             self._conn.execute(f'DROP INDEX "{quoted}"')
+        _check_watch_cancelled()
         generation = seed_rows(self._conn, base, ref, expected_head, self.checkout)
+        _check_watch_cancelled()
         fts = load_projections(
             self._conn, self._conn, base, ref, destination_root=self.checkout,
         )
         for _, ddl in indexes:
+            _check_watch_cancelled()
             self._conn.execute(ddl)
+        _check_watch_cancelled()
         if fts:
             rebuild_fts_index(self)
         return generation
