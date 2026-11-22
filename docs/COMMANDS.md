@@ -438,6 +438,10 @@ each reported retention budget. Set `CRG_RETENTION_DAYS`,
 Setting any limit to zero retains no unbound artifacts. Compact explicitly
 to reclaim unused SQLite pages on disk.
 
+`prune` also drops a registry entry whose repository is gone or whose
+registered `data_dir` no longer exists; with `CRG_SHARED_DB` set, checkouts
+never create their own directory, so only a missing repository counts there.
+
 Repository edits, daemon configuration and workspace manifest changes reach
 their watchers only through kernel file notifications. There is no polling
 fallback: a host without a native notification backend, or with its

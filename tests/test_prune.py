@@ -115,9 +115,13 @@ def test_prune_detects_orphan_external_data_dirs(
 
 
 def test_prune_ignores_a_data_dir_never_created_for_a_shared_checkout(
-    live_and_dead: tuple[Path, Path], home: Path, tmp_path: Path
+    live_and_dead: tuple[Path, Path],
+    home: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     live, _dead = live_and_dead
+    monkeypatch.setenv("CRG_SHARED_DB", str(tmp_path / "shared.db"))
     never_created = tmp_path / "shared-checkout-data"
     registry = Registry(home / "registry.json")
     registry.register(str(live), data_dir=str(never_created))
@@ -125,7 +129,25 @@ def test_prune_ignores_a_data_dir_never_created_for_a_shared_checkout(
     report = prune(registry=registry, apply=True, data_dirs=True)
 
     assert report.orphan_data_dirs == []
+    assert report.removed_registry == []
     assert registry.find_by_path(str(live)) is not None
+
+
+def test_prune_drops_an_entry_whose_data_dir_vanished(
+    live_and_dead: tuple[Path, Path], home: Path, tmp_path: Path
+) -> None:
+    live, _dead = live_and_dead
+    vanished = tmp_path / "pruned-data"
+    registry = Registry(home / "registry.json")
+    registry.register(str(live), data_dir=str(vanished))
+
+    dry = prune(registry=registry, apply=False)
+    assert dry.removed_registry == [str(live.resolve())]
+    assert registry.find_by_path(str(live)) is not None
+
+    applied = prune(registry=registry, apply=True)
+    assert applied.removed_registry == [str(live.resolve())]
+    assert registry.find_by_path(str(live)) is None
 
 
 def test_prune_apply_with_data_dirs_removes_orphans(

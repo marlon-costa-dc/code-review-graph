@@ -218,7 +218,9 @@ Then use `cross_repo_search_tool` to search every registered repository, or pass
 `code-review-graph repos` lists each repository's registered `data_dir`, marking
 missing directories with `[MISSING]`. If a registered directory disappears and
 the repository still has a local `.code-review-graph/graph.db`, graph commands
-warn and use normal resolution (`CRG_DATA_DIR`, then the local directory).
+fail naming the entry instead of reading that older local graph:
+`code-review-graph prune --apply` drops the dead entry, `build --data-dir`
+recreates it, and `CRG_SHARED_DB` serves the checkout from the shared database.
 Registering a fresh external directory for a repository with no local graph
 still creates that directory on the next write.
 

@@ -1,13 +1,12 @@
-"""Recovering the local graph when a registered data directory disappears.
+"""A registered data directory that disappears is refused across entry points.
 
-Edge cases for issue #1057 (PR #1080) beyond the PR's own module,
-``tests/test_missing_registered_data_dir.py``: the whole resolution chain
-(``get_db_path``, CLI ``status``/``build``/``update``, an MCP tool and
-cross-repo search), what counts as an existing local graph, relative,
-symlinked and non-ASCII repository paths, repeated resolution, a registered
-path that cannot be created, a database left at the repository root by early
-releases, explicit relocation with ``--data-dir``, and the ``repos`` listing
-across mixed registry entries.
+The checkout-local graph that predates the relocation is stale, so the whole
+resolution chain (``get_db_path``, CLI ``build``/``update``, an MCP tool and
+cross-repo search) refuses it, naming the dead registry entry, and never
+recreates the swept directory. Also covered: what counts as an existing local
+graph, non-ASCII paths, a registered path that cannot be created, a database
+left at the repository root by early releases, explicit relocation with
+``--data-dir``, and the ``repos`` listing across mixed registry entries.
 """
 
 from __future__ import annotations
@@ -28,6 +27,7 @@ from code_review_graph.incremental import full_build, get_data_dir, get_db_path
 from code_review_graph.registry import Registry, default_registry_path
 
 WARNING_TEXT = "Registered graph directory"
+REFUSAL_TEXT = "which no longer exists"
 
 _GIT = [
     "git", "-c", "user.email=test@example.com", "-c", "user.name=test",
@@ -115,38 +115,19 @@ def test_local_dir_without_a_graph_db_file_keeps_registered_dir(tmp_path, caplog
 
 
 @pytest.mark.parametrize("read_only", [True, False])
-def test_get_db_path_resolves_to_local_graph_without_side_effects(tmp_path, read_only):
+def test_get_db_path_refuses_the_local_graph_without_side_effects(tmp_path, read_only):
     repo = _make_repo(tmp_path)
     local_db = _build_local_graph(repo)
     graph_bytes = local_db.read_bytes()
     swept = tmp_path / "swept" / "data"
     registry_bytes = _register_swept_dir(repo, swept)
 
-    assert get_db_path(repo, read_only=read_only) == local_db
+    with pytest.raises(GraphStoreError, match=REFUSAL_TEXT):
+        get_db_path(repo, read_only=read_only)
     assert not swept.exists()
     assert not swept.parent.exists()
     assert local_db.read_bytes() == graph_bytes
     assert default_registry_path().read_bytes() == registry_bytes
-
-
-def test_repeated_resolution_is_stable_and_never_rewrites_registry(tmp_path, caplog):
-    repo = tmp_path / "repo"
-    local = repo / ".code-review-graph"
-    local.mkdir(parents=True)
-    (local / "graph.db").write_bytes(b"existing graph")
-    swept = tmp_path / "swept" / "data"
-    registry_bytes = _register_swept_dir(repo, swept)
-
-    with caplog.at_level(logging.WARNING):
-        results = [get_data_dir(repo, create=create) for create in (True, False, True)]
-
-    assert results == [local, local, local]
-    assert not swept.exists()
-    assert caplog.text.count(WARNING_TEXT) == 3
-    # The registration is reported, not repaired: the entry survives so the
-    # user can see it in ``repos`` and decide what to do with it.
-    assert default_registry_path().read_bytes() == registry_bytes
-    assert Registry().get_data_dir_for_repo(str(repo)) == str(swept.resolve())
 
 
 def test_registered_dir_regains_priority_once_it_exists_again(tmp_path):
@@ -157,7 +138,8 @@ def test_registered_dir_regains_priority_once_it_exists_again(tmp_path):
     swept = tmp_path / "swept" / "data"
     Registry().set_data_dir(str(repo), str(swept))
 
-    assert get_data_dir(repo) == local
+    with pytest.raises(GraphStoreError, match=REFUSAL_TEXT):
+        get_data_dir(repo)
     swept.mkdir(parents=True)
     assert get_data_dir(repo) == swept.resolve()
 
@@ -195,7 +177,7 @@ def test_explicit_environment_does_not_override_a_fresh_relocation(tmp_path, mon
 # --- repository path shapes -------------------------------------------------
 
 
-def test_relative_repo_root_falls_back_to_local_graph(tmp_path, monkeypatch):
+def test_relative_repo_root_names_the_resolved_entry(tmp_path, monkeypatch):
     """``--repo .`` reaches get_data_dir as the relative path ``.``."""
     repo = tmp_path / "repo"
     local = repo / ".code-review-graph"
@@ -205,12 +187,13 @@ def test_relative_repo_root_falls_back_to_local_graph(tmp_path, monkeypatch):
     Registry().set_data_dir(str(repo), str(swept))
     monkeypatch.chdir(repo)
 
-    assert get_data_dir(Path(".")).resolve() == local.resolve()
-    assert get_db_path(Path(".")).resolve() == (local / "graph.db").resolve()
+    with pytest.raises(GraphStoreError, match=REFUSAL_TEXT) as raised:
+        get_db_path(Path("."))
+    assert f"Registry entry {repo.resolve()} " in str(raised.value)
     assert not swept.exists()
 
 
-def test_unicode_and_spaces_in_repo_and_registered_paths(tmp_path, caplog):
+def test_unicode_and_spaces_in_repo_and_registered_paths(tmp_path):
     repo = tmp_path / "répo 日本 space"
     local = repo / ".code-review-graph"
     local.mkdir(parents=True)
@@ -218,28 +201,11 @@ def test_unicode_and_spaces_in_repo_and_registered_paths(tmp_path, caplog):
     swept = tmp_path / "swept tmp" / "dätä"
     Registry().set_data_dir(str(repo), str(swept))
 
-    with caplog.at_level(logging.WARNING):
-        assert get_data_dir(repo) == local
+    with pytest.raises(GraphStoreError, match=REFUSAL_TEXT) as raised:
+        get_data_dir(repo)
     assert not swept.exists()
-    assert str(swept.resolve()) in caplog.text
-    assert str(local) in caplog.text
-
-
-def test_symlinked_repo_root_falls_back_to_local_graph(tmp_path):
-    repo = tmp_path / "repo"
-    local = repo / ".code-review-graph"
-    local.mkdir(parents=True)
-    (local / "graph.db").write_bytes(b"existing graph")
-    link = tmp_path / "link"
-    try:
-        link.symlink_to(repo, target_is_directory=True)
-    except (OSError, NotImplementedError):
-        pytest.skip("symlinks are not available here")
-    swept = tmp_path / "swept"
-    Registry().set_data_dir(str(repo), str(swept))
-
-    assert get_data_dir(link).resolve() == local.resolve()
-    assert not swept.exists()
+    assert str(swept.resolve()) in str(raised.value)
+    assert str(local) in str(raised.value)
 
 
 # --- error paths ------------------------------------------------------------
@@ -279,22 +245,8 @@ def test_root_level_legacy_database_is_not_lost(tmp_path):
 # --- real user paths: CLI, MCP tool, cross-repo search -----------------------
 
 
-def test_cli_status_reads_local_graph(tmp_path, capsys):
-    repo = _make_repo(tmp_path)
-    _build_local_graph(repo)
-    swept = tmp_path / "swept" / "data"
-    _register_swept_dir(repo, swept)
-
-    _run_cli(["status", "--repo", str(repo)])
-
-    captured = capsys.readouterr()
-    assert "Nodes:" in captured.out
-    assert "No graph found" not in captured.err
-    assert not swept.exists()
-
-
 @pytest.mark.parametrize("command", ["build", "update"])
-def test_cli_writes_go_to_local_graph_not_recreated_dir(tmp_path, capsys, command):
+def test_cli_writes_refuse_the_dead_entry(tmp_path, capsys, command):
     repo = _make_repo(tmp_path)
     local_db = _build_local_graph(repo)
     (repo / "extra.py").write_text("def added():\n    return 1\n", encoding="utf-8")
@@ -310,10 +262,13 @@ def test_cli_writes_go_to_local_graph_not_recreated_dir(tmp_path, capsys, comman
     swept = tmp_path / "swept" / "data"
     _register_swept_dir(repo, swept)
 
-    _run_cli([command, "--repo", str(repo)])
+    with pytest.raises(SystemExit) as exited:
+        _run_cli([command, "--repo", str(repo)])
 
+    assert exited.value.code == 1
+    assert REFUSAL_TEXT in capsys.readouterr().err
     assert not swept.exists()
-    assert _node_count(local_db) > before
+    assert _node_count(local_db) == before
 
 
 def test_explicit_data_dir_still_relocates_a_repo_with_a_local_graph(tmp_path, capsys):
@@ -332,22 +287,20 @@ def test_explicit_data_dir_still_relocates_a_repo_with_a_local_graph(tmp_path, c
     assert local_db.read_bytes() == local_bytes
 
 
-def test_mcp_tool_answers_from_local_graph(tmp_path):
+def test_mcp_tool_refuses_the_dead_entry(tmp_path):
     from code_review_graph.tools.query import list_graph_stats
 
     repo = _make_repo(tmp_path)
-    local_db = _build_local_graph(repo)
+    _build_local_graph(repo)
     swept = tmp_path / "swept" / "data"
     _register_swept_dir(repo, swept)
 
-    result = list_graph_stats(repo_root=str(repo))
-
-    assert result["status"] == "ok"
-    assert result["total_nodes"] == _node_count(local_db) > 0
+    with pytest.raises(GraphStoreError, match=REFUSAL_TEXT):
+        list_graph_stats(repo_root=str(repo))
     assert not swept.exists()
 
 
-def test_cross_repo_search_reaches_local_graph_of_swept_registration(tmp_path):
+def test_cross_repo_search_skips_the_dead_entry_loudly(tmp_path, caplog):
     from code_review_graph.tools.registry_tools import cross_repo_search_func
 
     repo = _make_repo(tmp_path)
@@ -356,11 +309,12 @@ def test_cross_repo_search_reaches_local_graph_of_swept_registration(tmp_path):
     Registry().register(str(repo), alias="swept-repo")
     _register_swept_dir(repo, swept)
 
-    result = cross_repo_search_func(query="helper")
+    with caplog.at_level(logging.WARNING):
+        result = cross_repo_search_func(query="helper")
 
-    assert result["status"] == "ok"
-    assert result["repos_searched"] == ["swept-repo"]
-    assert any(item["name"] == "helper" for item in result["results"])
+    assert result["repos_searched"] == []
+    assert result["results"] == []
+    assert REFUSAL_TEXT in caplog.text
     assert not swept.exists()
 
 

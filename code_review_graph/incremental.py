@@ -696,8 +696,9 @@ def get_data_dir(repo_root: Path, *, create: bool = True) -> Path:
     2. CRG_DATA_DIR environment variable (global override)
     3. Default: <repo>/.code-review-graph/
 
-    A missing registered directory is ignored when a local graph.db already
-    exists, so an expired temporary relocation cannot strand that graph.
+    A registered directory that vanished while a checkout-local graph.db
+    exists raises :class:`GraphStoreError` naming the entry: that local graph
+    predates the relocation, so serving it would answer from a stale graph.
 
     By default, ``<repo_root>/.code-review-graph``. If the
     ``CRG_DATA_DIR`` environment variable is set, it is used verbatim
@@ -719,15 +720,16 @@ def get_data_dir(repo_root: Path, *, create: bool = True) -> Path:
             data_dir = Path(registry_data_dir).resolve()
             local_dir = repo_root / ".code-review-graph"
             if not data_dir.exists() and (local_dir / "graph.db").is_file():
-                logger.warning(
-                    "Registered graph directory %s is missing; falling back to "
-                    "normal resolution (local graph: %s).",
-                    data_dir, local_dir,
+                raise GraphStoreError(
+                    f"Registry entry {repo_root.resolve()} names graph directory {data_dir}, "
+                    f"which no longer exists; the older local graph at {local_dir} "
+                    "is not used in its place. Run 'code-review-graph prune --apply' "
+                    "to drop the dead entry, rebuild with 'build --data-dir', or set "
+                    "CRG_SHARED_DB to serve this checkout from the shared database."
                 )
-            else:
-                if create:
-                    _create_data_dir(data_dir)
-                return data_dir
+            if create:
+                _create_data_dir(data_dir)
+            return data_dir
 
     # Check environment variable
     env_override = os.environ.get("CRG_DATA_DIR", "").strip()

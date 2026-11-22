@@ -287,14 +287,13 @@ def run_hook() -> None:
 
     repo_path = find_project_root(Path(cwd))
     repo_root = str(repo_path)
-    db_path = get_db_path(repo_path)
-    if not db_path.exists():
-        return
 
     # Dispatch. The tool call goes ahead either way, so a graph that cannot be
     # read costs the extra context and nothing else.
     context = ""
     try:
+        if not get_db_path(repo_path).exists():
+            return
         if tool_name == "Read":
             fp = tool_input.get("file_path", "")
             if fp:
