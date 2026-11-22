@@ -216,26 +216,6 @@ def _nested_scope_files(store: GraphStore, repo_root: Path) -> set[str]:
     }
 
 
-def _load_dependents_pending(store: GraphStore) -> set[str]:
-    """Importers whose forced re-parse failed, for the next update to retry.
-
-    Their seed's new hash is already stored, so nothing else would find them.
-    """
-    try:
-        files = json.loads(store.get_metadata(_DEPENDENTS_PENDING_KEY) or "[]")
-    except (TypeError, ValueError):
-        return set()
-    if not isinstance(files, list):
-        return set()
-    return {
-        path for path in files
-        if isinstance(path, str)
-        and path
-        and not Path(path).is_absolute()
-        and ".." not in Path(path).parts
-    }
-
-
 def _load_cpp_identity_pending(store: GraphStore) -> set[str] | None:
     """Load failed paths from a complete attempt of this identity version.
 
@@ -2953,41 +2933,33 @@ def find_dependents(
     file_path: str,
     max_hops: int = _MAX_DEPENDENT_HOPS,
 ) -> DependentList:
-    """Find files that import from or depend on the given file.
+    """Preview dependents up to *max_hops*, with at most 500 returned paths."""
+    preview = list(islice(_iter_dependents(store, file_path, max_hops), _MAX_DEPENDENT_FILES + 1))
+    truncated = len(preview) > _MAX_DEPENDENT_FILES
+    if truncated:
+        logger.warning(
+            "Dependent preview capped at %d files for %s", _MAX_DEPENDENT_FILES, file_path,
+        )
+    return DependentList(preview[:_MAX_DEPENDENT_FILES], truncated=truncated)
 
-    Performs up to *max_hops* iterations of expansion (default 2).
-    Stops early if the total exceeds 500 files.
 
-    Returns a :class:`DependentList` — a regular ``list[str]`` that also
-    carries a ``.truncated`` flag.  When ``truncated is True`` the
-    returned list is capped at ``_MAX_DEPENDENT_FILES`` and the full
-    set of dependents was not explored.  See issue #261.
-    """
-    all_dependents: set[str] = set()
+def _iter_dependents(
+    store: GraphStore, file_path: str, max_hops: int = _MAX_DEPENDENT_HOPS,
+) -> Iterable[str]:
+    """Yield each dependent once, in stable breadth-first order."""
     visited: set[str] = {file_path}
-    frontier: set[str] = {file_path}
-    for _hop in range(max_hops):
-        next_frontier: set[str] = set()
+    frontier = [file_path]
+    for hop in range(max_hops):
+        next_frontier: list[str] = []
         for fp in frontier:
-            deps = _single_hop_dependents(store, fp)
-            new_deps = deps - visited
-            all_dependents.update(new_deps)
-            next_frontier.update(new_deps)
-        visited.update(next_frontier)
+            for dependent in sorted(_single_hop_dependents(store, fp) - visited):
+                visited.add(dependent)
+                if hop + 1 < max_hops:
+                    next_frontier.append(dependent)
+                yield dependent
         frontier = next_frontier
         if not frontier:
             break
-        if len(all_dependents) > _MAX_DEPENDENT_FILES:
-            logger.warning(
-                "Dependent expansion capped at %d files for %s",
-                len(all_dependents),
-                file_path,
-            )
-            return DependentList(
-                list(all_dependents)[:_MAX_DEPENDENT_FILES],
-                truncated=True,
-            )
-    return DependentList(list(all_dependents))
 
 
 class _SourceObservation(NamedTuple):
@@ -3029,13 +3001,14 @@ def _parse_jobs(
                 return (path, str(root), observation, facts)
         return (path, str(root), observation)
 
-    if cache is None:
-        yield from executor.map(_parse_single_file, map(job, paths), chunksize=20)
-        return
     # Executor.map eagerly queues its inputs on supported Python versions.
-    # Bound the amount of source bytes read ahead in the shared store.
+    # Bound parser work in flight and source bytes read ahead in the shared store.
     jobs = map(job, paths)
-    while batch := list(islice(jobs, _MAX_PARSE_WORKERS * 20)):
+    batch_size = min(_MAX_DEPENDENT_FILES, _MAX_PARSE_WORKERS * 20)
+    while batch := list(islice(jobs, batch_size)):
+        if cache is None:
+            yield from executor.map(_parse_single_file, batch, chunksize=20)
+            continue
         for result, new_scopes in executor.map(_parse_shared_job, batch, chunksize=20):
             if new_scopes is not None:
                 cache.remember(root / result[0], result[4], new_scopes)
@@ -3461,12 +3434,14 @@ def incremental_update(
     if followed_gone:
         stale_files = sorted(set(stale_files) | set(followed_gone))
 
+    dependents_pending = _load_pending_paths(store, _DEPENDENTS_PENDING_KEY)
     # Authoritative empty syncs (``base`` equals the last-stored HEAD) must
     # still fall through to the freshness write below — otherwise an empty
     # commit leaves the graph looking stale (#952 / PR #673 review).
     if (
         not changed_files
         and not stale_files
+        and not dependents_pending
         and not identity_pending
         and not authoritative_git_sync
     ):
@@ -3496,8 +3471,7 @@ def incremental_update(
             return event_source
         return _observe_source(repo_root / rel_path)
 
-    # Find dependent files (files that import from changed files)
-    dependents_pending = _load_dependents_pending(store)
+    # Collect the full dependency set before writing changes to the graph.
     dependent_files: set[str] = set(dependents_pending)
     for rel_path in changed_files:
         full_path = normalize_file_path(repo_root / rel_path)
@@ -3519,13 +3493,15 @@ def incremental_update(
                     continue
             except (OSError, PermissionError):
                 pass
-        deps = find_dependents(store, full_path)
-        for d in deps:
-            # Convert back to relative path if needed
-            try:
-                dependent_files.add(str(Path(d).relative_to(repo_root)))
-            except ValueError:
-                dependent_files.add(d)
+        dependent_files.update(
+            _relative_update_input(repo_root, path) for path in _iter_dependents(store, full_path)
+        )
+
+    # Local stores commit each file. Keep the planned importers discoverable
+    # if a refresh stops after storing the provider's new content hash.
+    if store.checkout is None and dependent_files != dependents_pending:
+        store.set_metadata(_DEPENDENTS_PENDING_KEY, json.dumps(sorted(dependent_files)))
+        dependents_pending = dependent_files
 
     # Combine changed + dependent
     all_files = set(changed_files) | dependent_files | (identity_pending or set())
@@ -3540,7 +3516,7 @@ def incremental_update(
     to_parse: list[str] = []
     # Importers re-parsed with unchanged bytes, and the hash that was checked.
     edges_only: dict[str, str] = {}
-    for rel_path in all_files:
+    for rel_path in sorted(all_files):
         if _should_ignore(rel_path, ignore_patterns):
             if rel_path in remaining_identity:
                 ignored_path = repo_root / rel_path
@@ -3699,8 +3675,6 @@ def incremental_update(
                 total_edges += len(edges)
 
     failed_dependents = dependent_files & {error["file"] for error in errors}
-    if failed_dependents != dependents_pending:
-        store.set_metadata(_DEPENDENTS_PENDING_KEY, json.dumps(sorted(failed_dependents)))
 
     removed_files = 0
     to_remove = sorted(set(missing_paths) | set(stale_files))
@@ -3798,16 +3772,17 @@ def incremental_update(
     if has_graph_changes or scoped_changed:
         _refresh_target_resolution(store)
 
-    # Freshness follows what was stored. A file that failed to parse is
-    # reported in ``errors`` and keeps its previous rows; it must not stop the
-    # successfully stored files from being recorded as current, otherwise one
-    # persistently failing file pins the anchor forever (every later update
-    # re-diffs the same range, and a failed full build forces full rebuilds).
+    if failed_dependents != dependents_pending:
+        store.set_metadata(_DEPENDENTS_PENDING_KEY, json.dumps(sorted(failed_dependents)))
+
+    # Independent source errors retain their previous rows and are reported
+    # separately. A failed dependent leaves the changed provider's edges
+    # unresolved and blocks freshness until its pending reparse succeeds.
     # Explicit batches (watch mode, ``--base``) record HEAD when they stored
     # something; an explicit batch that stored nothing is not evidence that
     # the graph matches HEAD, so it keeps the old anchor.
     freshness_advanced = False
-    if files_updated or authoritative_git_sync:
+    if (files_updated or authoritative_git_sync) and not failed_dependents:
         store.set_metadata("last_updated", datetime.now().isoformat())
         store.set_metadata("last_build_type", "incremental")
         if not remaining_identity:
@@ -3830,7 +3805,7 @@ def incremental_update(
         "total_nodes": total_nodes,
         "total_edges": total_edges,
         "changed_files": list(changed_files),
-        "dependent_files": list(dependent_files),
+        "dependent_files": sorted(dependent_files),
         "stale_files_removed": len(stale_files),
         "flow_entry_point_qns": flow_entry_point_qns,
         "communities_were_affected": communities_were_affected,

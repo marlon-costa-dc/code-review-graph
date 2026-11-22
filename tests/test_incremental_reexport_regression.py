@@ -396,11 +396,13 @@ def test_many_dependents_use_the_parallel_parse_path(tmp_path, monkeypatch):
         store.close()
 
 
-def test_forced_dependent_reparse_is_bounded_by_the_dependent_cap(tmp_path, monkeypatch):
-    """A widely imported file re-parses at most the capped dependent set."""
+def test_forced_dependent_reparse_completes_multiple_parser_batches(tmp_path, monkeypatch):
+    """Every batch of an affected importer set reaches the update result."""
     monkeypatch.setattr(incremental_module, '_MAX_DEPENDENT_FILES', 3)
+    monkeypatch.setenv('CRG_PARSE_EXECUTOR', 'thread')
+    monkeypatch.delenv('CRG_SERIAL_PARSE', raising=False)
     files = {'hub.ts': 'export function h(n: number) { return n; }\n'}
-    for i in range(6):
+    for i in range(9):
         files[f'm{i}.ts'] = f'import {{ h }} from "./hub.js";\nexport const v{i} = h({i});\n'
     repo = _repo(tmp_path / 'repo', files)
     store = GraphStore(tmp_path / 'graph.db')
@@ -411,8 +413,9 @@ def test_forced_dependent_reparse_is_bounded_by_the_dependent_cap(tmp_path, monk
         result = incremental_update(repo, store, changed_files=['hub.ts'], reconcile_stale=False)
 
         assert not result['errors']
-        assert len(result['dependent_files']) == 3
-        assert result['files_updated'] == 4
+        assert set(result['dependent_files']) == set(files) - {'hub.ts'}
+        assert result['files_updated'] == len(files)
+        _assert_matches_full_build(repo, store)
     finally:
         store.close()
 
