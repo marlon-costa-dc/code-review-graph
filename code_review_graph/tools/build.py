@@ -83,7 +83,9 @@ def _publish_refresh(
     store: GraphStore, inputs: _RefreshInputs, result: dict[str, Any],
 ) -> None:
     if store.checkout is not None:
-        result["generation_sha256"] = store.publish_generation(*inputs.anchor)
+        result["generation_sha256"] = store.publish_generation(
+            *inputs.anchor, seeded_generation=result.pop("seeded_generation", None),
+        )
         store.record_graph_inputs(inputs.manifest_sha256, inputs.paths, *inputs.anchor)
         result["input_manifest_sha256"] = inputs.manifest_sha256
         store.set_metadata(SEED_PROFILE_KEY, inputs.seed_profile)

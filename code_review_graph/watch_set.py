@@ -97,9 +97,10 @@ def _manifest_version(path: Path) -> tuple[int, int, int]:
 def wait_ready(repo: Path, timeout: int) -> dict[str, str]:
     """Wait on the native health publication and verify the selected graph."""
     from .build_state import BUILD_COMPLETE, BUILD_STATE_KEY
+    from .constants import normalize_file_path
     from .daemon import pid_alive, read_watch_health, watch_health_path
     from .errors import GraphStoreError
-    from .incremental import _git_branch_info, get_db_path
+    from .incremental import _git_branch_info, _observe_source, collect_all_files, get_db_path
     from .shared_sqlite import UnbuiltCheckoutError
 
     root = repo.resolve(strict=True)
@@ -128,8 +129,21 @@ def wait_ready(repo: Path, timeout: int) -> dict[str, str]:
                     and store.get_metadata("git_head_sha") == head
                     and store.get_metadata("git_branch") == branch
                 ):
-                    return {"repo": str(root), "head": head, "branch": branch}
-        except UnbuiltCheckoutError:
+                    # A worktree edit or revert need not change the Git anchor.
+                    # Compare the native inventory to the bytes in the File nodes.
+                    indexed = store.get_file_hashes()
+                    files = collect_all_files(root)
+                    if len(indexed) != len(files):
+                        return None
+                    for file in files:
+                        source = root / file
+                        if _observe_source(source).sha256 != indexed.get(
+                            normalize_file_path(source),
+                        ):
+                            return None
+                    if _git_branch_info(root) == (branch, head):
+                        return {"repo": str(root), "head": head, "branch": branch}
+        except (UnbuiltCheckoutError, FileNotFoundError):
             return None
         return None
 

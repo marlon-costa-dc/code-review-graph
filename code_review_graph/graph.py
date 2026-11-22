@@ -2146,7 +2146,9 @@ class GraphStore:
             extra=edge.extra,
         )
 
-    def publish_generation(self, branch: str, head: str) -> str:
+    def publish_generation(
+        self, branch: str, head: str, *, seeded_generation: int | None = None,
+    ) -> str:
         """Publish immutable node and edge content inside a shared refresh."""
         from .shared_generations import git_ref, publish, publish_projections
 
@@ -2157,6 +2159,7 @@ class GraphStore:
         ref = git_ref(branch, head)
         digest = publish(
             self._conn, self.checkout, ref, head, self.get_metadata("last_updated") or "",
+            seeded_generation=seeded_generation,
         )
         publish_projections(self._conn, self.checkout, ref)
         return digest
@@ -2205,23 +2208,28 @@ class GraphStore:
                 rebuild_fts_index(snapshot)
             yield snapshot
 
-    def seed_generation(self, base: Path, ref: str, expected_head: str) -> None:
+    def seed_generation(self, base: Path, ref: str, expected_head: str) -> int:
         """Populate this empty checkout from a peer's committed generation."""
         from .search import rebuild_fts_index
-        from .shared_generations import load_projections, read, restore_rows
+        from .shared_generations import load_projections, seed_rows
 
         if self.checkout is None or not isinstance(self._conn, CheckoutConnection):
             raise GraphStoreError("Generation seeding requires a shared checkout")
         if not self._conn.refresh_active or self.has_nodes():
             raise GraphStoreError("Generation seeding requires an empty checkout in a refresh")
-        head, _, rows = read(self._conn, base, ref, destination_root=self.checkout)
-        if head != expected_head:
-            raise GraphStoreError(f"Seed generation for {ref} in {base} changed; refresh the base")
-        restore_rows(self._conn, rows)
-        if load_projections(
-            self._conn, self._conn, base, ref, destination_root=self.checkout,
-        ):
-            rebuild_fts_index(self)
+        cache_size = self._conn.execute("PRAGMA cache_size").fetchone()[0]
+        # Keep the two bulk index writes from recycling the watcher's small
+        # steady-state page cache on every few rows.
+        self._conn.execute("PRAGMA cache_size=-65536")
+        try:
+            generation = seed_rows(self._conn, base, ref, expected_head, self.checkout)
+            if load_projections(
+                self._conn, self._conn, base, ref, destination_root=self.checkout,
+            ):
+                rebuild_fts_index(self)
+            return generation
+        finally:
+            self._conn.execute(f"PRAGMA cache_size={cache_size}")
 
     def record_graph_inputs(self, digest: str, paths: int, branch: str, head: str) -> None:
         """Bind a verified manifest in the shared refresh transaction."""

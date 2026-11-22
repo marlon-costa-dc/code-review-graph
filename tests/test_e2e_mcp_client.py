@@ -673,6 +673,8 @@ def test_shared_seed_reads_source_paths_under_advanced_gitlink(tmp_path):
 
 @pytest.mark.e2e
 def test_manifest_readiness_accepts_existing_and_newly_published_namespace(tmp_path):
+    from code_review_graph.locking import WriteLock
+
     base = _make_fixture_repo(tmp_path)
     peer = tmp_path / "peer"
     _git(base, "worktree", "add", "-q", "-b", "peer", str(peer))
@@ -683,8 +685,8 @@ def test_manifest_readiness_accepts_existing_and_newly_published_namespace(tmp_p
         "repo": str(base), "data_dir": str(tmp_path / "unused"),
     }]}), encoding="utf-8")
 
-    def ready(root):
-        return [*cli, "watch", "--wait-ready", "--repo", str(root), "--timeout", "20"]
+    def ready(root, timeout=20):
+        return [*cli, "watch", "--wait-ready", "--repo", str(root), "--timeout", str(timeout)]
 
     log = tmp_path / "manifest.log"
     with log.open("wb") as output, subprocess.Popen(
@@ -709,6 +711,30 @@ def test_manifest_readiness_accepts_existing_and_newly_published_namespace(tmp_p
                 assert db.execute(
                     "SELECT COUNT(*), COUNT(DISTINCT generation_id) FROM crg_generation_bindings",
                 ).fetchone() == (2, 1)
+
+            relative = "pkg/core.py"
+            source = peer / relative
+            original = source.read_bytes()
+            changed = b"def same_head_readiness(): return 1\n"
+            for contents, symbol in ((changed, True), (original, False)):
+                writer = WriteLock(Path(env["CRG_SHARED_DB"]))
+                assert writer.acquire()
+                try:
+                    source.write_bytes(contents)
+                    stale = subprocess.run(
+                        ready(peer, timeout=1), env=env, timeout=8,
+                        capture_output=True, text=True,
+                    )
+                    assert stale.returncode != 0
+                    assert "did not become ready within 1s" in stale.stderr
+                finally:
+                    writer.release()
+                published = json.loads(subprocess.check_output(ready(peer), env=env, timeout=25))
+                assert published["head"] == first["head"]
+                query = subprocess.check_output([
+                    *cli, "query", "file_summary", relative, "--repo", str(peer),
+                ], env=env, timeout=10)
+                assert (b"same_head_readiness" in query) is symbol
         finally:
             watcher.terminate()
             watcher.wait(timeout=15)

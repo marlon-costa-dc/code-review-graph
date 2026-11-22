@@ -88,7 +88,7 @@ def seed_checkout(
         return None
 
     peer, ref, base_head, metadata = seed
-    store.seed_generation(peer, ref, base_head)
+    generation = store.seed_generation(peer, ref, base_head)
     for key, value in metadata.items():
         store.set_metadata(key, value)
 
@@ -102,5 +102,7 @@ def seed_checkout(
     }
     if changed:
         result = incremental_update(root, store, changed_files=changed, enrich=enrich)
+    else:
+        result["seeded_generation"] = generation
     _store_vcs_metadata(root, store)
     return {**result, "seeded_from": str(peer), "seed_base_commit": base_head}

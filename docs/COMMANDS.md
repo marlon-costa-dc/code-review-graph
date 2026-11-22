@@ -463,8 +463,8 @@ watch exits with its original cause in the service log.
 `watch --wait-ready --repo /abs/new --timeout 10` reads the selected checkout
 and waits on kernel notifications from the running watcher. It returns one
 JSON object with `repo`, `head` and `branch` once the observer is ready and
-the complete graph matches the current branch and commit. Use the same
-`CRG_HOME` and `CRG_SHARED_DB` as the watcher.
+the complete graph matches the current branch, commit and indexable worktree
+contents. Use the same `CRG_HOME` and `CRG_SHARED_DB` as the watcher.
 
 ## Standalone Daemon CLI (`crg-daemon`)
 
