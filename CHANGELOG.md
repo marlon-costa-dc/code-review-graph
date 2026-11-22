@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [2.4.0-dc.8] - 2026-11-22
 
 ### Fixed
 
