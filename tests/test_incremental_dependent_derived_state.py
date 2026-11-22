@@ -1,8 +1,8 @@
 """Re-parsing an unchanged importer must not wipe its flows and communities.
 
-PR #1062 made a real content change to a file re-parse every file that
-imports it (up to ``_MAX_DEPENDENT_FILES``). Re-parsing replaces the
-importer's node rows, which gives them new ids and clears ``community_id``.
+PR #1062 made a real content change to a file re-parse files that import it.
+Re-parsing used to replace the importer's node rows, giving them new IDs and
+clearing ``community_id``.
 The update path that ``code-review-graph update`` and the
 ``build_or_update_graph`` MCP tool share then re-traces flows and re-detects
 communities only for ``result["changed_files"]``, so the importer's flows keep
@@ -12,6 +12,8 @@ flows and community membership of all its importers.
 """
 import subprocess
 from pathlib import Path
+
+import pytest
 
 from code_review_graph.graph import GraphStore
 from code_review_graph.incremental import full_build, incremental_update
@@ -39,11 +41,11 @@ FILES = {
 IMPORTER_FUNCTIONS = {'main', 'step1', 'step2', 'helper'}
 
 
-def _git(repo: Path, *args: str) -> None:
-    subprocess.run(
+def _git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
         ['git', '-c', 'user.email=t@test', '-c', 'user.name=t',
          '-c', 'commit.gpgsign=false', '-C', str(repo), *args],
-        check=True, capture_output=True,
+        check=True, capture_output=True, text=True,
     )
 
 
@@ -221,7 +223,8 @@ def test_update_post_processes_the_importers_it_reparsed(tmp_path, monkeypatch):
     assert sorted(seen['changed_files']) == ['fee.ts', 'use.ts']
 
 
-def test_full_build_clears_a_pending_importer_retry(tmp_path, monkeypatch):
+@pytest.mark.parametrize("recovery", ["update", "build"])
+def test_recovers_a_pending_importer_before_advancing_freshness(tmp_path, monkeypatch, recovery):
     monkeypatch.setenv('CRG_SERIAL_PARSE', '1')
     repo = _repo((tmp_path / 'repo').resolve())
     use = (repo / 'use.ts').resolve()
@@ -234,12 +237,54 @@ def test_full_build_clears_a_pending_importer_retry(tmp_path, monkeypatch):
 
     with GraphStore(tmp_path / 'graph.db') as store:
         assert not full_build(repo, store)['errors']
+        anchor = store.get_metadata('git_head_sha')
         (repo / 'fee.ts').write_text('// note\n' + FILES['fee.ts'], encoding='utf-8')
+        _git(repo, 'commit', '-qam', 'change provider')
         monkeypatch.setattr(Path, 'read_bytes', blocked_read_bytes)
         result = incremental_update(repo, store, changed_files=['fee.ts'], reconcile_stale=False)
         monkeypatch.setattr(Path, 'read_bytes', real_read_bytes)
         assert [error['file'] for error in result['errors']] == ['use.ts']
+        assert not result['freshness_advanced']
+        assert store.get_metadata('git_head_sha') == anchor
         assert store.get_metadata('dependents_reparse_pending') == '["use.ts"]'
 
-        assert not full_build(repo, store)['errors']
+        if recovery == "update":
+            retried = incremental_update(repo, store, changed_files=[], reconcile_stale=False)
+            assert retried['files_updated'] == 1
+            assert retried['freshness_advanced']
+            assert not retried['errors']
+        else:
+            assert not full_build(repo, store)['errors']
+        assert store.get_metadata('git_head_sha') == _git(repo, 'rev-parse', 'HEAD').stdout.strip()
         assert store.get_metadata('dependents_reparse_pending') == '[]'
+
+
+@pytest.mark.parametrize("interruption_point", ["store_file_edges", "refresh_target_resolution"])
+def test_local_retry_keeps_importers_after_an_interrupted_update(
+    tmp_path, monkeypatch, interruption_point,
+):
+    repo = _repo((tmp_path / 'repo').resolve())
+    provider = repo / 'fee.ts'
+    changed_source = '// note\n' + FILES['fee.ts']
+    with GraphStore(tmp_path / 'graph.db') as store:
+        assert not full_build(repo, store)['errors']
+        anchor = store.get_metadata('git_head_sha')
+        original_hash = store.get_nodes_by_file(str(provider))[0].file_hash
+        provider.write_text(changed_source, encoding='utf-8')
+        _git(repo, 'commit', '-qam', 'change provider')
+
+        def interrupt_importer(*_args):
+            raise KeyboardInterrupt
+
+        with monkeypatch.context() as patch:
+            patch.setattr(store, interruption_point, interrupt_importer)
+            with pytest.raises(KeyboardInterrupt):
+                incremental_update(repo, store, changed_files=['fee.ts'], reconcile_stale=False)
+
+        assert store.get_nodes_by_file(str(provider))[0].file_hash != original_hash
+        assert store.get_metadata('git_head_sha') == anchor
+        resumed = incremental_update(repo, store, changed_files=[], reconcile_stale=False)
+        assert resumed['dependent_files'] == ['use.ts']
+        assert resumed['files_updated'] == 1
+        assert resumed['freshness_advanced']
+        assert store.get_metadata('git_head_sha') == _git(repo, 'rev-parse', 'HEAD').stdout.strip()

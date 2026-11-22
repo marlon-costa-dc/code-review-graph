@@ -1,5 +1,12 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- Incremental refresh processes all affected importers in bounded batches before
+  recording the graph as current.
+
 ## [2.4.0-dc.7] - 2026-11-22
 
 The `v2.4.0-dc.6` tag never published: its source archive carried

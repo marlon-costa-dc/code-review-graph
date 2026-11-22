@@ -106,12 +106,16 @@ All modules live in `code_review_graph/`.
 ### Incremental update (`incremental.incremental_update()`)
 1. `get_changed_files()` asks the VCS for changed paths (git diff by default, plus
    untracked files that are not gitignored; SVN is supported).
-2. `find_dependents()` collects files with `IMPORTS_FROM`, `CALLS`, `INHERITS` or
-   `IMPLEMENTS` edges into the changed files, up to two hops and 500 files.
+2. Collect files with `IMPORTS_FROM`, `CALLS`, `INHERITS` or `IMPLEMENTS` edges into
+   changed files, up to two hops by default. The `find_dependents()` preview
+   returns at most 500 files and reports truncation. Refresh consumes all paths
+   within the hop limit and bounds each parallel parse batch to 500 files.
 3. Changed files whose hash differs from the stored one are re-parsed; the rest are
    skipped. A dependent is re-parsed too, and when its bytes have not changed only its
    edges are rewritten.
-4. Only those files' rows are replaced, then post-processing runs as for a full build.
+4. Only those files' rows are replaced, then post-processing runs as for a full
+   build. A dependent that fails to parse prevents the refresh from advancing
+   the freshness anchor.
 
 ### Write lock (`locking.py`)
 `build`, `update`, `postprocess`, `forget` and `embed` take a per-repository `flock` on

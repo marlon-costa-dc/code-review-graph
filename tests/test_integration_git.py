@@ -1013,6 +1013,45 @@ def test_update_auto_base_catches_commits_missed_by_head1(tmp_path: Path) -> Non
     assert set(res["changed_files"]) == {"beta.py", "gamma.py", "delta.py"}
 
 
+def test_update_refreshes_wide_dependency_frontier_before_freshness(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One update refreshes over 500 direct importers and their second hop."""
+    repo = _init_repo(tmp_path)
+    monkeypatch.setenv("CRG_SHARED_DB", str(tmp_path / "shared.db"))
+    monkeypatch.setenv("CRG_SERIAL_PARSE", "1")
+    importers = {f"consumer_{index:03d}.py" for index in range(501)}
+    for importer in sorted(importers):
+        (repo / importer).write_text(
+            "from a import alpha\n\ndef call_alpha():\n    return alpha()\n",
+            encoding="utf-8",
+        )
+    (repo / "leaf.py").write_text(
+        "from consumer_500 import call_alpha\n\ndef leaf():\n    return call_alpha()\n",
+        encoding="utf-8",
+    )
+    _git_ok(repo, "add", ".")
+    _git_ok(repo, "commit", "-m", "add wide dependency frontier")
+    initial = build_or_update_graph(full_rebuild=True, repo_root=str(repo), postprocess="minimal")
+    assert initial["status"] == "ok", initial
+
+    source = repo / "a.py"
+    source.write_text("def alpha():\n    return 2\n", encoding="utf-8")
+    _git_ok(repo, "commit", "-am", "change the provider")
+    updated = build_or_update_graph(repo_root=str(repo), postprocess="minimal")
+
+    assert updated["status"] == "ok", updated
+    assert updated["changed_files"] == ["a.py"]
+    assert set(updated["dependent_files"]) == importers | {"leaf.py"}
+    assert updated["files_updated"] == 503
+    assert updated["freshness_advanced"] is True
+
+    repeat = build_or_update_graph(repo_root=str(repo), postprocess="minimal")
+    assert repeat["status"] == "ok", repeat
+    assert repeat["files_updated"] == 0
+
+
 def test_update_auto_base_across_divergent_branch_switch(tmp_path: Path) -> None:
     """Build on one branch, then switch to a divergent branch whose HEAD~1 is
     NOT the anchor. A fixed HEAD~1 base would miss the difference and leave the
