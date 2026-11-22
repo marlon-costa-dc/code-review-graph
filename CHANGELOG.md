@@ -1,5 +1,23 @@
 # Changelog
 
+## [2.4.0-dc.6] - 2026-11-22
+
+### Fixed
+
+- File watching uses kernel notification only and never polls. Repository
+  watchers, the daemon config watcher and the workspace manifest watcher fail
+  at start with the remedy when the host has no native notification backend,
+  and an exhausted inotify quota fails loud instead of falling back to a poll
+  loop. The `poll_interval` daemon setting and `CRG_WATCH_POLL_INTERVAL` are
+  removed, along with the unused watchfiles adapter.
+- `prune` no longer reports the never-created data directory of a shared
+  checkout as an orphan.
+- Infrastructure documents are not dead-code subjects.
+
+### Added
+
+- The OpenAI-compatible embedding provider sends query and document prefixes.
+
 ## [2.4.0-dc.5] - 2026-11-18
 
 ### Fixed

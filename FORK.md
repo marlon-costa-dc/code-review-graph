@@ -3,11 +3,11 @@
 `main` mirrors upstream. Merge the upstream tip into a dedicated candidate
 based on `dc-use`, and merge that candidate through a reviewed PR. Never
 rewrite either integration branch. The package in this candidate is
-`2.4.0+dc.5`; a host-tools pin may refer only to the published release SHA.
+`2.4.0+dc.6`; a host-tools pin may refer only to the published release SHA.
 The usage guide, feature history, and upstream Action pins refer to the
 upstream base release. The fork package version belongs in its package
 metadata and bug-report form. Publish fork assets from a matching tag on
-`dc-use` (for example, `v2.4.0-dc.5` for `2.4.0+dc.5`), following the
+`dc-use` (for example, `v2.4.0-dc.6` for `2.4.0+dc.6`), following the
 provenance checks in `release-assets.yml`. Push the verified tag after
 integration. The workflow builds the assets and attaches them to a draft.
 Require the successful workflow run and its complete draft asset inventory.
