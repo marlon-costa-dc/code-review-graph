@@ -1275,7 +1275,7 @@ async def get_wiki_page_tool(
     The wiki must have been generated first via generate_wiki_tool.
 
     Args:
-        community_name: Community name to look up.
+        community_name: Community name to look up, or "index.md" for the overview.
         repo_root: Repository root path. Auto-detected if omitted.
         max_chars: Maximum characters of page content to return;
             total_chars reports the real length. Default: 20000.
