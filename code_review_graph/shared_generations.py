@@ -297,6 +297,21 @@ def restore_rows(conn: Connection, rows: Iterator[tuple[str, dict[str, Any]]]) -
         )
 
 
+def _publish_vector_projection(conn: Connection, checkout: bytes, ref: str) -> None:
+    conn.execute(
+        "DELETE FROM crg_generation_projection_vectors WHERE checkout=? AND ref=?",
+        (checkout, ref),
+    )
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(embeddings)")}
+    if "payload_id" in columns:
+        conn.execute(
+            "INSERT INTO crg_generation_projection_vectors "
+            "SELECT ?, ?, e.qualified_name, e.provider, e.text_hash, e.payload_id "
+            "FROM embeddings e JOIN nodes n USING (qualified_name)",
+            (checkout, ref),
+        )
+
+
 def publish_projections(conn: Connection, root: Path, ref: str) -> None:
     """Record the native search and flow state for the just-published binding."""
     conn.execute("""
@@ -317,18 +332,7 @@ def publish_projections(conn: Connection, root: Path, ref: str) -> None:
         "ON crg_generation_projection_vectors(payload_id)",
     )
     checkout = _checkout_key(root)
-    conn.execute(
-        "DELETE FROM crg_generation_projection_vectors WHERE checkout=? AND ref=?",
-        (checkout, ref),
-    )
-    columns = {row[1] for row in conn.execute("PRAGMA table_info(embeddings)")}
-    if "payload_id" in columns:
-        conn.execute(
-            "INSERT INTO crg_generation_projection_vectors "
-            "SELECT ?, ?, e.qualified_name, e.provider, e.text_hash, e.payload_id "
-            "FROM embeddings e JOIN nodes n USING (qualified_name)",
-            (checkout, ref),
-        )
+    _publish_vector_projection(conn, checkout, ref)
     names = dict(conn.execute("SELECT id, qualified_name FROM nodes"))
     flows = []
     for row in conn.execute(
@@ -388,25 +392,16 @@ def manifest_at(conn: Connection, root: Path, ref: str, head: str) -> str | None
 def seed_projections(
     conn: Connection, base: Path, base_ref: str, root: Path, ref: str,
 ) -> None:
-    """Bind a separate copy of the unchanged published projections in SQLite."""
+    """Copy unchanged search and flow state and bind this checkout's vector links."""
     old_checkout, new_checkout = _checkout_key(base), _checkout_key(root)
     old_prefix = normalize_file_path(base).rstrip("/") + "/"
-    new_prefix = normalize_file_path(root).rstrip("/") + "/"
     conn.execute(
         "INSERT INTO crg_generation_projections "
         "SELECT ?, ?, json_insert(data, '$.source_prefix', ?) "
         "FROM crg_generation_projections WHERE checkout=? AND ref=?",
         (new_checkout, ref, old_prefix, old_checkout, base_ref),
     )
-    conn.execute(
-        "INSERT INTO crg_generation_projection_vectors "
-        "SELECT :target, :ref, CASE WHEN substr(qualified_name, 1, length(:base_prefix)) "
-        "= :base_prefix THEN :prefix || substr(qualified_name, length(:base_prefix)+1) "
-        "ELSE qualified_name END, provider, text_hash, payload_id "
-        "FROM crg_generation_projection_vectors WHERE checkout=:base AND ref=:base_ref",
-        {"target": new_checkout, "ref": ref, "base_prefix": old_prefix,
-         "prefix": new_prefix, "base": old_checkout, "base_ref": base_ref},
-    )
+    _publish_vector_projection(conn, new_checkout, ref)
 
 
 def load_projections(
