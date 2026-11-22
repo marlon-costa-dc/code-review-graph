@@ -1,5 +1,14 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- Build a shared checkout from a compatible peer generation and parse only the
+  changed files and their affected dependents.
+- Wait on native watcher events until a complete graph matches the selected
+  checkout's branch, commit and source files.
+
 ## [2.4.0-dc.8] - 2026-11-22
 
 ### Fixed
