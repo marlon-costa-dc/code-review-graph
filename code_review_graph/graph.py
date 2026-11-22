@@ -1171,13 +1171,13 @@ class GraphStore:
         return SharedPythonFacts(self._conn, self.checkout.resolve(), parser)
 
     @contextmanager
-    def refresh(self) -> Iterator[None]:
+    def refresh(self, *, bulk: bool = False) -> Iterator[None]:
         """Publish a complete shared refresh or roll it back on failure."""
         if self.checkout is None:
             yield
             return
         assert isinstance(self._conn, CheckoutConnection)
-        with self._conn.refresh():
+        with self._conn.refresh(bulk=bulk):
             yield
 
     def _read_only_uri(self) -> str:
@@ -2147,10 +2147,10 @@ class GraphStore:
         )
 
     def publish_generation(
-        self, branch: str, head: str, *, seeded_generation: int | None = None,
+        self, branch: str, head: str, *, seeded_generation: tuple[int, Path, str] | None = None,
     ) -> str:
         """Publish immutable node and edge content inside a shared refresh."""
-        from .shared_generations import git_ref, publish, publish_projections
+        from .shared_generations import git_ref, publish, publish_projections, seed_projections
 
         if self.checkout is None or not isinstance(self._conn, CheckoutConnection):
             raise GraphStoreError("Generation publication requires a shared checkout")
@@ -2159,9 +2159,13 @@ class GraphStore:
         ref = git_ref(branch, head)
         digest = publish(
             self._conn, self.checkout, ref, head, self.get_metadata("last_updated") or "",
-            seeded_generation=seeded_generation,
+            seeded_generation=seeded_generation[0] if seeded_generation is not None else None,
         )
-        publish_projections(self._conn, self.checkout, ref)
+        if seeded_generation is None:
+            publish_projections(self._conn, self.checkout, ref)
+        else:
+            _, base, base_ref = seeded_generation
+            seed_projections(self._conn, base, base_ref, self.checkout, ref)
         return digest
 
     def historical_ref_for_checkout(self) -> str | None:
@@ -2217,19 +2221,25 @@ class GraphStore:
             raise GraphStoreError("Generation seeding requires a shared checkout")
         if not self._conn.refresh_active or self.has_nodes():
             raise GraphStoreError("Generation seeding requires an empty checkout in a refresh")
-        cache_size = self._conn.execute("PRAGMA cache_size").fetchone()[0]
-        # Keep the two bulk index writes from recycling the watcher's small
-        # steady-state page cache on every few rows.
-        self._conn.execute("PRAGMA cache_size=-65536")
-        try:
-            generation = seed_rows(self._conn, base, ref, expected_head, self.checkout)
-            if load_projections(
-                self._conn, self._conn, base, ref, destination_root=self.checkout,
-            ):
-                rebuild_fts_index(self)
-            return generation
-        finally:
-            self._conn.execute(f"PRAGMA cache_size={cache_size}")
+        # The schema already exists in this empty namespace. Build its
+        # secondary indexes in bulk after transferring structural rows.
+        indexes = self._conn.execute(
+            "SELECT name, sql FROM sqlite_schema WHERE type='index' AND sql IS NOT NULL "
+            "AND tbl_name IN (?, ?) ORDER BY name",
+            (self._conn.table("nodes"), self._conn.table("edges")),
+        ).fetchall()
+        for name, _ in indexes:
+            quoted = name.replace('"', '""')
+            self._conn.execute(f'DROP INDEX "{quoted}"')
+        generation = seed_rows(self._conn, base, ref, expected_head, self.checkout)
+        fts = load_projections(
+            self._conn, self._conn, base, ref, destination_root=self.checkout,
+        )
+        for _, ddl in indexes:
+            self._conn.execute(ddl)
+        if fts:
+            rebuild_fts_index(self)
+        return generation
 
     def record_graph_inputs(self, digest: str, paths: int, branch: str, head: str) -> None:
         """Bind a verified manifest in the shared refresh transaction."""

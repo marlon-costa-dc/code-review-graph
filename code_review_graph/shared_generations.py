@@ -385,6 +385,30 @@ def manifest_at(conn: Connection, root: Path, ref: str, head: str) -> str | None
     return row[0] if row else None
 
 
+def seed_projections(
+    conn: Connection, base: Path, base_ref: str, root: Path, ref: str,
+) -> None:
+    """Bind a separate copy of the unchanged published projections in SQLite."""
+    old_checkout, new_checkout = _checkout_key(base), _checkout_key(root)
+    old_prefix = normalize_file_path(base).rstrip("/") + "/"
+    new_prefix = normalize_file_path(root).rstrip("/") + "/"
+    conn.execute(
+        "INSERT INTO crg_generation_projections "
+        "SELECT ?, ?, json_insert(data, '$.source_prefix', ?) "
+        "FROM crg_generation_projections WHERE checkout=? AND ref=?",
+        (new_checkout, ref, old_prefix, old_checkout, base_ref),
+    )
+    conn.execute(
+        "INSERT INTO crg_generation_projection_vectors "
+        "SELECT :target, :ref, CASE WHEN substr(qualified_name, 1, length(:base_prefix)) "
+        "= :base_prefix THEN :prefix || substr(qualified_name, length(:base_prefix)+1) "
+        "ELSE qualified_name END, provider, text_hash, payload_id "
+        "FROM crg_generation_projection_vectors WHERE checkout=:base AND ref=:base_ref",
+        {"target": new_checkout, "ref": ref, "base_prefix": old_prefix,
+         "prefix": new_prefix, "base": old_checkout, "base_ref": base_ref},
+    )
+
+
 def load_projections(
     source: Connection, destination: Connection, root: Path, ref: str,
     *, require_communities: bool = False, destination_root: Path | None = None,
@@ -404,8 +428,8 @@ def load_projections(
     old_prefix = normalize_file_path(root).rstrip("/") + "/"
     new_prefix = normalize_file_path(destination_root or root).rstrip("/") + "/"
 
-    def qualified(name: str) -> str:
-        return new_prefix + name[len(old_prefix):] if name.startswith(old_prefix) else name
+    def qualified(name: str, prefix: str = state.get("source_prefix", old_prefix)) -> str:
+        return new_prefix + name[len(prefix):] if name.startswith(prefix) else name
 
     if require_communities or destination_root is not None:
         if "communities" not in state:
@@ -449,8 +473,8 @@ def load_projections(
             destination.executemany(
                 "INSERT INTO embeddings (qualified_name, provider, text_hash, payload_id) "
                 "VALUES (?, ?, ?, ?)",
-                ((qualified(name), provider, key, payload) for name, provider, key, payload
-                 in links),
+                ((qualified(name, old_prefix), provider, key, payload)
+                 for name, provider, key, payload in links),
             )
             return bool(state["fts"])
         vectors = source.execute(

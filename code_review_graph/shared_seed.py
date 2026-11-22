@@ -103,6 +103,6 @@ def seed_checkout(
     if changed:
         result = incremental_update(root, store, changed_files=changed, enrich=enrich)
     else:
-        result["seeded_generation"] = generation
+        result["seeded_generation"] = (generation, peer, ref)
     _store_vcs_metadata(root, store)
     return {**result, "seeded_from": str(peer), "seed_base_commit": base_head}

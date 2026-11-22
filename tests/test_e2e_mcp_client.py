@@ -585,7 +585,7 @@ def test_shared_cli_interns_equivalent_input_manifests_across_worktrees(tmp_path
 
 @pytest.mark.e2e
 @pytest.mark.parametrize("delta", [False, True])
-def test_shared_cli_seeds_only_the_checkout_delta(tmp_path, delta):
+def test_shared_cli_seeds_only_the_checkout_delta(tmp_path, delta, monkeypatch):
     base = _make_fixture_repo(tmp_path)
     target = tmp_path / "peer"
     _git(base, "worktree", "add", "-q", "-b", "peer", str(target))
@@ -620,10 +620,23 @@ def test_shared_cli_seeds_only_the_checkout_delta(tmp_path, delta):
         for previous in ("pkg/core.py", "pkg/service.py"):
             assert not json.loads(cli(target, "query", "file_summary", previous))["results"]
     else:
-        with sqlite3.connect(env["CRG_SHARED_DB"]) as db:
+        from code_review_graph.graph import GraphStore
+
+        database = Path(env["CRG_SHARED_DB"])
+        with sqlite3.connect(database) as db:
             assert db.execute(
                 "SELECT COUNT(*), COUNT(DISTINCT generation_id) FROM crg_generation_bindings",
             ).fetchone() == (2, 1)
+        monkeypatch.setenv("CRG_SHARED_DB", str(database))
+        with GraphStore(database, checkout=target, read_only=True) as store:
+            with store.open_generation(
+                "refs/heads/peer", projections=True, require_communities=True,
+            ) as snapshot:
+                members = [row[0] for row in snapshot._conn.execute(
+                    "SELECT qualified_name FROM nodes WHERE community_id IS NOT NULL",
+                )]
+        assert members and all(Path(name.partition("::")[0]).is_relative_to(target)
+                               for name in members)
 
 
 @pytest.mark.e2e

@@ -106,6 +106,7 @@ def wait_ready(repo: Path, timeout: int) -> dict[str, str]:
     root = repo.resolve(strict=True)
     health_path = watch_health_path(root)
     deadline = time.monotonic() + timeout
+    timeout_message = f"Watch for {root} did not become ready within {timeout}s"
 
     def ready() -> dict[str, str] | None:
         health = read_watch_health(root)
@@ -147,8 +148,10 @@ def wait_ready(repo: Path, timeout: int) -> dict[str, str]:
             return None
         return None
 
-    if result := ready():
+    if (result := ready()) and time.monotonic() <= deadline:
         return result
+    if time.monotonic() >= deadline:
+        raise GraphStoreError(timeout_message)
     health_path.parent.mkdir(parents=True, exist_ok=True)
     notified = threading.Event()
     observer = ConfigWatcher(health_path, notified.set)
@@ -156,7 +159,7 @@ def wait_ready(repo: Path, timeout: int) -> dict[str, str]:
     try:
         while True:
             notified.clear()
-            if result := ready():
+            if (result := ready()) and time.monotonic() <= deadline:
                 return result
             if not observer.is_alive():
                 raise GraphStoreError(f"Readiness notification backend stopped for {root}")
@@ -164,7 +167,7 @@ def wait_ready(repo: Path, timeout: int) -> dict[str, str]:
             if remaining <= 0 or not notified.wait(remaining):
                 if not observer.is_alive():
                     raise GraphStoreError(f"Readiness notification backend stopped for {root}")
-                raise GraphStoreError(f"Watch for {root} did not become ready within {timeout}s")
+                raise GraphStoreError(timeout_message)
     finally:
         observer.stop()
 

@@ -98,16 +98,17 @@ def refresh_shared_watch(root: Path, store: GraphStore, follow: bool | None, cal
     """Publish a watcher update while the caller holds the shared writer lock."""
     profile = _refresh_profile(False, None, "full", None, None, follow)
     request = _refresh_request(root, None, follow, profile)
-    with store.refresh():
+    base = store.get_metadata("git_head_sha")
+    cold = not base and not store.get_metadata("last_build_type")
+    with store.refresh(bulk=cold):
         if (completed := store.get_metadata(REFRESH_REQUEST_KEY)) and (
             json.loads(completed)["request"] == request.request
             and store.get_metadata(SEED_PROFILE_KEY) == request.seed_profile
         ):
             return
         store.invalidate_refresh()
-        base = store.get_metadata("git_head_sha")
         seeded = None
-        if not base and not store.get_metadata("last_build_type"):
+        if cold:
             if callback is not None:
                 seeded = seed_checkout(
                     store, profile=request.seed_profile, files=request.files,
@@ -741,7 +742,7 @@ def build_or_update_graph(
         store, root = _get_store(
             str(root), db_path=db_path, recover_corrupt=full_rebuild and recover_corrupt
         )
-        with store.refresh():
+        with store.refresh(bulk=seed_from is not None):
             completed = store.get_metadata(REFRESH_REQUEST_KEY)
             can_join = (waiting and completed != before) or (
                 store.checkout is not None and (not full_rebuild or seed_from is not None)
