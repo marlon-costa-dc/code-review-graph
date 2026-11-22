@@ -108,6 +108,8 @@ def watch_set(
     manifest: Path,
     on_files_updated: Callable[[GraphStore], Any] | None = None,
     stop_event: threading.Event | None = None,
+    *,
+    initialize_embeddings: bool = False,
 ) -> None:
     """Watch every repository the manifest names from this one process.
 
@@ -115,6 +117,7 @@ def watch_set(
         manifest: JSON manifest of ``{"repo", "data_dir"}`` entries.
         on_files_updated: Post-processing callback handed to each watcher.
         stop_event: Optional event that ends every watcher cleanly.
+        initialize_embeddings: Initialize indices of already-current checkouts.
 
     Raises:
         RuntimeError: if any repository watcher fails; every other watcher is
@@ -142,6 +145,7 @@ def watch_set(
                 on_files_updated=on_files_updated,
                 stop_event=watcher.stop,
                 startup_lock=startup_lock,
+                initialize_embeddings=initialize_embeddings,
             )
         except BaseException as failure:  # recorded for the main loop to raise
             if not (isinstance(failure, KeyboardInterrupt) and watcher.stop.is_set()):

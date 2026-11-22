@@ -2147,6 +2147,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="External directory to store graph database (useful for network shares)"
     )
     watch_cmd.add_argument("--manifest", help="JSON manifest of repository graph paths")
+    watch_cmd.add_argument(
+        "--initialize-embeddings", action="store_true",
+        help="Index checkouts without vectors using the explicit provider and model",
+    )
     _add_embedding_refresh_args(watch_cmd)
     _add_follow_symlinks_arg(watch_cmd)
 
@@ -3381,6 +3385,15 @@ def _dispatch() -> None:
         print(prune_report.summary())
         return
 
+    if args.command == "watch" and args.initialize_embeddings:
+        from .shared_sqlite import shared_database
+
+        if args.manifest is None or shared_database() is None or not embedding_refresh_kwargs:
+            ap.error(
+                "--initialize-embeddings requires --manifest, CRG_SHARED_DB, "
+                "--embedding-provider and --embedding-model",
+            )
+
     if args.command == "watch" and args.manifest is not None:
         import traceback
 
@@ -3393,10 +3406,14 @@ def _dispatch() -> None:
             watch_set(
                 Path(args.manifest).expanduser(),
                 on_files_updated=(
-                    partial(run_post_processing, **embedding_refresh_kwargs)
+                    partial(
+                        run_post_processing, **embedding_refresh_kwargs,
+                        initialize_embeddings=args.initialize_embeddings,
+                    )
                     if embedding_refresh_kwargs
                     else run_post_processing
                 ),
+                initialize_embeddings=args.initialize_embeddings,
             )
         except RuntimeError as exc:
             traceback.print_exception(exc, file=sys.stderr)

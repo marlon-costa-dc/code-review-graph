@@ -1528,6 +1528,68 @@ def test_manifest_watch_replaces_changed_shared_vectors(tmp_path, openai_loopbac
             watcher.wait(timeout=15)
 
 
+def test_shared_manifest_initializes_existing_and_cold_embedding_indices(
+    tmp_path, openai_loopback_server,
+):
+    endpoint, requests = openai_loopback_server
+    existing, cold = tmp_path / "existing", tmp_path / "cold"
+    for root, symbol in ((existing, "existing_symbol"), (cold, "new_symbol")):
+        root.mkdir()
+        (root / "app.py").write_text(f"def {symbol}(): return 1\n", encoding="utf-8")
+        subprocess.run(["git", "init", "-q", str(root)], check=True, timeout=15)
+    cli = [sys.executable, "-m", "code_review_graph"]
+    database = tmp_path / "shared.db"
+    env = {
+        **os.environ,
+        "CRG_HOME": str(tmp_path / "home"),
+        "CRG_SHARED_DB": str(database),
+        "CRG_OPENAI_API_KEY": "local-test",
+        "CRG_OPENAI_BASE_URL": endpoint,
+        "CRG_OPENAI_DOCUMENT_PREFIX": "document: ",
+    }
+    manifest = tmp_path / "watch.json"
+    command = [*cli, "watch", "--manifest", str(manifest)]
+    options = [
+        "--initialize-embeddings", "--embedding-provider", "openai",
+        "--embedding-model", "text-embedding-3-small",
+    ]
+    subprocess.check_call([*cli, "build", "--repo", str(existing)], env=env, timeout=30)
+
+    def start_and_wait(roots, flags=()):
+        manifest.write_text(json.dumps({"repos": [
+            {"repo": str(root), "data_dir": str(tmp_path / "unused")} for root in roots
+        ]}), encoding="utf-8")
+        log = tmp_path / "watch.log"
+        with log.open("wb") as output, subprocess.Popen(
+            [*command, *flags], env=env, stdout=output, stderr=subprocess.STDOUT,
+        ) as watcher:
+            try:
+                deadline = time.monotonic() + 30
+                expected = [f"Watching {root} for changes" for root in roots]
+                while not all(message in log.read_text(encoding="utf-8") for message in expected):
+                    assert watcher.poll() is None and time.monotonic() < deadline, log.read_text()
+                    time.sleep(0.1)
+            finally:
+                watcher.terminate()
+                watcher.wait(timeout=15)
+
+    # A watcher receipt for the existing namespace already matches its inputs.
+    start_and_wait((existing,))
+    start_and_wait((existing,), options[1:])
+    assert requests == []
+    start_and_wait((existing, cold), options)
+    texts = [" ".join(text.split(maxsplit=2)[:2])
+             for request in requests for text in request["input"]]
+    assert sorted(texts) == ["document: existing_symbol", "document: new_symbol"]
+    with sqlite3.connect(database) as db:
+        links = db.execute(
+            "SELECT qualified_name FROM crg_generation_projection_vectors",
+        ).fetchall()
+    assert {name.rsplit("::", 1)[1] for (name,) in links} == {"existing_symbol", "new_symbol"}
+    start_and_wait((existing, cold), options)
+    assert len(requests) == 2
+
+
 class TestIsLocalhostUrl:
     """Ensure localhost detection is robust against subdomain tricks."""
 

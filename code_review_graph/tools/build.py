@@ -86,15 +86,27 @@ def _publish_refresh(
     }))
 
 
-def refresh_shared_watch(root: Path, store: GraphStore, follow: bool | None, callback) -> None:
+def refresh_shared_watch(
+    root: Path, store: GraphStore, follow: bool | None, callback,
+    *, initialize_embeddings: bool = False,
+) -> None:
     """Publish a watcher update while the caller holds the shared writer lock."""
     profile = _refresh_profile(False, None, "full", None, None, follow)
     request = _refresh_request(root, None, follow, profile)
     with store.refresh():
-        if (completed := store.get_metadata(REFRESH_REQUEST_KEY)) and (
-            json.loads(completed)["request"] == request.request
-        ):
-            return
+        if completed := store.get_metadata(REFRESH_REQUEST_KEY):
+            prior = json.loads(completed)
+            if prior["request"] == request.request:
+                if initialize_embeddings and callback is not None:
+                    from ..embeddings import has_embeddings
+
+                    if not has_embeddings(store):
+                        postprocess = callback(store, embeddings_only=True)
+                        _raise_watch_postprocess_warnings(postprocess)
+                        _check_watch_cancelled()
+                        if postprocess.get("embeddings_refreshed"):
+                            _publish_refresh(store, request, {**prior["result"], **postprocess})
+                return
         store.invalidate_refresh()
         base = store.get_metadata("git_head_sha")
         if not base and not store.get_metadata("last_build_type"):
