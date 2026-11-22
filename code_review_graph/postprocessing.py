@@ -22,8 +22,10 @@ from __future__ import annotations
 import logging
 import sqlite3
 from collections.abc import Sequence
+from pathlib import Path
 from typing import Any
 
+from .constants import normalize_file_path
 from .graph import GraphStore
 
 logger = logging.getLogger(__name__)
@@ -34,6 +36,8 @@ def run_post_processing(
     *,
     changed_files: Sequence[str] | None = None,
     communities: bool = True,
+    communities_only: bool = False,
+    entry_point_qns: Sequence[str] = (),
     embedding_provider: str | None = None,
     embedding_model: str | None = None,
 ) -> dict[str, Any]:
@@ -50,6 +54,9 @@ def run_post_processing(
         communities: False leaves whole-graph community detection to the
             caller. The watcher passes it for each edit batch and runs one
             detection once the repository has been quiet for a while.
+        communities_only: Run the deferred community pass without refreshing
+            the flows, search index, or embeddings again.
+        entry_point_qns: Flow entry points captured before edited nodes changed.
         embedding_provider: Exact provider for an explicit embedding
             refresh. Must be supplied with ``embedding_model``.
         embedding_model: Exact model for an explicit embedding refresh.
@@ -63,19 +70,21 @@ def run_post_processing(
     result: dict[str, Any] = {}
     warnings: list[str] = []
 
-    _resolve_bare_endpoints(store, result, warnings)
-    _compute_signatures(store, result, warnings)
-    _sync_fts_index(store, result, warnings, changed_files)
-    _trace_flows(store, result, warnings)
+    if not communities_only:
+        root = Path(store.get_metadata("repo_root") or ".")
+        files = None if changed_files is None else [
+            normalize_file_path(root / path) for path in changed_files
+        ]
+        _resolve_bare_endpoints(store, result, warnings)
+        _compute_signatures(store, result, warnings)
+        _sync_fts_index(store, result, warnings, files)
+        _trace_flows(store, result, warnings, files, entry_point_qns)
+        _refresh_embeddings(
+            store, result, warnings, provider=embedding_provider,
+            model=embedding_model, file_paths=files,
+        )
     if communities:
         _detect_communities(store, result, warnings)
-    _refresh_embeddings(
-        store,
-        result,
-        warnings,
-        provider=embedding_provider,
-        model=embedding_model,
-    )
 
     if warnings:
         result["warnings"] = warnings
@@ -171,14 +180,17 @@ def _trace_flows(
     store: GraphStore,
     result: dict[str, Any],
     warnings: list[str],
+    file_paths: list[str] | None,
+    entry_point_qns: Sequence[str],
 ) -> None:
     """Trace execution flows from entry points."""
     try:
-        from .flows import store_flows, trace_flows
+        from .flows import incremental_trace_flows, store_flows, trace_flows
 
-        flows = trace_flows(store)
-        count = store_flows(store, flows)
-        result["flows_detected"] = count
+        result["flows_detected"] = (
+            store_flows(store, trace_flows(store)) if file_paths is None
+            else incremental_trace_flows(store, file_paths, entry_point_qns=entry_point_qns)
+        )
     except (sqlite3.OperationalError, ImportError) as e:
         logger.warning("Flow detection failed: %s", e)
         warnings.append(f"Flow detection failed: {type(e).__name__}: {e}")
@@ -208,6 +220,7 @@ def _refresh_embeddings(
     *,
     provider: str | None,
     model: str | None,
+    file_paths: list[str] | None,
 ) -> None:
     """Run an explicitly requested embedding refresh without failing a build."""
     if provider is None and model is None:
@@ -221,7 +234,7 @@ def _refresh_embeddings(
     try:
         from .embeddings import REFRESH_SKIPPED_WARNING, refresh_embeddings
 
-        refreshed = refresh_embeddings(store, provider=provider, model=model)
+        refreshed = refresh_embeddings(store, provider=provider, model=model, file_paths=file_paths)
         if refreshed is None:
             logger.warning(REFRESH_SKIPPED_WARNING)
             warnings.append(REFRESH_SKIPPED_WARNING)

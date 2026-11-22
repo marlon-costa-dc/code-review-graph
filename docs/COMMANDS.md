@@ -229,6 +229,10 @@ A hook or CI job can tell these apart without reading the message. `75` is
   full rebuild.
 - `update` prints a `Warning:` line on stderr naming files that failed to
   parse. Those files keep their previous graph rows.
+- `watch` refreshes FTS, execution flows and an enabled embedding index
+  from the affected file set. The deferred community pass runs once after
+  the quiet period. To refresh a seeded embedding index, pass the same
+  `--embedding-provider` and `--embedding-model` you used to embed it.
 - `detect-changes --brief` is read-only against the existing graph and takes
   about a second. `update --brief` re-parses changed files first, then prints
   the same summary and panel. Use `update --brief` after a rebase or a large

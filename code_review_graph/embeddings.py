@@ -1660,6 +1660,7 @@ def refresh_embeddings(
     *,
     provider: str,
     model: str,
+    file_paths: list[str] | None = None,
 ) -> dict[str, int] | None:
     """Refresh a previously embedded graph under one exact provider identity.
 
@@ -1672,6 +1673,7 @@ def refresh_embeddings(
     Existing vectors must all use the identity resolved from the requested
     provider/model (including the endpoint for OpenAI-compatible providers).
     Refresh never silently migrates an index to another model or endpoint.
+    A file selection limits text and provider work to those files.
     """
     provider = provider.strip().lower()
     model = model.strip()
@@ -1721,8 +1723,11 @@ def refresh_embeddings(
             )
 
         purged = embedding_store.purge_orphans()
-        all_nodes = graph_store.get_all_nodes(exclude_files=True)
-        embedded = embedding_store.embed_nodes(all_nodes)
+        nodes = graph_store.get_all_nodes(exclude_files=True) if file_paths is None else [
+            node for path in dict.fromkeys(file_paths)
+            for node in graph_store.get_nodes_by_file(path)
+        ]
+        embedded = embedding_store.embed_nodes(nodes)
         return {"embedded": embedded, "purged": purged}
     finally:
         embedding_store.close()
