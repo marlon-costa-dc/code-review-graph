@@ -1,6 +1,13 @@
 # Changelog
 
-## [2.4.0-dc.6] - 2026-11-22
+## [2.4.0-dc.7] - 2026-11-22
+
+The `v2.4.0-dc.6` tag never published: its source archive carried
+host-local `.opencode/skills` links to absolute paths, which `python -m build`
+refuses to extract. Those links are no longer tracked, and this release
+carries every change listed for 2.4.0-dc.6.
+
+## [2.4.0-dc.6] - 2026-11-22 (unpublished)
 
 ### Fixed
 
