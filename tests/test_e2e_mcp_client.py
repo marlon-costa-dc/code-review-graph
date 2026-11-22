@@ -638,6 +638,31 @@ def test_shared_cli_seeds_only_the_checkout_delta(tmp_path, delta, monkeypatch):
         assert members and all(Path(name.partition("::")[0]).is_relative_to(target)
                                for name in members)
 
+        source = "pkg/core.py"
+        (base / source).write_text("def from_base_only(): return 1\n", encoding="utf-8")
+        _git(base, "add", source)
+        _git(base, "commit", "-qm", "Advance the original checkout")
+        cli(base, "build")
+        subprocess.check_call(
+            [sys.executable, "-m", "code_review_graph", "prune", "--apply"],
+            env={**env, "CRG_RETENTION_DAYS": "0"}, timeout=30,
+        )
+        historical = json.loads(cli(
+            target, "query", "file_summary", source, "--generation-ref", "refs/heads/peer",
+        ))["results"]
+        assert any(row["name"] == "compute_total" for row in historical)
+        assert all(row["name"] != "from_base_only" for row in historical)
+
+        (target / source).write_text("def from_peer_only(): return 2\n", encoding="utf-8")
+        cli(target, "update")
+        for checkout, own, foreign in (
+            (base, "from_base_only", "from_peer_only"),
+            (target, "from_peer_only", "from_base_only"),
+        ):
+            rows = json.loads(cli(checkout, "query", "file_summary", source))["results"]
+            names = {row["name"] for row in rows}
+            assert own in names and foreign not in names
+
 
 @pytest.mark.e2e
 def test_shared_seed_reads_source_paths_under_advanced_gitlink(tmp_path):
