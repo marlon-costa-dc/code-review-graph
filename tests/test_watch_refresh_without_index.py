@@ -46,19 +46,14 @@ def test_startup_reconciliation_keeps_the_watch_running(tmp_path):
     deleted.unlink()
     results: list[dict] = []
     stop = threading.Event()
-
-    def completed_refresh(store, **kwargs):
-        result = _recording_refresh(results)(store, **kwargs)
-        stop.set()
-        return result
-
+    stop.set()  # the loop ends at its first tick
     try:
         with (
             patch("code_review_graph.embeddings.get_provider") as get_provider,
             patch("watchdog.observers.Observer") as observer,
         ):
             watch(
-                tmp_path, store, on_files_updated=completed_refresh, stop_event=stop
+                tmp_path, store, on_files_updated=_recording_refresh(results), stop_event=stop
             )
         get_provider.assert_not_called()
         assert [result.get("embeddings_refresh_skipped") for result in results] == [True]

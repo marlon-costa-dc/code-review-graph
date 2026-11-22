@@ -205,7 +205,8 @@ def watch_set(
                 startup_lock=startup_lock,
             )
         except BaseException as failure:  # recorded for the main loop to raise
-            watcher.failure = failure
+            if not (isinstance(failure, KeyboardInterrupt) and watcher.stop.is_set()):
+                watcher.failure = failure
         finally:
             if store is not None:
                 store.close()

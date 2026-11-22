@@ -5457,11 +5457,14 @@ def watch(
     owner = WriteLock(store.db_path, owner_path=owner_path)
     if not owner.acquire():
         raise RuntimeError(f"Another watcher already owns {repo_root}")
-    cancellation = _WATCH_CANCELLATION.set(stop_event)
+    # Only manifest-owned shared refreshes can abort an in-flight build and
+    # roll it back as a unit. Standalone watchers finish startup as before.
+    manifest_stop = stop_event if startup_lock is not None and store.checkout is not None else None
+    cancellation = _WATCH_CANCELLATION.set(manifest_stop)
     try:
         _watch(repo_root, store, on_files_updated, stop_event, follow_symlinks, startup_lock)
     except KeyboardInterrupt:
-        if stop_event is None or not stop_event.is_set():
+        if manifest_stop is None or not manifest_stop.is_set():
             raise
     finally:
         _WATCH_CANCELLATION.reset(cancellation)
@@ -5578,10 +5581,11 @@ def _watch(
             finally:
                 if startup_lock is not None:
                     startup_lock.release()
-    except BaseException:
+    except BaseException as failure:
         # Outside the lock, so a batch already waiting can finish; stopping the
         # debouncer joins it, and no writer outlives this call.
-        supervisor.clear_health()
+        if isinstance(failure, KeyboardInterrupt):
+            supervisor.clear_health()
         _run_time_boxed(observer.stop, "observer stop")
         if observer_started:
             observer.join(timeout=_WATCH_STOP_TIMEOUT)
@@ -5660,10 +5664,10 @@ def _watch(
                 last_event_at=handler.last_event_at,
                 events_seen=handler.events_seen,
             )
-    except KeyboardInterrupt:
-        pass
-    finally:
         supervisor.clear_health()
+    except KeyboardInterrupt:
+        supervisor.clear_health()
+    finally:
         restore_sigterm()
         _run_time_boxed(observer.stop, "observer stop")
         observer.join(timeout=_WATCH_STOP_TIMEOUT)

@@ -458,9 +458,9 @@ notification quota exhausted, fails at start with the cause.
 
 `watch --manifest` opens and migrates the shared checkout stores under the
 native writer lock before starting their observer threads. A failed open or
-watch exits with its original cause in the service log. On shutdown, a
-queued or running checkout stops publishing new batches. An interrupted
-shared refresh rolls back and releases its lock without advancing freshness.
+watch exits with its original cause in the service log. On shutdown, an
+interrupted shared manifest refresh rolls back and releases its lock without
+advancing freshness.
 
 `watch --wait-ready --repo /abs/new --timeout 10` reads the selected checkout
 and waits on kernel notifications from the running watcher. It returns one
