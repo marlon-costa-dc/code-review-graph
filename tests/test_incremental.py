@@ -2134,7 +2134,7 @@ class TestWatchReconciliation:
         deleted.unlink()
         callback_count = 0
 
-        def on_files_updated(_store):
+        def on_files_updated(_store, **_batch):
             nonlocal callback_count
             callback_count += 1
 
@@ -2194,7 +2194,7 @@ class TestWatchReconciliation:
         store = GraphStore(tmp_path / "graph.db")
         incremental_update(tmp_path, store, changed_files=["source.py"])
         callback_count = 0
-        def on_files_updated(_store):
+        def on_files_updated(_store, **_batch):
             nonlocal callback_count
             callback_count += 1
 
@@ -2217,7 +2217,7 @@ class TestWatchReconciliation:
         incremental_update(tmp_path, store, changed_files=["source.py"])
         callback_count = 0
 
-        def on_files_updated(_store):
+        def on_files_updated(_store, **_batch):
             nonlocal callback_count
             callback_count += 1
 
@@ -2244,7 +2244,9 @@ class TestWatchReconciliation:
 
             handler.process([FileDeletedEvent(str(source))])
 
-            callback.assert_called_once_with(store)
+            callback.assert_called_once_with(
+                store, changed_files=["deleted.py"], communities=False,
+            )
             assert store.get_nodes_by_file(str(source)) == []
         finally:
             store.close()
@@ -2380,7 +2382,7 @@ class TestWatchReconciliation:
         active = False
         phases = []
 
-        def callback(_store):
+        def callback(_store, **_batch):
             nonlocal active
             assert active is False
             phases.append("callback")

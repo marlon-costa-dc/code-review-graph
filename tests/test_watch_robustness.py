@@ -1091,7 +1091,7 @@ class TestWatchLoop:
                 store,
                 observer,
                 _TickDriver(deliver_event, capture_health),
-                on_files_updated=lambda _store: callbacks.append(1),
+                on_files_updated=lambda _store, **_batch: callbacks.append(1),
             )
             assert store.get_nodes_by_file(str(source)), "watch never parsed the change"
         finally:

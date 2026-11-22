@@ -172,7 +172,7 @@ def test_single_event_captured_during_startup_reaches_graph_after_startup(
     observer = _RecordingObserver(update_log)
     startups = []
 
-    def on_files_updated(store):
+    def on_files_updated(store, **batch):
         if not startups:
             startups.append(True)
             update_log.append("startup-postprocess-begin")
@@ -183,7 +183,7 @@ def test_single_event_captured_during_startup_reaches_graph_after_startup(
             result = run_post_processing(store)
             update_log.append("startup-postprocess-end")
             return result
-        return run_post_processing(store)
+        return run_post_processing(store, **batch)
 
     thread, stop, store, outcome = _run_watch(monkeypatch, repo, observer, on_files_updated)
     try:
@@ -288,9 +288,9 @@ def test_startup_failure_stops_observer_and_debouncer_and_keeps_its_error(
     if failure == "reconciliation":
         monkeypatch.setattr(incremental, "incremental_update", failing_reconciliation)
 
-    def on_files_updated(store):
+    def on_files_updated(store, **batch):
         if threading.current_thread().name != _WATCH_THREAD:
-            return run_post_processing(store)
+            return run_post_processing(store, **batch)
         queue_one_batch()
         if failure == "postprocess-crash":
             raise ValueError("forced startup crash")

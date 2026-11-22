@@ -113,7 +113,7 @@ def test_native_observer_delivers_subsequent_deep_edit_after_rule_relaxation(
     updated = threading.Event()
     with GraphStore(tmp_path / "graph.db") as store:
 
-        def callback(graph):
+        def callback(graph, **_batch):
             if any(node.name == "after" for node in graph.get_nodes_by_file(str(source))):
                 updated.set()
 
