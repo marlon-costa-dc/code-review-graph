@@ -1,13 +1,14 @@
-"""Missing registered graph directory recovery, issue #1057."""
+"""A registered graph directory that vanished is refused, never replaced."""
 
 import pytest
 
-from code_review_graph.incremental import get_data_dir
+from code_review_graph.errors import GraphStoreError
+from code_review_graph.incremental import get_data_dir, get_db_path
 from code_review_graph.registry import Registry
 
 
 @pytest.mark.parametrize("create", [True, False])
-def test_missing_registered_dir_uses_existing_local_graph(tmp_path, monkeypatch, caplog, create):
+def test_vanished_registered_dir_refuses_the_older_local_graph(tmp_path, monkeypatch, create):
     monkeypatch.delenv("CRG_DATA_DIR", raising=False)
     repo = tmp_path / "repo"
     local = repo / ".code-review-graph"
@@ -15,10 +16,23 @@ def test_missing_registered_dir_uses_existing_local_graph(tmp_path, monkeypatch,
     (local / "graph.db").write_bytes(b"existing graph")
     missing = tmp_path / "swept" / "data"
     Registry().set_data_dir(str(repo), str(missing))
-    assert get_data_dir(repo, create=create) == local
+    with pytest.raises(GraphStoreError, match="prune --apply") as raised:
+        get_data_dir(repo, create=create)
+    assert str(missing) in str(raised.value)
+    assert str(local) in str(raised.value)
     assert not missing.exists()
-    assert str(missing) in caplog.text
-    assert str(local) in caplog.text
+
+
+def test_vanished_registered_dir_routes_to_the_shared_database(tmp_path, monkeypatch):
+    monkeypatch.delenv("CRG_DATA_DIR", raising=False)
+    repo = tmp_path / "repo"
+    local = repo / ".code-review-graph"
+    local.mkdir(parents=True)
+    (local / "graph.db").write_bytes(b"existing graph")
+    Registry().set_data_dir(str(repo), str(tmp_path / "swept"))
+    shared = tmp_path / "shared.db"
+    monkeypatch.setenv("CRG_SHARED_DB", str(shared))
+    assert get_db_path(repo, read_only=True) == shared.resolve()
 
 
 @pytest.mark.parametrize("create", [True, False])
@@ -42,17 +56,6 @@ def test_existing_registered_directory_keeps_priority(tmp_path, monkeypatch):
     Registry().set_data_dir(str(repo), str(external))
     monkeypatch.setenv("CRG_DATA_DIR", str(tmp_path / "env"))
     assert get_data_dir(repo) == external
-
-
-def test_missing_registry_falls_through_to_explicit_environment(tmp_path, monkeypatch):
-    repo = tmp_path / "repo"
-    local = repo / ".code-review-graph"
-    local.mkdir(parents=True)
-    (local / "graph.db").touch()
-    Registry().set_data_dir(str(repo), str(tmp_path / "missing"))
-    override = tmp_path / "env"
-    monkeypatch.setenv("CRG_DATA_DIR", str(override))
-    assert get_data_dir(repo) == override
 
 
 @pytest.mark.parametrize("exists", [True, False])

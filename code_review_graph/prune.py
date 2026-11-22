@@ -63,15 +63,29 @@ def _repo_is_alive(path: str) -> bool:
     )
 
 
+def _dead_registry_paths(registry: Registry) -> list[str]:
+    """Entries whose repository path or registered graph directory is gone.
+
+    A registered ``data_dir`` that no longer exists makes the entry dead too:
+    reads refuse it rather than serve an older checkout-local graph. With
+    ``CRG_SHARED_DB`` set every checkout reads the shared database and never
+    creates its own directory, so only the repository path decides there.
+    """
+    shared = shared_database() is not None
+    return [
+        str(entry["path"])
+        for entry in registry.list_repos()
+        if entry.get("path")
+        and (
+            not _repo_is_alive(str(entry["path"]))
+            or (entry.get("data_dir") and not shared and not Path(entry["data_dir"]).is_dir())
+        )
+    ]
+
+
 def prune_registry(registry: Registry) -> list[str]:
-    """Unregister every entry whose repository path is gone."""
-    removed: list[str] = []
-    for entry in registry.list_repos():
-        path = str(entry.get("path", ""))
-        if path and not _repo_is_alive(path):
-            if registry.unregister(path):
-                removed.append(path)
-    return removed
+    """Unregister every dead entry (see :func:`_dead_registry_paths`)."""
+    return [path for path in _dead_registry_paths(registry) if registry.unregister(path)]
 
 
 def _raw_watch_paths(config_path: Path) -> list[str]:
@@ -199,11 +213,7 @@ def prune(
         raise ValueError("--compact requires --apply and an existing CRG_SHARED_DB")
     if shared is not None and shared.is_file():
         report.vector_retention = _prune_shared_artifacts(shared, apply=apply, compact=compact)
-    report.removed_registry = [
-        str(entry.get("path", ""))
-        for entry in registry.list_repos()
-        if entry.get("path") and not _repo_is_alive(str(entry["path"]))
-    ]
+    report.removed_registry = _dead_registry_paths(registry)
     report.removed_watch = [
         p for p in _raw_watch_paths(config_path or default_config_path()) if not _repo_is_alive(p)
     ]
