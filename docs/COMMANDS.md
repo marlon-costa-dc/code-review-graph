@@ -453,7 +453,9 @@ notification quota exhausted, fails at start with the cause.
 
 `watch --manifest` opens and migrates the shared checkout stores under the
 native writer lock before starting their observer threads. A failed open or
-watch exits with its original cause in the service log.
+watch exits with its original cause in the service log. On shutdown, an
+interrupted shared manifest refresh rolls back and releases its lock without
+advancing freshness.
 
 ## Standalone Daemon CLI (`crg-daemon`)
 
