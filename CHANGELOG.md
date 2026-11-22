@@ -1,5 +1,21 @@
 # Changelog
 
+## [2.4.0-dc.9] - 2026-11-22
+
+### Added
+
+- Seed a shared checkout from a compatible peer generation and reconcile
+  the file delta before publication. Identical trees require no re-parsing.
+- Wait for a complete, current checkout graph through native watcher events.
+
+### Fixed
+
+- Open and migrate shared checkout schemas before starting their observers.
+  Interrupted refreshes roll back, and shutdown retains the original failure.
+- Refresh affected flows, search rows, and enabled vector inputs on edits.
+  The quiet community pass does not repeat those steps.
+- Report wiki coverage limits and propagate unavailable graph reads.
+
 ## [2.4.0-dc.8] - 2026-11-22
 
 ### Fixed
