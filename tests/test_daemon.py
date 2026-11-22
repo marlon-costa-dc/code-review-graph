@@ -139,6 +139,28 @@ class TestConfigParsing:
         assert len(cfg.repos) == 1
         assert cfg.repos[0].path == str(repo_a.resolve())
 
+    def test_duplicate_alias_resolves_to_the_primary_checkout(self, tmp_path):
+        """A linked worktree listed first never takes the primary's alias."""
+        git = ["git", "-c", "user.email=t@e", "-c", "user.name=t", "-c", "commit.gpgsign=false"]
+        primary = tmp_path / "primary"
+        primary.mkdir()
+        lane = tmp_path / "lane"
+        for args in (
+            ["init", "-q"],
+            ["commit", "-q", "--allow-empty", "-m", "init"],
+            ["worktree", "add", "-q", str(lane)],
+        ):
+            subprocess.run([*git, *args], cwd=primary, check=True, capture_output=True)
+
+        config_file = tmp_path / "watch.toml"
+        config_file.write_text(
+            f'[[repos]]\npath = "{lane.as_posix()}"\nalias = "app"\n\n'
+            f'[[repos]]\npath = "{primary.as_posix()}"\nalias = "app"\n',
+            encoding="utf-8",
+        )
+        cfg = load_config(config_file)
+        assert [repo.path for repo in cfg.repos] == [str(primary.resolve())]
+
     def test_load_config_rejects_two_aliases_for_one_checkout(self, tmp_path):
         repo = tmp_path / "repo"
         (repo / ".git").mkdir(parents=True)
