@@ -5165,6 +5165,9 @@ def _create_watch_handler(
                             newly_included
                             | {path for event in events for path in self._event_paths(event)}
                         )
+                        affected = set(changed_files)
+                        flow_entries: list[str] = []
+                        reconcile_full_derivations = files_updated > 0
                         if changed_files:
                             result = incremental_update(
                                 repo_root,
@@ -5175,11 +5178,16 @@ def _create_watch_handler(
                             )
                             _raise_watch_update_errors(result, "incremental update")
                             files_updated += result["files_updated"]
+                            affected.update(result.get("dependent_files", ()))
+                            flow_entries = result.get("flow_entry_point_qns", [])
+                            reconcile_full_derivations |= result.get("identity_rebuild", False)
                         if follow:
                             links_changed, contents_changed = self._touches_followed(events)
                             links_changed = links_changed or ignore_patterns is not patterns_before
                             if links_changed or contents_changed:
-                                files_updated += self._reconcile_followed()
+                                updated_followed = self._reconcile_followed()
+                                files_updated += updated_followed
+                                reconcile_full_derivations |= updated_followed > 0
                         if (
                             files_updated > 0
                             # A project file change parses nothing but can rebind
@@ -5192,8 +5200,10 @@ def _create_watch_handler(
                                 # stay current per batch; community detection
                                 # waits for settle().
                                 _raise_watch_postprocess_warnings(on_files_updated(
-                                    store, changed_files=changed_files or None,
-                                    communities=False,
+                                    store, communities=False,
+                                    changed_files=None if reconcile_full_derivations
+                                    else sorted(affected),
+                                    **({"entry_point_qns": flow_entries} if flow_entries else {}),
                                 ))
                                 self.unsettled = True
                                 if store.checkout is not None:
@@ -5227,7 +5237,9 @@ def _create_watch_handler(
                     ):
                         with store.refresh():
                             store.invalidate_refresh()
-                            _raise_watch_postprocess_warnings(on_files_updated(store))
+                            _raise_watch_postprocess_warnings(on_files_updated(
+                                store, communities_only=True,
+                            ))
                             if anchor is not None:
                                 store.publish_generation(*anchor)
                     self.unsettled = False
