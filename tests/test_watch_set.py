@@ -23,6 +23,7 @@ from code_review_graph.daemon import read_watch_health, watch_health_path
 from code_review_graph.graph import GraphStore
 from code_review_graph.incremental import full_build
 from code_review_graph.locking import WriteLock
+from code_review_graph.shared_sqlite import UnbuiltCheckoutError
 from code_review_graph.watch_set import load_manifest, watch_set
 
 
@@ -88,6 +89,10 @@ class TestWatchSet:
     def test_shutdown_while_waiting_for_shared_writer(self, tmp_path, monkeypatch):
         database = tmp_path / "shared.db"
         monkeypatch.setenv("CRG_SHARED_DB", str(database))
+        existing = tmp_path / "existing"
+        existing.mkdir()
+        with GraphStore(database, checkout=existing):
+            pass
         repo = tmp_path / "cold"
         repo.mkdir()
         manifest = tmp_path / "lock.json"
@@ -118,7 +123,8 @@ main()
                     cli.terminate()
                     assert cli.wait(timeout=5) == 0
                     assert writer.holder_pid() == os.getpid()
-                    assert not database.exists()
+                    with pytest.raises(UnbuiltCheckoutError):
+                        GraphStore(database, checkout=repo, read_only=True)
                 finally:
                     if cli.poll() is None:
                         cli.kill()
@@ -131,6 +137,10 @@ main()
 
         database = tmp_path / "shared.db"
         monkeypatch.setenv("CRG_SHARED_DB", str(database))
+        existing = tmp_path / "existing"
+        existing.mkdir()
+        with GraphStore(database, checkout=existing):
+            pass
         repo = tmp_path / "cold"
         repo.mkdir()
         for name in ("first", "second", "third"):
