@@ -1358,6 +1358,7 @@ def _handle_build_update(args, repo_root: Path, embedding_refresh_kwargs) -> Non
     _ensure_project_marker(repo_root)
     if args.command == "build":
         shared = shared_database()
+        shared_seed = args.seed_from if shared is not None else None
         if shared is None and args.seed_from is not None:
             from .vstore import default_store_root
 
@@ -1381,7 +1382,7 @@ def _handle_build_update(args, repo_root: Path, embedding_refresh_kwargs) -> Non
                 repo_root=str(repo_root),
                 postprocess=pp,
                 wait_for_lock=getattr(args, "wait", False),
-                seed_from=args.seed_from if shared is not None else None,
+                **({"seed_from": shared_seed} if shared_seed is not None else {}),
                 **_enrich_kwargs(args),
                 **embedding_refresh_kwargs,
                 **_follow_symlinks_kwargs(args),
@@ -2008,7 +2009,7 @@ def build_parser() -> argparse.ArgumentParser:
         nargs="?",
         const="auto",
         default=None,
-        metavar="STORE",
+        metavar="SOURCE",
         help="Seed from a vstore bundle, or from an absolute peer checkout path "
         "with CRG_SHARED_DB (bare flag: select the default store or a linked checkout)",
     )
