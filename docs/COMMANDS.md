@@ -438,10 +438,10 @@ each reported retention budget. Set `CRG_RETENTION_DAYS`,
 Setting any limit to zero retains no unbound artifacts. Compact explicitly
 to reclaim unused SQLite pages on disk.
 
-Workspace manifest changes reach the watcher only through kernel file
-notifications. There is no polling fallback: a host without a native
-notification backend, or with its notification quota exhausted, fails at
-start with the cause.
+Repository edits, daemon configuration and workspace manifest changes reach
+their watchers only through kernel file notifications. There is no polling
+fallback: a host without a native notification backend, or with its
+notification quota exhausted, fails at start with the cause.
 
 ## Standalone Daemon CLI (`crg-daemon`)
 

@@ -40,3 +40,15 @@ def test_exhausted_notification_quota_fails_loud_instead_of_polling(tmp_path, mo
     with pytest.raises(OSError, match="watch quota exhausted"):
         watcher.start()
     assert not watcher.is_alive()
+
+
+def test_polling_only_backend_fails_loud(tmp_path, monkeypatch):
+    from watchdog.observers.polling import PollingObserver
+
+    monkeypatch.setattr("watchdog.observers.Observer", PollingObserver)
+    config = tmp_path / "watch.toml"
+    config.write_text("[daemon]\n", encoding="utf-8")
+    watcher = ConfigWatcher(config, threading.Event().set)
+    with pytest.raises(RuntimeError, match="polling is not supported"):
+        watcher.start()
+    assert not watcher.is_alive()

@@ -53,7 +53,6 @@ def sample_config_file(tmp_path):
         f"[daemon]\n"
         f'session_name = "test-session"\n'
         f'log_dir = "{(tmp_path / "logs").as_posix()}"\n'
-        f"poll_interval = 5\n"
         f"\n"
         f"[[repos]]\n"
         f'path = "{repo_a.as_posix()}"\n'
