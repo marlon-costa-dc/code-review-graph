@@ -2183,7 +2183,7 @@ class GraphStore:
         Node IDs are local to this materialization. Optionally rebuild
         the search index and load the published flow projection.
         """
-        from .shared_generations import load_projections, read
+        from .shared_generations import load_projections, read, restore_rows
 
         if self.checkout is None:
             raise GraphStoreError("Generation lookup requires a shared checkout")
@@ -2193,13 +2193,7 @@ class GraphStore:
             snapshot.set_metadata("git_head_sha", head)
             snapshot.set_metadata("last_updated", built_at)
             snapshot._conn.execute("BEGIN")
-            for kind, row in rows:
-                fields = ", ".join(row)
-                marks = ", ".join("?" for _ in row)
-                snapshot._conn.execute(
-                    f"INSERT INTO {kind} ({fields}, updated_at) VALUES ({marks}, 0)",
-                    tuple(row.values()),
-                )
+            restore_rows(snapshot._conn, rows)
             fts = projections and load_projections(
                 self._conn, snapshot._conn, self.checkout, ref,
                 require_communities=require_communities,
@@ -2210,6 +2204,24 @@ class GraphStore:
 
                 rebuild_fts_index(snapshot)
             yield snapshot
+
+    def seed_generation(self, base: Path, ref: str, expected_head: str) -> None:
+        """Populate this empty checkout from a peer's committed generation."""
+        from .search import rebuild_fts_index
+        from .shared_generations import load_projections, read, restore_rows
+
+        if self.checkout is None or not isinstance(self._conn, CheckoutConnection):
+            raise GraphStoreError("Generation seeding requires a shared checkout")
+        if not self._conn.refresh_active or self.has_nodes():
+            raise GraphStoreError("Generation seeding requires an empty checkout in a refresh")
+        head, _, rows = read(self._conn, base, ref, destination_root=self.checkout)
+        if head != expected_head:
+            raise GraphStoreError(f"Seed generation for {ref} in {base} changed; refresh the base")
+        restore_rows(self._conn, rows)
+        if load_projections(
+            self._conn, self._conn, base, ref, destination_root=self.checkout,
+        ):
+            rebuild_fts_index(self)
 
     def record_graph_inputs(self, digest: str, paths: int, branch: str, head: str) -> None:
         """Bind a verified manifest in the shared refresh transaction."""

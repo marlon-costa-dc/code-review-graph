@@ -1353,10 +1353,12 @@ _BUILD_NEXT_STEP = (
 def _handle_build_update(args, repo_root: Path, embedding_refresh_kwargs) -> None:
     """Run writers before the generic CLI store initialization."""
     from .incremental import assert_graph_serves_root, get_db_path
+    from .shared_sqlite import shared_database
 
     _ensure_project_marker(repo_root)
     if args.command == "build":
-        if args.seed_from is not None:
+        shared = shared_database()
+        if shared is None and args.seed_from is not None:
             from .vstore import default_store_root
 
             root = default_store_root() if args.seed_from == "auto" else Path(args.seed_from)
@@ -1379,6 +1381,7 @@ def _handle_build_update(args, repo_root: Path, embedding_refresh_kwargs) -> Non
                 repo_root=str(repo_root),
                 postprocess=pp,
                 wait_for_lock=getattr(args, "wait", False),
+                seed_from=args.seed_from if shared is not None else None,
                 **_enrich_kwargs(args),
                 **embedding_refresh_kwargs,
                 **_follow_symlinks_kwargs(args),
@@ -1386,7 +1389,7 @@ def _handle_build_update(args, repo_root: Path, embedding_refresh_kwargs) -> Non
         finally:
             logging.disable(previous_disable)
         _exit_if_contended(result)
-        if result.get("refresh_reused"):
+        if result.get("refresh_reused") or result.get("seeded_from"):
             if not args.quiet:
                 print(result["summary"])
             return
@@ -2006,8 +2009,8 @@ def build_parser() -> argparse.ArgumentParser:
         const="auto",
         default=None,
         metavar="STORE",
-        help="Seed the index from a vstore bundle matching this tree hash "
-        "instead of rebuilding (bare flag: default store root)",
+        help="Seed from a vstore bundle, or from an absolute peer checkout path "
+        "with CRG_SHARED_DB (bare flag: select the default store or a linked checkout)",
     )
     _add_embedding_refresh_args(build_cmd)
     _add_follow_symlinks_arg(build_cmd)
@@ -2146,7 +2149,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="External directory to store graph database (useful for network shares)"
     )
-    watch_cmd.add_argument("--manifest", help="JSON manifest of repository graph paths")
+    watch_mode = watch_cmd.add_mutually_exclusive_group()
+    watch_mode.add_argument("--manifest", help="JSON manifest of repository graph paths")
+    watch_mode.add_argument(
+        "--wait-ready", action="store_true",
+        help="Wait for a running watcher to publish a complete current checkout graph",
+    )
+    watch_cmd.add_argument("--timeout", type=_positive_int, help="Readiness deadline in seconds")
     _add_embedding_refresh_args(watch_cmd)
     _add_follow_symlinks_arg(watch_cmd)
 
@@ -3380,6 +3389,17 @@ def _dispatch() -> None:
             print(f"data dir: {path}")
         print(prune_report.summary())
         return
+
+    if args.command == "watch" and args.wait_ready:
+        from .watch_set import wait_ready
+
+        if not args.repo or args.data_dir or embedding_refresh_kwargs or args.follow_symlinks:
+            ap.error("watch --wait-ready requires --repo and only accepts --timeout with it")
+        print(json.dumps(wait_ready(Path(args.repo).expanduser(), args.timeout or 10)))
+        return
+
+    if args.command == "watch" and args.timeout is not None:
+        ap.error("watch --timeout requires --wait-ready")
 
     if args.command == "watch" and args.manifest is not None:
         import traceback

@@ -7,8 +7,10 @@ import json
 import logging
 import os
 import sqlite3
+import sys
 import time
 from contextlib import closing
+from importlib.metadata import version
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -24,6 +26,7 @@ from ..build_state import (
     read_build_state,
 )
 from ..constants import normalize_file_path
+from ..errors import GraphStoreError
 from ..graph import GraphStore
 from ..incremental import (
     VERIFIED_FILE_COUNT_KEY,
@@ -42,6 +45,7 @@ from ..incremental import (
 )
 from ..locking import WriteLock, write_lock_path
 from ..postprocessing import populate_signatures
+from ..shared_seed import SEED_PROFILE_KEY, seed_checkout
 from ..shared_sqlite import CheckoutConnection, shared_database
 from ._common import _get_store, _resolve_root
 
@@ -71,6 +75,8 @@ class _RefreshInputs(NamedTuple):
     manifest_sha256: str
     paths: int
     anchor: tuple[str, str]
+    seed_profile: str
+    files: dict[str, str]
 
 
 def _publish_refresh(
@@ -80,6 +86,7 @@ def _publish_refresh(
         result["generation_sha256"] = store.publish_generation(*inputs.anchor)
         store.record_graph_inputs(inputs.manifest_sha256, inputs.paths, *inputs.anchor)
         result["input_manifest_sha256"] = inputs.manifest_sha256
+        store.set_metadata(SEED_PROFILE_KEY, inputs.seed_profile)
     store.set_metadata(REFRESH_REQUEST_KEY, json.dumps({
         "request": inputs.request, "result": result, "finished": time.time_ns(),
     }))
@@ -92,22 +99,38 @@ def refresh_shared_watch(root: Path, store: GraphStore, follow: bool | None, cal
     with store.refresh():
         if (completed := store.get_metadata(REFRESH_REQUEST_KEY)) and (
             json.loads(completed)["request"] == request.request
+            and store.get_metadata(SEED_PROFILE_KEY) == request.seed_profile
         ):
             return
         store.invalidate_refresh()
         base = store.get_metadata("git_head_sha")
+        seeded = None
         if not base and not store.get_metadata("last_build_type"):
-            result = full_build(root, store, follow_symlinks=follow)
+            if callback is not None:
+                seeded = seed_checkout(
+                    store, profile=request.seed_profile, files=request.files,
+                    head=request.anchor[1], manifest=request.manifest_sha256,
+                )
+            result = seeded if seeded is not None else full_build(
+                root, store, follow_symlinks=follow,
+            )
         else:
             result = incremental_update(root, store, base=base or "HEAD", follow_symlinks=follow)
         _raise_watch_update_errors(result, "shared refresh")
         if callback is not None:
-            _raise_watch_postprocess_warnings(callback(store))
+            if seeded is None:
+                _raise_watch_postprocess_warnings(callback(store))
+            elif seeded["changed_files"]:
+                _raise_watch_postprocess_warnings(callback(
+                    store, changed_files=seeded["changed_files"],
+                ))
             store.set_metadata("postprocess_level", "full")
             store.set_metadata(BUILD_STATE_KEY, BUILD_COMPLETE)
             if request == _refresh_request(root, None, follow, profile):
                 result.update(status="ok", build_type="incremental", base_resolved=base)
                 _publish_refresh(store, request, result)
+            elif seeded is not None:
+                raise GraphStoreError(f"Checkout changed during seed refresh: {root}")
 
 
 def _refresh_request(
@@ -117,9 +140,9 @@ def _refresh_request(
     from ..custom_languages import CONFIG_RELATIVE_PATH
 
     paths = set(collect_all_files(root, recurse, follow))
-    paths.update(path for path in (
+    configs = {path for path in (
         CONFIG_RELATIVE_PATH.as_posix(), ".code-review-graphignore",
-    ) if (root / path).is_file())
+    ) if (root / path).is_file()}
 
     def stamp(path: str) -> tuple[str, int, int, str]:
         with (root / path).open("rb") as source:
@@ -129,7 +152,7 @@ def _refresh_request(
                 digest.update(block)
         return path, state.st_mtime_ns, state.st_ctime_ns, digest.hexdigest()
 
-    stamps = [stamp(path) for path in sorted(paths)]
+    stamps = [stamp(path) for path in sorted(paths | configs)]
     anchor = _git_branch_info(root)
     payload = (anchor, profile, stamps)
     # Keep the input key independent of checkout/branch and file timestamps.
@@ -138,11 +161,23 @@ def _refresh_request(
     # not yet all in this manifest; equality alone never authorizes reuse.
     manifest = ("crg-graph-inputs-v1", profile[2:],
                 [(path, digest) for path, _, _, digest in stamps])
+    seed_profile = ""
+    if profile[2] == "full" and not follow_symlinks_enabled(follow) and anchor[1]:
+        seed_profile = hashlib.sha256(json.dumps((
+            "crg-seed-v1", profile[2:],
+            tuple(sys.version_info[:3]),
+            [(name, version(name)) for name in (
+                "code-review-graph", "tree-sitter", "tree-sitter-language-pack",
+            )],
+            [(path, digest) for path, _, _, digest in stamps if path in configs],
+        )).encode()).hexdigest()
     return _RefreshInputs(
         hashlib.sha256(json.dumps(payload).encode()).hexdigest(),
         hashlib.sha256(json.dumps(manifest).encode()).hexdigest(),
         len(stamps),
         anchor,
+        seed_profile,
+        {path: digest for path, _, _, digest in stamps if path in paths},
     )
 
 
@@ -614,6 +649,7 @@ def build_or_update_graph(
     recover_corrupt: bool = False,
     enrich: bool | None = None,
     follow_symlinks: bool | None = None,
+    seed_from: str | None = None,
 ) -> dict[str, Any]:
     """Build or incrementally update the code knowledge graph.
 
@@ -664,6 +700,8 @@ def build_or_update_graph(
             point inside the repository (never outside it). When None
             (default), falls back to the CRG_FOLLOW_SYMLINKS environment
             variable. Default: disabled.
+        seed_from: Seed an empty shared checkout from a compatible peer, identified
+            by an absolute checkout path or discovered among its linked worktrees.
 
     Returns:
         Summary with files_parsed/updated, node/edge counts, and errors. A run
@@ -704,12 +742,17 @@ def build_or_update_graph(
         with store.refresh():
             completed = store.get_metadata(REFRESH_REQUEST_KEY)
             can_join = (waiting and completed != before) or (
-                store.checkout is not None and not full_rebuild
+                store.checkout is not None and (not full_rebuild or seed_from is not None)
             )
             if can_join and not explicit_vectors and request is not None and completed:
                 prior = json.loads(completed)
+                same_seed = seed_from is None or seed_from == "auto" or (
+                    str(Path(seed_from).expanduser()) == prior["result"].get("seeded_from")
+                )
                 if (
-                    prior["request"] == request.request
+                    same_seed and prior["request"] == request.request
+                    and (store.checkout is None
+                         or store.get_metadata(SEED_PROFILE_KEY) == request.seed_profile)
                     and request == _refresh_request(
                         root, recurse_submodules, follow_symlinks, request_profile,
                     )
@@ -744,6 +787,39 @@ def build_or_update_graph(
                 and not store.get_metadata("last_build_type")
             ):
                 raise RuntimeError(_UPDATE_REQUIRES_GRAPH)
+
+            if seed_from is not None:
+                if store.checkout is None or request is None:
+                    raise GraphStoreError("A shared checkout seed requires CRG_SHARED_DB")
+                seeded = seed_checkout(
+                    store, profile=request.seed_profile, files=request.files,
+                    head=request.anchor[1], manifest=request.manifest_sha256,
+                    source=seed_from, enrich=enrich,
+                )
+                if seeded is not None:
+                    _raise_watch_update_errors(seeded, "seed refresh")
+                    seeded.update(
+                        status="ok", build_type="seed", postprocess_level=postprocess,
+                        summary=(f"Seeded from {seeded['seeded_from']}; "
+                                 f"re-parsed {seeded['files_parsed']} files."),
+                    )
+                    if seeded["changed_files"]:
+                        warnings = _run_postprocess(
+                            store, seeded, postprocess, full_rebuild=False,
+                            changed_files=seeded["changed_files"] + seeded["dependent_files"],
+                            repo_root=str(root), embedding_provider=embedding_provider,
+                            embedding_model=embedding_model,
+                            entry_point_qns=seeded.pop("flow_entry_point_qns", None),
+                            communities_were_affected=seeded["communities_were_affected"],
+                        )
+                        _raise_watch_postprocess_warnings({"warnings": warnings})
+                    store.set_metadata(BUILD_STATE_KEY, BUILD_COMPLETE)
+                    if request != _refresh_request(
+                        root, recurse_submodules, follow_symlinks, request_profile,
+                    ):
+                        raise GraphStoreError(f"Checkout changed during seed refresh: {root}")
+                    _publish_refresh(store, request, seeded)
+                    return seeded
 
             # A previous run that died before post-processing left a current anchor
             # over a half-derived graph. Preserve the visible incomplete marker,

@@ -3802,6 +3802,7 @@ def incremental_update(
     return {
         **(facts_cache.report() if facts_cache is not None else {}),
         "files_updated": files_updated,
+        "files_parsed": parsed_files,
         "total_nodes": total_nodes,
         "total_edges": total_edges,
         "changed_files": list(changed_files),

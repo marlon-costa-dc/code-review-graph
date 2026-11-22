@@ -23,6 +23,7 @@ import logging
 import signal
 import sys
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -72,7 +73,7 @@ def load_manifest(path: Path) -> tuple[WatchTarget, ...]:
         if not repo.is_absolute() or not data_dir.is_absolute():
             raise ValueError(f"watch manifest {path}: paths must be absolute: {entry}")
         target = WatchTarget(repo=repo.resolve(strict=True), data_dir=data_dir.resolve())
-        if not (shared or target.data_dir / _DATABASE_NAME).is_file():
+        if shared is None and not (target.data_dir / _DATABASE_NAME).is_file():
             raise ValueError(
                 f"watch manifest {path}: no graph at {target.data_dir / _DATABASE_NAME}; "
                 "build it before watching"
@@ -91,6 +92,67 @@ def _manifest_version(path: Path) -> tuple[int, int, int]:
     """Return the identity that changes whenever the manifest is replaced."""
     stat = path.stat()
     return (stat.st_ino, stat.st_mtime_ns, stat.st_size)
+
+
+def wait_ready(repo: Path, timeout: int) -> dict[str, str]:
+    """Wait on the native health publication and verify the selected graph."""
+    from .build_state import BUILD_COMPLETE, BUILD_STATE_KEY
+    from .daemon import pid_alive, read_watch_health, watch_health_path
+    from .errors import GraphStoreError
+    from .incremental import _git_branch_info, get_db_path
+    from .shared_sqlite import UnbuiltCheckoutError
+
+    root = repo.resolve(strict=True)
+    health_path = watch_health_path(root)
+    deadline = time.monotonic() + timeout
+
+    def ready() -> dict[str, str] | None:
+        health = read_watch_health(root)
+        if (
+            not health or health.get("repo") != str(root) or health.get("stalled")
+            or health.get("phase") != "watching" or health.get("observer_alive") is not True
+            or health.get("failed_paths") or not health.get("watched_paths")
+            or type(health.get("pid")) is not int or health["pid"] <= 0
+            or not isinstance(health.get("age"), (float, int)) or health["age"] < 0
+            or not pid_alive(health["pid"])
+        ):
+            return None
+        path = get_db_path(root, read_only=True)
+        if not path.is_file():
+            return None
+        try:
+            with GraphStore(path, checkout=root, read_only=True) as store:
+                branch, head = _git_branch_info(root)
+                if (
+                    head and store.get_metadata(BUILD_STATE_KEY) == BUILD_COMPLETE
+                    and store.get_metadata("git_head_sha") == head
+                    and store.get_metadata("git_branch") == branch
+                ):
+                    return {"repo": str(root), "head": head, "branch": branch}
+        except UnbuiltCheckoutError:
+            return None
+        return None
+
+    if result := ready():
+        return result
+    health_path.parent.mkdir(parents=True, exist_ok=True)
+    notified = threading.Event()
+    observer = ConfigWatcher(health_path, notified.set)
+    observer.start()
+    try:
+        while True:
+            notified.clear()
+            if result := ready():
+                return result
+            if not observer.is_alive():
+                raise GraphStoreError(f"Readiness notification backend stopped for {root}")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not notified.wait(remaining):
+                if not observer.is_alive():
+                    raise GraphStoreError(f"Readiness notification backend stopped for {root}")
+                raise GraphStoreError(f"Watch for {root} did not become ready within {timeout}s")
+    finally:
+        observer.stop()
 
 
 @dataclass
