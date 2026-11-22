@@ -37,6 +37,7 @@ import pytest
 
 from code_review_graph.communities import store_communities
 from code_review_graph.graph import GraphStore
+from code_review_graph.incremental import get_db_path
 from code_review_graph.parser import EdgeInfo, NodeInfo
 
 try:
@@ -241,17 +242,16 @@ async def test_mcp_wiki_distinguishes_index_and_preserves_php_namespaces(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The aggregate, colliding community and qualified dependency survive stdio."""
+    monkeypatch.delenv("CRG_DATA_DIR", raising=False)
     monkeypatch.delenv("CRG_SHARED_DB", raising=False)
     repo = _make_fixture_repo(tmp_path)
-    data_dir = repo / ".code-review-graph"
-    data_dir.mkdir()
     core = (repo / "pkg" / "core.py").as_posix()
     job = (repo / "pkg" / "job.php").as_posix()
     caller = f"{core}::compute_total"
     symbol = r"App\Domain\Job"
     target = f"{job}::{symbol}"
 
-    with GraphStore(data_dir / "graph.db") as store:
+    with GraphStore(get_db_path(repo)) as store:
         store.upsert_node(NodeInfo("Function", "compute_total", core, 4, 5, "python"))
         store.upsert_node(NodeInfo("Function", "normalize_amount", core, 1, 2, "python"))
         store.upsert_node(NodeInfo("Class", symbol, job, 1, 2, "php"))
@@ -282,6 +282,16 @@ async def test_mcp_wiki_distinguishes_index_and_preserves_php_namespaces(
             assert page.startswith("# Index\n")
             assert f"`pkg/job.php::{symbol}`" in page
             assert repo.as_posix() not in page
+
+            generated_page = _payload(await _call(
+                session, "get_wiki_page_tool", {"community_name": "index-3.md"},
+            ))
+            assert generated_page["content"] == page
+
+            partial = _payload(await _call(
+                session, "get_wiki_page_tool", {"community_name": "dex-3"},
+            ))
+            assert partial["status"] == "not_found"
 
 
 async def test_mcp_client_full_review_journey(tmp_path: Path) -> None:

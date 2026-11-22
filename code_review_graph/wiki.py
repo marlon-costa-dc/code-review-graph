@@ -307,45 +307,34 @@ def get_wiki_page(wiki_dir: str | Path, page_name: str) -> str | None:
 
     Args:
         wiki_dir: Directory containing wiki pages.
-        page_name: Community name, or "index.md" for the wiki overview.
+        page_name: Exact community name or generated slug or filename.
+            Use "index.md" for the wiki overview.
 
     Returns:
         Page content as a string, or None if the page does not exist.
     """
-    wiki_path = Path(wiki_dir)
-    index_path = wiki_path / "index.md"
-    if index_path.is_file():
-        index = index_path.read_text(encoding="utf-8", errors="replace")
-        if page_name == index_path.name:
-            return index
+    wiki_path = Path(wiki_dir).resolve()
+    filename_pattern = r"[a-z0-9-]+\.md"
+    filename = f"{page_name.removesuffix('.md')}.md"
+    index_path = (wiki_path / "index.md").resolve()
+    if (
+        page_name != "index.md"
+        and index_path.is_relative_to(wiki_path)
+        and index_path.is_file()
+    ):
         # Colliding titles get unique slugs; the generated index holds their links.
         row = re.search(
             rf"^\| {re.escape(_md_cell(page_name))} \| \d+ \| "
-            r"\[(?P<filename>[a-z0-9-]+\.md)\]\((?P=filename)\) \|$",
-            index,
+            rf"\[(?P<filename>{filename_pattern})\]\((?P=filename)\) \|$",
+            index_path.read_text(encoding="utf-8", errors="replace"),
             re.MULTILINE,
         )
         if row:
-            indexed_path = (wiki_path / row["filename"]).resolve()
-            if indexed_path.is_relative_to(wiki_path.resolve()) and indexed_path.is_file():
-                return indexed_path.read_text(encoding="utf-8", errors="replace")
-            return None
+            filename = row["filename"]
 
-    slug = _slugify(page_name)
-    filepath = wiki_path / f"{slug}.md"
-
-    if filepath.is_file():
-        return filepath.read_text(encoding="utf-8", errors="replace")
-
-    # Fallback: try exact filename match — with path traversal protection
-    exact_path = (wiki_path / page_name).resolve()
-    if exact_path.is_file() and exact_path.is_relative_to(wiki_path.resolve()):
-        return exact_path.read_text(encoding="utf-8", errors="replace")
-
-    # Fallback: search for partial match
-    if wiki_path.is_dir():
-        for p in wiki_path.iterdir():
-            if p.suffix == ".md" and slug in p.stem:
-                return p.read_text(encoding="utf-8", errors="replace")
-
-    return None
+    if re.fullmatch(filename_pattern, filename) is None:
+        return None
+    filepath = (wiki_path / filename).resolve()
+    if not filepath.is_relative_to(wiki_path) or not filepath.is_file():
+        return None
+    return filepath.read_text(encoding="utf-8", errors="replace")
