@@ -5476,10 +5476,8 @@ def watch(
     manifest_stop = stop_event if startup_lock is not None and store.checkout is not None else None
     cancellation = _WATCH_CANCELLATION.set(manifest_stop)
     try:
-        _watch(
-            repo_root, store, on_files_updated, stop_event, follow_symlinks, startup_lock,
-            initialize_embeddings=initialize_embeddings,
-        )
+        run = partial(_watch, initialize_embeddings=True) if initialize_embeddings else _watch
+        run(repo_root, store, on_files_updated, stop_event, follow_symlinks, startup_lock)
     except KeyboardInterrupt:
         if manifest_stop is None or not manifest_stop.is_set():
             raise
@@ -5496,7 +5494,7 @@ def _watch(
     follow_symlinks: bool | None,
     startup_lock: threading.Lock | None,
     *,
-    initialize_embeddings: bool,
+    initialize_embeddings: bool = False,
 ) -> None:
     """Watch for file changes and auto-update the graph.
 
