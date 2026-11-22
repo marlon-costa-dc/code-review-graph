@@ -502,6 +502,7 @@ class TestRefreshWiring:
                 graph,
                 provider="local",
                 model="test-model",
+                file_paths=None,
             )
             assert result["embeddings_refreshed"] == 3
             assert result["embeddings_purged"] == 2

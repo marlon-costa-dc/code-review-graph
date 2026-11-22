@@ -451,6 +451,11 @@ notification quota exhausted, fails at start with the cause.
 native writer lock before starting their observer threads. A failed open or
 watch exits with its original cause in the service log.
 
+The watcher refreshes FTS, execution flows and an enabled embedding index
+from the affected file set. The deferred community pass runs once after
+the quiet period. To refresh a seeded embedding index, pass the same
+`--embedding-provider` and `--embedding-model` you used to embed it.
+
 ## Standalone Daemon CLI (`crg-daemon`)
 
 `crg-daemon` is installed with `code-review-graph` and mirrors the

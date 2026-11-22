@@ -12,7 +12,7 @@ import subprocess
 import threading
 import time
 
-from code_review_graph import communities, incremental
+from code_review_graph import communities, flows, incremental
 from code_review_graph.daemon import read_watch_health
 from code_review_graph.graph import GraphStore
 from code_review_graph.incremental import full_build, watch
@@ -56,6 +56,14 @@ def test_one_file_edit_defers_leiden_to_one_quiet_pass(tmp_path, monkeypatch):
 
     monkeypatch.setattr(communities, "detect_communities", counting_detect)
     monkeypatch.setattr(incremental, "_SETTLE_SECONDS", _SETTLE_SECONDS)
+    full_flows = []
+    real_trace = flows.trace_flows
+
+    def count_full_flows(*args, **kwargs):
+        full_flows.append(1)
+        return real_trace(*args, **kwargs)
+
+    monkeypatch.setattr(flows, "trace_flows", count_full_flows)
     fts_modes: list[str] = []
     real_post_processing = run_post_processing
 
@@ -99,6 +107,8 @@ def test_one_file_edit_defers_leiden_to_one_quiet_pass(tmp_path, monkeypatch):
         assert leiden_passes[0] - edited_at >= _SETTLE_SECONDS - 1.0
         time.sleep(_SETTLE_SECONDS + 1.0)
         assert len(leiden_passes) == 1, "an idle watcher kept rerunning Leiden"
+        assert fts_modes == ["delta", ""], fts_modes
+        assert full_flows == []
     finally:
         stop.set()
         thread.join(timeout=20)
