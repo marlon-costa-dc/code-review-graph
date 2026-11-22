@@ -447,6 +447,10 @@ their watchers only through kernel file notifications. There is no polling
 fallback: a host without a native notification backend, or with its
 notification quota exhausted, fails at start with the cause.
 
+`watch --manifest` opens and migrates the shared checkout stores under the
+native writer lock before starting their observer threads. A failed open or
+watch exits with its original cause in the service log.
+
 ## Standalone Daemon CLI (`crg-daemon`)
 
 `crg-daemon` is installed with `code-review-graph` and mirrors the

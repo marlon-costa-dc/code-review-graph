@@ -31,6 +31,7 @@ from typing import Any
 from .daemon import ConfigWatcher
 from .graph import GraphStore
 from .incremental import _WATCH_STOP_TIMEOUT, _WATCH_TICK_SECONDS, watch
+from .locking import WriteLock
 from .shared_sqlite import shared_database
 
 logger = logging.getLogger(__name__)
@@ -129,14 +130,12 @@ def watch_set(
     desired: dict[Path, WatchTarget] = {}
     changed = threading.Event()
     observer = ConfigWatcher(manifest, changed.set)
+    shared = shared_database()
 
-    def run(watcher: _Watcher) -> None:
-        store: GraphStore | None = None
+    def run(watcher: _Watcher, store: GraphStore | None) -> None:
         try:
-            store = GraphStore(
-                shared_database() or watcher.target.data_dir / _DATABASE_NAME,
-                checkout=watcher.target.repo,
-            )
+            if store is None:
+                store = GraphStore(watcher.target.data_dir / _DATABASE_NAME)
             watch(
                 watcher.target.repo,
                 store,
@@ -153,17 +152,43 @@ def watch_set(
             if store is not None:
                 store.close()
 
-    def start(target: WatchTarget) -> None:
+    def start(target: WatchTarget, store: GraphStore | None = None) -> None:
         watcher = _Watcher(target=target)
         watcher.thread = threading.Thread(
             target=run,
-            args=(watcher,),
+            args=(watcher, store),
             name=f"crg-watch:{target.repo.name}",
             daemon=True,
         )
-        watchers[target.repo] = watcher
         watcher.thread.start()
+        watchers[target.repo] = watcher
         logger.info("Watching %s (graph %s)", target.repo, target.data_dir)
+
+    def start_shared(targets: list[WatchTarget], path: Path) -> None:
+        # Opening a writable store can migrate both the file and its checkout
+        # schema. Finish every open under the native writer lock before any
+        # of these observers can queue a write or spawn parser workers.
+        opened: dict[WatchTarget, GraphStore] = {}
+        lock = WriteLock(path)
+        if not lock.acquire(blocking=True):
+            raise RuntimeError(f"Cannot open {path}: shared graph writer holds the lock")
+        try:
+            try:
+                for target in targets:
+                    try:
+                        opened[target] = GraphStore(path, checkout=target.repo)
+                    except Exception as exc:
+                        raise RuntimeError(
+                            f"watch for {target.repo} failed to open {path}",
+                        ) from exc
+            finally:
+                lock.release()
+            for target in targets:
+                start(target, opened[target])
+                del opened[target]
+        finally:
+            for store in opened.values():
+                store.close()
 
     def raise_failure(watcher: _Watcher) -> None:
         if watcher.failure is not None:
@@ -182,10 +207,13 @@ def watch_set(
             retiring.append(watcher)
         reap()
         unwinding = {watcher.target.repo for watcher in retiring}
-        for repo, target in desired.items():
-            # A repository still unwinding keeps its graph until it is reaped;
-            # starting a second writer on that graph would race it.
-            if repo not in watchers and repo not in unwinding:
+        # A repository still unwinding keeps its graph until it is reaped.
+        pending = [target for repo, target in desired.items()
+                   if repo not in watchers and repo not in unwinding]
+        if pending and shared is not None:
+            start_shared(pending, shared)
+        else:
+            for target in pending:
                 start(target)
 
     def stop_all(*, report_failures: bool) -> BaseException | None:

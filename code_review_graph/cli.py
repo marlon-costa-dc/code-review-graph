@@ -3382,6 +3382,8 @@ def _dispatch() -> None:
         return
 
     if args.command == "watch" and args.manifest is not None:
+        import traceback
+
         if args.repo is not None or args.data_dir is not None:
             ap.error("watch --manifest names every repository; drop --repo and --data-dir")
         from .postprocessing import run_post_processing
@@ -3397,7 +3399,7 @@ def _dispatch() -> None:
                 ),
             )
         except RuntimeError as exc:
-            print(f"Error: {exc}", file=sys.stderr)
+            traceback.print_exception(exc, file=sys.stderr)
             sys.exit(1)
         return
 

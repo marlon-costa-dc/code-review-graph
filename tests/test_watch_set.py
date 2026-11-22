@@ -20,6 +20,7 @@ import code_review_graph.watch_set as watch_set_module
 from code_review_graph.daemon import read_watch_health, watch_health_path
 from code_review_graph.graph import GraphStore
 from code_review_graph.incremental import full_build
+from code_review_graph.locking import WriteLock
 from code_review_graph.watch_set import load_manifest, watch_set
 
 
@@ -137,10 +138,28 @@ class TestWatchSet:
             repo.mkdir()
             (repo / "app.py").write_text("def initial(): return 1\n", encoding="utf-8")
             cli_main_argv(["build", "--repo", str(repo)])
+            with GraphStore(database, checkout=repo) as store:
+                store.set_metadata("schema_version", "15")
         manifest = tmp_path / "shared.json"
         _write_manifest(manifest, entries)
         stop = threading.Event()
         failures: list[BaseException] = []
+        opened: list[Path] = []
+        watch = watch_set_module.watch
+
+        def open_store(path: Path, *, checkout: Path) -> GraphStore:
+            assert not WriteLock(path).acquire(), "shared migration escaped the writer lock"
+            store = GraphStore(path, checkout=checkout)
+            assert store.get_metadata("schema_version") == "16"
+            opened.append(checkout)
+            return store
+
+        def watch_after_migration(repo, store, **kwargs):
+            assert opened == [target for target, _ in entries]
+            watch(repo, store, **kwargs)
+
+        monkeypatch.setattr(watch_set_module, "GraphStore", open_store)
+        monkeypatch.setattr(watch_set_module, "watch", watch_after_migration)
 
         def run() -> None:
             from code_review_graph.postprocessing import run_post_processing
@@ -211,7 +230,9 @@ class TestWatchManifestCli:
         with pytest.raises(SystemExit) as exited:
             cli_main_argv(["watch", "--manifest", str(manifest)])
         assert exited.value.code == 1
-        assert f"watch for {repo} failed" in capsys.readouterr().err
+        errors = capsys.readouterr().err
+        assert f"watch for {repo} failed" in errors
+        assert "file is not a database" in errors
 
 
 class TestQueuedWatcherLiveness:
