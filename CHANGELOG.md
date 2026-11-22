@@ -10,6 +10,17 @@
   and an exhausted inotify quota fails loud instead of falling back to a poll
   loop. The `poll_interval` daemon setting and `CRG_WATCH_POLL_INTERVAL` are
   removed, along with the unused watchfiles adapter.
+- A watched edit costs work proportional to the change. Each batch rewrites
+  only the edited files' search rows, and whole-graph community detection
+  (Leiden) runs once the repository has been quiet for
+  `CRG_WATCH_SETTLE_SECONDS` (default 30), not after every batch.
+- A registered `data_dir` that no longer exists is refused instead of
+  silently replaced by an older checkout-local graph: reads fail naming the
+  registry entry and the remedy (`prune --apply`, `build --data-dir`, or
+  `CRG_SHARED_DB`), and `prune` drops such an entry. With `CRG_SHARED_DB` set,
+  only a missing repository makes an entry dead.
+- The multi-repo daemon resolves a duplicated alias to the primary checkout,
+  never to whichever linked worktree `watch.toml` listed first.
 - `prune` no longer reports the never-created data directory of a shared
   checkout as an orphan.
 - Infrastructure documents are not dead-code subjects.
