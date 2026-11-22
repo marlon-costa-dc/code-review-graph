@@ -161,7 +161,7 @@ def test_daemon_start_and_reload_reuse_registered_external_graphs(tmp_path, monk
         return repo, db
 
     def publish(*repos):
-        text = "[daemon]\npoll_interval = 1\n"
+        text = "[daemon]\n"
         for repo in repos:
             text += f"\n[[repos]]\npath = {json.dumps(repo.as_posix())}\nalias = \"{repo.name}\"\n"
         staged = config.with_suffix(".new")

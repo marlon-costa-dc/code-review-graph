@@ -4,9 +4,12 @@ import json
 import threading
 
 from watchdog.events import FileSystemEventHandler
-from watchdog.observers.polling import PollingObserver
 
-from code_review_graph.incremental import _load_ignore_patterns, _WatchSupervisor
+from code_review_graph.incremental import (
+    _load_ignore_patterns,
+    _WatchSupervisor,
+    native_observer,
+)
 from tests.test_watch_robustness import FakeObserver
 
 
@@ -97,7 +100,7 @@ def test_vanished_unadopted_directory_clears_transient_degradation(tmp_path):
     assert health["degraded"] is False
 
 
-def test_polling_observer_keeps_events_across_promotion_failure(tmp_path, monkeypatch):
+def test_native_observer_keeps_events_across_promotion_failure(tmp_path, monkeypatch):
     import code_review_graph.incremental as incremental_module
 
     # This test is about event delivery across a failed promotion, not about
@@ -116,7 +119,7 @@ def test_polling_observer_keeps_events_across_promotion_failure(tmp_path, monkey
             if event.src_path == wanted[0]:
                 delivered.set()
 
-    observer = PollingObserver(timeout=0.02)
+    observer = native_observer()
     supervisor = _WatchSupervisor(
         observer,
         tmp_path,

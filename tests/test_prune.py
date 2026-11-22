@@ -53,7 +53,7 @@ def test_prune_reports_dead_entries_without_applying(
     shutil.rmtree(dead)
     (home / "watch.toml").write_text(
         f'[daemon]\nsession_name = "crg-watch"\nlog_dir = "{home}/logs"\n'
-        f'poll_interval = 2\n\n[[repos]]\npath = "{live}"\nalias = "live"\n\n'
+        f'\n[[repos]]\npath = "{live}"\nalias = "live"\n\n'
         f'[[repos]]\npath = "{dead}"\nalias = "dead"\n',
         encoding="utf-8",
     )
@@ -78,7 +78,7 @@ def test_prune_apply_rewrites_registry_and_watch(
     shutil.rmtree(dead)
     (home / "watch.toml").write_text(
         f'[daemon]\nsession_name = "crg-watch"\nlog_dir = "{home}/logs"\n'
-        f'poll_interval = 2\n\n[[repos]]\npath = "{live}"\nalias = "live"\n\n'
+        f'\n[[repos]]\npath = "{live}"\nalias = "live"\n\n'
         f'[[repos]]\npath = "{dead}"\nalias = "dead"\n',
         encoding="utf-8",
     )

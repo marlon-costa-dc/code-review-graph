@@ -26,15 +26,8 @@ EDIT_AFTER_RECONCILIATION_SECONDS = 1.0
 
 
 def test_edit_saved_during_startup_postprocessing_reaches_graph(tmp_path, monkeypatch):
-    import watchdog.observers
-    from watchdog.observers.polling import PollingObserver
-
     monkeypatch.setattr(crg_main, "_default_repo_root", None)
     monkeypatch.delenv("CRG_TOOLS", raising=False)
-    # Portable, deterministic observer: its snapshot is taken when it starts.
-    monkeypatch.setattr(
-        watchdog.observers, "Observer", lambda: PollingObserver(timeout=0.2),
-    )
 
     repo = tmp_path / "repo"
     repo.mkdir()

@@ -5343,6 +5343,30 @@ def _install_sigterm_interrupt() -> Callable[[], None]:
     return _restore
 
 
+def native_observer() -> Any:
+    """Return watchdog's kernel-notification observer; never its polling one.
+
+    watchdog silently substitutes ``PollingObserver`` when the platform's
+    native backend cannot load (an unsupported libc for inotify, missing
+    fsevents/kqueue or ReadDirectoryChangesW).  Polling is not supported.
+
+    Raises:
+        RuntimeError: if watchdog only offers its polling observer.
+    """
+    from watchdog.observers import Observer
+    from watchdog.observers.polling import PollingObserver
+
+    observer = Observer()
+    if isinstance(observer, PollingObserver):
+        raise RuntimeError(
+            "watchdog has no kernel notification backend on this host and "
+            "polling is not supported: install a watchdog build whose native "
+            "observer loads here (Linux inotify, macOS FSEvents/kqueue, Windows "
+            "ReadDirectoryChangesW) and run on a filesystem that emits native events"
+        )
+    return observer
+
+
 def watch(
     repo_root: Path,
     store: GraphStore,
@@ -5396,11 +5420,10 @@ def _watch(
             ``CRG_FOLLOW_SYMLINKS`` env var. Default: off.
 
     Raises:
-        RuntimeError: if a watch update fails, or if the filesystem observer
-            stops running.
+        RuntimeError: if a watch update fails, if the filesystem observer
+            stops running, or if the host has no kernel notification backend.
     """
     from watchdog.events import DirCreatedEvent, DirDeletedEvent
-    from watchdog.observers import Observer
 
     # Refuse a graph built for another root before anything can queue a write
     # to it.  Startup reconciliation checks this too, but only once the
@@ -5419,7 +5442,7 @@ def _watch(
     # stalled for the whole build.
     supervisor.report_health(observer_alive=True, phase="initial-build", force=True)
 
-    observer = Observer()
+    observer = native_observer()
     supervisor.attach(observer)
     handler = _create_watch_handler(
         repo_root, store, on_files_updated, supervisor.request_replan,

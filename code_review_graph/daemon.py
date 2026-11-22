@@ -1228,8 +1228,8 @@ class ConfigWatcher:
             RuntimeError: if watchdog only offers its polling observer.
         """
         from watchdog.events import FileSystemEventHandler
-        from watchdog.observers import Observer
-        from watchdog.observers.polling import PollingObserver
+
+        from .incremental import native_observer
 
         watcher = self
 
@@ -1247,12 +1247,7 @@ class ConfigWatcher:
                 ):
                     watcher._on_config_changed()
 
-        observer = Observer()
-        if isinstance(observer, PollingObserver):
-            raise RuntimeError(
-                f"no kernel notification backend for {self._config_path}; "
-                "polling is not supported"
-            )
+        observer = native_observer()
         observer.schedule(_Handler(), str(self._config_path.parent), recursive=False)
         observer.daemon = True
         observer.start()

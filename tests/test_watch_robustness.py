@@ -1516,7 +1516,7 @@ class TestRealObserver:
         # The initial-build heartbeat is published before watches are registered.
         return self._wait_for(ready)
 
-    def _polling_watch_survives_failed_replan(
+    def _native_watch_survives_failed_replan(
         self,
         tmp_path,
         *,
@@ -1526,7 +1526,8 @@ class TestRealObserver:
         retry: bool = False,
     ) -> None:
         from watchdog.events import FileSystemEventHandler
-        from watchdog.observers.polling import PollingObserver
+
+        from code_review_graph.incremental import native_observer
 
         source = tmp_path / "src" / "deep" / "a.py"
         source.parent.mkdir(parents=True)
@@ -1543,7 +1544,7 @@ class TestRealObserver:
                 if not event.is_directory and event.src_path == str(source):
                     delivered.set()
 
-        observer = PollingObserver(timeout=0.05)
+        observer = native_observer()
         supervisor = _WatchSupervisor(
             observer,
             tmp_path,
@@ -1592,18 +1593,18 @@ class TestRealObserver:
             observer.stop()
             observer.join()
 
-    def test_polling_observer_keeps_recursive_root_after_failed_split(self, tmp_path):
-        self._polling_watch_survives_failed_replan(
+    def test_native_observer_keeps_recursive_root_after_failed_split(self, tmp_path):
+        self._native_watch_survives_failed_replan(
             tmp_path,
             start_ignored=False,
             failed_path=tmp_path / "src",
             failed_recursive=True,
         )
 
-    def test_polling_observer_keeps_coverage_while_split_replan_retries(
+    def test_native_observer_keeps_coverage_while_split_replan_retries(
         self, tmp_path
     ):
-        self._polling_watch_survives_failed_replan(
+        self._native_watch_survives_failed_replan(
             tmp_path,
             start_ignored=False,
             failed_path=tmp_path / "src",
@@ -1611,18 +1612,18 @@ class TestRealObserver:
             retry=True,
         )
 
-    def test_polling_observer_keeps_source_watch_after_failed_restore(self, tmp_path):
-        self._polling_watch_survives_failed_replan(
+    def test_native_observer_keeps_source_watch_after_failed_restore(self, tmp_path):
+        self._native_watch_survives_failed_replan(
             tmp_path,
             start_ignored=True,
             failed_path=tmp_path,
             failed_recursive=True,
         )
 
-    def test_polling_observer_keeps_coverage_while_restore_replan_retries(
+    def test_native_observer_keeps_coverage_while_restore_replan_retries(
         self, tmp_path
     ):
-        self._polling_watch_survives_failed_replan(
+        self._native_watch_survives_failed_replan(
             tmp_path,
             start_ignored=True,
             failed_path=tmp_path,

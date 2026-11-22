@@ -68,9 +68,12 @@ def test_973_failed_replan_keeps_delivering_deep_edits(tmp_path, monkeypatch, tr
     import threading
 
     from watchdog.events import FileSystemEventHandler
-    from watchdog.observers.polling import PollingObserver
 
-    from code_review_graph.incremental import _load_ignore_patterns, _WatchSupervisor
+    from code_review_graph.incremental import (
+        _load_ignore_patterns,
+        _WatchSupervisor,
+        native_observer,
+    )
 
     source = tmp_path / "src"
     file = source / "deep" / "held.py"
@@ -91,7 +94,7 @@ def test_973_failed_replan_keeps_delivering_deep_edits(tmp_path, monkeypatch, tr
             if event.src_path == str(file):
                 delivered.set()
 
-    observer = PollingObserver(timeout=0.03)
+    observer = native_observer()
     supervisor = _WatchSupervisor(observer, tmp_path, _load_ignore_patterns(tmp_path))
     supervisor.schedule_initial(Handler())
     observer.start()

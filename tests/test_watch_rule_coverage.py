@@ -4,7 +4,6 @@ import threading
 
 import pytest
 from watchdog.events import FileModifiedEvent
-from watchdog.observers.polling import PollingObserver
 
 from code_review_graph.graph import GraphStore
 from code_review_graph.incremental import (
@@ -14,6 +13,7 @@ from code_review_graph.incremental import (
     _sync_watch_tree,
     _WatchSupervisor,
     clear_nested_ignore_cache,
+    native_observer,
 )
 from tests.test_watch_robustness import FakeObserver
 
@@ -102,13 +102,13 @@ def test_failed_relaxed_rule_adoption_is_explicit(tmp_path, monkeypatch, max_sch
         assert supervisor.watched_paths == before
 
 
-def test_polling_observer_delivers_subsequent_deep_edit_after_rule_relaxation(
+def test_native_observer_delivers_subsequent_deep_edit_after_rule_relaxation(
     tmp_path,
     monkeypatch,
 ):
     config, source = excluded_tree(tmp_path)
     monkeypatch.setattr("code_review_graph.incremental._DEBOUNCE_SECONDS", 0.02)
-    observer = PollingObserver(timeout=0.02)
+    observer = native_observer()
     delivered = threading.Event()
     updated = threading.Event()
     with GraphStore(tmp_path / "graph.db") as store:
