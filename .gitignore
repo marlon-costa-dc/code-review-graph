@@ -60,6 +60,8 @@ QODER.md
 .mimocode/
 opencode.json
 opencode.jsonc
+# Host-local skill links into the user's tool cache (absolute paths).
+.opencode/skills/
 .codebuddy/
 CODEBUDDY.md
 .github/instructions/code-review-graph.instructions.md
