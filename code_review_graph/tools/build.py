@@ -27,6 +27,7 @@ from ..constants import normalize_file_path
 from ..graph import GraphStore
 from ..incremental import (
     VERIFIED_FILE_COUNT_KEY,
+    _check_watch_cancelled,
     _git_branch_info,
     _prepare_db_path,
     _raise_watch_postprocess_warnings,
@@ -101,6 +102,7 @@ def refresh_shared_watch(root: Path, store: GraphStore, follow: bool | None, cal
         else:
             result = incremental_update(root, store, base=base or "HEAD", follow_symlinks=follow)
         _raise_watch_update_errors(result, "shared refresh")
+        _check_watch_cancelled()
         if callback is not None:
             _raise_watch_postprocess_warnings(callback(store))
             store.set_metadata("postprocess_level", "full")
@@ -108,6 +110,7 @@ def refresh_shared_watch(root: Path, store: GraphStore, follow: bool | None, cal
             if request == _refresh_request(root, None, follow, profile):
                 result.update(status="ok", build_type="incremental", base_resolved=base)
                 _publish_refresh(store, request, result)
+        _check_watch_cancelled()
 
 
 def _refresh_request(
@@ -122,6 +125,7 @@ def _refresh_request(
     ) if (root / path).is_file())
 
     def stamp(path: str) -> tuple[str, int, int, str]:
+        _check_watch_cancelled()
         with (root / path).open("rb") as source:
             state = os.fstat(source.fileno())
             digest = hashlib.sha256()
