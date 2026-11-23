@@ -1179,6 +1179,13 @@ async def test_mcp_shared_sqlite_isolates_sibling_worktrees(tmp_path, monkeypatc
                 return result
 
             await asyncio.gather(refresh(repo, full=True), refresh(sibling, full=True))
+            with sqlite3.connect(db) as writer:
+                writer.execute("BEGIN IMMEDIATE")
+                context = _payload(await _call(session, "get_minimal_context_tool", {
+                    "repo_root": str(sibling),
+                }))
+                assert context["status"] == "ok", context
+                assert context["_graph"]["head_matches_build"] is True
             await query(repo, "left_symbol", "right_symbol")
             await query(sibling, "right_symbol", "left_symbol")
             assert list(tmp_path.rglob("*.db")) == [db]

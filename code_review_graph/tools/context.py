@@ -15,7 +15,7 @@ from ..incremental import (
     resolve_review_base,
 )
 from ..parser import normalize_file_path
-from ._common import _get_store, _resolve_root, compact_response, graph_provenance
+from ._common import _get_store_for_read, _resolve_root, compact_response, graph_provenance
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +60,12 @@ def get_minimal_context(
             "No graph database found. Build the graph before requesting context.",
         )
 
-    store, root = _get_store(str(root))
+    store, _, _ = _get_store_for_read(str(root))
+    if store is None:
+        return _not_ready(
+            "empty_graph",
+            "The graph database contains no nodes. Build the graph before requesting context.",
+        )
     try:
         # 1. Quick stats
         stats = store.get_stats()

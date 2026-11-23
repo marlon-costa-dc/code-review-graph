@@ -1,21 +1,24 @@
 # Changelog
 
-## [Unreleased]
+## [2.4.0-dc.9] - 2026-11-22
 
 ### Added
 
-- Build a shared checkout from a compatible peer generation and parse only the
-  changed files and their affected dependents.
-- Wait on native watcher events until a complete graph matches the selected
-  checkout's branch, commit and source files.
+- Seed a shared checkout from a compatible peer generation and reconcile
+  the file delta before publication. Identical trees require no re-parsing.
+- Wait for a complete, current checkout graph through native watcher events.
 
 - Shared manifest watchers can initialize new vector indices when given an
   explicit provider, model, and `--initialize-embeddings`.
 
 ### Fixed
 
-- A shared manifest watcher shuts down while waiting for another writer. An
-  interrupted build rolls back, and a shutdown error preserves the original cause.
+- Open and migrate shared checkout schemas before starting their observers.
+  The manifest watcher can shut down while waiting for another writer.
+  Interrupted refreshes roll back, and shutdown retains the original failure.
+- Refresh affected flows, search rows, and enabled vector inputs on edits.
+  The quiet community pass does not repeat those steps.
+- Report wiki coverage limits and propagate unavailable graph reads.
 - Wiki lookup resolves exact community names even when titles produce the same
   base filename. Request `index.md` for the overview. Dependency names retain
   their namespace separators.
