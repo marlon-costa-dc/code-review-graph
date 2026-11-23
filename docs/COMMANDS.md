@@ -987,7 +987,9 @@ community_name: str
 repo_root: str | None
 max_chars: int = 20000       # Page content returned (max 80000)
 ```
-`total_chars` reports the real page length; `truncated` marks a cut.
+Use the exact community name or its generated slug or filename. Request
+`index.md` for the wiki overview. `total_chars` reports the real page length;
+`truncated` marks a cut.
 
 ### Multi-Repo Tools
 
