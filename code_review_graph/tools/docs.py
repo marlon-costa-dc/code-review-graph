@@ -300,7 +300,8 @@ def get_wiki_page_func(
     community. The wiki must have been generated first via generate_wiki.
 
     Args:
-        community_name: Community name to look up (slugified for filename).
+        community_name: Exact community name or generated slug or filename.
+            Use "index.md" for the overview.
         repo_root: Repository root path. Auto-detected if omitted.
         max_chars: Maximum characters of page content to return (default
             20000, capped at 80000). A wiki page grows with its community,

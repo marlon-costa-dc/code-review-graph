@@ -5461,6 +5461,8 @@ def watch(
     stop_event: threading.Event | None = None,
     follow_symlinks: bool | None = None,
     startup_lock: threading.Lock | None = None,
+    *,
+    initialize_embeddings: bool = False,
 ) -> None:
     """Run a filesystem observer with exclusive checkout ownership."""
     from .daemon import watch_health_path
@@ -5475,7 +5477,8 @@ def watch(
     manifest_stop = stop_event if startup_lock is not None and store.checkout is not None else None
     cancellation = _WATCH_CANCELLATION.set(manifest_stop)
     try:
-        _watch(repo_root, store, on_files_updated, stop_event, follow_symlinks, startup_lock)
+        run = partial(_watch, initialize_embeddings=True) if initialize_embeddings else _watch
+        run(repo_root, store, on_files_updated, stop_event, follow_symlinks, startup_lock)
     except KeyboardInterrupt:
         if manifest_stop is None or not manifest_stop.is_set():
             raise
@@ -5491,6 +5494,8 @@ def _watch(
     stop_event: threading.Event | None,
     follow_symlinks: bool | None,
     startup_lock: threading.Lock | None,
+    *,
+    initialize_embeddings: bool = False,
 ) -> None:
     """Watch for file changes and auto-update the graph.
 
@@ -5580,6 +5585,7 @@ def _watch(
 
                             refresh_shared_watch(
                                 repo_root, store, follow_symlinks, on_files_updated,
+                                initialize_embeddings=initialize_embeddings,
                             )
                         else:
                             base = store.get_metadata("git_head_sha")

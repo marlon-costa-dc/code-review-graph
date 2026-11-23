@@ -8,6 +8,9 @@
   the file delta before publication. Identical trees require no re-parsing.
 - Wait for a complete, current checkout graph through native watcher events.
 
+- Shared manifest watchers can initialize new vector indices when given an
+  explicit provider, model, and `--initialize-embeddings`.
+
 ### Fixed
 
 - Open and migrate shared checkout schemas before starting their observers.
@@ -16,6 +19,11 @@
 - Refresh affected flows, search rows, and enabled vector inputs on edits.
   The quiet community pass does not repeat those steps.
 - Report wiki coverage limits and propagate unavailable graph reads.
+- A shared manifest watcher shuts down while waiting for another writer. An
+  interrupted build rolls back, and a shutdown error preserves the original cause.
+- Wiki lookup resolves exact community names even when titles produce the same
+  base filename. Request `index.md` for the overview. Dependency names retain
+  their namespace separators.
 
 ## [2.4.0-dc.8] - 2026-11-22
 

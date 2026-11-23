@@ -35,6 +35,11 @@ from typing import Any
 
 import pytest
 
+from code_review_graph.communities import store_communities
+from code_review_graph.graph import GraphStore
+from code_review_graph.incremental import get_db_path
+from code_review_graph.parser import EdgeInfo, NodeInfo
+
 try:
     from mcp import ClientSession
     from mcp.client.stdio import StdioServerParameters, stdio_client
@@ -231,6 +236,62 @@ def _posix(path: str) -> str:
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
+
+
+async def test_mcp_wiki_distinguishes_index_and_preserves_php_namespaces(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The aggregate, colliding community and qualified dependency survive stdio."""
+    monkeypatch.delenv("CRG_DATA_DIR", raising=False)
+    monkeypatch.delenv("CRG_SHARED_DB", raising=False)
+    repo = _make_fixture_repo(tmp_path)
+    core = (repo / "pkg" / "core.py").as_posix()
+    job = (repo / "pkg" / "job.php").as_posix()
+    caller = f"{core}::compute_total"
+    symbol = r"App\Domain\Job"
+    target = f"{job}::{symbol}"
+
+    with GraphStore(get_db_path(repo)) as store:
+        store.upsert_node(NodeInfo("Function", "compute_total", core, 4, 5, "python"))
+        store.upsert_node(NodeInfo("Function", "normalize_amount", core, 1, 2, "python"))
+        store.upsert_node(NodeInfo("Class", symbol, job, 1, 2, "php"))
+        store.upsert_edge(EdgeInfo("REFERENCES", caller, target, core, 5))
+        store.commit()
+        store_communities(store, [
+            {"name": "Index-2", "size": 2, "members": [f"{core}::normalize_amount", target]},
+            {"name": "Index", "size": 1, "members": [caller]},
+        ])
+
+    async with stdio_client(_server_params(repo, tmp_path / "crg-home")) as (read, write):
+        async with ClientSession(
+            read, write, read_timeout_seconds=read_timeout(CALL_TIMEOUT),
+        ) as session:
+            await asyncio.wait_for(session.initialize(), timeout=CALL_TIMEOUT)
+            generated = _payload(await _call(session, "generate_wiki_tool"))
+            assert generated["status"] == "ok"
+
+            overview = _payload(await _call(
+                session, "get_wiki_page_tool", {"community_name": "index.md"},
+            ))["content"]
+            assert overview.startswith("# Code Wiki\n")
+            assert "| Index | 1 | [index-3.md](index-3.md) |" in overview
+
+            page = _payload(await _call(
+                session, "get_wiki_page_tool", {"community_name": "Index"},
+            ))["content"]
+            assert page.startswith("# Index\n")
+            assert f"`pkg/job.php::{symbol}`" in page
+            assert repo.as_posix() not in page
+
+            generated_page = _payload(await _call(
+                session, "get_wiki_page_tool", {"community_name": "index-3.md"},
+            ))
+            assert generated_page["content"] == page
+
+            partial = _payload(await _call(
+                session, "get_wiki_page_tool", {"community_name": "dex-3"},
+            ))
+            assert partial["status"] == "not_found"
 
 
 async def test_mcp_client_full_review_journey(tmp_path: Path) -> None:
