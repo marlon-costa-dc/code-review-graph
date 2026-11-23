@@ -120,20 +120,29 @@ class CheckoutConnection(sqlite3.Connection):
             raise RuntimeError("No graph write step to roll back")
 
     @contextmanager
-    def refresh(self) -> Iterator[None]:
+    def refresh(self, *, bulk: bool = False) -> Iterator[None]:
         """Keep native graph write steps in one SQLite publication."""
-        super().execute("BEGIN IMMEDIATE")
-        self._atomic = True
+        # A seed commits durably in the WAL. Let a normal writer checkpoint
+        # it, and keep bulk index sorting out of the watcher's small cache.
+        settings = {"wal_autocheckpoint": 0, "cache_size": -131072, "temp_store": 2} if bulk else {}
+        previous = {key: self.execute(f"PRAGMA {key}").fetchone()[0] for key in settings}
         try:
-            yield
-            if self._step:
-                raise RuntimeError("Unfinished graph write step")
-            super().commit()
-        except BaseException:
-            super().rollback()
-            raise
+            for key, value in settings.items():
+                super().execute(f"PRAGMA {key}={value}")
+            super().execute("BEGIN IMMEDIATE")
+            self._atomic = True
+            try:
+                yield
+                if self._step:
+                    raise RuntimeError("Unfinished graph write step")
+                super().commit()
+            except BaseException:
+                super().rollback()
+                raise
         finally:
             self._atomic = self._step = False
+            for key, value in previous.items():
+                super().execute(f"PRAGMA {key}={value}")
 
 
 def _migrate_namespaces(conn: CheckoutConnection, tables: set[str], version: int) -> None:

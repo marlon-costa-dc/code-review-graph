@@ -398,6 +398,15 @@ shared setting with a per-command `--data-dir`. Launch the VS Code extension
 host with the same setting to read the selected workspace checkout from the
 shared database.
 
+`build --repo /abs/new --seed-from /abs/base` preloads a compatible complete
+generation from a peer checkout in the shared file. The target uses its own
+paths and links. It parses only changed files and affected dependents, then
+publishes the target generation in one transaction. An explicit base must
+match the repository identity and the indexing profile. The watcher discovers
+eligible linked worktrees for this operation and builds directly from source
+when none has a complete generation. Outside shared mode, `--seed-from`
+continues to select a vstore bundle.
+
 Use `code-review-graph query file_summary path.py --generation-ref refs/heads/main`
 to read the last published structural view of that ref for the selected
 checkout. The MCP `query_graph_tool` accepts the same `generation_ref`. This
@@ -456,6 +465,12 @@ native writer lock before starting their observer threads. A failed open or
 watch exits with its original cause in the service log. On shutdown, an
 interrupted shared manifest refresh rolls back and releases its lock without
 advancing freshness.
+
+`watch --wait-ready --repo /abs/new --timeout 10` reads the selected checkout
+and waits on kernel notifications from the running watcher. It returns one
+JSON object with `repo`, `head` and `branch` once the observer is ready and
+the complete graph matches the current branch, commit and indexable worktree
+contents. Use the same `CRG_HOME` and `CRG_SHARED_DB` as the watcher.
 
 With `CRG_SHARED_DB` set, add `--initialize-embeddings`, `--embedding-provider`
 and `--embedding-model` to `watch --manifest` to build the first vector index
@@ -978,7 +993,9 @@ community_name: str
 repo_root: str | None
 max_chars: int = 20000       # Page content returned (max 80000)
 ```
-`total_chars` reports the real page length; `truncated` marks a cut.
+Use the exact community name or its generated slug or filename. Request
+`index.md` for the wiki overview. `total_chars` reports the real page length;
+`truncated` marks a cut.
 
 ### Multi-Repo Tools
 

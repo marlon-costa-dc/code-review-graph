@@ -14,7 +14,7 @@ from typing import Any
 
 from .communities import get_communities
 from .flows import get_flows
-from .graph import GraphStore, _sanitize_name
+from .graph import GraphStore, _is_path_qualified, _sanitize_name
 from .parser import repo_relative_path
 
 
@@ -177,8 +177,12 @@ def _generate_community_page(store: GraphStore, community: dict[str, Any]) -> st
             lines.append(f"### {heading}")
             lines.append("")
             for target, count in counts.most_common(15):
-                relative = repo_relative_path(target, repo_root) if repo_root else None
-                lines.append(f"- `{_sanitize_name(relative or target)}` ({count} edge(s))")
+                if repo_root and _is_path_qualified(target):
+                    path, separator, symbol = target.partition("::")
+                    relative = repo_relative_path(path, repo_root)
+                    if relative is not None:
+                        target = f"{relative}{separator}{symbol}"
+                lines.append(f"- `{_sanitize_name(target)}` ({count} edge(s))")
             if len(counts) > 15:
                 lines.append(f"- *... and {len(counts) - 15} more dependencies.*")
             lines.append("")
@@ -303,27 +307,34 @@ def get_wiki_page(wiki_dir: str | Path, page_name: str) -> str | None:
 
     Args:
         wiki_dir: Directory containing wiki pages.
-        page_name: Community name (will be slugified for filename lookup).
+        page_name: Exact community name or generated slug or filename.
+            Use "index.md" for the wiki overview.
 
     Returns:
         Page content as a string, or None if the page does not exist.
     """
-    wiki_path = Path(wiki_dir)
-    slug = _slugify(page_name)
-    filepath = wiki_path / f"{slug}.md"
+    wiki_path = Path(wiki_dir).resolve()
+    filename_pattern = r"[a-z0-9-]+\.md"
+    filename = f"{page_name.removesuffix('.md')}.md"
+    index_path = (wiki_path / "index.md").resolve()
+    if (
+        page_name != "index.md"
+        and index_path.is_relative_to(wiki_path)
+        and index_path.is_file()
+    ):
+        # Colliding titles get unique slugs; the generated index holds their links.
+        row = re.search(
+            rf"^\| {re.escape(_md_cell(page_name))} \| \d+ \| "
+            rf"\[(?P<filename>{filename_pattern})\]\((?P=filename)\) \|$",
+            index_path.read_text(encoding="utf-8", errors="replace"),
+            re.MULTILINE,
+        )
+        if row:
+            filename = row["filename"]
 
-    if filepath.is_file():
-        return filepath.read_text(encoding="utf-8", errors="replace")
-
-    # Fallback: try exact filename match — with path traversal protection
-    exact_path = (wiki_path / page_name).resolve()
-    if exact_path.is_file() and exact_path.is_relative_to(wiki_path.resolve()):
-        return exact_path.read_text(encoding="utf-8", errors="replace")
-
-    # Fallback: search for partial match
-    if wiki_path.is_dir():
-        for p in wiki_path.iterdir():
-            if p.suffix == ".md" and slug in p.stem:
-                return p.read_text(encoding="utf-8", errors="replace")
-
-    return None
+    if re.fullmatch(filename_pattern, filename) is None:
+        return None
+    filepath = (wiki_path / filename).resolve()
+    if not filepath.is_relative_to(wiki_path) or not filepath.is_file():
+        return None
+    return filepath.read_text(encoding="utf-8", errors="replace")

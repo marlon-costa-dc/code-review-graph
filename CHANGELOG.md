@@ -4,6 +4,11 @@
 
 ### Added
 
+- Build a shared checkout from a compatible peer generation and parse only the
+  changed files and their affected dependents.
+- Wait on native watcher events until a complete graph matches the selected
+  checkout's branch, commit and source files.
+
 - Shared manifest watchers can initialize new vector indices when given an
   explicit provider, model, and `--initialize-embeddings`.
 
@@ -11,6 +16,9 @@
 
 - A shared manifest watcher shuts down while waiting for another writer. An
   interrupted build rolls back, and a shutdown error preserves the original cause.
+- Wiki lookup resolves exact community names even when titles produce the same
+  base filename. Request `index.md` for the overview. Dependency names retain
+  their namespace separators.
 
 ## [2.4.0-dc.8] - 2026-11-22
 
