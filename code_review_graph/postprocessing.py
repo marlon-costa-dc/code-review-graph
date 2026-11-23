@@ -40,6 +40,8 @@ def run_post_processing(
     entry_point_qns: Sequence[str] = (),
     embedding_provider: str | None = None,
     embedding_model: str | None = None,
+    initialize_embeddings: bool = False,
+    embeddings_only: bool = False,
 ) -> dict[str, Any]:
     """Run all post-build steps on a populated graph.
 
@@ -61,6 +63,9 @@ def run_post_processing(
             refresh. Must be supplied with ``embedding_model``.
         embedding_model: Exact model for an explicit embedding refresh.
             Must be supplied with ``embedding_provider``.
+        initialize_embeddings: Allow the configured provider to index a graph
+            without existing vectors.
+        embeddings_only: Keep the current non-vector projections.
 
     Returns:
         Dict with keys for each step's result count and a ``warnings``
@@ -75,15 +80,16 @@ def run_post_processing(
         files = None if changed_files is None else [
             normalize_file_path(root / path) for path in changed_files
         ]
-        _resolve_bare_endpoints(store, result, warnings)
-        _compute_signatures(store, result, warnings)
-        _sync_fts_index(store, result, warnings, files)
-        _trace_flows(store, result, warnings, files, entry_point_qns)
+        if not embeddings_only:
+            _resolve_bare_endpoints(store, result, warnings)
+            _compute_signatures(store, result, warnings)
+            _sync_fts_index(store, result, warnings, files)
+            _trace_flows(store, result, warnings, files, entry_point_qns)
         _refresh_embeddings(
             store, result, warnings, provider=embedding_provider,
-            model=embedding_model, file_paths=files,
+            model=embedding_model, file_paths=files, initialize=initialize_embeddings,
         )
-    if communities:
+    if communities and not embeddings_only:
         _detect_communities(store, result, warnings)
 
     if warnings:
@@ -221,6 +227,7 @@ def _refresh_embeddings(
     provider: str | None,
     model: str | None,
     file_paths: list[str] | None,
+    initialize: bool = False,
 ) -> None:
     """Run an explicitly requested embedding refresh without failing a build."""
     if provider is None and model is None:
@@ -234,7 +241,10 @@ def _refresh_embeddings(
     try:
         from .embeddings import REFRESH_SKIPPED_WARNING, refresh_embeddings
 
-        refreshed = refresh_embeddings(store, provider=provider, model=model, file_paths=file_paths)
+        refreshed = refresh_embeddings(
+            store, provider=provider, model=model, file_paths=file_paths,
+            **({"initialize": True} if initialize else {}),
+        )
         if refreshed is None:
             logger.warning(REFRESH_SKIPPED_WARNING)
             warnings.append(REFRESH_SKIPPED_WARNING)

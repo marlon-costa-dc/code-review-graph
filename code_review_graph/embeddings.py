@@ -1661,14 +1661,15 @@ def refresh_embeddings(
     provider: str,
     model: str,
     file_paths: list[str] | None = None,
+    initialize: bool = False,
 ) -> dict[str, int] | None:
-    """Refresh a previously embedded graph under one exact provider identity.
+    """Refresh an embedding index, optionally creating its first vectors.
 
     This function is deliberately not called by default build paths.  Callers
     must supply both provider and model explicitly.  A graph with no existing
-    vectors returns ``None`` before provider resolution, so routine builds
-    cannot load a local model, contact a cloud service, or incur API cost;
-    the build paths report that case with ``REFRESH_SKIPPED_WARNING``.
+    vectors returns ``None`` before provider resolution unless ``initialize``
+    is set. Initialization covers the entire graph, including when the caller
+    supplied paths for an incremental refresh.
 
     Existing vectors must all use the identity resolved from the requested
     provider/model (including the endpoint for OpenAI-compatible providers).
@@ -1682,20 +1683,24 @@ def refresh_embeddings(
             "Embedding refresh requires an explicit provider and model.",
         )
 
-    if not has_embeddings(graph_store):
+    indexed = has_embeddings(graph_store)
+    if not indexed and not initialize:
         return None
-    try:
-        rows = graph_store._conn.execute(
-            "SELECT DISTINCT provider FROM embeddings ORDER BY provider",
-        ).fetchall()
-    except sqlite3.OperationalError as exc:
-        if "no such column" in str(exc).lower() and "provider" in str(exc).lower():
-            raise ValueError(
-                "Embedding refresh refused: existing rows have no provider identity; "
-                "run an explicit embed to migrate and rebuild the index.",
-            ) from exc
-        raise
-    identities = {str(row["provider"]) for row in rows}
+    identities: set[str] = set()
+    if indexed:
+        try:
+            identities = {str(row["provider"]) for row in graph_store._conn.execute(
+                "SELECT DISTINCT provider FROM embeddings ORDER BY provider",
+            )}
+        except sqlite3.OperationalError as exc:
+            if "no such column" in str(exc).lower() and "provider" in str(exc).lower():
+                raise ValueError(
+                    "Embedding refresh refused: existing rows have no provider identity; "
+                    "run an explicit embed to migrate and rebuild the index.",
+                ) from exc
+            raise
+    if not indexed:
+        file_paths = None
 
     embedding_store = EmbeddingStore(
         graph_store.db_path,
@@ -1715,7 +1720,7 @@ def refresh_embeddings(
                 raise ValueError(
                     f"MiniMax refresh model must be '{resolved_model}', got '{model}'.",
                 )
-        if identities != {resolved_identity}:
+        if indexed and identities != {resolved_identity}:
             existing = ", ".join(sorted(identities))
             raise ValueError(
                 "Embedding refresh refused: existing embeddings use "

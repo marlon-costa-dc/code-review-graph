@@ -2150,6 +2150,10 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="External directory to store graph database (useful for network shares)"
     )
+    watch_cmd.add_argument(
+        "--initialize-embeddings", action="store_true",
+        help="Index checkouts without vectors using the explicit provider and model",
+    )
     watch_mode = watch_cmd.add_mutually_exclusive_group()
     watch_mode.add_argument("--manifest", help="JSON manifest of repository graph paths")
     watch_mode.add_argument(
@@ -3402,6 +3406,7 @@ def _dispatch() -> None:
     if args.command == "watch" and args.timeout is not None:
         ap.error("watch --timeout requires --wait-ready")
 
+
     if args.command == "watch" and args.manifest is not None:
         import traceback
 
@@ -3414,10 +3419,14 @@ def _dispatch() -> None:
             watch_set(
                 Path(args.manifest).expanduser(),
                 on_files_updated=(
-                    partial(run_post_processing, **embedding_refresh_kwargs)
+                    partial(
+                        run_post_processing, **embedding_refresh_kwargs,
+                        initialize_embeddings=args.initialize_embeddings,
+                    )
                     if embedding_refresh_kwargs
                     else run_post_processing
                 ),
+                initialize_embeddings=args.initialize_embeddings,
             )
         except RuntimeError as exc:
             traceback.print_exception(exc, file=sys.stderr)

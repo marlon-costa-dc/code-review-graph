@@ -9,6 +9,9 @@
 - Wait on native watcher events until a complete graph matches the selected
   checkout's branch, commit and source files.
 
+- Shared manifest watchers can initialize new vector indices when given an
+  explicit provider, model, and `--initialize-embeddings`.
+
 ### Fixed
 
 - A shared manifest watcher shuts down while waiting for another writer. An

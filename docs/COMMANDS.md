@@ -472,6 +472,12 @@ JSON object with `repo`, `head` and `branch` once the observer is ready and
 the complete graph matches the current branch, commit and indexable worktree
 contents. Use the same `CRG_HOME` and `CRG_SHARED_DB` as the watcher.
 
+With `CRG_SHARED_DB` set, add `--initialize-embeddings`, `--embedding-provider`
+and `--embedding-model` to `watch --manifest` to build the first vector index
+for each checkout that has no vectors. The same provider and model refresh
+affected inputs on later edits. Omitting `--initialize-embeddings` keeps the
+existing refresh-only behavior.
+
 ## Standalone Daemon CLI (`crg-daemon`)
 
 `crg-daemon` is installed with `code-review-graph` and mirrors the
