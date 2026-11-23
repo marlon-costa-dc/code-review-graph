@@ -6,9 +6,7 @@ providing a navigable documentation wiki for the codebase architecture.
 
 from __future__ import annotations
 
-import logging
 import re
-import sqlite3
 import unicodedata
 from collections import Counter
 from pathlib import Path
@@ -17,8 +15,7 @@ from typing import Any
 from .communities import get_communities
 from .flows import get_flows
 from .graph import GraphStore, _sanitize_name
-
-logger = logging.getLogger(__name__)
+from .parser import repo_relative_path
 
 
 def _md_cell(value: Any) -> str:
@@ -65,6 +62,7 @@ def _generate_community_page(store: GraphStore, community: dict[str, Any]) -> st
     lang = community.get("dominant_language", "")
     description = community.get("description", "")
 
+    repo_root = store.get_repo_root()
     lines: list[str] = []
     lines.append(f"# {_md_cell(name)}")
     lines.append("")
@@ -107,9 +105,10 @@ def _generate_community_page(store: GraphStore, community: dict[str, Any]) -> st
         for qn in lookup_qns[:50]:
             node = store.get_node(qn)
             if node and node.kind != "File":
+                file_path = repo_relative_path(node.file_path, repo_root) or node.file_path
                 lines.append(
                     f"| {_md_cell(node.name)} | {_md_cell(node.kind)} "
-                    f"| {_md_cell(node.file_path)} "
+                    f"| {_md_cell(file_path)} "
                     f"| {_md_cell(f'{node.line_start}-{node.line_end}')} |"
                 )
                 member_count += 1
@@ -130,72 +129,62 @@ def _generate_community_page(store: GraphStore, community: dict[str, Any]) -> st
     # Execution flows through community
     lines.append("## Execution Flows")
     lines.append("")
-    member_set = set(member_qns)
-    try:
-        all_flows = get_flows(store, sort_by="criticality", limit=200)
-        community_flows: list[dict] = []
-        for flow in all_flows:
-            # Check if this flow passes through any community member
-            flow_qns = store.get_flow_qualified_names(flow["id"])
-            if flow_qns & member_set:
-                community_flows.append(flow)
+    member_set = set(lookup_qns)
+    all_flows = get_flows(store, sort_by="criticality", limit=200)
+    lines.append(f"Examined {len(all_flows)} flows in criticality order (limit 200).")
+    lines.append("")
+    community_flows: list[dict] = []
+    for flow in all_flows:
+        # Check if this flow passes through any community member
+        flow_qns = store.get_flow_qualified_names(flow["id"])
+        if flow_qns & member_set:
+            community_flows.append(flow)
 
-        if community_flows:
-            for flow in community_flows[:10]:
-                flow_name = _sanitize_name(flow.get("name", "unnamed"))
-                criticality = flow.get("criticality", 0.0)
-                depth = flow.get("depth", 0)
-                lines.append(
-                    f"- **{flow_name}** (criticality: {criticality:.2f}, depth: {depth})"
-                )
-            if len(community_flows) > 10:
-                lines.append(f"- *... and {len(community_flows) - 10} more flows.*")
-        else:
-            lines.append("No execution flows pass through this community.")
-    except sqlite3.OperationalError as exc:
-        logger.debug("wiki: flows table unavailable: %s", exc)
-        lines.append("Execution flow data not available.")
+    if community_flows:
+        for flow in community_flows[:10]:
+            flow_name = _sanitize_name(flow.get("name", "unnamed"))
+            criticality = flow.get("criticality", 0.0)
+            depth = flow.get("depth", 0)
+            lines.append(
+                f"- **{flow_name}** (criticality: {criticality:.2f}, depth: {depth})"
+            )
+        if len(community_flows) > 10:
+            lines.append(f"- *... and {len(community_flows) - 10} more flows.*")
+    else:
+        lines.append("No matching flow among those examined.")
     lines.append("")
 
     # Dependencies (cross-community edges)
     lines.append("## Dependencies")
     lines.append("")
-    try:
-        outgoing_targets: Counter[str] = Counter()
-        incoming_sources: Counter[str] = Counter()
-        if member_qns:
-            qns = list(member_qns)
+    outgoing_targets: Counter[str] = Counter()
+    incoming_sources: Counter[str] = Counter()
+    if member_qns:
+        qns = lookup_qns
 
-            # Outgoing: source is a member
-            for t in store.get_outgoing_targets(qns):
-                if t not in member_set:
-                    outgoing_targets[t] += 1
+        # Outgoing: source is a member
+        for t in store.get_outgoing_targets(qns):
+            if t not in member_set:
+                outgoing_targets[t] += 1
 
-            # Incoming: target is a member
-            for s in store.get_incoming_sources(qns):
-                if s not in member_set:
-                    incoming_sources[s] += 1
+        # Incoming: target is a member
+        for s in store.get_incoming_sources(qns):
+            if s not in member_set:
+                incoming_sources[s] += 1
 
-        if outgoing_targets:
-            lines.append("### Outgoing")
+    for heading, counts in (("Outgoing", outgoing_targets), ("Incoming", incoming_sources)):
+        if counts:
+            lines.append(f"### {heading}")
             lines.append("")
-            for target, count in outgoing_targets.most_common(15):
-                lines.append(f"- `{_sanitize_name(target)}` ({count} edge(s))")
-            lines.append("")
-
-        if incoming_sources:
-            lines.append("### Incoming")
-            lines.append("")
-            for source, count in incoming_sources.most_common(15):
-                lines.append(f"- `{_sanitize_name(source)}` ({count} edge(s))")
+            for target, count in counts.most_common(15):
+                relative = repo_relative_path(target, repo_root) if repo_root else None
+                lines.append(f"- `{_sanitize_name(relative or target)}` ({count} edge(s))")
+            if len(counts) > 15:
+                lines.append(f"- *... and {len(counts) - 15} more dependencies.*")
             lines.append("")
 
-        if not outgoing_targets and not incoming_sources:
-            lines.append("No cross-community dependencies detected.")
-            lines.append("")
-    except sqlite3.OperationalError as exc:
-        logger.debug("wiki: dependency edges unavailable: %s", exc)
-        lines.append("Dependency data not available.")
+    if not outgoing_targets and not incoming_sources:
+        lines.append("No cross-community dependencies detected.")
         lines.append("")
 
     return "\n".join(lines)
@@ -236,7 +225,7 @@ def generate_wiki(
     # "data-processing.md", causing silent data loss and inflated "updated"
     # counters (each collision was counted as an update while only one file
     # made it to disk).
-    used_slugs: set[str] = set()
+    used_slugs: set[str] = {"index"}
 
     for comm in communities:
         name = comm["name"]

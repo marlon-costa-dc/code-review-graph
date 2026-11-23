@@ -1,7 +1,10 @@
 """Tests for wiki generation."""
 
+import sqlite3
 import tempfile
 from pathlib import Path
+
+import pytest
 
 from code_review_graph.communities import detect_communities, store_communities
 from code_review_graph.graph import GraphStore
@@ -156,6 +159,13 @@ class TestWiki:
         assert "## Members" in page
         assert "## Execution Flows" in page
         assert "## Dependencies" in page
+        assert "Examined 0 flows in criticality order (limit 200)" in page
+
+    def test_wiki_rejects_unavailable_flow_data(self):
+        self._seed_communities()
+        self.store._conn.execute("DROP TABLE flows")
+        with pytest.raises(sqlite3.OperationalError, match="flows"):
+            generate_wiki(self.store, self.wiki_dir)
 
     def test_slugify(self):
         """_slugify converts names to safe filenames."""

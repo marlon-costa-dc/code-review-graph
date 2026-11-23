@@ -229,6 +229,10 @@ A hook or CI job can tell these apart without reading the message. `75` is
   full rebuild.
 - `update` prints a `Warning:` line on stderr naming files that failed to
   parse. Those files keep their previous graph rows.
+- `watch` refreshes FTS, execution flows and an enabled embedding index
+  from the affected file set. The deferred community pass runs once after
+  the quiet period. To refresh a seeded embedding index, pass the same
+  `--embedding-provider` and `--embedding-model` you used to embed it.
 - `detect-changes --brief` is read-only against the existing graph and takes
   about a second. `update --brief` re-parses changed files first, then prints
   the same summary and panel. Use `update --brief` after a rebase or a large
@@ -394,6 +398,15 @@ shared setting with a per-command `--data-dir`. Launch the VS Code extension
 host with the same setting to read the selected workspace checkout from the
 shared database.
 
+`build --repo /abs/new --seed-from /abs/base` preloads a compatible complete
+generation from a peer checkout in the shared file. The target uses its own
+paths and links. It parses only changed files and affected dependents, then
+publishes the target generation in one transaction. An explicit base must
+match the repository identity and the indexing profile. The watcher discovers
+eligible linked worktrees for this operation and builds directly from source
+when none has a complete generation. Outside shared mode, `--seed-from`
+continues to select a vstore bundle.
+
 Use `code-review-graph query file_summary path.py --generation-ref refs/heads/main`
 to read the last published structural view of that ref for the selected
 checkout. The MCP `query_graph_tool` accepts the same `generation_ref`. This
@@ -449,7 +462,15 @@ notification quota exhausted, fails at start with the cause.
 
 `watch --manifest` opens and migrates the shared checkout stores under the
 native writer lock before starting their observer threads. A failed open or
-watch exits with its original cause in the service log.
+watch exits with its original cause in the service log. On shutdown, an
+interrupted shared manifest refresh rolls back and releases its lock without
+advancing freshness.
+
+`watch --wait-ready --repo /abs/new --timeout 10` reads the selected checkout
+and waits on kernel notifications from the running watcher. It returns one
+JSON object with `repo`, `head` and `branch` once the observer is ready and
+the complete graph matches the current branch, commit and indexable worktree
+contents. Use the same `CRG_HOME` and `CRG_SHARED_DB` as the watcher.
 
 ## Standalone Daemon CLI (`crg-daemon`)
 

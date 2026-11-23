@@ -11,6 +11,7 @@
 ### Fixed
 
 - Open and migrate shared checkout schemas before starting their observers.
+  The manifest watcher can shut down while waiting for another writer.
   Interrupted refreshes roll back, and shutdown retains the original failure.
 - Refresh affected flows, search rows, and enabled vector inputs on edits.
   The quiet community pass does not repeat those steps.

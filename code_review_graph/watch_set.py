@@ -23,6 +23,7 @@ import logging
 import signal
 import sys
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -30,7 +31,7 @@ from typing import Any
 
 from .daemon import ConfigWatcher
 from .graph import GraphStore
-from .incremental import _WATCH_STOP_TIMEOUT, _WATCH_TICK_SECONDS, watch
+from .incremental import _WATCH_STOP_TIMEOUT, _WATCH_TICK_SECONDS, _wait_for_watch_write_lock, watch
 from .locking import WriteLock
 from .shared_sqlite import shared_database
 
@@ -72,7 +73,7 @@ def load_manifest(path: Path) -> tuple[WatchTarget, ...]:
         if not repo.is_absolute() or not data_dir.is_absolute():
             raise ValueError(f"watch manifest {path}: paths must be absolute: {entry}")
         target = WatchTarget(repo=repo.resolve(strict=True), data_dir=data_dir.resolve())
-        if not (shared or target.data_dir / _DATABASE_NAME).is_file():
+        if shared is None and not (target.data_dir / _DATABASE_NAME).is_file():
             raise ValueError(
                 f"watch manifest {path}: no graph at {target.data_dir / _DATABASE_NAME}; "
                 "build it before watching"
@@ -91,6 +92,84 @@ def _manifest_version(path: Path) -> tuple[int, int, int]:
     """Return the identity that changes whenever the manifest is replaced."""
     stat = path.stat()
     return (stat.st_ino, stat.st_mtime_ns, stat.st_size)
+
+
+def wait_ready(repo: Path, timeout: int) -> dict[str, str]:
+    """Wait on the native health publication and verify the selected graph."""
+    from .build_state import BUILD_COMPLETE, BUILD_STATE_KEY
+    from .constants import normalize_file_path
+    from .daemon import pid_alive, read_watch_health, watch_health_path
+    from .errors import GraphStoreError
+    from .incremental import _git_branch_info, _observe_source, collect_all_files, get_db_path
+    from .shared_sqlite import UnbuiltCheckoutError
+
+    root = repo.resolve(strict=True)
+    health_path = watch_health_path(root)
+    deadline = time.monotonic() + timeout
+    timeout_message = f"Watch for {root} did not become ready within {timeout}s"
+
+    def ready() -> dict[str, str] | None:
+        health = read_watch_health(root)
+        if (
+            not health or health.get("repo") != str(root) or health.get("stalled")
+            or health.get("phase") != "watching" or health.get("observer_alive") is not True
+            or health.get("failed_paths") or not health.get("watched_paths")
+            or type(health.get("pid")) is not int or health["pid"] <= 0
+            or not isinstance(health.get("age"), (float, int)) or health["age"] < 0
+            or not pid_alive(health["pid"])
+        ):
+            return None
+        path = get_db_path(root, read_only=True)
+        if not path.is_file():
+            return None
+        try:
+            with GraphStore(path, checkout=root, read_only=True) as store:
+                branch, head = _git_branch_info(root)
+                if (
+                    head and store.get_metadata(BUILD_STATE_KEY) == BUILD_COMPLETE
+                    and store.get_metadata("git_head_sha") == head
+                    and store.get_metadata("git_branch") == branch
+                ):
+                    # A worktree edit or revert need not change the Git anchor.
+                    # Compare the native inventory to the bytes in the File nodes.
+                    indexed = store.get_file_hashes()
+                    files = collect_all_files(root)
+                    if len(indexed) != len(files):
+                        return None
+                    for file in files:
+                        source = root / file
+                        if _observe_source(source).sha256 != indexed.get(
+                            normalize_file_path(source),
+                        ):
+                            return None
+                    if _git_branch_info(root) == (branch, head):
+                        return {"repo": str(root), "head": head, "branch": branch}
+        except (UnbuiltCheckoutError, FileNotFoundError):
+            return None
+        return None
+
+    if (result := ready()) and time.monotonic() <= deadline:
+        return result
+    if time.monotonic() >= deadline:
+        raise GraphStoreError(timeout_message)
+    health_path.parent.mkdir(parents=True, exist_ok=True)
+    notified = threading.Event()
+    observer = ConfigWatcher(health_path, notified.set)
+    observer.start()
+    try:
+        while True:
+            notified.clear()
+            if (result := ready()) and time.monotonic() <= deadline:
+                return result
+            if not observer.is_alive():
+                raise GraphStoreError(f"Readiness notification backend stopped for {root}")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not notified.wait(remaining):
+                if not observer.is_alive():
+                    raise GraphStoreError(f"Readiness notification backend stopped for {root}")
+                raise GraphStoreError(timeout_message)
+    finally:
+        observer.stop()
 
 
 @dataclass
@@ -123,9 +202,8 @@ def watch_set(
     stopping = stop_event if stop_event is not None else threading.Event()
     startup_lock = threading.Lock()
     watchers: dict[Path, _Watcher] = {}
-    # Removed from the manifest but still unwinding (a running initial build
-    # does not look at its stop event); reaped on a later tick, never joined
-    # inline, so one slow build cannot stall or tear down the others.
+    # Removed from the manifest but still unwinding. Reap on a later tick so
+    # waiting for a parser batch cannot stall or tear down the other watches.
     retiring: list[_Watcher] = []
     desired: dict[Path, WatchTarget] = {}
     changed = threading.Event()
@@ -144,8 +222,6 @@ def watch_set(
                 startup_lock=startup_lock,
             )
         except BaseException as failure:  # recorded for the main loop to raise
-            # A stop requested while queued behind another repository's
-            # initial build unwinds as KeyboardInterrupt; that is a clean stop.
             if not (isinstance(failure, KeyboardInterrupt) and watcher.stop.is_set()):
                 watcher.failure = failure
         finally:
@@ -170,11 +246,13 @@ def watch_set(
         # of these observers can queue a write or spawn parser workers.
         opened: dict[WatchTarget, GraphStore] = {}
         lock = WriteLock(path)
-        if not lock.acquire(blocking=True):
-            raise RuntimeError(f"Cannot open {path}: shared graph writer holds the lock")
+        if not _wait_for_watch_write_lock(lock, stopping):
+            return
         try:
             try:
                 for target in targets:
+                    if stopping.is_set():
+                        return
                     try:
                         opened[target] = GraphStore(path, checkout=target.repo)
                     except Exception as exc:
@@ -184,6 +262,8 @@ def watch_set(
             finally:
                 lock.release()
             for target in targets:
+                if stopping.is_set():
+                    return
                 start(target, opened[target])
                 del opened[target]
         finally:
@@ -219,26 +299,31 @@ def watch_set(
     def stop_all(*, report_failures: bool) -> BaseException | None:
         """Stop and join every watcher; return the first problem found.
 
-        Every watcher is joined even when one is stuck, so one slow build
-        never leaves the others running.  Watcher failures are reported only
-        when no failure is already propagating (it is that same failure).
+        Every watcher gets the stop signal before joins use a shared deadline.
+        A watcher failure takes precedence over timeouts during shutdown.
         """
         everyone = [*watchers.values(), *retiring]
         for watcher in everyone:
             watcher.stop.set()
-        first: BaseException | None = None
+        deadline = time.monotonic() + _WATCH_STOP_TIMEOUT * 2
+        timed_out = []
         for watcher in everyone:
             if watcher.thread is not None:
-                watcher.thread.join(timeout=_WATCH_STOP_TIMEOUT * 2)
-                if watcher.thread.is_alive() and first is None:
-                    first = TimeoutError(f"watcher for {watcher.target.repo} did not stop")
-        if report_failures and first is None:
+                watcher.thread.join(timeout=max(0.0, deadline - time.monotonic()))
+                if watcher.thread.is_alive():
+                    timed_out.append(str(watcher.target.repo))
+        timeout = (
+            TimeoutError(f"Watchers did not stop: {', '.join(timed_out)}") if timed_out else None
+        )
+        if report_failures:
             for watcher in everyone:
                 if watcher.failure is not None:
                     first = RuntimeError(f"watch for {watcher.target.repo} failed")
                     first.__cause__ = watcher.failure
-                    break
-        return first
+                    if timeout is not None:
+                        logger.error("Stopping the watchers also failed: %s", timeout)
+                    return first
+        return timeout
 
     previous_handler = None
     if threading.current_thread() is threading.main_thread():
@@ -270,8 +355,13 @@ def watch_set(
     finally:
         active = sys.exc_info()[1]
         try:
-            observer.stop()
             problem = stop_all(report_failures=active is None)
+            try:
+                observer.stop()
+            except Exception:
+                if active is None and problem is None:
+                    raise
+                logger.exception("Stopping the manifest observer also failed")
             if problem is not None:
                 if active is None:
                     raise problem

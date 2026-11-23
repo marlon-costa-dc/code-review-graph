@@ -1464,6 +1464,114 @@ def test_shared_hybrid_search_uses_published_branch_vectors(tmp_path, openai_loo
     assert [request["input"] for request in requests[before_requests:]] == [["main_invoice"]]
 
 
+def test_manifest_watch_replaces_changed_shared_vectors(tmp_path, openai_loopback_server):
+    endpoint, requests = openai_loopback_server
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    edited = repo / "edited.py"
+    edited.write_text("def before_edit(): return 1\n", encoding="utf-8")
+    (repo / "other.py").write_text("def independent(): return 2\n", encoding="utf-8")
+    cli = [sys.executable, "-m", "code_review_graph"]
+    database = tmp_path / "shared.db"
+    env = {
+        **os.environ,
+        "CRG_HOME": str(tmp_path / "home"),
+        "CRG_SHARED_DB": str(database),
+        "CRG_OPENAI_API_KEY": "local-test",
+        "CRG_OPENAI_BASE_URL": endpoint,
+        "CRG_OPENAI_QUERY_PREFIX": "query: ",
+        "CRG_OPENAI_DOCUMENT_PREFIX": "document: ",
+    }
+    model = "text-embedding-3-small"
+    manifest = tmp_path / "watch.json"
+    manifest.write_text(json.dumps({"repos": [{
+        "repo": str(repo), "data_dir": str(tmp_path / "unused"),
+    }]}), encoding="utf-8")
+    subprocess.run(["git", "init", "-q", str(repo)], check=True, timeout=15)
+    subprocess.check_call([*cli, "build", "--repo", str(repo)], env=env, timeout=30)
+    subprocess.check_call(
+        [*cli, "embed", "--provider", "openai", "--model", model, "--repo", str(repo)],
+        env=env, timeout=30,
+    )
+
+    def projected() -> dict[str, int]:
+        with sqlite3.connect(database) as db:
+            return dict(db.execute(
+                "SELECT qualified_name, payload_id FROM crg_generation_projection_vectors",
+            ))
+
+    before = projected()
+    original_calls = len(requests)
+    log = tmp_path / "watch.log"
+    with log.open("wb") as output, subprocess.Popen(
+        [*cli, "watch", "--manifest", str(manifest),
+         "--embedding-provider", "openai", "--embedding-model", model],
+        env=env, stdout=output, stderr=subprocess.STDOUT,
+    ) as watcher:
+        try:
+            deadline = time.monotonic() + 30
+            while "for changes" not in log.read_text(encoding="utf-8"):
+                assert watcher.poll() is None and time.monotonic() < deadline
+                time.sleep(0.1)
+            edited.write_text("def after_edit(): return 3\n", encoding="utf-8")
+            while not any(name.endswith("::after_edit") for name in projected()):
+                assert watcher.poll() is None and time.monotonic() < deadline
+                time.sleep(0.1)
+            after = projected()
+            assert not any(name.endswith("::before_edit") for name in after)
+            independent = next(name for name in before if name.endswith("::independent"))
+            assert after[independent] == before[independent]
+            texts = [text for request in requests[original_calls:] for text in request["input"]]
+            assert len(texts) == 1 and texts[0].startswith("document: after_edit")
+        finally:
+            watcher.terminate()
+            watcher.wait(timeout=15)
+
+
+def test_exact_shared_seed_inherits_published_vector_payload(tmp_path, openai_loopback_server):
+    endpoint, requests = openai_loopback_server
+    base, peer = tmp_path / "base", tmp_path / "peer"
+    base.mkdir()
+    (base / "app.py").write_text("def inherited(): return 1\n", encoding="utf-8")
+    subprocess.run(["git", "init", "-q", "-b", "main", str(base)], check=True, timeout=15)
+
+    def git(*args):
+        subprocess.run(["git", "-C", str(base), *args], check=True, timeout=15)
+
+    git("add", "app.py")
+    git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+        "commit", "-qm", "Base source")
+    git("worktree", "add", "-qb", "peer", str(peer))
+    cli = [sys.executable, "-m", "code_review_graph"]
+    database = tmp_path / "shared.db"
+    env = {
+        **os.environ,
+        "CRG_HOME": str(tmp_path / "home"),
+        "CRG_SHARED_DB": str(database),
+        "CRG_OPENAI_API_KEY": "local-test",
+        "CRG_OPENAI_BASE_URL": endpoint,
+    }
+
+    def run(root, *args):
+        return subprocess.check_output(
+            [*cli, *args, "--repo", str(root)], env=env, text=True, timeout=30,
+        )
+
+    run(base, "build")
+    run(base, "embed", "--provider", "openai", "--model", "text-embedding-3-small")
+    calls = len(requests)
+    assert "re-parsed 0 files" in run(peer, "build", "--seed-from", str(base))
+    assert len(requests) == calls == 1
+    with sqlite3.connect(database) as db:
+        rows = db.execute(
+            "SELECT ref, qualified_name, payload_id FROM crg_generation_projection_vectors "
+            "ORDER BY ref",
+        ).fetchall()
+    assert len(rows) == 2
+    assert rows[0] == ("refs/heads/main", f"{base.as_posix()}/app.py::inherited", rows[0][2])
+    assert rows[1] == ("refs/heads/peer", f"{peer.as_posix()}/app.py::inherited", rows[0][2])
+
+
 class TestIsLocalhostUrl:
     """Ensure localhost detection is robust against subdomain tricks."""
 
