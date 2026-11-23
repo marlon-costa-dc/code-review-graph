@@ -145,6 +145,11 @@ def refresh_shared_watch(
                     store, changed_files=None if seeded.get("identity_rebuild") else affected,
                     **({"entry_point_qns": flow_entries} if flow_entries else {}),
                 ))
+            elif initialize_embeddings:
+                from ..embeddings import has_embeddings
+
+                if not has_embeddings(store):
+                    _raise_watch_postprocess_warnings(callback(store, embeddings_only=True))
             store.set_metadata("postprocess_level", "full")
             store.set_metadata(BUILD_STATE_KEY, BUILD_COMPLETE)
             if request == _refresh_request(root, None, follow, profile):
