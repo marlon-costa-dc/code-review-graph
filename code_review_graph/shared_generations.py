@@ -136,37 +136,46 @@ def bind_manifest(conn: Connection, root: Path, ref: str, digest: str, paths: in
         )
 
 
-def publish(conn: Connection, root: Path, ref: str, head: str, built_at: str) -> str:
+def publish(
+    conn: Connection, root: Path, ref: str, head: str, built_at: str,
+    *, seeded_generation: int | None = None,
+) -> str:
     """Intern immutable rows and move only this checkout/reference binding."""
     checkout = _checkout_key(root)
     previous = conn.execute(
         "SELECT generation_id FROM crg_generation_bindings WHERE checkout=? AND ref=?",
         (checkout, ref),
     ).fetchone()
-    counts, payloads = _payloads(conn, root)
-    digest = hashlib.sha256(b"crg-graph-rows-v1\0")
-    for payload, count in sorted(counts.items()):
-        digest.update(payload)
-        digest.update(count.to_bytes(8, "big"))
-    key = digest.digest()
-    row = conn.execute(
-        "SELECT id FROM crg_graph_generations WHERE digest=?", (key,),
-    ).fetchone()
-    if row is None:
-        generation = conn.execute(
-            "INSERT INTO crg_graph_generations (digest) VALUES (?)", (key,),
-        ).lastrowid
-        conn.executemany(
-            "INSERT OR IGNORE INTO crg_generation_payloads (digest, data) VALUES (?, ?)",
-            payloads.items(),
-        )
-        conn.executemany(
-            "INSERT INTO crg_generation_members "
-            "SELECT ?, id, ? FROM crg_generation_payloads WHERE digest=?",
-            ((generation, count, payload) for payload, count in counts.items()),
-        )
+    if seeded_generation is not None:
+        generation = seeded_generation
+        key = conn.execute(
+            "SELECT digest FROM crg_graph_generations WHERE id=?", (generation,),
+        ).fetchone()[0]
     else:
-        generation = row[0]
+        counts, payloads = _payloads(conn, root)
+        digest = hashlib.sha256(b"crg-graph-rows-v1\0")
+        for payload, count in sorted(counts.items()):
+            digest.update(payload)
+            digest.update(count.to_bytes(8, "big"))
+        key = digest.digest()
+        row = conn.execute(
+            "SELECT id FROM crg_graph_generations WHERE digest=?", (key,),
+        ).fetchone()
+        if row is None:
+            generation = conn.execute(
+                "INSERT INTO crg_graph_generations (digest) VALUES (?)", (key,),
+            ).lastrowid
+            conn.executemany(
+                "INSERT OR IGNORE INTO crg_generation_payloads (digest, data) VALUES (?, ?)",
+                payloads.items(),
+            )
+            conn.executemany(
+                "INSERT INTO crg_generation_members "
+                "SELECT ?, id, ? FROM crg_generation_payloads WHERE digest=?",
+                ((generation, count, payload) for payload, count in counts.items()),
+            )
+        else:
+            generation = row[0]
     conn.execute(
         "INSERT INTO crg_generation_bindings VALUES (?, ?, ?, ?, ?) "
         "ON CONFLICT(checkout, ref) DO UPDATE SET "
@@ -198,11 +207,7 @@ def publish(conn: Connection, root: Path, ref: str, head: str, built_at: str) ->
     return key.hex()
 
 
-def read(
-    conn: Connection, root: Path, ref: str,
-) -> tuple[str, str, Iterator[tuple[str, dict[str, Any]]]]:
-    """Read only a generation bound to this checkout and Git reference."""
-    prefix = normalize_file_path(root).rstrip("/") + "/"
+def _binding(conn: Connection, root: Path, ref: str) -> tuple[int, str, str]:
     table = conn.execute(
         "SELECT 1 FROM sqlite_schema WHERE type='table' AND name='crg_generation_bindings'",
     ).fetchone()
@@ -213,11 +218,20 @@ def read(
     ).fetchone()
     if binding is None:
         raise GraphStoreError(f"No published graph generation for {ref} in {root}")
+    return binding[0], binding[1], binding[2]
+
+
+def read(
+    conn: Connection, root: Path, ref: str,
+) -> tuple[str, str, Iterator[tuple[str, dict[str, Any]]]]:
+    """Read only a generation bound to this checkout and Git reference."""
+    prefix = normalize_file_path(root).rstrip("/") + "/"
+    generation, head, built_at = _binding(conn, root, ref)
     rows = conn.execute(
         "SELECT p.data, m.multiplicity FROM crg_generation_members m "
         "JOIN crg_generation_payloads p ON p.id=m.payload_id "
         "WHERE m.generation_id=? ORDER BY p.digest",
-        (binding[0],),
+        (generation,),
     )
 
     def materialize() -> Iterator[tuple[str, dict[str, Any]]]:
@@ -230,7 +244,72 @@ def read(
             for _ in range(count):
                 yield kind, row.copy()
 
-    return binding[1], binding[2], materialize()
+    return head, built_at, materialize()
+
+
+def seed_rows(
+    conn: Connection, base: Path, ref: str, expected_head: str, destination: Path,
+) -> int:
+    """Copy immutable rows into the connection's native checkout in SQLite."""
+    generation, head, _ = _binding(conn, base, ref)
+    if head != expected_head:
+        raise GraphStoreError(f"Seed generation for {ref} in {base} changed; refresh the base")
+    prefix = normalize_file_path(destination).rstrip("/") + "/"
+    for kind, columns in (("nodes", _NODE_COLUMNS), ("edges", _EDGE_COLUMNS)):
+        fields = []
+        for index in range(len(columns)):
+            value = f"$[1][{index}]"
+            # Only checkout-relative path markers are encoded as JSON arrays.
+            fields.append(
+                f"CASE json_type(p.data, '{value}') WHEN 'array' "
+                f"THEN :prefix || json_extract(p.data, '{value}[0]') "
+                f"ELSE json_extract(p.data, '{value}') END"
+            )
+        conn.execute(
+            f"""
+            WITH RECURSIVE copies(number) AS (
+                VALUES (1)
+                UNION ALL SELECT number + 1 FROM copies
+                LIMIT (SELECT COALESCE(MAX(multiplicity), 0) FROM crg_generation_members
+                       WHERE generation_id=:generation)
+            )
+            INSERT INTO {kind} ({', '.join(columns)}, updated_at)
+            SELECT {', '.join(fields)}, 0
+            FROM crg_generation_members m
+            JOIN crg_generation_payloads p ON p.id=m.payload_id
+            JOIN copies ON copies.number<=m.multiplicity
+            WHERE m.generation_id=:generation AND json_extract(p.data, '$[0]')=:kind
+            ORDER BY {columns.index('file_path') + 1}, p.digest
+            """,
+            {"generation": generation, "prefix": prefix, "kind": kind},
+        )
+    return generation
+
+
+def restore_rows(conn: Connection, rows: Iterator[tuple[str, dict[str, Any]]]) -> None:
+    """Materialize a published generation in a native checkout schema."""
+    for kind, row in rows:
+        fields = ", ".join(row)
+        marks = ", ".join("?" for _ in row)
+        conn.execute(
+            f"INSERT INTO {kind} ({fields}, updated_at) VALUES ({marks}, 0)",
+            tuple(row.values()),
+        )
+
+
+def _publish_vector_projection(conn: Connection, checkout: bytes, ref: str) -> None:
+    conn.execute(
+        "DELETE FROM crg_generation_projection_vectors WHERE checkout=? AND ref=?",
+        (checkout, ref),
+    )
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(embeddings)")}
+    if "payload_id" in columns:
+        conn.execute(
+            "INSERT INTO crg_generation_projection_vectors "
+            "SELECT ?, ?, e.qualified_name, e.provider, e.text_hash, e.payload_id "
+            "FROM embeddings e JOIN nodes n USING (qualified_name)",
+            (checkout, ref),
+        )
 
 
 def publish_projections(conn: Connection, root: Path, ref: str) -> None:
@@ -253,18 +332,7 @@ def publish_projections(conn: Connection, root: Path, ref: str) -> None:
         "ON crg_generation_projection_vectors(payload_id)",
     )
     checkout = _checkout_key(root)
-    conn.execute(
-        "DELETE FROM crg_generation_projection_vectors WHERE checkout=? AND ref=?",
-        (checkout, ref),
-    )
-    columns = {row[1] for row in conn.execute("PRAGMA table_info(embeddings)")}
-    if "payload_id" in columns:
-        conn.execute(
-            "INSERT INTO crg_generation_projection_vectors "
-            "SELECT ?, ?, e.qualified_name, e.provider, e.text_hash, e.payload_id "
-            "FROM embeddings e JOIN nodes n USING (qualified_name)",
-            (checkout, ref),
-        )
+    _publish_vector_projection(conn, checkout, ref)
     names = dict(conn.execute("SELECT id, qualified_name FROM nodes"))
     flows = []
     for row in conn.execute(
@@ -306,9 +374,39 @@ def publish_projections(conn: Connection, root: Path, ref: str) -> None:
     )
 
 
+def manifest_at(conn: Connection, root: Path, ref: str, head: str) -> str | None:
+    """Find a verified manifest still bound to the requested generation."""
+    if not conn.execute(
+        "SELECT 1 FROM sqlite_schema WHERE name='crg_graph_input_bindings'",
+    ).fetchone():
+        return None
+    row = conn.execute(
+        "SELECT i.digest FROM crg_graph_input_bindings i "
+        "JOIN crg_generation_bindings g USING (checkout, ref) "
+        "WHERE g.checkout=? AND g.ref=? AND g.head=?",
+        (_checkout_key(root), ref, head),
+    ).fetchone()
+    return row[0] if row else None
+
+
+def seed_projections(
+    conn: Connection, base: Path, base_ref: str, root: Path, ref: str,
+) -> None:
+    """Copy unchanged search and flow state and bind this checkout's vector links."""
+    old_checkout, new_checkout = _checkout_key(base), _checkout_key(root)
+    old_prefix = normalize_file_path(base).rstrip("/") + "/"
+    conn.execute(
+        "INSERT INTO crg_generation_projections "
+        "SELECT ?, ?, json_insert(data, '$.source_prefix', ?) "
+        "FROM crg_generation_projections WHERE checkout=? AND ref=?",
+        (new_checkout, ref, old_prefix, old_checkout, base_ref),
+    )
+    _publish_vector_projection(conn, new_checkout, ref)
+
+
 def load_projections(
     source: Connection, destination: Connection, root: Path, ref: str,
-    *, require_communities: bool = False,
+    *, require_communities: bool = False, destination_root: Path | None = None,
 ) -> bool:
     """Restore stored flows with IDs remapped to the materialized nodes."""
     table = source.execute(
@@ -321,7 +419,14 @@ def load_projections(
     if row is None:
         raise GraphStoreError(f"No published search and flow state for {ref}; build that ref")
     state = json.loads(row[0])
-    if require_communities:
+
+    old_prefix = normalize_file_path(root).rstrip("/") + "/"
+    new_prefix = normalize_file_path(destination_root or root).rstrip("/") + "/"
+
+    def qualified(name: str, prefix: str = state.get("source_prefix", old_prefix)) -> str:
+        return new_prefix + name[len(prefix):] if name.startswith(prefix) else name
+
+    if require_communities or destination_root is not None:
         if "communities" not in state:
             raise GraphStoreError(f"No published communities for {ref}; build that ref")
         destination.executemany(
@@ -330,18 +435,19 @@ def load_projections(
         )
         destination.executemany(
             "UPDATE nodes SET community_id=? WHERE qualified_name=?",
-            state.get("community_members", ()),
+            ((group, qualified(name)) for group, name in state.get("community_members", ())),
         )
         if state.get("community_detector") is not None:
             destination.execute(
                 "INSERT INTO metadata VALUES ('community_detector', ?)",
                 (state["community_detector"],),
             )
-        return False
+        if require_communities:
+            return False
     ids = dict(destination.execute("SELECT qualified_name, id FROM nodes"))
     for flow in state["flows"]:
-        path = [ids[name] for name in flow[7]]
-        flow[2], flow[7] = ids[flow[2]], json.dumps(path)
+        path = [ids[qualified(name)] for name in flow[7]]
+        flow[2], flow[7] = ids[qualified(flow[2])], json.dumps(path)
         destination.execute("INSERT INTO flows VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", flow)
         destination.executemany(
             "INSERT OR IGNORE INTO flow_memberships VALUES (?, ?, ?)",
@@ -350,6 +456,22 @@ def load_projections(
     if source.execute(
         "SELECT 1 FROM sqlite_schema WHERE name='crg_generation_projection_vectors'",
     ).fetchone():
+        if destination_root is not None:
+            from .shared_vectors import initialize as initialize_vectors
+
+            initialize_vectors(destination)
+            links = source.execute(
+                "SELECT qualified_name, provider, text_hash, payload_id "
+                "FROM crg_generation_projection_vectors WHERE checkout=? AND ref=?",
+                (_checkout_key(root), ref),
+            )
+            destination.executemany(
+                "INSERT INTO embeddings (qualified_name, provider, text_hash, payload_id) "
+                "VALUES (?, ?, ?, ?)",
+                ((qualified(name, old_prefix), provider, key, payload)
+                 for name, provider, key, payload in links),
+            )
+            return bool(state["fts"])
         vectors = source.execute(
             "SELECT e.qualified_name, p.vector, e.text_hash, e.provider "
             "FROM crg_generation_projection_vectors e "

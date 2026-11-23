@@ -584,6 +584,201 @@ def test_shared_cli_interns_equivalent_input_manifests_across_worktrees(tmp_path
 
 
 @pytest.mark.e2e
+@pytest.mark.parametrize("delta", [False, True])
+def test_shared_cli_seeds_only_the_checkout_delta(tmp_path, delta, monkeypatch):
+    base = _make_fixture_repo(tmp_path)
+    target = tmp_path / "peer"
+    _git(base, "worktree", "add", "-q", "-b", "peer", str(target))
+    env = {**_server_env(tmp_path / "home"), "CRG_SHARED_DB": str(tmp_path / "shared.db")}
+
+    def cli(repo, *args):
+        return subprocess.check_output(
+            [sys.executable, "-m", "code_review_graph", *args, "--repo", str(repo)],
+            text=True, env=env, timeout=30,
+        )
+
+    cli(base, "build")
+    selected = "pkg/service.py"
+    if delta:
+        _git(target, "mv", selected, "pkg/moved.py")
+        _git(target, "rm", "pkg/core.py")
+        _git(target, "commit", "-qm", "Move service and remove core")
+        selected = "pkg/moved.py"
+    seeded = cli(target, "build", "--seed-from", str(base))
+    # The renamed source and the unchanged test that imported deleted core.py
+    # are re-parsed. The independent files are reused from the seed.
+    assert f"re-parsed {2 if delta else 0} files" in seeded
+    status = json.loads(cli(target, "status", "--json"))
+    assert status["built_at_commit"] == status["current_sha"]
+    assert status["built_on_branch"] == "peer"
+    results = json.loads(cli(target, "query", "file_summary", selected))["results"]
+    assert any(row["name"] == "build_invoice" for row in results)
+    assert all(Path(row["file_path"]).is_relative_to(target) for row in results)
+    baseline = json.loads(cli(base, "query", "file_summary", "pkg/core.py"))["results"]
+    assert any(row["name"] == "compute_total" for row in baseline)
+    if delta:
+        for previous in ("pkg/core.py", "pkg/service.py"):
+            assert not json.loads(cli(target, "query", "file_summary", previous))["results"]
+    else:
+        from code_review_graph.graph import GraphStore
+
+        database = Path(env["CRG_SHARED_DB"])
+        with sqlite3.connect(database) as db:
+            assert db.execute(
+                "SELECT COUNT(*), COUNT(DISTINCT generation_id) FROM crg_generation_bindings",
+            ).fetchone() == (2, 1)
+        monkeypatch.setenv("CRG_SHARED_DB", str(database))
+        with GraphStore(database, checkout=target, read_only=True) as store:
+            with store.open_generation(
+                "refs/heads/peer", projections=True, require_communities=True,
+            ) as snapshot:
+                members = [row[0] for row in snapshot._conn.execute(
+                    "SELECT qualified_name FROM nodes WHERE community_id IS NOT NULL",
+                )]
+        assert members and all(Path(name.partition("::")[0]).is_relative_to(target)
+                               for name in members)
+
+        source = "pkg/core.py"
+        (base / source).write_text("def from_base_only(): return 1\n", encoding="utf-8")
+        _git(base, "add", source)
+        _git(base, "commit", "-qm", "Advance the original checkout")
+        cli(base, "build")
+        subprocess.check_call(
+            [sys.executable, "-m", "code_review_graph", "prune", "--apply"],
+            env={**env, "CRG_RETENTION_DAYS": "0"}, timeout=30,
+        )
+        historical = json.loads(cli(
+            target, "query", "file_summary", source, "--generation-ref", "refs/heads/peer",
+        ))["results"]
+        assert any(row["name"] == "compute_total" for row in historical)
+        assert all(row["name"] != "from_base_only" for row in historical)
+
+        (target / source).write_text("def from_peer_only(): return 2\n", encoding="utf-8")
+        cli(target, "update")
+        for checkout, own, foreign in (
+            (base, "from_base_only", "from_peer_only"),
+            (target, "from_peer_only", "from_base_only"),
+        ):
+            rows = json.loads(cli(checkout, "query", "file_summary", source))["results"]
+            names = {row["name"] for row in rows}
+            assert own in names and foreign not in names
+
+
+@pytest.mark.e2e
+def test_shared_seed_reads_source_paths_under_advanced_gitlink(tmp_path):
+    member = tmp_path / "member"
+    member.mkdir()
+    _git(member, "init", "-q")
+    (member / "api.py").write_text("def before_rollup(): return 1\n", encoding="utf-8")
+    _git(member, "add", "api.py")
+    _git(member, "commit", "-qm", "Initial member")
+
+    base = _make_fixture_repo(tmp_path)
+    _git(base, "-c", "protocol.file.allow=always", "submodule", "add", str(member), "dependency")
+    _git(base, "commit", "-qm", "Index member")
+    target = tmp_path / "peer"
+    _git(base, "worktree", "add", "-q", "-b", "peer", str(target))
+    _git(target, "-c", "protocol.file.allow=always", "submodule", "update", "--init")
+
+    env = {
+        **_server_env(tmp_path / "home"), "CRG_SHARED_DB": str(tmp_path / "shared.db"),
+        "CRG_RECURSE_SUBMODULES": "1",
+    }
+
+    def cli(root, *args):
+        return subprocess.check_output(
+            [sys.executable, "-m", "code_review_graph", *args, "--repo", str(root)],
+            text=True, env=env, timeout=30,
+        )
+
+    cli(base, "build")
+    dependency = target / "dependency"
+    (dependency / "api.py").write_text("def after_rollup(): return 2\n", encoding="utf-8")
+    _git(dependency, "add", "api.py")
+    _git(dependency, "commit", "-qm", "Update member API")
+    _git(target, "add", "dependency")
+    _git(target, "commit", "-qm", "Advance gitlink")
+    assert "re-parsed 1 files" in cli(target, "build", "--seed-from", str(base))
+
+    def symbols(root):
+        return {row["name"] for row in json.loads(
+            cli(root, "query", "file_summary", "dependency/api.py"),
+        )["results"] if row["kind"] == "Function"}
+
+    assert symbols(base) == {"before_rollup"}
+    assert symbols(target) == {"after_rollup"}
+
+
+@pytest.mark.e2e
+def test_manifest_readiness_accepts_existing_and_newly_published_namespace(tmp_path):
+    from code_review_graph.locking import WriteLock
+
+    base = _make_fixture_repo(tmp_path)
+    peer = tmp_path / "peer"
+    _git(base, "worktree", "add", "-q", "-b", "peer", str(peer))
+    env = {**_server_env(tmp_path / "home"), "CRG_SHARED_DB": str(tmp_path / "shared.db")}
+    cli = [sys.executable, "-m", "code_review_graph"]
+    manifest = tmp_path / "watch.json"
+    manifest.write_text(json.dumps({"repos": [{
+        "repo": str(base), "data_dir": str(tmp_path / "unused"),
+    }]}), encoding="utf-8")
+
+    def ready(root, timeout=20):
+        return [*cli, "watch", "--wait-ready", "--repo", str(root), "--timeout", str(timeout)]
+
+    log = tmp_path / "manifest.log"
+    with log.open("wb") as output, subprocess.Popen(
+        [*cli, "watch", "--manifest", str(manifest)], env=env,
+        stdout=output, stderr=subprocess.STDOUT,
+    ) as watcher:
+        try:
+            first = json.loads(subprocess.check_output(ready(base), env=env, timeout=25))
+            assert first["branch"] == "main"
+            assert first == json.loads(subprocess.check_output(ready(base), env=env, timeout=25))
+            with subprocess.Popen(ready(peer), env=env, stdout=subprocess.PIPE) as waiting:
+                replacement = manifest.with_suffix(".new")
+                replacement.write_text(json.dumps({"repos": [
+                    {"repo": str(root), "data_dir": str(tmp_path / "unused")}
+                    for root in (base, peer)
+                ]}), encoding="utf-8")
+                replacement.replace(manifest)
+                stdout, _ = waiting.communicate(timeout=25)
+                assert waiting.returncode == 0, log.read_text(encoding="utf-8")
+            assert json.loads(stdout)["head"] == first["head"]
+            with sqlite3.connect(env["CRG_SHARED_DB"]) as db:
+                assert db.execute(
+                    "SELECT COUNT(*), COUNT(DISTINCT generation_id) FROM crg_generation_bindings",
+                ).fetchone() == (2, 1)
+
+            relative = "pkg/core.py"
+            source = peer / relative
+            original = source.read_bytes()
+            changed = b"def same_head_readiness(): return 1\n"
+            for contents, symbol in ((changed, True), (original, False)):
+                writer = WriteLock(Path(env["CRG_SHARED_DB"]))
+                assert writer.acquire()
+                try:
+                    source.write_bytes(contents)
+                    stale = subprocess.run(
+                        ready(peer, timeout=1), env=env, timeout=8,
+                        capture_output=True, text=True,
+                    )
+                    assert stale.returncode != 0
+                    assert "did not become ready within 1s" in stale.stderr
+                finally:
+                    writer.release()
+                published = json.loads(subprocess.check_output(ready(peer), env=env, timeout=25))
+                assert published["head"] == first["head"]
+                query = subprocess.check_output([
+                    *cli, "query", "file_summary", relative, "--repo", str(peer),
+                ], env=env, timeout=10)
+                assert (b"same_head_readiness" in query) is symbol
+        finally:
+            watcher.terminate()
+            watcher.wait(timeout=15)
+
+
+@pytest.mark.e2e
 def test_shared_cli_reuses_watcher_reconciliation(tmp_path):
     repo = _make_fixture_repo(tmp_path)
     env = {**_server_env(tmp_path / "home"), "CRG_SHARED_DB": str(tmp_path / "shared.db")}

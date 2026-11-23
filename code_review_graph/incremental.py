@@ -3822,6 +3822,7 @@ def incremental_update(
     return {
         **(facts_cache.report() if facts_cache is not None else {}),
         "files_updated": files_updated,
+        "files_parsed": parsed_files,
         "total_nodes": total_nodes,
         "total_edges": total_edges,
         "changed_files": list(changed_files),
@@ -5166,7 +5167,6 @@ def _create_watch_handler(
                 # Recorded before the work so a stalled watcher is distinguishable
                 # from a watcher whose repository is simply quiet.
                 self.last_event_at = time.time()
-                self.events_seen += len(events)
                 token = _WATCH_CANCELLATION.set(cancellation)
                 try:
                     anchor = _git_branch_info(repo_root) if store.checkout is not None else None
@@ -5251,6 +5251,7 @@ def _create_watch_handler(
                 finally:
                     _WATCH_CANCELLATION.reset(token)
                     self.write_lock.release()
+                    self.events_seen += len(events)
 
         def settle(self) -> bool:
             """Run the whole-graph pass the quiet burst deferred; False retries."""
@@ -5613,6 +5614,7 @@ def _watch(
     try:
         import time as _time
 
+        reported_events = 0
         while True:
             if stop_event is not None:
                 if stop_event.wait(_WATCH_TICK_SECONDS):
@@ -5674,11 +5676,14 @@ def _watch(
                     repo_root,
                 )
                 raise RuntimeError(f"watch observer stopped: dead thread(s) {names}")
+            events_seen = handler.events_seen
             supervisor.report_health(
                 observer_alive=True,
                 last_event_at=handler.last_event_at,
-                events_seen=handler.events_seen,
+                events_seen=events_seen,
+                force=store.checkout is not None and events_seen != reported_events,
             )
+            reported_events = events_seen
         supervisor.clear_health()
     except KeyboardInterrupt:
         supervisor.clear_health()
