@@ -472,6 +472,12 @@ JSON object with `repo`, `head` and `branch` once the observer is ready and
 the complete graph matches the current branch, commit and indexable worktree
 contents. Use the same `CRG_HOME` and `CRG_SHARED_DB` as the watcher.
 
+With `CRG_SHARED_DB` set, add `--initialize-embeddings`, `--embedding-provider`
+and `--embedding-model` to `watch --manifest` to build the first vector index
+for each checkout that has no vectors. The same provider and model refresh
+affected inputs on later edits. Omitting `--initialize-embeddings` keeps the
+existing refresh-only behavior.
+
 ## Standalone Daemon CLI (`crg-daemon`)
 
 `crg-daemon` is installed with `code-review-graph` and mirrors the
@@ -987,7 +993,9 @@ community_name: str
 repo_root: str | None
 max_chars: int = 20000       # Page content returned (max 80000)
 ```
-`total_chars` reports the real page length; `truncated` marks a cut.
+Use the exact community name or its generated slug or filename. Request
+`index.md` for the wiki overview. `total_chars` reports the real page length;
+`truncated` marks a cut.
 
 ### Multi-Repo Tools
 

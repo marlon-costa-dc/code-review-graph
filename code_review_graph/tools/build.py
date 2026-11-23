@@ -95,7 +95,10 @@ def _publish_refresh(
     }))
 
 
-def refresh_shared_watch(root: Path, store: GraphStore, follow: bool | None, callback) -> None:
+def refresh_shared_watch(
+    root: Path, store: GraphStore, follow: bool | None, callback,
+    *, initialize_embeddings: bool = False,
+) -> None:
     """Publish a watcher update while the caller holds the shared writer lock."""
     profile = _refresh_profile(False, None, "full", None, None, follow)
     request = _refresh_request(root, None, follow, profile)
@@ -106,6 +109,16 @@ def refresh_shared_watch(root: Path, store: GraphStore, follow: bool | None, cal
             json.loads(completed)["request"] == request.request
             and store.get_metadata(SEED_PROFILE_KEY) == request.seed_profile
         ):
+            prior = json.loads(completed)
+            if initialize_embeddings and callback is not None:
+                from ..embeddings import has_embeddings
+
+                if not has_embeddings(store):
+                    postprocess = callback(store, embeddings_only=True)
+                    _raise_watch_postprocess_warnings(postprocess)
+                    _check_watch_cancelled()
+                    if postprocess.get("embeddings_refreshed"):
+                        _publish_refresh(store, request, {**prior["result"], **postprocess})
             return
         store.invalidate_refresh()
         seeded = None
@@ -132,6 +145,11 @@ def refresh_shared_watch(root: Path, store: GraphStore, follow: bool | None, cal
                     store, changed_files=None if seeded.get("identity_rebuild") else affected,
                     **({"entry_point_qns": flow_entries} if flow_entries else {}),
                 ))
+            elif initialize_embeddings:
+                from ..embeddings import has_embeddings
+
+                if not has_embeddings(store):
+                    _raise_watch_postprocess_warnings(callback(store, embeddings_only=True))
             store.set_metadata("postprocess_level", "full")
             store.set_metadata(BUILD_STATE_KEY, BUILD_COMPLETE)
             if request == _refresh_request(root, None, follow, profile):
